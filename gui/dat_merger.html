@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DAT Merger — ToSort Toolkit</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@400;500;600&display=swap');
+
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;
+  --border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
+
+#app{display:flex;flex-direction:column;height:100vh}
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:12px;-webkit-app-region:drag;user-select:none;flex-shrink:0}
+.titlebar .logo{font-family:var(--mono);font-size:15px;color:var(--info);letter-spacing:2px}
+.titlebar .sub{font-size:11px;color:var(--text2)}
+
+.content{flex:1;display:flex;flex-direction:column;overflow-y:auto;padding:14px;gap:12px;min-height:0}
+
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:6px;flex-shrink:0}
+.panel-hdr{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text2);border-radius:6px 6px 0 0}
+.panel-hdr .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.panel-body{padding:12px 14px}
+
+.row{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.row label{font-size:11px;color:var(--text2);width:110px;flex-shrink:0}
+.path-input{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;transition:.15s;user-select:text;-webkit-user-select:text}
+.path-input:focus{border-color:var(--acc)}
+.browse-btn{padding:5px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:11px;cursor:pointer;white-space:nowrap;font-family:var(--font)}
+.browse-btn:hover{border-color:var(--acc);color:var(--acc)}
+
+.file-list{background:var(--bg0);border:1px solid var(--border);border-radius:4px;min-height:120px;max-height:240px;overflow-y:auto;padding:6px;margin-bottom:8px}
+.file-item{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:3px;font-family:var(--mono);font-size:11px;color:var(--text2)}
+.file-item:hover{background:var(--bg2)}
+.file-item .fname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-item .fcount{color:var(--text3);font-size:10px;flex-shrink:0}
+.file-item .fdel{cursor:pointer;color:var(--text3);font-size:14px;padding:0 4px;flex-shrink:0}
+.file-item .fdel:hover{color:var(--danger)}
+.file-ext{padding:1px 5px;border-radius:3px;font-size:9px;font-family:var(--mono);flex-shrink:0}
+.file-ext.dat{background:rgba(74,240,160,.12);color:var(--acc);border:1px solid rgba(74,240,160,.3)}
+.file-ext.xml{background:rgba(64,160,240,.12);color:var(--info);border:1px solid rgba(64,160,240,.3)}
+.file-empty{text-align:center;padding:30px;color:var(--text3);font-size:12px}
+
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+
+.opt{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:var(--text2);user-select:none}
+.opt input[type=checkbox]{accent-color:var(--acc);width:13px;height:13px;cursor:pointer}
+
+.stats-bar{display:flex;gap:16px;padding:8px 0;flex-wrap:wrap}
+.stat{display:flex;flex-direction:column;gap:2px}
+.stat-val{font-family:var(--mono);font-size:18px;color:var(--acc)}
+.stat-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px}
+
+.progress-wrap{margin:6px 0 2px}
+.progress-label{display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-bottom:4px}
+.pbar-bg{height:5px;background:var(--bg3);border-radius:3px;overflow:hidden}
+.pbar{height:100%;width:0%;border-radius:3px;transition:width .35s ease;background:var(--info)}
+
+.log-wrap{background:var(--bg0);border:1px solid var(--border);border-radius:4px;height:200px;overflow-y:auto;padding:8px;font-family:var(--mono);font-size:11px;line-height:1.55;user-select:text;-webkit-user-select:text;cursor:text}
+.ll{margin:1px 0;user-select:text;-webkit-user-select:text}
+.ll-info{color:var(--info)}
+.ll-ok{color:var(--acc)}
+.ll-warn{color:var(--warn)}
+.ll-err{color:var(--danger)}
+.ll-dim{color:var(--text3)}
+
+.footer{background:var(--bg1);border-top:1px solid var(--border);padding:9px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.btn-start{padding:7px 24px;background:var(--acc2);border:1px solid var(--acc);border-radius:5px;color:#000;font-family:var(--font);font-weight:600;font-size:13px;cursor:pointer}
+.btn-start:hover{background:var(--acc)}
+.btn-start:disabled{background:var(--bg3);border-color:var(--border);color:var(--text3);cursor:not-allowed}
+.btn-stop{padding:7px 18px;background:transparent;border:1px solid var(--danger);border-radius:5px;color:var(--danger);font-family:var(--font);font-size:12px;cursor:pointer}
+.btn-stop:hover{background:rgba(240,64,64,.1)}
+.btn-stop:disabled{border-color:var(--border);color:var(--text3);cursor:not-allowed}
+.footer-status{font-size:11px;color:var(--text2)}
+.pill{padding:2px 8px;border-radius:10px;font-size:10px;font-family:var(--mono);flex-shrink:0}
+.pill-idle{background:var(--bg3);color:var(--text3)}
+.pill-running{background:rgba(64,160,240,.15);color:var(--info);animation:blink 1.1s infinite}
+.pill-done{background:rgba(74,240,160,.2);color:var(--acc)}
+.pill-error{background:rgba(240,64,64,.15);color:var(--danger)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg0)}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--border)}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="titlebar">
+    <span class="logo">&#9830; DAT MERGER</span>
+    <span class="sub">Merge &amp; Deduplicate DAT/XML files for RomVault</span>
+    <span id="status-pill" class="pill pill-idle" style="margin-left:auto">IDLE</span>
+  </div>
+
+  <div class="content">
+
+    <!-- INPUT FILES -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="dot" style="background:var(--info)"></div>
+        Input DAT/XML Files
+        <span id="file-count" style="margin-left:auto;font-family:var(--mono);color:var(--text3)">0 files</span>
+      </div>
+      <div class="panel-body">
+        <div class="btn-row">
+          <button class="browse-btn" onclick="addFiles()">+ Add Files</button>
+          <button class="browse-btn" onclick="addFolder()">+ Add Folder (scan all .dat/.xml)</button>
+          <button class="browse-btn" onclick="clearFiles()" style="margin-left:auto;border-color:var(--danger);color:var(--danger)">Clear All</button>
+        </div>
+        <div class="file-list" id="file-list">
+          <div class="file-empty">No files added yet &mdash; click Add Files or Add Folder above</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- OUTPUT SETTINGS -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="dot" style="background:var(--acc)"></div>
+        Output Settings
+      </div>
+      <div class="panel-body">
+        <div class="row">
+          <label>Output File</label>
+          <input class="path-input" id="output-path" placeholder="Click Browse or type full path (e.g. D:\DATs\merged.dat)" />
+          <button class="browse-btn" onclick="browseOutput()">Browse&hellip;</button>
+        </div>
+        <div class="row">
+          <label>DAT Name</label>
+          <input class="path-input" id="dat-name" placeholder="Name shown in RomVault (e.g. My Merged TOSEC Set)" value="Merged DAT" />
+        </div>
+        <div class="row">
+          <label>Description</label>
+          <input class="path-input" id="dat-desc" placeholder="Optional description" />
+        </div>
+        <div class="row">
+          <label>Author</label>
+          <input class="path-input" id="dat-author" placeholder="Optional author name" value="ToSort Toolkit" />
+        </div>
+        <div style="padding:6px 0;display:flex;gap:16px">
+          <label class="opt"><input type="checkbox" id="dedupe" checked> Deduplicate by ROM hash (SHA1/CRC+size)</label>
+        </div>
+        <div style="padding:2px 0;font-size:11px;color:var(--text3)">
+          Output is always CLRMamePro format (.dat) &mdash; fully compatible with RomVault.
+          Deduplication compares ROM hashes: identical ROM sets = duplicate, first occurrence kept.
+        </div>
+      </div>
+    </div>
+
+    <!-- STATS -->
+    <div class="panel" id="stats-panel" style="display:none">
+      <div class="panel-hdr">
+        <div class="dot" style="background:var(--acc)"></div>
+        Results
+      </div>
+      <div class="panel-body">
+        <div class="stats-bar">
+          <div class="stat"><span class="stat-val" id="st-input">0</span><span class="stat-label">Input entries</span></div>
+          <div class="stat"><span class="stat-val" id="st-dupes">0</span><span class="stat-label">Dupes removed</span></div>
+          <div class="stat"><span class="stat-val" id="st-output">0</span><span class="stat-label">Final entries</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PROGRESS + LOG -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="dot" style="background:var(--info)"></div>
+        Progress &amp; Log
+        <button class="browse-btn" style="margin-left:auto;padding:2px 10px;font-size:10px" onclick="clearLog()">Clear</button>
+      </div>
+      <div class="panel-body">
+        <div class="progress-wrap">
+          <div class="progress-label">
+            <span id="pstep">Waiting&hellip;</span>
+            <span id="ppct">0%</span>
+          </div>
+          <div class="pbar-bg"><div class="pbar" id="pbar"></div></div>
+        </div>
+        <div class="log-wrap" id="log"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    <button class="btn-start" id="btn-start" onclick="startMerge()">&#9654;&nbsp; MERGE</button>
+    <button class="btn-stop" id="btn-stop" disabled onclick="doStop()">&#9632;&nbsp; STOP</button>
+    <span class="footer-status" id="footer-status"></span>
+  </div>
+
+</div>
+
+<script>
+// ── File list state ──────────────────────────────────────────────────────────
+let files = [];  // array of full paths
+
+function renderFiles() {
+  const list = document.getElementById('file-list');
+  const count = document.getElementById('file-count');
+  count.textContent = files.length + ' file' + (files.length !== 1 ? 's' : '');
+  if (files.length === 0) {
+    list.innerHTML = '<div class="file-empty">No files added yet &mdash; click Add Files or Add Folder above</div>';
+    return;
+  }
+  list.innerHTML = '';
+  files.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    const ext = f.toLowerCase().endsWith('.xml') ? 'xml' : 'dat';
+    div.innerHTML = `
+      <span class="file-ext ${ext}">${ext.toUpperCase()}</span>
+      <span class="fname" title="${f}">${f.split(/[\\/]/).pop()}</span>
+      <span class="fcount">${f.split(/[\\/]/).slice(0, -1).pop() || ''}</span>
+      <span class="fdel" onclick="removeFile(${i})" title="Remove">&times;</span>
+    `;
+    list.appendChild(div);
+  });
+}
+
+function removeFile(idx) {
+  files.splice(idx, 1);
+  renderFiles();
+}
+
+function clearFiles() {
+  files = [];
+  renderFiles();
+}
+
+async function addFiles() {
+  try {
+    const result = await window.pywebview.api.browse_files();
+    if (result && result.length) {
+      result.forEach(f => { if (!files.includes(f)) files.push(f); });
+      renderFiles();
+    }
+  } catch(e) { addLog('Error: ' + e, 'err'); }
+}
+
+async function addFolder() {
+  try {
+    const folder = await window.pywebview.api.browse_folder();
+    if (folder) {
+      addLog('Scanning folder: ' + folder, 'dim');
+      const found = await window.pywebview.api.scan_folder(folder);
+      if (found && found.length) {
+        let added = 0;
+        found.forEach(f => { if (!files.includes(f)) { files.push(f); added++; } });
+        addLog('Found ' + found.length + ' DAT/XML file(s), added ' + added + ' new.', 'ok');
+        renderFiles();
+      } else {
+        addLog('No .dat or .xml files found in folder.', 'warn');
+      }
+    }
+  } catch(e) { addLog('Error: ' + e, 'err'); }
+}
+
+async function browseOutput() {
+  try {
+    const name = document.getElementById('dat-name').value.trim().replace(/[^a-zA-Z0-9_\- ]/g, '') || 'merged';
+    const result = await window.pywebview.api.browse_save(name + '.dat');
+    if (result) document.getElementById('output-path').value = result;
+  } catch(e) { addLog('Error: ' + e, 'err'); }
+}
+
+// ── Log ──────────────────────────────────────────────────────────────────────
+function addLog(msg, cls) {
+  const log = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = 'll' + (cls ? ' ll-' + cls : '');
+  d.textContent = '[' + new Date().toLocaleTimeString('en-GB') + '] ' + msg;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearLog() { document.getElementById('log').innerHTML = ''; }
+
+// ── Progress ─────────────────────────────────────────────────────────────────
+function setProgress(pct, label) {
+  document.getElementById('pbar').style.width = pct + '%';
+  document.getElementById('ppct').textContent = pct + '%';
+  document.getElementById('pstep').textContent = label;
+}
+
+function setStatus(state) {
+  const pill = document.getElementById('status-pill');
+  const map = {
+    idle:    ['IDLE', 'pill-idle'],
+    running: ['RUNNING', 'pill-running'],
+    done:    ['DONE', 'pill-done'],
+    error:   ['ERROR', 'pill-error'],
+  };
+  const [label, cls] = map[state] || ['?', 'pill-idle'];
+  pill.textContent = label;
+  pill.className = 'pill ' + cls;
+}
+
+// ── Python → JS bridge ───────────────────────────────────────────────────────
+window.pyEvent = function(event, data) {
+  switch(event) {
+    case 'log':
+      addLog(data.msg, data.cls);
+      break;
+    case 'progress':
+      setProgress(data.pct, data.label);
+      break;
+    case 'done':
+      document.getElementById('btn-start').disabled = false;
+      document.getElementById('btn-stop').disabled = true;
+      setStatus(data.success ? 'done' : 'error');
+      document.getElementById('footer-status').textContent = data.success ? 'Merge complete.' : 'Failed.';
+      if (data.stats) {
+        document.getElementById('stats-panel').style.display = '';
+        document.getElementById('st-input').textContent = (data.stats.total_input || 0).toLocaleString();
+        document.getElementById('st-dupes').textContent = (data.stats.duplicates_removed || 0).toLocaleString();
+        document.getElementById('st-output').textContent = (data.stats.total_output || 0).toLocaleString();
+      }
+      break;
+  }
+};
+
+// ── Start ────────────────────────────────────────────────────────────────────
+function startMerge() {
+  if (files.length === 0) { addLog('No files to merge.', 'err'); return; }
+  const output = document.getElementById('output-path').value.trim();
+  if (!output) { addLog('No output path set.', 'err'); return; }
+
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('btn-stop').disabled = false;
+  document.getElementById('stats-panel').style.display = 'none';
+  setStatus('running');
+  setProgress(0, 'Starting...');
+  document.getElementById('footer-status').textContent = 'Merging...';
+
+  window.pywebview.api.run_merge({
+    files: files,
+    output_path: output,
+    dat_name: document.getElementById('dat-name').value.trim() || 'Merged DAT',
+    dat_description: document.getElementById('dat-desc').value.trim() || '',
+    dat_author: document.getElementById('dat-author').value.trim() || 'ToSort Toolkit',
+    dedupe: document.getElementById('dedupe').checked,
+  });
+}
+
+function doStop() {
+  window.pywebview.api.stop();
+  addLog('Stop requested...', 'warn');
+}
+
+addLog('DAT Merger ready. Add DAT/XML files and configure output.', 'info');
+renderFiles();
+</script>
+</body>
+</html>

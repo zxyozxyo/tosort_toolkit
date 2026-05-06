@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ToSort Toolkit</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@400;500;600&display=swap');
+
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;
+  --border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
+
+/* ── Layout ── */
+#app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:12px;-webkit-app-region:drag;user-select:none;flex-shrink:0}
+.titlebar .logo{font-family:var(--mono);font-size:15px;color:var(--acc);letter-spacing:2px}
+.titlebar .sub{font-size:11px;color:var(--text2)}
+.main{display:flex;flex:1;overflow:hidden;min-height:0}
+
+/* ── Sidebar ── */
+.sidebar{width:210px;background:var(--bg1);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:10px 0;flex-shrink:0;overflow-y:auto;min-height:0}
+.sidebar-section{padding:8px 14px 4px;font-size:10px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase}
+.mod-row{display:flex;align-items:center;gap:6px;padding:7px 14px;cursor:pointer;transition:.12s;user-select:none}
+.mod-row:hover{background:var(--bg2)}
+.mod-row.active{background:var(--bg3);border-left:2px solid var(--acc)}
+.mod-row .mod-num{font-family:var(--mono);font-size:10px;width:17px;height:17px;border:1px solid var(--text3);border-radius:3px;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--text2)}
+.mod-row.active .mod-num{border-color:var(--acc);color:var(--acc)}
+.mod-row .mod-label{font-size:12px;color:var(--text2);flex:1}
+.mod-row.active .mod-label{color:var(--acc)}
+.cb{width:15px;height:15px;border:1px solid var(--border);border-radius:3px;display:flex;align-items:center;justify-content:center;flex-shrink:0;cursor:pointer;background:var(--bg0)}
+.cb.on{background:var(--acc2);border-color:var(--acc)}
+.cb.on::after{content:'✓';font-size:9px;color:#000;font-weight:bold}
+.divider{height:1px;background:var(--border);margin:8px 12px}
+.sidebar-btns{padding:4px 14px;display:flex;gap:6px}
+.sm-btn{flex:1;padding:4px 0;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;text-align:center}
+.sm-btn:hover{border-color:var(--acc);color:var(--acc)}
+
+/* ── Content area ── */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.panels{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;display:flex;flex-direction:column;gap:12px;min-height:0}
+
+/* ── Panels — height fits content, no overflow:hidden clipping ── */
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:6px;overflow:visible;transition:.15s;flex-shrink:0}
+.panel.active-panel{border-color:rgba(74,240,160,.4)}
+.panel-hdr{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text2);border-radius:6px 6px 0 0}
+.panel-hdr .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-green{background:var(--acc)}
+.dot-amber{background:var(--warn)}
+.dot-blue{background:var(--info)}
+.dot-dim{background:var(--text3)}
+.panel-body{padding:10px 14px}
+
+/* ── Form elements ── */
+.row{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.row label{font-size:11px;color:var(--text2);width:130px;flex-shrink:0}
+.path-input{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;transition:.15s;user-select:text;-webkit-user-select:text}
+.path-input:focus{border-color:var(--acc)}
+.browse-btn{padding:5px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:11px;cursor:pointer;white-space:nowrap;font-family:var(--font)}
+.browse-btn:hover{border-color:var(--acc);color:var(--acc)}
+.opt-row{display:flex;flex-wrap:wrap;gap:12px;padding:4px 0 6px}
+.opt{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:var(--text2);user-select:none}
+.opt input[type=checkbox]{accent-color:var(--acc);width:13px;height:13px;cursor:pointer}
+.opt:hover{color:var(--text)}
+
+/* ── Progress ── */
+.progress-wrap{margin:6px 0 2px}
+.progress-label{display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-bottom:4px}
+.pbar-bg{height:5px;background:var(--bg3);border-radius:3px;overflow:hidden}
+.pbar{height:100%;width:0%;border-radius:3px;transition:width .35s ease}
+.pbar-green{background:var(--acc)}
+.pbar-amber{background:var(--warn)}
+.pbar-blue{background:var(--info)}
+.pbar-anim{background:repeating-linear-gradient(90deg,var(--acc) 0,var(--acc2) 20px,var(--acc) 40px);background-size:80px 100%;animation:slide 1s linear infinite}
+@keyframes slide{from{background-position:0 0}to{background-position:80px 0}}
+
+/* ── Status pills ── */
+.pill{padding:2px 8px;border-radius:10px;font-size:10px;font-family:var(--mono);flex-shrink:0}
+.pill-idle{background:var(--bg3);color:var(--text3)}
+.pill-running{background:rgba(74,240,160,.15);color:var(--acc)}
+.pill-done{background:rgba(74,240,160,.2);color:var(--acc)}
+.pill-error{background:rgba(240,64,64,.15);color:var(--danger)}
+.pill-skip{background:var(--bg3);color:var(--text3)}
+.pill-blink{animation:blink 1.1s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── Log ── */
+.log-wrap{background:var(--bg0);border:1px solid var(--border);border-radius:4px;height:190px;overflow-y:auto;padding:8px;font-family:var(--mono);font-size:11px;line-height:1.55;user-select:text;-webkit-user-select:text;cursor:text}
+.ll{margin:1px 0;user-select:text;-webkit-user-select:text}
+.ll-info{color:var(--info)}
+.ll-ok{color:var(--acc)}
+.ll-warn{color:var(--warn)}
+.ll-err{color:var(--danger)}
+.ll-dim{color:var(--text3)}
+
+/* ── Footer ── */
+.footer{background:var(--bg1);border-top:1px solid var(--border);padding:9px 14px;display:flex;align-items:center;gap:10px;position:relative;flex-shrink:0}
+.btn-start{padding:7px 24px;background:var(--acc2);border:1px solid var(--acc);border-radius:5px;color:#000;font-family:var(--font);font-weight:600;font-size:13px;cursor:pointer}
+.btn-start:hover{background:var(--acc)}
+.btn-start:disabled{background:var(--bg3);border-color:var(--border);color:var(--text3);cursor:not-allowed}
+.btn-stop{padding:7px 18px;background:transparent;border:1px solid var(--danger);border-radius:5px;color:var(--danger);font-family:var(--font);font-size:12px;cursor:pointer}
+.btn-stop:hover{background:rgba(240,64,64,.1)}
+.btn-stop:disabled{border-color:var(--border);color:var(--text3);cursor:not-allowed}
+.stop-menu{position:absolute;bottom:54px;left:180px;background:var(--bg2);border:1px solid var(--danger);border-radius:5px;overflow:hidden;z-index:99;min-width:220px;display:none}
+.stop-menu.open{display:block}
+.stop-opt{padding:9px 16px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border)}
+.stop-opt:last-child{border-bottom:none}
+.stop-opt:hover{background:rgba(240,64,64,.15);color:var(--danger)}
+.footer-status{font-size:11px;color:var(--text2)}
+.footer-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.verbose-lbl{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text2);cursor:pointer;user-select:none}
+.verbose-lbl input{accent-color:var(--info);width:13px;height:13px}
+
+/* ── Stub notice ── */
+.stub-note{padding:5px 0 2px;font-size:11px;color:var(--text3)}
+
+/* Scrollbar styling */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg0)}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--border)}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Title bar -->
+  <div class="titlebar">
+    <span class="logo">&#9670; TOSORT TOOLKIT</span>
+    <span class="sub">RomVault Cleaning Pipeline</span>
+    <button class="browse-btn" id="dat-merger-btn" onclick="openDatMerger()" style="margin-left:auto;border-color:var(--info);color:var(--info);padding:4px 14px;font-size:11px">&#9830; DAT Merger</button>
+    <span id="global-pill" class="pill pill-idle">IDLE</span>
+  </div>
+
+  <div class="main">
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="sidebar-section">Pipeline Modules</div>
+
+      <div class="mod-row active" id="modrow-0" onclick="selectMod(0)">
+        <div class="mod-num">1</div>
+        <div class="cb on" id="cb-0" onclick="toggleMod(event,0)"></div>
+        <span class="mod-label">Archive Extractor</span>
+      </div>
+      <div class="mod-row" id="modrow-1" onclick="selectMod(1)">
+        <div class="mod-num">2</div>
+        <div class="cb on" id="cb-1" onclick="toggleMod(event,1)"></div>
+        <span class="mod-label">File Sorter</span>
+      </div>
+      <div class="mod-row" id="modrow-2" onclick="selectMod(2)">
+        <div class="mod-num">3</div>
+        <div class="cb on" id="cb-2" onclick="toggleMod(event,2)"></div>
+        <span class="mod-label">Empty Folders</span>
+      </div>
+      <div class="mod-row" id="modrow-3" onclick="selectMod(3)">
+        <div class="mod-num">4</div>
+        <div class="cb on" id="cb-3" onclick="toggleMod(event,3)"></div>
+        <span class="mod-label">Dupe Finder</span>
+      </div>
+      <div class="divider"></div>
+      <div class="sidebar-section">Quick Select</div>
+      <div class="sidebar-btns">
+        <div class="sm-btn" onclick="setAll(true)">All On</div>
+        <div class="sm-btn" onclick="setAll(false)">All Off</div>
+      </div>
+    </div>
+
+    <!-- Main content -->
+    <div class="content">
+      <div class="panels">
+
+        <!-- MODULE 1: EXTRACTOR -->
+        <div class="panel active-panel" id="panel-0">
+          <div class="panel-hdr">
+            <div class="dot dot-green"></div>
+            Module 1 — Archive Extractor
+            <span id="pill-0" class="pill pill-idle" style="margin-left:auto">IDLE</span>
+          </div>
+          <div class="panel-body">
+            <div class="row">
+              <label>Source Folder</label>
+              <input class="path-input" id="m0-src" placeholder="Folder containing archives to process" />
+              <button class="browse-btn" onclick="browse('m0-src')">Browse…</button>
+            </div>
+            <div class="row">
+              <label>Nested Archive Dest</label>
+              <input class="path-input" id="m0-nested" placeholder="Nested archives moved here (not extracted)" />
+              <button class="browse-btn" onclick="browse('m0-nested')">Browse…</button>
+            </div>
+            <div class="row">
+              <label>Extract Output</label>
+              <input class="path-input" id="m0-out" placeholder="Where extracted files go (blank = source folder)" />
+              <button class="browse-btn" onclick="browse('m0-out')">Browse…</button>
+            </div>
+            <div class="row">
+              <label>Bad Archive Dest</label>
+              <input class="path-input" id="m0-bad" placeholder="_BadArchives folder (corrupt + password-protected)" />
+              <button class="browse-btn" onclick="browse('m0-bad')">Browse&hellip;</button>
+            </div>
+            <div class="divider" style="margin:8px 0"></div>
+            <div style="font-size:11px;color:var(--text);font-weight:600;margin-bottom:6px">
+              Recursive Nested Extraction
+              <span style="font-weight:400;color:var(--text3)"> &mdash; unpack archives-within-archives until fully flat</span>
+            </div>
+            <div class="row">
+              <label>Nested Source</label>
+              <input class="path-input" id="m0-recurse-src" placeholder="Folder with nested archives to fully unpack (leave blank to skip)" />
+              <button class="browse-btn" onclick="browse('m0-recurse-src')">Browse&hellip;</button>
+            </div>
+            <div class="row">
+              <label>Nested Final Dest</label>
+              <input class="path-input" id="m0-recurse-dst" placeholder="Where fully extracted files end up (blank = same as source)" />
+              <button class="browse-btn" onclick="browse('m0-recurse-dst')">Browse&hellip;</button>
+            </div>
+            <div style="padding:2px 0 4px;font-size:11px;color:var(--text3)">
+              Extracts repeatedly (up to 10 passes) until no archives remain.
+              Point the Nested Archive Dest above at archives with nested archives,
+              then point this source at that same folder to fully flatten them.
+            </div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:4px;margin-top:4px">Formats to extract:</div>
+            <div class="opt-row">
+              <label class="opt"><input type="checkbox" id="m0-zip" checked> .zip</label>
+              <label class="opt"><input type="checkbox" id="m0-rar" checked> .rar</label>
+              <label class="opt"><input type="checkbox" id="m0-7z" checked> .7z</label>
+              <label class="opt"><input type="checkbox" id="m0-zst" checked> .zst (ZSTD)</label>
+              <label class="opt"><input type="checkbox" id="m0-iso"> .iso</label>
+              <label class="opt"><input type="checkbox" id="m0-chd"> .chd</label>
+              <label class="opt"><input type="checkbox" id="m0-dms"> .dms (Amiga)</label>
+            </div>
+            <div class="opt-row">
+              <label class="opt"><input type="checkbox" id="m0-del"> Delete archives after extract</label>
+              <label class="opt"><input type="checkbox" id="m0-over"> Overwrite existing files</label>
+            </div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:4px">Never delete after extract (keep originals):</div>
+            <div class="opt-row">
+              <label class="opt"><input type="checkbox" id="m0-no-del-iso" checked> Keep .iso</label>
+              <label class="opt"><input type="checkbox" id="m0-no-del-chd" checked> Keep .chd</label>
+              <label class="opt"><input type="checkbox" id="m0-no-del-dms" checked> Keep .dms</label>
+            </div>
+            <div style="padding:2px 0 4px;font-size:11px;color:var(--text3)">
+              .iso = copied as-is &bull; .chd = converted via chdman.exe (drop in app folder) &bull;
+              .dms = extracted via xdms.exe (drop in app folder). Falls back to copy if tools missing.
+            </div>
+            <div class="progress-wrap">
+              <div class="progress-label">
+                <span id="pstep-0">Waiting…</span>
+                <span id="ppct-0">0%</span>
+              </div>
+              <div class="pbar-bg"><div class="pbar pbar-green" id="pbar-0"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- MODULE 2: FILE SORTER + ROM SORTER -->
+        <div class="panel" id="panel-1">
+          <div class="panel-hdr">
+            <div class="dot dot-green"></div>
+            Module 2 &mdash; File Sorter by Extension
+            <span id="pill-1" class="pill pill-idle" style="margin-left:auto">IDLE</span>
+          </div>
+          <div class="panel-body">
+            <div class="row">
+              <label>Source Folder</label>
+              <input class="path-input" id="m1-src" placeholder="Folder of unsorted files (single scan for all)" />
+              <button class="browse-btn" onclick="browse('m1-src')">Browse&hellip;</button>
+            </div>
+            <div class="row">
+              <label>General Output</label>
+              <input class="path-input" id="m1-out" placeholder="Where A/ B/ &hellip; MISC/ folders are created" />
+              <button class="browse-btn" onclick="browse('m1-out')">Browse&hellip;</button>
+            </div>
+            <div class="opt-row">
+              <label class="opt"><input type="checkbox" id="m1-misc" checked> Non-alpha extensions &rarr; MISC/</label>
+              <label class="opt"><input type="checkbox" id="m1-rename" checked> Append on name collision</label>
+            </div>
+            <div class="divider" style="margin:8px 0"></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <label class="opt" style="font-size:12px;color:var(--text);font-weight:600">
+                <input type="checkbox" id="m1-rom-enable" checked onchange="toggleRomSection()">
+                &nbsp;Enable ROM Sorting
+              </label>
+              <span style="font-size:11px;color:var(--text3)">— known ROM/emulator extensions sorted separately in one pass</span>
+            </div>
+            <div id="rom-section">
+              <div class="row">
+                <label>ROM Output Root</label>
+                <input class="path-input" id="m1-rom-out" placeholder="e.g. D:\_RomVault_Sorted" />
+                <button class="browse-btn" onclick="browse('m1-rom-out')">Browse&hellip;</button>
+              </div>
+              <div class="opt-row">
+                <label class="opt"><input type="checkbox" id="m1-companions" checked> Move companion files (.cue .m3u .xml .dat .nfo&hellip;) into named subfolders</label>
+                <label class="opt"><input type="checkbox" id="m1-dry"> Dry run &mdash; count only, no moves</label>
+              </div>
+              <div style="padding:2px 0 6px;font-size:11px;color:var(--text3)">
+                200+ extensions: TOSEC &bull; No-Intro &bull; Redump &bull; MAME/CHD &bull; all major consoles &amp; home computers.
+                ROM files &rarr; ROM Output. Everything else &rarr; General Output. Single scan, two destinations.
+              </div>
+            </div>
+            <div class="progress-wrap">
+              <div class="progress-label"><span id="pstep-1">Waiting&hellip;</span><span id="ppct-1">0%</span></div>
+              <div class="pbar-bg"><div class="pbar pbar-green" id="pbar-1"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- MODULE 3: EMPTY FOLDERS -->
+        <div class="panel" id="panel-2">
+          <div class="panel-hdr">
+            <div class="dot dot-green"></div>
+            Module 3 &mdash; Empty Folder Cleanup
+            <span id="pill-2" class="pill pill-idle" style="margin-left:auto">IDLE</span>
+          </div>
+          <div class="panel-body">
+            <div style="font-size:11px;color:var(--text2);margin-bottom:6px">Target Folders <span style="color:var(--text3)">(add as many as needed)</span></div>
+            <div id="m2-folder-list" style="display:flex;flex-direction:column;gap:5px;margin-bottom:6px"></div>
+            <button class="browse-btn" onclick="addFolderRow('m2-folder-list')" style="margin-bottom:8px">+ Add Folder</button>
+            <div class="opt-row">
+              <label class="opt"><input type="checkbox" id="m2-recurse" checked> Recursive (catches nested empties &mdash; multiple passes)</label>
+              <label class="opt"><input type="checkbox" id="m2-dry"> Dry run &mdash; list only, no deletes</label>
+            </div>
+            <div class="progress-wrap">
+              <div class="progress-label"><span id="pstep-2">Waiting&hellip;</span><span id="ppct-2">0%</span></div>
+              <div class="pbar-bg"><div class="pbar pbar-green" id="pbar-2"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- MODULE 4: DUPE FINDER -->
+        <div class="panel" id="panel-3">
+          <div class="panel-hdr">
+            <div class="dot dot-green"></div>
+            Module 4 &mdash; Duplicate File Finder &amp; Deleter
+            <span id="pill-3" class="pill pill-idle" style="margin-left:auto">IDLE</span>
+          </div>
+          <div class="panel-body">
+            <div style="font-size:11px;color:var(--text2);margin-bottom:6px">Scan Folders <span style="color:var(--text3)">(add as many as you need — dupes found across all folders)</span></div>
+            <div id="m3-folder-list" style="display:flex;flex-direction:column;gap:5px;margin-bottom:6px"></div>
+            <button class="browse-btn" onclick="addFolderRow('m3-folder-list','m3-folders')" style="margin-bottom:8px">+ Add Folder</button>
+            <div class="opt-row">
+              <label class="opt"><input type="checkbox" id="m3-md5" checked> MD5 hash</label>
+              <label class="opt"><input type="checkbox" id="m3-size" checked> Size pre-filter (faster)</label>
+              <label class="opt"><input type="checkbox" id="m3-dry"> Dry run &mdash; list dupes only, no deletes</label>
+            </div>
+            <div style="padding:4px 0 6px;font-size:11px;color:var(--text3)">
+              Two-phase: size grouping &rarr; partial hash (1 MB) &rarr; full MD5 confirm.
+              Progress saved after each group so interrupted runs resume automatically.
+            </div>
+            <div class="progress-wrap">
+              <div class="progress-label"><span id="pstep-3">Waiting&hellip;</span><span id="ppct-3">0%</span></div>
+              <div class="pbar-bg"><div class="pbar pbar-green" id="pbar-3"></div></div>
+            </div>
+          </div>
+        </div>
+
+                <!-- REPORT SETTINGS -->
+        <div class="panel" id="panel-report">
+          <div class="panel-hdr">
+            <div class="dot dot-blue"></div>
+            Pipeline Summary Report
+          </div>
+          <div class="panel-body">
+            <div class="row">
+              <label>Save Reports To</label>
+              <input class="path-input" id="report-dir" placeholder="Folder where .txt reports are saved after each run" />
+              <button class="browse-btn" onclick="browse('report-dir')">Browse&hellip;</button>
+            </div>
+            <div style="padding:2px 0 4px;font-size:11px;color:var(--text3)">
+              A timestamped .txt file is saved after every pipeline run listing counts, timings and errors per module.
+              Leave blank to disable.
+            </div>
+          </div>
+        </div>
+
+        <!-- WATCH FOLDER -->
+        <div class="panel" id="panel-watch">
+          <div class="panel-hdr">
+            <div class="dot dot-blue"></div>
+            Watch Mode &mdash; Auto-run Pipeline on Timer
+            <span id="pill-watch" class="pill pill-idle" style="margin-left:auto">OFF</span>
+          </div>
+          <div class="panel-body">
+            <div class="row">
+              <label>Run interval</label>
+              <select id="watch-preset" style="background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none" onchange="watchPresetChange()">
+                <option value="5">Every 5 minutes</option>
+                <option value="15">Every 15 minutes</option>
+                <option value="30" selected>Every 30 minutes</option>
+                <option value="60">Every 1 hour</option>
+                <option value="120">Every 2 hours</option>
+                <option value="0">Custom&hellip;</option>
+              </select>
+              <input class="path-input" id="watch-custom" placeholder="minutes" style="width:80px;flex:none;display:none" type="number" min="1" max="9999" />
+            </div>
+            <div class="opt-row">
+              <span style="font-size:11px;color:var(--text2);margin-right:4px">Modules to run:</span>
+              <label class="opt"><input type="checkbox" id="watch-m0" checked> Extractor</label>
+              <label class="opt"><input type="checkbox" id="watch-m1" checked> File Sorter</label>
+              <label class="opt"><input type="checkbox" id="watch-m2" checked> Empty Folders</label>
+              <label class="opt"><input type="checkbox" id="watch-m3" checked> Dupe Finder</label>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+              <button class="browse-btn" id="watch-arm-btn" onclick="toggleWatch()" style="padding:5px 18px;border-color:var(--info);color:var(--info)">&#9654; Arm Watch</button>
+              <span id="watch-countdown" style="font-family:var(--mono);font-size:12px;color:var(--text2)"></span>
+            </div>
+          </div>
+        </div>
+        <!-- LOG -->
+        <div class="panel">
+          <div class="panel-hdr">
+            <div class="dot dot-blue"></div>
+            Output Log
+            <button class="browse-btn" style="margin-left:auto;padding:2px 10px;font-size:10px" onclick="clearLog()">Clear</button>
+          </div>
+          <div class="panel-body">
+            <div class="log-wrap" id="log"></div>
+          </div>
+        </div>
+
+      </div><!-- /panels -->
+
+      <!-- Footer -->
+      <div class="footer">
+        <button class="btn-start" id="btn-start" onclick="startPipeline()">&#9654;&nbsp; START</button>
+        <button class="btn-stop"  id="btn-stop"  disabled onclick="toggleStopMenu()">&#9632;&nbsp; STOP</button>
+
+        <div class="stop-menu" id="stop-menu">
+          <div class="stop-opt" onclick="doSkip()">&#8594;&nbsp; Skip current — continue pipeline</div>
+          <div class="stop-opt" style="color:var(--danger)" onclick="doStopAll()">&#9632;&nbsp; Terminate everything</div>
+        </div>
+
+        <span class="footer-status" id="footer-status"></span>
+
+        <div class="footer-right">
+          <label class="verbose-lbl"><input type="checkbox" id="verbose" checked>&nbsp;Verbose output</label>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+const modEnabled = [true, true, true, true];
+let pipelineRunning = false;
+
+// ─── Sidebar selection ───────────────────────────────────────────────────────
+function selectMod(n) {
+  document.querySelectorAll('.mod-row').forEach((r, i) => r.classList.toggle('active', i === n));
+  document.querySelectorAll('.panel[id^="panel-"]').forEach((p, i) => p.classList.toggle('active-panel', i === n));
+}
+
+function toggleMod(e, n) {
+  e.stopPropagation();
+  modEnabled[n] = !modEnabled[n];
+  document.getElementById('cb-' + n).classList.toggle('on', modEnabled[n]);
+}
+
+function setAll(v) {
+  modEnabled.forEach((_, i) => {
+    modEnabled[i] = v;
+    document.getElementById('cb-' + i).classList.toggle('on', v);
+  });
+}
+
+// ─── Browse (native folder dialog via Python) ─────────────────────────────────
+async function browse(inputId) {
+  try {
+    const path = await window.pywebview.api.browse_folder();
+    if (path) {
+      const el = document.getElementById(inputId);
+      el.value = path;
+      el.style.borderColor = 'var(--acc)';
+      setTimeout(() => el.style.borderColor = '', 1500);
+    }
+  } catch (e) {
+    addLog('Browse error: ' + e, 'err');
+  }
+}
+
+// ─── Log ──────────────────────────────────────────────────────────────────────
+function addLog(msg, cls) {
+  const log = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = 'll' + (cls ? ' ll-' + cls : '');
+  const ts = new Date().toLocaleTimeString('en-GB');
+  d.textContent = '[' + ts + '] ' + msg;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '';
+}
+
+// ─── Progress ─────────────────────────────────────────────────────────────────
+function setProgress(mod, pct, label) {
+  document.getElementById('pbar-' + mod).style.width = pct + '%';
+  document.getElementById('ppct-' + mod).textContent = pct + '%';
+  document.getElementById('pstep-' + mod).textContent = label;
+}
+
+// ─── Module status pills ──────────────────────────────────────────────────────
+function setModStatus(mod, state) {
+  const el = document.getElementById('pill-' + mod);
+  const map = {
+    idle:    ['IDLE',    'pill-idle'],
+    running: ['RUNNING', 'pill-running pill-blink'],
+    done:    ['DONE',    'pill-done'],
+    error:   ['ERROR',   'pill-error'],
+    skip:    ['SKIP',    'pill-skip'],
+  };
+  const [label, cls] = map[state] || ['?', 'pill-idle'];
+  el.textContent = label;
+  el.className = 'pill ' + cls;
+}
+
+function setGlobalStatus(state) {
+  const el = document.getElementById('global-pill');
+  const map = {
+    idle:    ['IDLE',    'pill-idle'],
+    running: ['RUNNING', 'pill-running pill-blink'],
+    done:    ['DONE',    'pill-done'],
+    stopped: ['STOPPED', 'pill-error'],
+  };
+  const [label, cls] = map[state] || ['?', 'pill-idle'];
+  el.textContent = label;
+  el.className = 'pill ' + cls;
+}
+
+// ─── Python → JS event bridge ─────────────────────────────────────────────────
+window.pyEvent = function(event, data) {
+  switch(event) {
+    case 'log':
+      addLog(data.msg, data.cls);
+      break;
+    case 'progress':
+      setProgress(data.mod, data.pct, data.label);
+      break;
+    case 'modStatus':
+      setModStatus(data.mod, data.state);
+      break;
+    case 'globalStatus':
+      setGlobalStatus(data.state);
+      if (data.state === 'done' || data.state === 'stopped') {
+        pipelineRunning = false;
+        document.getElementById('btn-start').disabled = false;
+        document.getElementById('btn-stop').disabled = true;
+        document.getElementById('footer-status').textContent =
+          data.state === 'stopped' ? 'Stopped by user.' : 'All modules complete.';
+      }
+      break;
+  }
+};
+
+// ─── START ────────────────────────────────────────────────────────────────────
+function startPipeline() {
+  if (pipelineRunning) return;
+  pipelineRunning = true;
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('btn-stop').disabled = false;
+  document.getElementById('footer-status').textContent = 'Pipeline running…';
+  setGlobalStatus('running');
+  for (let i = 0; i < 4; i++) {
+    setProgress(i, 0, 'Waiting…');
+    setModStatus(i, 'idle');
+  }
+  window.pywebview.api.run_pipeline(buildConfig());
+}
+
+// ─── STOP menu ────────────────────────────────────────────────────────────────
+function toggleStopMenu() {
+  document.getElementById('stop-menu').classList.toggle('open');
+}
+
+function doSkip() {
+  document.getElementById('stop-menu').classList.remove('open');
+  addLog('Skipping to next module…', 'warn');
+  window.pywebview.api.stop_current();
+}
+
+function doStopAll() {
+  document.getElementById('stop-menu').classList.remove('open');
+  addLog('Terminating pipeline…', 'err');
+  window.pywebview.api.stop_all();
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#btn-stop') && !e.target.closest('#stop-menu'))
+    document.getElementById('stop-menu').classList.remove('open');
+});
+
+// ─── Settings save/load ──────────────────────────────────────────────────────
+const SETTINGS_IDS = [
+  'm0-src','m0-nested','m0-out','m0-bad','m0-recurse-src','m0-recurse-dst','m0-zip','m0-rar','m0-7z','m0-zst','m0-iso','m0-chd','m0-dms','m0-no-del-iso','m0-no-del-chd','m0-no-del-dms','m0-del','m0-over','report-dir',
+  'm1-src','m1-out','m1-misc','m1-rename',
+  'm2-recurse','m2-dry',
+  'm3-md5','m3-size','m3-dry',
+  'm1-rom-enable','m1-rom-out','m1-companions','m1-dry',
+  'verbose','watch-preset','watch-custom','watch-m0','watch-m1','watch-m2','watch-m3'
+];
+// Multi-folder list IDs saved separately as arrays
+const FOLDER_LIST_IDS = ['m2-folder-list', 'm3-folder-list'];
+const MOD_CB_IDS = ['cb-0','cb-1','cb-2','cb-3'];
+
+function gatherSettings() {
+  const s = { modEnabled: [...modEnabled] };
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    s[id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  // Save multi-folder lists as arrays
+  FOLDER_LIST_IDS.forEach(id => { s[id] = getFolderList(id); });
+  return s;
+}
+
+function applySettings(s) {
+  if (!s) return;
+  if (Array.isArray(s.modEnabled)) {
+    s.modEnabled.forEach((v, i) => {
+      modEnabled[i] = v;
+      const cb = document.getElementById('cb-' + i);
+      if (cb) cb.classList.toggle('on', v);
+    });
+  }
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el || !(id in s)) return;
+    if (el.type === 'checkbox') el.checked = s[id];
+    else el.value = s[id];
+  });
+  // Restore multi-folder lists
+  FOLDER_LIST_IDS.forEach(id => {
+    if (Array.isArray(s[id])) setFolderList(id, s[id]);
+  });
+  // Show custom interval input if needed
+  if (s['watch-preset'] === '0') {
+    const c = document.getElementById('watch-custom');
+    if (c) c.style.display = '';
+  }
+}
+
+function saveSettings() {
+  if (window.pywebview && window.pywebview.api)
+    window.pywebview.api.save_settings(gatherSettings());
+}
+
+// Auto-save on any input/change
+document.addEventListener('change', saveSettings);
+document.addEventListener('input',  saveSettings);
+
+async function loadAndApplySettings() {
+  try {
+    const s = await window.pywebview.api.load_settings();
+    applySettings(s);
+    addLog('Settings restored.', 'dim');
+  } catch(e) {
+    // First run, no settings yet
+  }
+}
+
+// ─── Watch mode ────────────────────────────────────────────────────────────
+let watchArmed = false;
+
+function watchPresetChange() {
+  const v = document.getElementById('watch-preset').value;
+  const custom = document.getElementById('watch-custom');
+  custom.style.display = (v === '0') ? '' : 'none';
+  saveSettings();
+}
+
+function getWatchMinutes() {
+  const v = document.getElementById('watch-preset').value;
+  if (v === '0') {
+    const c = parseInt(document.getElementById('watch-custom').value) || 30;
+    return c;
+  }
+  return parseInt(v);
+}
+
+function toggleWatch() {
+  watchArmed = !watchArmed;
+  const btn  = document.getElementById('watch-arm-btn');
+  const pill = document.getElementById('pill-watch');
+  const cd   = document.getElementById('watch-countdown');
+  if (watchArmed) {
+    const mins = getWatchMinutes();
+    const cfg  = buildConfig();
+    cfg.interval_minutes = mins;
+    cfg.modules = [
+      document.getElementById('watch-m0').checked,
+      document.getElementById('watch-m1').checked,
+      document.getElementById('watch-m2').checked,
+      document.getElementById('watch-m3').checked,
+    ];
+    window.pywebview.api.start_watch(cfg);
+    btn.textContent  = '\u25A0 Disarm Watch';
+    btn.style.borderColor = 'var(--danger)';
+    btn.style.color       = 'var(--danger)';
+    pill.textContent = 'ARMED';
+    pill.className   = 'pill pill-running pill-blink';
+    addLog('Watch mode armed — interval: ' + mins + ' min.', 'info');
+  } else {
+    window.pywebview.api.stop_watch();
+    btn.textContent  = '\u25B6 Arm Watch';
+    btn.style.borderColor = 'var(--info)';
+    btn.style.color       = 'var(--info)';
+    pill.textContent = 'OFF';
+    pill.className   = 'pill pill-idle';
+    cd.textContent   = '';
+    addLog('Watch mode disarmed.', 'warn');
+  }
+}
+
+function formatCountdown(secs) {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h > 0) return `Next run in ${h}h ${m}m ${s}s`;
+  if (m > 0) return `Next run in ${m}m ${s}s`;
+  return `Next run in ${s}s`;
+}
+
+// ─── Extended pyEvent to handle watch events ─────────────────────────────────
+const _origPyEvent = window.pyEvent;
+window.pyEvent = function(event, data) {
+  _origPyEvent(event, data);
+  if (event === 'watchTick') {
+    document.getElementById('watch-countdown').textContent = formatCountdown(data.remaining);
+  }
+  if (event === 'watchFired') {
+    addLog('Watch timer fired — running pipeline...', 'info');
+    document.getElementById('watch-countdown').textContent = 'Running now...';
+  }
+};
+
+// ─── ROM section toggle ──────────────────────────────────────────────────────────────────────────────
+function toggleRomSection() {
+  const enabled = document.getElementById('m1-rom-enable').checked;
+  const sec = document.getElementById('rom-section');
+  sec.style.opacity  = enabled ? '1' : '0.35';
+  sec.style.pointerEvents = enabled ? '' : 'none';
+  saveSettings();
+}
+
+// ─── Multi-folder row helpers ──────────────────────────────────────────────────────────────────────────────
+async function addFolderRow(listId, path) {
+  const list = document.getElementById(listId);
+  const row  = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:6px';
+  const inp = document.createElement('input');
+  inp.className = 'path-input';
+  inp.style.flex = '1';
+  inp.placeholder = 'Click Browse to select folder...';
+  if (path) inp.value = path;
+  const btn = document.createElement('button');
+  btn.className = 'browse-btn';
+  btn.textContent = 'Browse…';
+  btn.onclick = async () => {
+    try {
+      const p = await window.pywebview.api.browse_folder();
+      if (p) inp.value = p;
+      saveSettings();
+    } catch(e) {}
+  };
+  const del = document.createElement('button');
+  del.className = 'browse-btn';
+  del.textContent = '✕';
+  del.style.cssText = 'padding:5px 8px;border-color:var(--danger);color:var(--danger)';
+  del.onclick = () => { list.removeChild(row); saveSettings(); };
+  row.appendChild(inp);
+  row.appendChild(btn);
+  row.appendChild(del);
+  list.appendChild(row);
+  saveSettings();
+}
+
+function getFolderList(listId) {
+  const list = document.getElementById(listId);
+  if (!list) return [];
+  return Array.from(list.querySelectorAll('input'))
+    .map(i => i.value.trim()).filter(Boolean);
+}
+
+function setFolderList(listId, paths) {
+  const list = document.getElementById(listId);
+  if (!list) return;
+  list.innerHTML = '';
+  (paths || []).forEach(p => addFolderRow(listId, p));
+}
+
+// ─── Build config helper (extracted so watch can reuse it) ────────────────────
+function buildConfig() {
+  const fmts = [];
+  if (document.getElementById('m0-zip').checked) fmts.push('.zip');
+  if (document.getElementById('m0-rar').checked) fmts.push('.rar');
+  if (document.getElementById('m0-7z').checked)  fmts.push('.7z');
+  if (document.getElementById('m0-zst').checked) fmts.push('.zst');
+  if (document.getElementById('m0-iso').checked) fmts.push('.iso');
+  if (document.getElementById('m0-chd').checked) fmts.push('.chd');
+  if (document.getElementById('m0-dms').checked) fmts.push('.dms');
+  return {
+    modules: [...modEnabled],
+    report_dir: document.getElementById('report-dir').value.trim(),
+    verbose: document.getElementById('verbose').checked,
+    mod0: {
+      src:         document.getElementById('m0-src').value.trim(),
+      nested_dest: document.getElementById('m0-nested').value.trim(),
+      out:         document.getElementById('m0-out').value.trim(),
+      bad_dest:    document.getElementById('m0-bad').value.trim(),
+      fmts,
+      del_after:   document.getElementById('m0-del').checked,
+      overwrite:   document.getElementById('m0-over').checked,
+      no_del_iso:  document.getElementById('m0-no-del-iso').checked,
+      no_del_chd:  document.getElementById('m0-no-del-chd').checked,
+      no_del_dms:  document.getElementById('m0-no-del-dms').checked,
+      recurse_nested_src: document.getElementById('m0-recurse-src').value.trim(),
+      recurse_nested_dst: document.getElementById('m0-recurse-dst').value.trim(),
+    },
+    mod1: {
+      src:         document.getElementById('m1-src').value.trim(),
+      out:         document.getElementById('m1-out').value.trim(),
+      misc_catch:  document.getElementById('m1-misc').checked,
+      rename_dupe: document.getElementById('m1-rename').checked,
+      rom_enable:  document.getElementById('m1-rom-enable').checked,
+      rom_out:     document.getElementById('m1-rom-out').value.trim(),
+      companions:  document.getElementById('m1-companions').checked,
+      dry_run:     document.getElementById('m1-dry').checked,
+    },
+    mod2: {
+      srcs:    getFolderList('m2-folder-list'),
+      recurse: document.getElementById('m2-recurse').checked,
+      dry_run: document.getElementById('m2-dry').checked,
+    },
+    mod3: {
+      srcs:     getFolderList('m3-folder-list'),
+      hash_md5: document.getElementById('m3-md5').checked,
+      size_pre: document.getElementById('m3-size').checked,
+      dry_run:  document.getElementById('m3-dry').checked,
+    },
+
+  };
+}
+
+addLog('ToSort Toolkit ready. Configure folders and press START.', 'info');
+
+// ─── DAT Merger window ──────────────────────────────────────────────────────
+function openDatMerger() {
+  try {
+    window.pywebview.api.open_dat_merger_window();
+  } catch(e) {
+    addLog("Could not open DAT Merger: " + e, "err");
+  }
+}
+
+// Load saved settings and check dependencies once pywebview API is ready
+async function onReady() {
+  await loadAndApplySettings();
+  try {
+    const deps = await window.pywebview.api.get_dependency_status();
+    if (!deps.rarfile) {
+      addLog('WARNING: RAR support unavailable.', 'warn');
+      if (deps.rar_error) deps.rar_error.split('\n').forEach(l => addLog('  ' + l, 'warn'));
+    }
+    if (!deps.py7zr)     addLog('WARNING: py7zr not installed — .7z files will fail. Run: pip install py7zr', 'warn');
+    if (!deps.zstandard) addLog('WARNING: zstandard not installed — .zst files will fail. Run: pip install zstandard', 'warn');
+    if (deps.rarfile && deps.py7zr && deps.zstandard) addLog('All archive dependencies OK.', 'ok');
+  } catch(e) {}
+}
+window.addEventListener('pywebviewready', onReady);
+</script>
+</body>
+</html>

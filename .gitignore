@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime files
+settings.json
+dedupe_progress.json
+tosort_report_*.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Tools (user drops these in locally)
+UnRAR.exe
+unrar.exe
+chdman.exe
+xdms.exe

@@ -1,0 +1,428 @@
+======================================================================
+  ToSort Toolkit - Recognised ROM/Emulator File Extensions
+  Alphabetical Reference (generated from api.py ROM_EXTS)
+======================================================================
+  Total: 348 extensions
+
+  Extension        System / Format
+  --------------   ---------------------------------------------
+  .$b              ZX Microdrive
+  .$c              ZX Microdrive
+  .$t              ZX Microdrive
+  .$u              ZX Microdrive
+  .$w              ZX Microdrive
+  .$x              ZX Microdrive
+  .$z              ZX Microdrive
+  .1dd             Floppy disk image (1DD)
+  .2d              Japanese PC floppy
+  .2hd             Japanese PC floppy
+  .2mg             Apple II disk image
+  .2sf             NDS music rip
+  .32x             Sega 32X
+  .3ds             Nintendo 3DS
+  .3dsx            Nintendo 3DS homebrew
+  .669             Composer 669 tracker
+  .88d             PC-88 floppy
+  .a22             TRS-80 / misc 8-bit
+  .a26             Atari 2600
+  .a2r             Apple II flux
+  .a52             Atari 5200
+  .a78             Atari 7800
+  .abs             Atari Jaguar ABS
+  .ace             Jupiter Ace / Camputers Lynx
+  .adf             Amiga/BBC disk
+  .adl             Acorn/BBC disk
+  .adm             Acorn/BBC disk
+  .agb             Game Boy Advance
+  .ahx             Amiga AHX tracker
+  .aif             Audio (tape capture)
+  .app             TRS-80 / misc application
+  .arc             Acorn Archimedes
+  .arduboy         Arduboy ROM
+  .ark             Acorn RISC OS
+  .asm             Assembly source (TOSEC)
+  .asy             Misc 8-bit
+  .atr             Atari 8-bit disk
+  .atx             Atari 8-bit disk (extended)
+  .ay              ZX Spectrum AY chip music
+  .bac             TRS-80 / misc 8-bit
+  .bas             BASIC source (multi-system)
+  .baz             Floppy disk format
+  .bbc             BBC Micro
+  .bee             Aamber Pegasus / Microbee
+  .bin             Generic binary ROM / Mega Drive
+  .bios            BIOS file
+  .bjl             Atari Jaguar BJL
+  .bkp             Robotron / KC85 backup
+  .bs5             Misc 8-bit
+  .c64             Commodore 64
+  .caq             TRS-80 CoCo
+  .car             Atari 8-bit cartridge
+  .cas             Atari 8-bit / Dragon tape
+  .ccd             Clone CD image
+  .cci             Nintendo 3DS
+  .cdt             Amstrad CPC tape
+  .cgd             Dragon CoCo
+  .chd             MAME/arcade CHD
+  .cia             Nintendo 3DS CIA
+  .cjr             TRS-80 / misc 8-bit
+  .cmd             Commodore / misc command
+  .cmt             Tape image (generic)
+  .cof             Atari Jaguar COFF
+  .col             ColecoVision
+  .com             CP/M executable
+  .cp2             Disk image format
+  .cpc             Amstrad CPC / CPC music
+  .cpm             CP/M disk
+  .cpr             Amstrad CPC cartridge
+  .cram            Robotron compressed RAM
+  .crt             C64 cartridge
+  .cso             PSP compressed ISO
+  .csw             ZX Spectrum compressed tape
+  .cv              ColecoVision
+  .cxi             Nintendo 3DS
+  .d13             Apple II 13-sector
+  .d2m             Commodore 1571
+  .d40             Commodore 1540
+  .d4m             Commodore 1571
+  .d64             Commodore 64 disk
+  .d71             Commodore 128 disk
+  .d77             PC-88 floppy
+  .d80             Commodore 8050
+  .d81             Commodore 128 disk
+  .d88             PC-88 floppy
+  .dai             DAI Personal Computer
+  .dax             PSP DAX
+  .dbm             Amiga DigiBooster
+  .dc              Dreamcast
+  .dck             Mattel Aquarius / misc
+  .dcp             Disk image
+  .ddp             Atari ST data dump
+  .dfi             DiscFerret flux image
+  .dgn             Dragon 32/64
+  .dim             Floppy disk image
+  .dmf             Deflemask tracker
+  .dmk             TRS-80 / CoCo disk
+  .dmp             Memory dump
+  .dms             Amiga Disk Masher
+  .dol             GameCube/Wii homebrew
+  .dsd             BBC Micro double-sided
+  .dsf             Dreamcast music rip
+  .dsi             Nintendo DSi
+  .dsk             Multi-system floppy
+  .dtf             Enterprise 128
+  .ecb             Misc 8-bit
+  .ecm             ECM compressed disc
+  .edd             Apple II / floppy
+  .elf             ARM/Linux executable ROM
+  .ent             Misc 8-bit
+  .ep128s          Enterprise 128 snapshot
+  .far             Farandole tracker
+  .fbt             VTech / misc
+  .fc13            Future Composer 1.3
+  .fc14            Future Composer 1.4
+  .fd              Thomson / generic floppy
+  .fdd             Floppy disk image
+  .fdi             Floppy disk image
+  .fds             Famicom Disk System
+  .fig             Super Nintendo
+  .fla             Flash save
+  .formzt          Sharp MZ format
+  .fpk             Misc 8-bit pack
+  .fsd             BBC Micro floppy
+  .g64             C64 disk (nibble)
+  .gal             Galaksija
+  .gb              Game Boy
+  .gba             Game Boy Advance
+  .gbc             Game Boy Color
+  .gbs             Game Boy music rip
+  .gbx             Game Boy extended
+  .gcm             GameCube disc
+  .gcz             GameCube compressed
+  .gdi             Dreamcast GDI
+  .gen             Sega Mega Drive
+  .gg              Sega Game Gear
+  .gsf             GBA music rip
+  .gtp             Galaksija tape
+  .gym             Sega Genesis/MD music
+  .hdf             Amiga hard disk
+  .hdm             Japanese PC floppy
+  .hdv             Apple II hard disk volume
+  .hes             PC Engine music rip
+  .hex             Intel HEX (Arduboy etc)
+  .hfe             HxC floppy emulator
+  .hsc             AdLib HSC music
+  .hvl             Amiga HivelyTracker
+  .hxcstream       HxC stream flux
+  .ihx             Intel HEX
+  .ima             DOS floppy image
+  .imd             ImageDisk floppy
+  .img             Generic disc/floppy image
+  .imz             Compressed floppy image
+  .int             Intellivision
+  .ipf             Amiga/SPS disk
+  .iso             Disc image (ISO 9660)
+  .it              Impulse Tracker music
+  .jag             Atari Jaguar
+  .jfd             Japanese floppy disk
+  .jrc             Misc 8-bit
+  .k7              Thomson MO/TO tape
+  .ksm             AdLib KSM music
+  .kss             MSX/Sega music
+  .l3              Misc 8-bit
+  .l3b             Misc 8-bit
+  .l3c             Misc 8-bit
+  .lbr             CP/M library archive
+  .lds             AdLib LDS music
+  .lib             Library file (TOSEC)
+  .lnx             Atari Lynx
+  .lyx             Atari Lynx
+  .m7              Thomson MO7
+  .mac             Macintosh disk image
+  .mcr             Memory card save
+  .md              Sega Mega Drive
+  .mdf             Disc image (Alcohol)
+  .mdr             ZX Microdrive cartridge
+  .mds             Disc image descriptor
+  .mdv             Sinclair QL Microdrive
+  .med             Amiga MED/OctaMED
+  .mfm             MFM flux image
+  .mgt             ZX DISCiPLE/+D
+  .min             No-Intro minimal ROM
+  .mini2sf         NDS music (lib)
+  .minidsf         Dreamcast music (lib)
+  .minigsf         GBA music (lib)
+  .minipsf         PS1 music (lib)
+  .minipsf2        PS2 music (lib)
+  .minissf         Saturn music (lib)
+  .miniusf         N64 music (lib)
+  .mod             Amiga ProTracker module
+  .mtm             MultiTracker module
+  .mtx             Memotech MTX
+  .mx1             MSX ROM
+  .mx2             MSX2 ROM
+  .mzf             Sharp MZ tape
+  .n64             -- (uncategorised)
+  .nas             Nascom
+  .ndd             Nintendo 64DD
+  .nds             Nintendo DS
+  .nes             Nintendo NES
+  .nfd             Japanese PC floppy
+  .ngc             Neo Geo Pocket Color
+  .ngp             Neo Geo Pocket
+  .nib             C64 nibble disk
+  .nsf             NES music rip
+  .nsfe            NES music (extended)
+  .nsp             Nintendo Switch
+  .o2              Odyssey 2
+  .oct             Amiga OctaMED
+  .opd             ZX Opus Discovery
+  .orig            Original (TOSEC backup)
+  .out             Unix executable (TOSEC)
+  .p00             C64 program
+  .p6              NEC PC-6001
+  .pak             Dragon / CoCo / misc pack
+  .pbp             PlayStation Portable
+  .pce             PC Engine
+  .pdi             Floppy flux image
+  .pfdc            PFDC floppy
+  .pkg             PS3/PS4 package
+  .pl              TOSEC playlist
+  .po              Apple II ProDOS
+  .pop             Misc 8-bit
+  .prg             C64 program
+  .pri             Floppy flux image
+  .prn             Printer output (TOSEC)
+  .psc             ZX Spectrum PROTRACKER
+  .psf             PlayStation music rip
+  .psf2            PS2 music rip
+  .psi             Floppy sector image
+  .psid            C64 SID music (old format)
+  .pss             Misc 8-bit save state
+  .pt1             ZX ProTracker 1
+  .pt2             ZX ProTracker 2
+  .pt3             ZX ProTracker 3
+  .ptp             Paper tape image
+  .qd              Quick Disk
+  .qdf             Sharp MZ disk
+  .rad             Reality AdLib Tracker
+  .raw             Raw dump
+  .reu             C64 REU image
+  .rim             Soviet/Russian micro
+  .rk5             Soviet Radio-86RK
+  .rom             Generic ROM / MSX
+  .rpx             Wii U
+  .rsid            C64 SID (RSID format)
+  .rsn             SNES music archive
+  .run             Memotech MTX / misc
+  .rvz             Wii/GC compressed
+  .rx1             Soviet micro
+  .s               Object file (TOSEC)
+  .s3m             ScreamTracker 3
+  .s98             NEC PC-98 music
+  .sad             SAM Coupé disk
+  .sap             Atari 8-bit music / Thomson
+  .sat             Sega Saturn
+  .sav             Save file
+  .sc68            Atari ST SC68 music
+  .scd             Sega CD
+  .scp             SuperCard Pro flux
+  .sd              Misc SD card image
+  .sda             SpectraVideo self-extract
+  .sdf             SAM Coupé disk format
+  .sfc             Super Famicom
+  .sfx             SpectraVideo / misc SFX
+  .sgb             Super Game Boy
+  .sgx             SuperGrafx
+  .sid             C64 SID music
+  .sis             Misc 8-bit
+  .smc             Super Nintendo
+  .sms             Sega Master System
+  .smu             Misc 8-bit
+  .sna             ZX Spectrum snapshot
+  .sndh            Atari ST SNDH music
+  .sol             Misc 8-bit
+  .sp              ZX Spectrum SPECTRA
+  .spc             SNES SPC700 music
+  .sqt             ZX Spectrum SQ-Tracker
+  .srm             SRAM save
+  .srn             Misc 8-bit
+  .ss              Sega Saturn
+  .ss1             Save state slot 1
+  .ss2             Save state slot 2
+  .ssd             BBC Micro single-sided
+  .ssf             Saturn music rip
+  .st              Atari ST disk image
+  .sta             Save state
+  .stc             ZX Spectrum STC tracker
+  .stm             ScreamTracker module
+  .stp             ZX Spectrum STP tracker
+  .stt             Atari ST disk (extended)
+  .stx             Atari ST Pasti flux
+  .sub             Clone CD subchannel
+  .svt             Misc 8-bit
+  .szx             ZX Spectrum state
+  .t64             C64 tape container
+  .t77             Toshiba Pasopia tape
+  .t88             NEC PC-88 tape
+  .tap             ZX Spectrum / C64 tape
+  .tape            Generic tape image
+  .tc              Floppy track image
+  .td0             Teledisk floppy
+  .tfe             TFM tracker
+  .tfm             TFM tracker
+  .tos             Atari ST TOS image
+  .trim            No-Intro trimmed ROM
+  .tu6             Soviet micro
+  .tzx             ZX Spectrum tape
+  .uae             Amiga/UAE disk config
+  .udi             ZX UDI disk
+  .uef             BBC Micro tape
+  .ult             UltraTracker module
+  .unf             NES (UNIF)
+  .unif            NES (UNIF)
+  .usf             N64 music rip
+  .v0              Misc 8-bit
+  .v64             N64 (V64)
+  .vb              Virtual Boy
+  .vdk             Dragon 32/64 disk
+  .vec             Vectrex
+  .velf            VELF homebrew
+  .vgm             Video Game Music
+  .vgz             VGM compressed
+  .vmp             PSP save
+  .vms             Dreamcast VMU
+  .vpk             Vita package
+  .vtp             VTech / misc
+  .wad             Wii WAD
+  .wav             Audio tape capture
+  .wbfs            Wii disc
+  .wdr             ZX disk image
+  .wmf             Windows Metafile (TOSEC)
+  .woz             Apple II flux (Applesauce)
+  .wr3             Misc 8-bit
+  .ws              WonderSwan
+  .wsc             WonderSwan Color
+  .wux             Wii U compressed
+  .xbe             Original Xbox
+  .xci             Nintendo Switch
+  .xdf             Extended floppy
+  .xex             Xbox 360 / Atari 8-bit
+  .xfd             Atari 8-bit disk
+  .xiso            Xbox ISO
+  .xm              FastTracker II module
+  .ym              Atari ST YM chip music
+  .z64             N64 (Z64)
+  .z80             ZX Spectrum snapshot
+
+----------------------------------------------------------------------
+  MUSIC / CHIPTUNE / VGM formats included:
+----------------------------------------------------------------------
+  .2sf             NDS music rip
+  .669             Composer 669 tracker
+  .ahx             Amiga AHX tracker
+  .ay              ZX Spectrum AY chip music
+  .cpc             Amstrad CPC / CPC music
+  .dbm             Amiga DigiBooster
+  .dmf             Deflemask tracker
+  .dsf             Dreamcast music rip
+  .far             Farandole tracker
+  .fc13            Future Composer 1.3
+  .fc14            Future Composer 1.4
+  .gbs             Game Boy music rip
+  .gsf             GBA music rip
+  .gym             Sega Genesis/MD music
+  .hes             PC Engine music rip
+  .hsc             AdLib HSC music
+  .hvl             Amiga HivelyTracker
+  .it              Impulse Tracker music
+  .ksm             AdLib KSM music
+  .kss             MSX/Sega music
+  .lds             AdLib LDS music
+  .med             Amiga MED/OctaMED
+  .mini2sf         NDS music (lib)
+  .minidsf         Dreamcast music (lib)
+  .minigsf         GBA music (lib)
+  .minipsf         PS1 music (lib)
+  .minipsf2        PS2 music (lib)
+  .minissf         Saturn music (lib)
+  .miniusf         N64 music (lib)
+  .mod             Amiga ProTracker module
+  .mtm             MultiTracker module
+  .nsf             NES music rip
+  .nsfe            NES music (extended)
+  .oct             Amiga OctaMED
+  .psc             ZX Spectrum PROTRACKER
+  .psf             PlayStation music rip
+  .psf2            PS2 music rip
+  .psid            C64 SID music (old format)
+  .pt1             ZX ProTracker 1
+  .pt2             ZX ProTracker 2
+  .pt3             ZX ProTracker 3
+  .rad             Reality AdLib Tracker
+  .rsid            C64 SID (RSID format)
+  .rsn             SNES music archive
+  .s3m             ScreamTracker 3
+  .s98             NEC PC-98 music
+  .sc68            Atari ST SC68 music
+  .sid             C64 SID music
+  .sndh            Atari ST SNDH music
+  .spc             SNES SPC700 music
+  .sqt             ZX Spectrum SQ-Tracker
+  .ssf             Saturn music rip
+  .stc             ZX Spectrum STC tracker
+  .stm             ScreamTracker module
+  .stp             ZX Spectrum STP tracker
+  .tfe             TFM tracker
+  .tfm             TFM tracker
+  .ult             UltraTracker module
+  .usf             N64 music rip
+  .vgm             Video Game Music
+  .vgz             VGM compressed
+  .xm              FastTracker II module
+  .ym              Atari ST YM chip music
+
+======================================================================
+  To add missing extensions, paste them to Claude
+  Last updated: generated from current ROM_EXTS in api.py
+======================================================================

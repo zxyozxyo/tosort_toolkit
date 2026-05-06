@@ -1,0 +1,4 @@
+pywebview>=4.4
+py7zr>=0.20
+rarfile>=4.1
+zstandard>=0.21
