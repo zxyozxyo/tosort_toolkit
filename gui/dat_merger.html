@@ -240,7 +240,11 @@ async function addFiles() {
   try {
     const result = await window.pywebview.api.browse_files();
     if (result && result.length) {
-      result.forEach(f => { if (!files.includes(f)) files.push(f); });
+      result.forEach(f => {
+        const lf = f.toLowerCase();
+        if ((lf.endsWith('.dat') || lf.endsWith('.xml')) && !files.includes(f)) files.push(f);
+        else if (!lf.endsWith('.dat') && !lf.endsWith('.xml')) addLog('Skipped: ' + f.split(/[\\/]/).pop() + ' (not .dat/.xml)', 'dim');
+      });
       renderFiles();
     }
   } catch(e) { addLog('Error: ' + e, 'err'); }

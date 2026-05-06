@@ -348,7 +348,7 @@ class DatMergerAPI:
         result = self._window.create_file_dialog(
             webview.OPEN_DIALOG,
             allow_multiple=True,
-            file_types=('DAT Files (*.dat)', 'XML Files (*.xml)')
+            file_types=('All Files (*.*)',)
         )
         if result and len(result) > 0:
             return list(result)
