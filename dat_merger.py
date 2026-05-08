@@ -520,3 +520,528 @@ class DatMergerAPI:
 
         self._running = False
         self._emit("done", {"success": True, "stats": stats})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE 2: DAT DIFF
+    # ══════════════════════════════════════════════════════════════════
+    def run_diff(self, config: dict):
+        """
+        config = {
+            master_file: str,           # path to the master/newest DAT
+            older_files: [str, ...],    # paths to older DATs to diff against
+            output_path: str,
+            dat_name: str,
+            dat_author: str,
+        }
+        """
+        if self._running:
+            return
+        t = threading.Thread(target=self._diff_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _diff_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        master_path = config.get("master_file", "")
+        older_paths = config.get("older_files", [])
+        output = config.get("output_path", "")
+        dat_name = config.get("dat_name", "Diff DAT")
+        dat_author = config.get("dat_author", "ToSort Toolkit")
+
+        self._log("=" * 50, "info")
+        self._log("DAT Diff started", "ok")
+        self._log("=" * 50, "info")
+
+        if not master_path or not older_paths or not output:
+            self._log("Missing master file, older files, or output path.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        if not output.lower().endswith('.dat'):
+            output += '.dat'
+
+        # Parse master DAT
+        self._progress(5, "Parsing master DAT...")
+        try:
+            master_hdr, master_entries = parse_dat_file(Path(master_path))
+            self._log(f"  Master: {Path(master_path).name} — {len(master_entries)} entries", "ok")
+        except Exception as e:
+            self._log(f"  ERROR parsing master: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        # Parse all older DATs and collect their hashes
+        older_hashes = set()
+        for i, opath in enumerate(older_paths):
+            if self._stop.is_set():
+                break
+            pct = 10 + int((i / len(older_paths)) * 40)
+            self._progress(pct, f"Parsing: {Path(opath).name}")
+            try:
+                _, older_entries = parse_dat_file(Path(opath))
+                for entry in older_entries:
+                    older_hashes.add(entry.hash_key())
+                self._log(f"  Older: {Path(opath).name} — {len(older_entries)} entries", "ok")
+            except Exception as e:
+                self._log(f"  ERROR parsing {Path(opath).name}: {e}", "err")
+
+        if self._stop.is_set():
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        # Find entries in master that are NOT in any older DAT
+        self._progress(60, "Computing diff...")
+        self._log("Computing diff (entries in master but not in older DATs)...", "info")
+
+        diff_entries = []
+        for entry in master_entries:
+            if entry.hash_key() not in older_hashes:
+                diff_entries.append(entry)
+
+        self._log(f"  Master entries:   {len(master_entries)}", "info")
+        self._log(f"  Older entries:    {len(older_hashes)} unique hashes", "info")
+        self._log(f"  Diff (new only):  {len(diff_entries)}", "ok")
+
+        # Write output
+        self._progress(80, "Writing diff DAT...")
+        out_header = DatHeader()
+        out_header.name = dat_name
+        out_header.description = f"Diff: {len(diff_entries)} entries not in older DATs"
+        out_header.author = dat_author
+        out_header.version = time.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            write_clrmamepro_dat(Path(output), out_header, diff_entries)
+            self._log(f"  Written: {output}", "ok")
+        except Exception as e:
+            self._log(f"  ERROR writing: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._progress(100, "Complete")
+        self._log("", "")
+        self._log(f"Diff complete — {len(diff_entries)} new entries found.", "ok")
+
+        self._running = False
+        self._emit("done", {
+            "success": True,
+            "stats": {
+                "total_input": len(master_entries),
+                "duplicates_removed": len(master_entries) - len(diff_entries),
+                "total_output": len(diff_entries),
+            }
+        })
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE 3: SMART MERGE (by DAT name keyword)
+    # ══════════════════════════════════════════════════════════════════
+    def scan_dats_in_folder(self, folder_path: str) -> list:
+        """Scan folder for DATs and return list of {path, name, filename}."""
+        results = []
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                for f in files:
+                    if f.lower().endswith(('.dat', '.xml')):
+                        fpath = os.path.join(root, f)
+                        # Quick parse just the header for the DAT name
+                        try:
+                            hdr, entries = parse_dat_file(Path(fpath))
+                            dat_name = hdr.name or f
+                            results.append({
+                                "path": fpath,
+                                "name": dat_name,
+                                "filename": f,
+                                "entries": len(entries),
+                            })
+                        except Exception:
+                            results.append({
+                                "path": fpath,
+                                "name": f,
+                                "filename": f,
+                                "entries": 0,
+                            })
+        except Exception as e:
+            self._log(f"Scan error: {e}", "err")
+        return results
+
+    def run_smart_merge(self, config: dict):
+        """
+        config = {
+            folder: str,
+            keyword: str,        # filter DAT names containing this keyword
+            output_path: str,
+            dat_name: str,
+            dat_author: str,
+            dedupe: bool,
+        }
+        """
+        if self._running:
+            return
+        t = threading.Thread(target=self._smart_merge_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _smart_merge_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        folder = config.get("folder", "")
+        keyword = config.get("keyword", "").strip().lower()
+        output = config.get("output_path", "")
+        dat_name = config.get("dat_name", "Smart Merged DAT")
+        dat_author = config.get("dat_author", "ToSort Toolkit")
+        dedupe = config.get("dedupe", True)
+
+        self._log("=" * 50, "info")
+        self._log(f'Smart Merge — keyword: "{keyword}"', 'ok')
+        self._log("=" * 50, "info")
+
+        if not folder or not keyword or not output:
+            self._log("Missing folder, keyword, or output path.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        if not output.lower().endswith('.dat'):
+            output += '.dat'
+
+        # Scan folder for all DATs
+        self._progress(5, "Scanning folder...")
+        self._log(f"Scanning: {folder}", "info")
+        all_dats = self.scan_dats_in_folder(folder)
+        self._log(f"  Found {len(all_dats)} DAT/XML file(s) total", "info")
+
+        # Filter by keyword (match against DAT name and filename)
+        matched = [
+            d for d in all_dats
+            if keyword in d['name'].lower() or keyword in d['filename'].lower()
+        ]
+        self._log(f'  Matched "{keyword}": {len(matched)} file(s)', 'ok')
+
+        if not matched:
+            self._log("No DATs matched the keyword.", "warn")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        for d in matched:
+            self._log(f"    {d['filename']}  [{d['name']}]  ({d['entries']} entries)", "dim")
+
+        # Parse and merge matched DATs
+        all_entries = []
+        for i, d in enumerate(matched):
+            if self._stop.is_set():
+                break
+            pct = 10 + int((i / len(matched)) * 50)
+            self._progress(pct, f"Parsing: {d['filename']}")
+            try:
+                _, entries = parse_dat_file(Path(d['path']))
+                all_entries.extend(entries)
+            except Exception as e:
+                self._log(f"  ERROR: {d['filename']}: {e}", "err")
+
+        if self._stop.is_set():
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._log(f"  Total entries loaded: {len(all_entries)}", "info")
+
+        # Dedupe
+        self._progress(65, "Deduplicating..." if dedupe else "Merging...")
+        merged, stats = merge_and_dedupe(all_entries, dedupe=dedupe)
+        if dedupe:
+            self._log(f"  Deduped: {stats['duplicates_removed']} duplicates removed", "ok")
+
+        # Write
+        self._progress(85, "Writing output...")
+        out_header = DatHeader()
+        out_header.name = dat_name
+        out_header.description = f"Smart merge: {keyword} ({len(merged)} entries)"
+        out_header.author = dat_author
+        out_header.version = time.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            write_clrmamepro_dat(Path(output), out_header, merged)
+            self._log(f"  Written: {output}", "ok")
+        except Exception as e:
+            self._log(f"  ERROR: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._progress(100, "Complete")
+        self._log(f"Smart merge complete — {stats['total_output']} entries.", "ok")
+        self._running = False
+        self._emit("done", {"success": True, "stats": stats})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE 4: EXTENSION MERGE (merge DATs containing specific ext)
+    # ══════════════════════════════════════════════════════════════════
+    def run_ext_merge(self, config: dict):
+        """
+        config = {
+            folder: str,
+            extension: str,      # e.g. "tap" or ".tap"
+            output_path: str,
+            dat_name: str,
+            dat_author: str,
+            dedupe: bool,
+        }
+        """
+        if self._running:
+            return
+        t = threading.Thread(target=self._ext_merge_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _ext_merge_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        folder = config.get("folder", "")
+        ext = config.get("extension", "").strip().lower().lstrip(".")
+        output = config.get("output_path", "")
+        dat_name = config.get("dat_name", "Extension Merged DAT")
+        dat_author = config.get("dat_author", "ToSort Toolkit")
+        dedupe = config.get("dedupe", True)
+
+        self._log("=" * 50, "info")
+        self._log(f'Extension Merge — looking for .{ext}', 'ok')
+        self._log("=" * 50, "info")
+
+        if not folder or not ext or not output:
+            self._log("Missing folder, extension, or output path.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        if not output.lower().endswith('.dat'):
+            output += '.dat'
+
+        # Scan and find all DATs
+        self._progress(5, "Scanning folder...")
+        dat_files = []
+        try:
+            for root, dirs, files in os.walk(folder):
+                for f in files:
+                    if f.lower().endswith(('.dat', '.xml')):
+                        dat_files.append(os.path.join(root, f))
+        except Exception as e:
+            self._log(f"Scan error: {e}", "err")
+
+        self._log(f"  Found {len(dat_files)} DAT/XML file(s)", "info")
+
+        # Parse each DAT and check if any ROM has the target extension
+        matched_entries = []
+        matched_count = 0
+        for i, fpath in enumerate(dat_files):
+            if self._stop.is_set():
+                break
+            pct = 10 + int((i / max(len(dat_files), 1)) * 50)
+            if i % 10 == 0:
+                self._progress(pct, f"Scanning: {Path(fpath).name}")
+            try:
+                _, entries = parse_dat_file(Path(fpath))
+                has_ext = False
+                for entry in entries:
+                    for rom in entry.roms:
+                        rname = rom.get('name', '').lower()
+                        if rname.endswith('.' + ext):
+                            has_ext = True
+                            break
+                    if has_ext:
+                        break
+                if has_ext:
+                    matched_entries.extend(entries)
+                    matched_count += 1
+                    self._log(f"  MATCH: {Path(fpath).name} ({len(entries)} entries)", "ok")
+            except Exception as e:
+                self._log(f"  ERROR: {Path(fpath).name}: {e}", "err")
+
+        if self._stop.is_set():
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._log(f"  {matched_count} DAT(s) contain .{ext} files, {len(matched_entries)} total entries", "info")
+
+        if not matched_entries:
+            self._log(f"No DATs contain .{ext} files.", "warn")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        # Dedupe
+        self._progress(65, "Deduplicating..." if dedupe else "Merging...")
+        merged, stats = merge_and_dedupe(matched_entries, dedupe=dedupe)
+        if dedupe:
+            self._log(f"  Deduped: {stats['duplicates_removed']} duplicates removed", "ok")
+
+        # Write
+        self._progress(85, "Writing output...")
+        out_header = DatHeader()
+        out_header.name = dat_name
+        out_header.description = f"Extension merge: .{ext} ({len(merged)} entries)"
+        out_header.author = dat_author
+        out_header.version = time.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            write_clrmamepro_dat(Path(output), out_header, merged)
+            self._log(f"  Written: {output}", "ok")
+        except Exception as e:
+            self._log(f"  ERROR: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._progress(100, "Complete")
+        self._log(f"Extension merge complete — {stats['total_output']} entries.", "ok")
+        self._running = False
+        self._emit("done", {"success": True, "stats": stats})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE 5: DAT SIZE CALCULATOR
+    # ══════════════════════════════════════════════════════════════════
+    def run_size_calc(self, config: dict):
+        """
+        config = {
+            files: [str, ...],    # DAT/XML file paths
+            output_txt: str,      # optional: save summary to .txt
+        }
+        """
+        if self._running:
+            return
+        t = threading.Thread(target=self._size_calc_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _size_calc_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        files = config.get("files", [])
+        output_txt = config.get("output_txt", "").strip()
+
+        self._log("=" * 50, "info")
+        self._log(f"DAT Size Calculator — {len(files)} file(s)", "ok")
+        self._log("=" * 50, "info")
+
+        if not files:
+            self._log("No files selected.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        results = []
+        grand_total = 0
+
+        for i, fpath in enumerate(files):
+            if self._stop.is_set():
+                break
+            pct = int((i / len(files)) * 90)
+            self._progress(pct, f"Calculating: {Path(fpath).name}")
+
+            try:
+                hdr, entries = parse_dat_file(Path(fpath))
+                dat_name = hdr.name or Path(fpath).name
+                total_bytes = 0
+                rom_count = 0
+                for entry in entries:
+                    for rom in entry.roms:
+                        try:
+                            size = int(rom.get('size', 0))
+                            total_bytes += size
+                            rom_count += 1
+                        except (ValueError, TypeError):
+                            pass
+
+                grand_total += total_bytes
+                size_str = self._format_size(total_bytes)
+                results.append({
+                    "file": Path(fpath).name,
+                    "dat_name": dat_name,
+                    "entries": len(entries),
+                    "roms": rom_count,
+                    "bytes": total_bytes,
+                    "size_str": size_str,
+                })
+                self._log(f"  {dat_name}  =  {size_str}  ({len(entries)} games, {rom_count} ROMs)", "ok")
+
+            except Exception as e:
+                self._log(f"  ERROR: {Path(fpath).name}: {e}", "err")
+                results.append({
+                    "file": Path(fpath).name,
+                    "dat_name": "ERROR",
+                    "entries": 0,
+                    "roms": 0,
+                    "bytes": 0,
+                    "size_str": "ERROR",
+                })
+
+        # Summary
+        self._progress(95, "Done")
+        self._log("", "")
+        self._log("=" * 50, "info")
+        self._log(f"Grand total: {self._format_size(grand_total)}", "ok")
+        self._log("=" * 50, "info")
+
+        # Save to txt if requested
+        if output_txt:
+            try:
+                lines = []
+                lines.append("=" * 65)
+                lines.append("  ToSort Toolkit — DAT Size Calculator Report")
+                lines.append("=" * 65)
+                lines.append(f"  Generated: {time.strftime('%Y-%m-%d %H:%M')}")
+                lines.append("")
+                lines.append(f"  {'DAT Name':<45} {'Size':>12}  {'Games':>7}  {'ROMs':>7}")
+                lines.append(f"  {'-'*43}   {'-'*10}  {'-'*7}  {'-'*7}")
+                for r in results:
+                    name = r['dat_name'][:43]
+                    lines.append(f"  {name:<45} {r['size_str']:>12}  {r['entries']:>7}  {r['roms']:>7}")
+                lines.append("")
+                lines.append(f"  {'GRAND TOTAL':<45} {self._format_size(grand_total):>12}")
+                lines.append("=" * 65)
+
+                if not output_txt.lower().endswith('.txt'):
+                    output_txt += '.txt'
+                Path(output_txt).parent.mkdir(parents=True, exist_ok=True)
+                with open(output_txt, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(lines))
+                self._log(f"Report saved: {output_txt}", "ok")
+            except Exception as e:
+                self._log(f"Could not save report: {e}", "err")
+
+        self._progress(100, "Complete")
+        self._running = False
+        self._emit("done", {
+            "success": True,
+            "stats": {
+                "total_input": len(files),
+                "duplicates_removed": 0,
+                "total_output": len(results),
+            },
+            "size_results": results,
+            "grand_total": self._format_size(grand_total),
+        })
+
+    @staticmethod
+    def _format_size(nbytes: int) -> str:
+        """Format bytes into human-readable size."""
+        if nbytes < 1024:
+            return f"{nbytes} B"
+        elif nbytes < 1024 * 1024:
+            return f"{nbytes / 1024:.1f} KB"
+        elif nbytes < 1024 * 1024 * 1024:
+            return f"{nbytes / (1024*1024):.1f} MB"
+        elif nbytes < 1024 * 1024 * 1024 * 1024:
+            return f"{nbytes / (1024*1024*1024):.2f} GB"
+        else:
+            return f"{nbytes / (1024*1024*1024*1024):.2f} TB"
+
