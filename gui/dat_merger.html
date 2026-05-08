@@ -93,7 +93,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     <div class="tab" onclick="switchTab('diff')">DAT Diff</div>
     <div class="tab" onclick="switchTab('smart')">Smart Merge</div>
     <div class="tab" onclick="switchTab('ext')">Extension Merge</div>
-    <div class="tab" onclick="switchTab('size')">Size Calculator</div>
+    <div class="tab" onclick="switchTab('intdedupe')">Internal Dedupe</div>
+    <div class="tab" onclick="switchTab('integrity')">Integrity Check</div>
+    <div class="tab" onclick="switchTab('create')">DAT Creator</div>
+    <div class="tab" onclick="switchTab('rebuild')">Rebuilder</div>
+    <div class="tab" onclick="switchTab('size')">Size Calc</div>
   </div>
 
   <div class="content">
@@ -200,7 +204,86 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       </div>
     </div>
 
-    <!-- ═══ STATS + LOG (shared across all tabs) ═══ -->
+    <!-- ═══ TAB: INTERNAL DEDUPE ═══ -->
+    <div class="tab-body" id="tab-intdedupe">
+      <div class="panel">
+        <div class="panel-hdr"><div class="dot" style="background:var(--info)"></div>Single-DAT Internal Deduper</div>
+        <div class="panel-body">
+          <div class="hint" style="margin-bottom:8px">Remove duplicate entries within a single DAT file (entries with identical ROM hashes but different names).</div>
+          <div class="row"><label>Input DAT</label><input class="path-input" id="intdedupe-file" placeholder="Select a single DAT/XML file"/><button class="browse-btn" onclick="browseSingle('intdedupe-file')">Browse&hellip;</button></div>
+          <div class="row"><label>Output File</label><input class="path-input" id="intdedupe-output" placeholder="Cleaned output DAT"/><button class="browse-btn" onclick="browseSave('intdedupe-output')">Browse&hellip;</button></div>
+          <div class="row"><label>DAT Name</label><input class="path-input" id="intdedupe-name" placeholder="Leave blank to keep original name"/></div>
+          <div class="row"><label>Author</label><input class="path-input" id="intdedupe-author" value="ToSort Toolkit"/></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: INTEGRITY CHECK ═══ -->
+    <div class="tab-body" id="tab-integrity">
+      <div class="panel">
+        <div class="panel-hdr"><div class="dot" style="background:var(--warn)"></div>DAT Integrity Check</div>
+        <div class="panel-body">
+          <div class="hint" style="margin-bottom:8px">Scan DATs for problems: missing hashes, duplicate names, empty entries, zero-size ROMs, malformed data.</div>
+          <div class="btn-row">
+            <button class="browse-btn" onclick="addFiles('integrity-list')">+ Add Files</button>
+            <button class="browse-btn" onclick="addFolder('integrity-list')">+ Add Folder</button>
+            <button class="browse-btn" onclick="clearList('integrity-list')" style="margin-left:auto;border-color:var(--danger);color:var(--danger)">Clear</button>
+          </div>
+          <div class="file-list" id="integrity-list"><div class="file-empty">Add DATs to check</div></div>
+          <div class="row"><label>Save report to</label><input class="path-input" id="integrity-txt" placeholder="Optional .txt report path"/><button class="browse-btn" onclick="browseSave('integrity-txt','integrity_report.txt')">Browse&hellip;</button></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: DAT CREATOR ═══ -->
+    <div class="tab-body" id="tab-create">
+      <div class="panel">
+        <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>DAT Creator &mdash; generate a DAT from files on disk</div>
+        <div class="panel-body">
+          <div class="hint" style="margin-bottom:8px">Point at a folder, hash every file, generate a CLRMamePro DAT. Useful for creating DATs of your own collections.</div>
+          <div class="row"><label>Source Folder</label><input class="path-input" id="create-folder" placeholder="Folder containing files to catalogue"/><button class="browse-btn" onclick="browseFolder('create-folder')">Browse&hellip;</button></div>
+          <div class="row"><label>Output File</label><input class="path-input" id="create-output" placeholder="D:\DATs\my_collection.dat"/><button class="browse-btn" onclick="browseSave('create-output')">Browse&hellip;</button></div>
+          <div class="row"><label>DAT Name</label><input class="path-input" id="create-name" value="My Collection" placeholder="Name shown in RomVault"/></div>
+          <div class="row"><label>Author</label><input class="path-input" id="create-author" value="ToSort Toolkit"/></div>
+          <div style="padding:6px 0;display:flex;gap:16px">
+            <label class="opt"><input type="checkbox" id="create-recursive" checked> Scan subfolders</label>
+            <label class="opt"><input type="checkbox" id="create-sha1" checked> Include SHA1</label>
+            <label class="opt"><input type="checkbox" id="create-md5"> Include MD5</label>
+          </div>
+          <div class="hint">CRC32 is always included. SHA1 recommended for RomVault compatibility.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: REBUILDER ═══ -->
+    <div class="tab-body" id="tab-rebuild">
+      <div class="panel">
+        <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>DAT Rebuilder &mdash; sort files into sets using DATs</div>
+        <div class="panel-body">
+          <div class="hint" style="margin-bottom:8px">Load one or more DATs as reference, scan a source folder, and move any matching files to the destination organised by game name. Unmatched files are left in place.</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:6px">Reference DATs</div>
+          <div class="btn-row">
+            <button class="browse-btn" onclick="addFiles('rebuild-dats')">+ Add DATs</button>
+            <button class="browse-btn" onclick="addFolder('rebuild-dats')">+ Add Folder of DATs</button>
+            <button class="browse-btn" onclick="clearList('rebuild-dats')" style="margin-left:auto;border-color:var(--danger);color:var(--danger)">Clear</button>
+          </div>
+          <div class="file-list" id="rebuild-dats" style="min-height:60px;max-height:120px"><div class="file-empty">Add DAT files to use as reference</div></div>
+          <div class="row"><label>Source Folder</label><input class="path-input" id="rebuild-source" placeholder="Folder with loose/unsorted files"/><button class="browse-btn" onclick="browseFolder('rebuild-source')">Browse&hellip;</button></div>
+          <div class="row"><label>Destination</label><input class="path-input" id="rebuild-dest" placeholder="Where matched files are moved (organised by game name)"/><button class="browse-btn" onclick="browseFolder('rebuild-dest')">Browse&hellip;</button></div>
+          <div style="padding:6px 0;display:flex;gap:16px">
+            <label class="opt"><input type="checkbox" id="rebuild-dry"> Dry run &mdash; list matches only</label>
+            <span style="font-size:11px;color:var(--text2)">Match by:</span>
+            <select id="rebuild-match" style="background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 8px;color:var(--text);font-family:var(--mono);font-size:11px">
+              <option value="crc" selected>CRC32 (fastest)</option>
+              <option value="sha1">SHA1 (most accurate)</option>
+              <option value="md5">MD5</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+        <!-- ═══ STATS + LOG (shared across all tabs) ═══ -->
     <div style="padding:0 14px 14px;display:flex;flex-direction:column;gap:12px;flex-shrink:0">
       <div class="panel" id="stats-panel" style="display:none">
         <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>Results</div>
@@ -235,7 +318,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 let activeTab = 'merge';
 function switchTab(name) {
   activeTab = name;
-  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', ['merge','diff','smart','ext','size'][i] === name));
+  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', ['merge','diff','smart','ext','intdedupe','integrity','create','rebuild','size'][i] === name));
   document.querySelectorAll('.tab-body').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
 }
@@ -400,6 +483,36 @@ function runActive() {
       dat_author: document.getElementById('ext-author').value.trim(),
       dedupe: document.getElementById('ext-dedupe').checked,
     });
+  } else if (activeTab === 'intdedupe') {
+    api.run_internal_dedupe({
+      file: document.getElementById('intdedupe-file').value.trim(),
+      output_path: document.getElementById('intdedupe-output').value.trim(),
+      dat_name: document.getElementById('intdedupe-name').value.trim(),
+      dat_author: document.getElementById('intdedupe-author').value.trim(),
+    });
+  } else if (activeTab === 'integrity') {
+    api.run_integrity_check({
+      files: getList('integrity-list'),
+      output_txt: document.getElementById('integrity-txt').value.trim(),
+    });
+  } else if (activeTab === 'create') {
+    api.run_create_dat({
+      folder: document.getElementById('create-folder').value.trim(),
+      output_path: document.getElementById('create-output').value.trim(),
+      dat_name: document.getElementById('create-name').value.trim() || 'My Collection',
+      dat_author: document.getElementById('create-author').value.trim(),
+      recursive: document.getElementById('create-recursive').checked,
+      use_sha1: document.getElementById('create-sha1').checked,
+      use_md5: document.getElementById('create-md5').checked,
+    });
+  } else if (activeTab === 'rebuild') {
+    api.run_rebuild({
+      dat_files: getList('rebuild-dats'),
+      source_folder: document.getElementById('rebuild-source').value.trim(),
+      dest_folder: document.getElementById('rebuild-dest').value.trim(),
+      dry_run: document.getElementById('rebuild-dry').checked,
+      match_by: document.getElementById('rebuild-match').value,
+    });
   } else if (activeTab === 'size') {
     api.run_size_calc({
       files: getList('size-list'),
@@ -413,7 +526,34 @@ function doStop() {
   addLog('Stop requested...', 'warn');
 }
 
-addLog('DAT Tools ready. Select a tab and configure.', 'info');
+// ── Drag and drop support ────────────────────────────────────────────────────
+document.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); });
+document.addEventListener('drop', e => {
+  e.preventDefault(); e.stopPropagation();
+  // Find the closest file-list element
+  const list = e.target.closest('.file-list');
+  if (!list) return;
+  const listId = list.id;
+  if (!listId) return;
+  const items = e.dataTransfer.files;
+  const fl = getList(listId);
+  let added = 0;
+  for (let i = 0; i < items.length; i++) {
+    const path = items[i].path || items[i].name;
+    if (path && (path.toLowerCase().endsWith('.dat') || path.toLowerCase().endsWith('.xml'))) {
+      if (!fl.includes(path)) { fl.push(path); added++; }
+    }
+  }
+  if (added) { renderList(listId); addLog('Dropped ' + added + ' file(s).', 'ok'); }
+});
+// Highlight drop targets
+document.querySelectorAll('.file-list').forEach(el => {
+  el.addEventListener('dragenter', () => el.style.borderColor = 'var(--acc)');
+  el.addEventListener('dragleave', () => el.style.borderColor = '');
+  el.addEventListener('drop', () => el.style.borderColor = '');
+});
+
+addLog('DAT Tools ready. Select a tab and configure. Drag & drop files onto lists.', 'info');
 </script>
 </body>
 </html>

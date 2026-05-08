@@ -1535,6 +1535,53 @@ class ToSortAPI:
                 pass
         return {}
 
+    def export_settings(self, path: str) -> bool:
+        """Export all settings to a user-chosen JSON file."""
+        try:
+            import json
+            settings = self.load_settings()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def import_settings(self, path: str) -> dict:
+        """Import settings from a user-chosen JSON file."""
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            # Also save as current settings
+            self.save_settings(settings)
+            return settings
+        except Exception:
+            return None
+
+    def browse_save_file(self, default_name: str = "settings.json"):
+        """Open save dialog."""
+        import webview as _wv
+        result = self._window.create_file_dialog(
+            _wv.SAVE_DIALOG,
+            save_filename=default_name,
+            file_types=('JSON Files (*.json)',)
+        )
+        if result:
+            return result if isinstance(result, str) else result[0] if result else None
+        return None
+
+    def browse_open_file(self):
+        """Open file dialog for JSON."""
+        import webview as _wv
+        result = self._window.create_file_dialog(
+            _wv.OPEN_DIALOG,
+            allow_multiple=False,
+            file_types=('JSON Files (*.json)',)
+        )
+        if result and len(result) > 0:
+            return result[0]
+        return None
+
     def save_settings(self, settings: dict) -> bool:
         """Called by JS on close / field change. Persists GUI state."""
         settings_path = Path(__file__).parent / "settings.json"

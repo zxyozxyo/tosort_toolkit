@@ -1031,6 +1031,522 @@ class DatMergerAPI:
             "grand_total": self._format_size(grand_total),
         })
 
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE: SINGLE-DAT INTERNAL DEDUPER
+    # ══════════════════════════════════════════════════════════════════
+    def run_internal_dedupe(self, config: dict):
+        """
+        config = {
+            file: str,           # single DAT/XML path
+            output_path: str,
+            dat_name: str,       # optional override
+            dat_author: str,
+        }
+        """
+        if self._running: return
+        t = threading.Thread(target=self._internal_dedupe_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _internal_dedupe_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        fpath = config.get("file", "")
+        output = config.get("output_path", "")
+        dat_name_override = config.get("dat_name", "").strip()
+        dat_author = config.get("dat_author", "ToSort Toolkit")
+
+        self._log("=" * 50, "info")
+        self._log("Single-DAT Internal Deduper", "ok")
+        self._log("=" * 50, "info")
+
+        if not fpath or not output:
+            self._log("Missing input file or output path.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        if not output.lower().endswith('.dat'):
+            output += '.dat'
+
+        self._progress(10, "Parsing...")
+        try:
+            header, entries = parse_dat_file(Path(fpath))
+            self._log(f"  Loaded: {Path(fpath).name} — {len(entries)} entries", "ok")
+        except Exception as e:
+            self._log(f"  ERROR: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._progress(40, "Deduplicating internally...")
+        seen = {}
+        unique = []
+        dupes = 0
+        for entry in entries:
+            key = entry.hash_key()
+            if key in seen:
+                dupes += 1
+                self._log(f"  DUPE: {entry.name}  ==  {seen[key]}", "dim")
+            else:
+                seen[key] = entry.name
+                unique.append(entry)
+
+        self._log(f"  {len(entries)} input, {dupes} internal duplicates, {len(unique)} unique", "ok")
+
+        self._progress(70, "Writing...")
+        out_header = DatHeader()
+        out_header.name = dat_name_override or header.name or "Deduped DAT"
+        out_header.description = header.description or out_header.name
+        out_header.author = dat_author
+        out_header.version = time.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            write_clrmamepro_dat(Path(output), out_header, unique)
+            self._log(f"  Written: {output}", "ok")
+        except Exception as e:
+            self._log(f"  ERROR: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._progress(100, "Complete")
+        self._log(f"Internal dedupe done — {dupes} duplicates removed.", "ok")
+        self._running = False
+        self._emit("done", {"success": True, "stats": {
+            "total_input": len(entries), "duplicates_removed": dupes, "total_output": len(unique)
+        }})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE: DAT INTEGRITY CHECK
+    # ══════════════════════════════════════════════════════════════════
+    def run_integrity_check(self, config: dict):
+        """
+        config = {
+            files: [str, ...],
+            output_txt: str,     # optional report path
+        }
+        """
+        if self._running: return
+        t = threading.Thread(target=self._integrity_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _integrity_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        files = config.get("files", [])
+        output_txt = config.get("output_txt", "").strip()
+
+        self._log("=" * 50, "info")
+        self._log(f"DAT Integrity Check — {len(files)} file(s)", "ok")
+        self._log("=" * 50, "info")
+
+        if not files:
+            self._log("No files selected.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        all_issues = []
+        total_ok = 0
+
+        for fi, fpath in enumerate(files):
+            if self._stop.is_set(): break
+            pct = int((fi / len(files)) * 90)
+            fname = Path(fpath).name
+            self._progress(pct, f"Checking: {fname}")
+
+            issues = []
+            try:
+                header, entries = parse_dat_file(Path(fpath))
+                dat_name = header.name or fname
+
+                if not header.name:
+                    issues.append("WARNING: DAT has no name in header")
+                if not entries:
+                    issues.append("WARNING: DAT contains zero entries")
+
+                name_counts = {}
+                empty_games = 0
+                missing_hash = 0
+                missing_size = 0
+                zero_size = 0
+                total_roms = 0
+
+                for entry in entries:
+                    # Check duplicate game names
+                    name_counts[entry.name] = name_counts.get(entry.name, 0) + 1
+
+                    if not entry.roms:
+                        empty_games += 1
+                        continue
+
+                    for rom in entry.roms:
+                        total_roms += 1
+                        has_any_hash = bool(rom.get('crc') or rom.get('md5') or rom.get('sha1'))
+                        if not has_any_hash:
+                            missing_hash += 1
+                        if not rom.get('size'):
+                            missing_size += 1
+                        elif rom.get('size') == '0':
+                            zero_size += 1
+
+                # Duplicate names
+                dupe_names = {k: v for k, v in name_counts.items() if v > 1}
+                if dupe_names:
+                    for name, count in sorted(dupe_names.items()):
+                        issues.append(f"DUPLICATE NAME: '{name}' appears {count} times")
+
+                if empty_games > 0:
+                    issues.append(f"EMPTY ENTRIES: {empty_games} game(s) with no ROMs")
+                if missing_hash > 0:
+                    issues.append(f"MISSING HASH: {missing_hash} ROM(s) with no CRC/MD5/SHA1")
+                if missing_size > 0:
+                    issues.append(f"MISSING SIZE: {missing_size} ROM(s) with no size attribute")
+                if zero_size > 0:
+                    issues.append(f"ZERO SIZE: {zero_size} ROM(s) with size=0")
+
+                if issues:
+                    self._log(f"  {dat_name}: {len(issues)} issue(s) found", "warn")
+                    for iss in issues:
+                        self._log(f"    {iss}", "warn")
+                    all_issues.append({"file": fname, "dat_name": dat_name,
+                                       "entries": len(entries), "roms": total_roms,
+                                       "issues": issues})
+                else:
+                    self._log(f"  {dat_name}: OK ({len(entries)} entries, {total_roms} ROMs)", "ok")
+                    total_ok += 1
+
+            except Exception as e:
+                issues.append(f"PARSE ERROR: {e}")
+                self._log(f"  {fname}: PARSE ERROR — {e}", "err")
+                all_issues.append({"file": fname, "dat_name": fname,
+                                   "entries": 0, "roms": 0, "issues": issues})
+
+        # Summary
+        self._progress(95, "Done")
+        self._log("", "")
+        self._log(f"Integrity check: {total_ok} OK, {len(all_issues)} with issues, out of {len(files)} checked.", "ok" if not all_issues else "warn")
+
+        if output_txt:
+            try:
+                lines = ["=" * 60, "  DAT Integrity Check Report", "=" * 60,
+                         f"  Date: {time.strftime('%Y-%m-%d %H:%M')}",
+                         f"  Files checked: {len(files)}",
+                         f"  Clean: {total_ok}  |  Issues: {len(all_issues)}", ""]
+                for item in all_issues:
+                    lines.append(f"  {item['dat_name']}  ({item['file']})")
+                    lines.append(f"    Entries: {item['entries']}  ROMs: {item['roms']}")
+                    for iss in item['issues']:
+                        lines.append(f"    - {iss}")
+                    lines.append("")
+                lines.append("=" * 60)
+                if not output_txt.lower().endswith('.txt'):
+                    output_txt += '.txt'
+                Path(output_txt).parent.mkdir(parents=True, exist_ok=True)
+                with open(output_txt, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(lines))
+                self._log(f"Report saved: {output_txt}", "ok")
+            except Exception as e:
+                self._log(f"Could not save report: {e}", "err")
+
+        self._progress(100, "Complete")
+        self._running = False
+        self._emit("done", {"success": True, "stats": {
+            "total_input": len(files), "duplicates_removed": len(all_issues),
+            "total_output": total_ok
+        }})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE: DAT CREATOR
+    # ══════════════════════════════════════════════════════════════════
+    def run_create_dat(self, config: dict):
+        """
+        config = {
+            folder: str,         # folder to scan
+            output_path: str,
+            dat_name: str,
+            dat_author: str,
+            recursive: bool,
+            use_sha1: bool,
+            use_md5: bool,
+        }
+        """
+        if self._running: return
+        t = threading.Thread(target=self._create_dat_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _create_dat_thread(self, config: dict):
+        import hashlib
+        self._running = True
+        self._stop.clear()
+
+        folder = Path(config.get("folder", "")).expanduser()
+        output = config.get("output_path", "")
+        dat_name = config.get("dat_name", "Created DAT")
+        dat_author = config.get("dat_author", "ToSort Toolkit")
+        recursive = config.get("recursive", True)
+        use_sha1 = config.get("use_sha1", True)
+        use_md5 = config.get("use_md5", False)
+
+        self._log("=" * 50, "info")
+        self._log("DAT Creator", "ok")
+        self._log("=" * 50, "info")
+
+        if not folder.is_dir():
+            self._log(f"Folder not found: {folder}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+        if not output:
+            self._log("No output path set.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+        if not output.lower().endswith('.dat'):
+            output += '.dat'
+
+        # Collect files
+        self._progress(5, "Collecting files...")
+        all_files = []
+        if recursive:
+            for root, dirs, files in os.walk(folder):
+                for f in files:
+                    all_files.append(Path(root) / f)
+        else:
+            all_files = [f for f in folder.iterdir() if f.is_file()]
+
+        self._log(f"  Found {len(all_files)} file(s)", "info")
+
+        if not all_files:
+            self._log("No files found.", "warn")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        # Hash each file and create entries
+        entries = []
+        for i, fpath in enumerate(all_files):
+            if self._stop.is_set(): break
+            if i % 50 == 0:
+                pct = 5 + int((i / len(all_files)) * 85)
+                self._progress(pct, f"Hashing: {fpath.name} ({i}/{len(all_files)})")
+
+            try:
+                size = fpath.stat().st_size
+                # CRC32 always
+                import zlib
+                crc = 0
+                sha1_h = hashlib.sha1() if use_sha1 else None
+                md5_h = hashlib.md5() if use_md5 else None
+                with open(fpath, 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk: break
+                        crc = zlib.crc32(chunk, crc)
+                        if sha1_h: sha1_h.update(chunk)
+                        if md5_h: md5_h.update(chunk)
+
+                crc_str = format(crc & 0xFFFFFFFF, '08X')
+                rom = {
+                    'name': str(fpath.relative_to(folder)),
+                    'size': str(size),
+                    'crc': crc_str,
+                }
+                if use_sha1: rom['sha1'] = sha1_h.hexdigest()
+                if use_md5: rom['md5'] = md5_h.hexdigest()
+
+                game_name = fpath.stem
+                entry = DatEntry(game_name, game_name, [rom], str(folder))
+                entries.append(entry)
+
+            except Exception as e:
+                self._log(f"  ERR: {fpath.name}: {e}", "err")
+
+        self._log(f"  Hashed {len(entries)} file(s)", "ok")
+
+        # Write
+        self._progress(92, "Writing DAT...")
+        out_header = DatHeader()
+        out_header.name = dat_name
+        out_header.description = f"Created from {folder.name} ({len(entries)} files)"
+        out_header.author = dat_author
+        out_header.version = time.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            write_clrmamepro_dat(Path(output), out_header, entries)
+            self._log(f"  Written: {output}", "ok")
+        except Exception as e:
+            self._log(f"  ERROR: {e}", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        self._progress(100, "Complete")
+        self._log(f"DAT created — {len(entries)} entries.", "ok")
+        self._running = False
+        self._emit("done", {"success": True, "stats": {
+            "total_input": len(all_files), "duplicates_removed": 0, "total_output": len(entries)
+        }})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE: DAT REBUILDER
+    # ══════════════════════════════════════════════════════════════════
+    def run_rebuild(self, config: dict):
+        """
+        config = {
+            dat_files: [str,...],    # DAT(s) to use as reference
+            source_folder: str,      # folder with loose files
+            dest_folder: str,        # where matched files are moved
+            dry_run: bool,
+            match_by: str,           # 'crc', 'sha1', 'md5'
+        }
+        """
+        if self._running: return
+        t = threading.Thread(target=self._rebuild_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _rebuild_thread(self, config: dict):
+        import hashlib, zlib
+        self._running = True
+        self._stop.clear()
+
+        dat_files = config.get("dat_files", [])
+        source = Path(config.get("source_folder", "")).expanduser()
+        dest = Path(config.get("dest_folder", "")).expanduser()
+        dry_run = config.get("dry_run", False)
+        match_by = config.get("match_by", "crc")
+
+        self._log("=" * 50, "info")
+        self._log("DAT Rebuilder", "ok")
+        self._log("=" * 50, "info")
+
+        if not dat_files or not source.is_dir() or not dest:
+            self._log("Missing DAT files, source folder, or destination.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+
+        dest.mkdir(parents=True, exist_ok=True)
+        if dry_run:
+            self._log("Dry run — files will be listed but NOT moved.", "warn")
+
+        # Step 1: Build hash lookup from DAT(s)
+        self._progress(5, "Building hash index from DATs...")
+        hash_index = {}  # hash -> (game_name, rom_name)
+        total_dat_roms = 0
+
+        for dpath in dat_files:
+            if self._stop.is_set(): break
+            try:
+                _, entries = parse_dat_file(Path(dpath))
+                for entry in entries:
+                    for rom in entry.roms:
+                        h = None
+                        if match_by == 'sha1' and rom.get('sha1'):
+                            h = rom['sha1'].lower()
+                        elif match_by == 'md5' and rom.get('md5'):
+                            h = rom['md5'].lower()
+                        elif rom.get('crc'):
+                            h = rom['crc'].upper()
+                        if h:
+                            hash_index[h] = (entry.name, rom.get('name', ''))
+                            total_dat_roms += 1
+                self._log(f"  Loaded: {Path(dpath).name}", "ok")
+            except Exception as e:
+                self._log(f"  ERROR: {Path(dpath).name}: {e}", "err")
+
+        self._log(f"  Hash index: {len(hash_index)} unique ROM hashes from {total_dat_roms} total", "info")
+
+        # Step 2: Scan source folder, hash each file, check against index
+        self._progress(30, "Scanning source files...")
+        source_files = []
+        for root, dirs, files in os.walk(source):
+            rp = Path(root).resolve()
+            if rp == dest.resolve() or str(rp).startswith(str(dest.resolve())):
+                dirs.clear(); continue
+            for f in files:
+                source_files.append(Path(root) / f)
+
+        self._log(f"  Source files: {len(source_files)}", "info")
+
+        matched = 0
+        unmatched = 0
+        errors = 0
+
+        for i, fpath in enumerate(source_files):
+            if self._stop.is_set(): break
+            if i % 50 == 0:
+                pct = 30 + int((i / max(len(source_files), 1)) * 65)
+                self._progress(pct, f"Checking: {fpath.name} ({i}/{len(source_files)})")
+
+            try:
+                # Hash the file
+                if match_by == 'sha1':
+                    h = hashlib.sha1()
+                    with open(fpath, 'rb') as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            h.update(chunk)
+                    file_hash = h.hexdigest().lower()
+                elif match_by == 'md5':
+                    h = hashlib.md5()
+                    with open(fpath, 'rb') as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            h.update(chunk)
+                    file_hash = h.hexdigest().lower()
+                else:  # crc
+                    crc = 0
+                    with open(fpath, 'rb') as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            crc = zlib.crc32(chunk, crc)
+                    file_hash = format(crc & 0xFFFFFFFF, '08X')
+
+                if file_hash in hash_index:
+                    game_name, rom_name = hash_index[file_hash]
+                    # Move to dest/game_name/rom_name
+                    game_dir = dest / game_name
+                    game_dir.mkdir(parents=True, exist_ok=True)
+                    dest_file = game_dir / (rom_name or fpath.name)
+                    # Handle collision
+                    if dest_file.exists():
+                        stem, sfx = os.path.splitext(dest_file.name)
+                        n = 1
+                        while dest_file.exists():
+                            dest_file = game_dir / f"{stem}_{n}{sfx}"
+                            n += 1
+
+                    if not dry_run:
+                        try:
+                            os.rename(str(fpath), str(dest_file))
+                        except OSError:
+                            import shutil
+                            shutil.copy2(str(fpath), str(dest_file))
+                            os.unlink(str(fpath))
+
+                    matched += 1
+                    if matched % 100 == 0:
+                        self._log(f"  Matched {matched} files so far...", "dim")
+                else:
+                    unmatched += 1
+
+            except Exception as e:
+                errors += 1
+                self._log(f"  ERR: {fpath.name}: {e}", "err")
+
+        self._progress(100, "Complete")
+        action = "Would move" if dry_run else "Moved"
+        self._log("", "")
+        self._log(f"Rebuild done — {action} {matched} matched, {unmatched} unmatched, {errors} errors.", "ok")
+        self._running = False
+        self._emit("done", {"success": True, "stats": {
+            "total_input": len(source_files), "duplicates_removed": unmatched,
+            "total_output": matched,
+        }})
+
     @staticmethod
     def _format_size(nbytes: int) -> str:
         """Format bytes into human-readable size."""

@@ -134,7 +134,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
   <div class="titlebar">
     <span class="logo">&#9670; TOSORT TOOLKIT</span>
     <span class="sub">RomVault Cleaning Pipeline</span>
-    <button class="browse-btn" id="dat-merger-btn" onclick="openDatMerger()" style="margin-left:auto;border-color:var(--info);color:var(--info);padding:4px 14px;font-size:11px">&#9830; DAT Merger</button>
+    <button class="browse-btn" id="dat-merger-btn" onclick="openDatMerger()" style="margin-left:auto;border-color:var(--text3);color:var(--text2);padding:4px 10px;font-size:10px" onclick="exportSettings()">Export Settings</button>
+    <button class="browse-btn" style="border-color:var(--text3);color:var(--text2);padding:4px 10px;font-size:10px" onclick="importSettings()">Import Settings</button>
+    <button class="browse-btn" id="dat-merger-btn" onclick="openDatMerger()" style="border-color:var(--info);color:var(--info);padding:4px 14px;font-size:11px">&#9830; DAT Tools</button>
     <span id="global-pill" class="pill pill-idle">IDLE</span>
   </div>
 
@@ -851,6 +853,27 @@ function buildConfig() {
 }
 
 addLog('ToSort Toolkit ready. Configure folders and press START.', 'info');
+
+// ─── Settings Export/Import ──────────────────────────────────────────────────────────────
+async function exportSettings() {
+  try {
+    const path = await window.pywebview.api.browse_save_file("tosort_settings.json");
+    if (path) {
+      const ok = await window.pywebview.api.export_settings(path);
+      addLog(ok ? "Settings exported: " + path : "Export failed.", ok ? "ok" : "err");
+    }
+  } catch(e) { addLog("Export error: " + e, "err"); }
+}
+async function importSettings() {
+  try {
+    const path = await window.pywebview.api.browse_open_file();
+    if (path) {
+      const s = await window.pywebview.api.import_settings(path);
+      if (s) { applySettings(s); addLog("Settings imported: " + path, "ok"); }
+      else { addLog("Import failed.", "err"); }
+    }
+  } catch(e) { addLog("Import error: " + e, "err"); }
+}
 
 // ─── DAT Merger window ──────────────────────────────────────────────────────
 function openDatMerger() {
