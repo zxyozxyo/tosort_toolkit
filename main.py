@@ -5,40 +5,31 @@ Requires: pip install pywebview py7zr rarfile zstandard
 """
 
 import webview
-import sys
 import os
-import threading
 
 from api import ToSortAPI
 from dat_merger import DatMergerAPI
 
-dat_window = None
-dat_api = None
+_dat_api = None
 
 
 def open_dat_merger():
-    """Called from the main window to open/focus the DAT merger window."""
-    global dat_window, dat_api
-    if dat_window is not None:
-        try:
-            dat_window.show()
-            dat_window.on_top = True
-            dat_window.on_top = False
-            return
-        except Exception:
-            pass
+    """Open or re-create the DAT Tools window."""
+    global _dat_api
 
-    dat_api = DatMergerAPI()
+    # Always create a fresh window - pywebview windows can't be
+    # re-shown after being closed by the user
+    _dat_api = DatMergerAPI()
     dat_window = webview.create_window(
-        title="DAT Merger \u2014 ToSort Toolkit",
+        title="DAT Tools \u2014 ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "dat_merger.html"),
-        js_api=dat_api,
-        width=900,
-        height=750,
+        js_api=_dat_api,
+        width=960,
+        height=780,
         min_size=(700, 500),
         background_color="#0d0f12",
     )
-    dat_api.set_window(dat_window)
+    _dat_api.set_window(dat_window)
 
 
 def main():

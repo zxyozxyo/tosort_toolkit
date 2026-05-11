@@ -17,21 +17,26 @@ import webview
 
 class DatEntry:
     """Represents a single game/set entry with its ROMs."""
-    __slots__ = ('name', 'description', 'roms', 'source_dat')
+    __slots__ = ('name', 'description', 'roms', 'source_dat', 'mtime')
 
     def __init__(self, name: str, description: str = "", roms: list = None,
-                 source_dat: str = ""):
+                 source_dat: str = "", mtime: float = None):
         self.name = name
         self.description = description or name
         self.roms = roms or []
         self.source_dat = source_dat
+        self.mtime = mtime  # filesystem mtime in seconds (Unix timestamp)
 
     def hash_key(self) -> str:
         """
         Unique key based on sorted ROM hashes.
         Uses SHA1 if available, falls back to CRC+size.
-        This determines what counts as a 'duplicate'.
+        Entries with no ROMs get a name-based key so they
+        are still deduplicated correctly (not passed through all).
         """
+        if not self.roms:
+            # No ROM data — use name as key so duplicates are caught
+            return f"__norom__{self.name.lower().strip()}"
         parts = []
         for rom in sorted(self.roms, key=lambda r: r.get('name', '')):
             if rom.get('sha1'):
@@ -133,82 +138,140 @@ def parse_logiqx_xml(filepath: Path) -> tuple:
 
 def parse_clrmamepro(filepath: Path) -> tuple:
     """
-    Parse a CLRMamePro format DAT file.
+    Streaming CLRMamePro parser — processes line by line without loading
+    the entire file into memory. Safe for DAT files of any size.
     Returns (DatHeader, list[DatEntry]).
     """
     header = DatHeader()
     entries = []
     source = filepath.name
+    file_size = filepath.stat().st_size
 
-    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-        content = f.read()
+    # State machine
+    in_header = False
+    in_game   = False
+    in_rom    = False
+    depth     = 0
 
-    # Parse header block
-    hdr_match = re.search(r'clrmamepro\s*\((.*?)\)', content, re.DOTALL | re.IGNORECASE)
-    if hdr_match:
-        hdr_block = hdr_match.group(1)
-        header.name = _extract_field(hdr_block, 'name')
-        header.description = _extract_field(hdr_block, 'description')
-        header.version = _extract_field(hdr_block, 'version')
-        header.author = _extract_field(hdr_block, 'author')
-        header.homepage = _extract_field(hdr_block, 'homepage')
-        header.url = _extract_field(hdr_block, 'url')
-        header.category = _extract_field(hdr_block, 'category')
-        header.date = _extract_field(hdr_block, 'date')
+    # Accumulators
+    hdr_lines   = []
+    game_lines  = []
+    rom_lines   = []
+    bytes_read  = 0
 
-    # Parse game blocks — handle nested parentheses properly
-    pos = 0
-    while True:
-        # Find next 'game (' or 'resource ('
-        match = re.search(r'(?:game|resource)\s*\(', content[pos:], re.IGNORECASE)
-        if not match:
-            break
-        block_start = pos + match.end()
-        # Find matching closing paren (handle nested rom( ) blocks)
-        depth = 1
-        i = block_start
-        while i < len(content) and depth > 0:
-            if content[i] == '(':
-                depth += 1
-            elif content[i] == ')':
-                depth -= 1
-            i += 1
-        block = content[block_start:i - 1]
-        pos = i
+    def parse_block_fields(lines):
+        """Extract fields from a list of lines."""
+        block = "\n".join(lines)
+        return block
 
-        name = _extract_field(block, 'name')
-        desc = _extract_field(block, 'description') or name
+    def finish_game(game_lines):
+        block = "\n".join(game_lines)
+        name = _extract_field(block, "name")
+        desc = _extract_field(block, "description") or name
+        _mtime = None
+        comment = _extract_field(block, "comment")
+        if comment and comment.startswith("mtime="):
+            try: _mtime = float(comment[6:])
+            except ValueError: pass
 
         roms = []
-        for rom_match in re.finditer(r'rom\s*\((.*?)\)', block, re.DOTALL):
-            rom_block = rom_match.group(1)
+        rp = 0
+        while True:
+            rm = re.search(r"\brom\s*\(", block[rp:], re.IGNORECASE)
+            if not rm: break
+            rs = rp + rm.end()
+            rd = 1; ri = rs
+            while ri < len(block) and rd > 0:
+                if block[ri] == "(": rd += 1
+                elif block[ri] == ")": rd -= 1
+                ri += 1
+            rom_block = block[rs:ri-1]
+            rp = ri
             rom_entry = {
-                'name': _extract_field(rom_block, 'name'),
-                'size': _extract_field(rom_block, 'size'),
-                'crc':  _extract_field(rom_block, 'crc'),
-                'md5':  _extract_field(rom_block, 'md5'),
-                'sha1': _extract_field(rom_block, 'sha1'),
+                "name": _extract_field(rom_block, "name"),
+                "size": _extract_field(rom_block, "size"),
+                "crc":  _extract_field(rom_block, "crc"),
+                "md5":  _extract_field(rom_block, "md5"),
+                "sha1": _extract_field(rom_block, "sha1"),
             }
             roms.append(rom_entry)
 
-        if name:
-            entries.append(DatEntry(name, desc, roms, source))
+        if name and name.strip():
+            if roms or len(name) > 2:
+                return DatEntry(name.strip(), desc.strip(), roms, source, mtime=_mtime)
+        return None
+
+    def finish_header(hdr_lines):
+        block = "\n".join(hdr_lines)
+        header.name        = _extract_field(block, "name")
+        header.description = _extract_field(block, "description")
+        header.version     = _extract_field(block, "version")
+        header.author      = _extract_field(block, "author")
+        header.homepage    = _extract_field(block, "homepage")
+        header.url         = _extract_field(block, "url")
+        header.category    = _extract_field(block, "category")
+        header.date        = _extract_field(block, "date")
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            bytes_read += len(raw_line.encode("utf-8", errors="replace"))
+            line = raw_line.rstrip("\n\r")
+            stripped = line.strip().lower()
+
+            # Detect block openings
+            if not in_header and not in_game:
+                if re.match(r"clrmamepro\s*\(", stripped, re.IGNORECASE):
+                    in_header = True
+                    depth = 1
+                    hdr_lines = []
+                    continue
+                if re.match(r"(?:game|resource|machine)\s*\(", stripped, re.IGNORECASE):
+                    in_game = True
+                    depth = 1
+                    game_lines = []
+                    continue
+
+            elif in_header:
+                depth += line.count("(") - line.count(")")
+                if depth <= 0:
+                    finish_header(hdr_lines)
+                    in_header = False
+                else:
+                    hdr_lines.append(line)
+
+            elif in_game:
+                depth += line.count("(") - line.count(")")
+                if depth <= 0:
+                    entry = finish_game(game_lines)
+                    if entry:
+                        entries.append(entry)
+                    in_game = False
+                    game_lines = []
+                else:
+                    game_lines.append(line)
 
     return header, entries
 
 
 def _extract_field(block: str, field: str) -> str:
-    """Extract a field value from a CLRMamePro block."""
-    # Try quoted value first
-    m = re.search(rf'{field}\s+"([^"]*)"', block, re.IGNORECASE)
+    """
+    Extract a field value from a CLRMamePro block.
+    Handles names with embedded double quotes (e.g. Game "Title" (1984)).
+    """
+    ef = re.escape(field)
+    # Match quoted value including escaped internal quotes
+    m = re.search(ef + r'\s+"((?:[^"\\]|\\.)*)"', block, re.IGNORECASE)
+    if m:
+        return m.group(1).replace('\"'  , '"'  ).strip()
+    # Fallback - line-safe quoted match
+    m = re.search(ef + r'\s+"([^"]*)"', block, re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # Try unquoted value
-    m = re.search(rf'{field}\s+(\S+)', block, re.IGNORECASE)
+    # Unquoted single token
+    m = re.search(ef + r'\s+(\S+)', block, re.IGNORECASE)
     if m:
         return m.group(1).strip()
     return ""
-
 
 def parse_dat_file(filepath: Path) -> tuple:
     """Auto-detect format and parse a DAT file. Returns (DatHeader, list[DatEntry])."""
@@ -242,10 +305,12 @@ def merge_and_dedupe(all_entries: list, dedupe: bool = True) -> tuple:
     seen_hashes = {}
     merged = []
     dupes = 0
+    empty_skipped = 0
 
     for entry in all_entries:
         key = entry.hash_key()
-        if key and key in seen_hashes:
+        # key is now always non-empty (no-ROM entries get name-based key)
+        if key in seen_hashes:
             dupes += 1
         else:
             seen_hashes[key] = entry.name
@@ -263,8 +328,12 @@ def merge_and_dedupe(all_entries: list, dedupe: bool = True) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════
 
 def _escape_dat_string(s: str) -> str:
-    """Escape a string for CLRMamePro format."""
-    return s.replace('"', "'")
+    """
+    Escape a string for CLRMamePro format.
+    Only escape embedded double quotes — do NOT double-escape backslashes
+    as that causes \\[ to appear in names like [Misc].
+    """
+    return s.replace('"', '\"')
 
 
 def write_clrmamepro_dat(filepath: Path, header: DatHeader, entries: list):
@@ -287,11 +356,28 @@ def write_clrmamepro_dat(filepath: Path, header: DatHeader, entries: list):
     lines.append('')
 
     # Game entries
-    for entry in sorted(entries, key=lambda e: e.name.lower()):
+    # Filter: skip empty entries and entries with malformed names and no ROMs
+    def _is_valid_entry(e):
+        if not e.name or not e.name.strip(): return False
+        n = e.name.strip()
+        # Entries with no ROMs and names starting with quote/backslash are artefacts
+        bad_starts = ('"', "'", '\\')
+        return True
+    valid_entries = [e for e in entries if _is_valid_entry(e)]
+    for entry in sorted(valid_entries, key=lambda e: e.name.lower()):
         lines.append('game (')
-        lines.append(f'\tname "{_escape_dat_string(entry.name)}"')
+        # Strip any leading/trailing quote chars that crept in during parsing
+        clean_name = entry.name.strip().lstrip('"\\').rstrip()
+        lines.append(f'\tname "{_escape_dat_string(clean_name)}"')
         if entry.description and entry.description != entry.name:
             lines.append(f'\tdescription "{_escape_dat_string(entry.description)}"')
+        # Write mtime as a dat comment field so rebuilder can restore it
+        if hasattr(entry, 'mtime') and entry.mtime:
+            import datetime as _dt
+            ts = _dt.datetime.fromtimestamp(entry.mtime).strftime('%Y-%m-%d %H:%M:%S')
+            lines.append(f'\tdate "{ts}"')
+            # Also store raw unix timestamp for precision
+            lines.append(f'\tcomment "mtime={entry.mtime:.3f}"')
         for rom in sorted(entry.roms, key=lambda r: r.get('name', '')):
             parts = [f'name "{_escape_dat_string(rom.get("name", ""))}"']
             if rom.get('size'):
@@ -323,6 +409,35 @@ class DatMergerAPI:
 
     def set_window(self, window):
         self._window = window
+        # Register Python-side drag-drop handler to get full file paths
+        try:
+            from webview.dom import DOMEventHandler
+
+            def on_drop(e):
+                files = e.get('dataTransfer', {}).get('files', [])
+                if not files:
+                    return
+                paths = []
+                for f in files:
+                    path = f.get('pywebviewFullPath') or f.get('path') or f.get('name', '')
+                    if path and (path.lower().endswith('.dat') or path.lower().endswith('.xml')):
+                        paths.append(path)
+                if paths:
+                    import json
+                    paths_json = json.dumps(paths)
+                    # Tell JS which list to add to based on currently visible tab
+                    self._window.evaluate_js(
+                        f'window.handlePythonDrop({paths_json})'
+                    )
+
+            def on_drag(e):
+                pass  # needed to suppress default behaviour
+
+            window.dom.document.events.dragenter += DOMEventHandler(on_drag, True, True)
+            window.dom.document.events.dragover  += DOMEventHandler(on_drag, True, True, debounce=200)
+            window.dom.document.events.drop      += DOMEventHandler(on_drop, True, True)
+        except Exception:
+            pass  # DOMEventHandler not available in older pywebview versions
 
     def _emit(self, event: str, data: dict):
         if self._window:
@@ -642,30 +757,41 @@ class DatMergerAPI:
     # FEATURE 3: SMART MERGE (by DAT name keyword)
     # ══════════════════════════════════════════════════════════════════
     def scan_dats_in_folder(self, folder_path: str) -> list:
-        """Scan folder for DATs and return list of {path, name, filename}."""
+        """
+        Fast scan — reads only first 8KB of each file to extract the DAT name
+        from the header. Does NOT parse entries, so works quickly even on
+        very large DAT files.
+        """
         results = []
         try:
             for root, dirs, files in os.walk(folder_path):
                 for f in files:
                     if f.lower().endswith(('.dat', '.xml')):
                         fpath = os.path.join(root, f)
-                        # Quick parse just the header for the DAT name
+                        dat_name = f  # default to filename
                         try:
-                            hdr, entries = parse_dat_file(Path(fpath))
-                            dat_name = hdr.name or f
-                            results.append({
-                                "path": fpath,
-                                "name": dat_name,
-                                "filename": f,
-                                "entries": len(entries),
-                            })
+                            with open(fpath, 'r', encoding='utf-8', errors='replace') as fh:
+                                head = fh.read(8192)
+                            # Try XML header name first
+                            m = re.search(r'<name>([^<]+)</name>', head, re.IGNORECASE)
+                            if m:
+                                dat_name = m.group(1).strip()
+                            else:
+                                # Try CLRMamePro header
+                                m = re.search(
+                                    r'clrmamepro\s*\(.*?name\s+"([^"]+)"',
+                                    head, re.DOTALL | re.IGNORECASE
+                                )
+                                if m:
+                                    dat_name = m.group(1).strip()
                         except Exception:
-                            results.append({
-                                "path": fpath,
-                                "name": f,
-                                "filename": f,
-                                "entries": 0,
-                            })
+                            pass
+                        results.append({
+                            "path": fpath,
+                            "name": dat_name,
+                            "filename": f,
+                            "entries": -1,  # -1 = not counted (fast mode)
+                        })
         except Exception as e:
             self._log(f"Scan error: {e}", "err")
         return results
@@ -691,18 +817,23 @@ class DatMergerAPI:
         self._stop.clear()
 
         folder = config.get("folder", "")
-        keyword = config.get("keyword", "").strip().lower()
+        # Support multiple keywords (list or comma-separated string)
+        raw_kw = config.get("keywords", config.get("keyword", ""))
+        if isinstance(raw_kw, list):
+            keywords = [k.strip().lower() for k in raw_kw if k.strip()]
+        else:
+            keywords = [k.strip().lower() for k in str(raw_kw).split(",") if k.strip()]
         output = config.get("output_path", "")
         dat_name = config.get("dat_name", "Smart Merged DAT")
         dat_author = config.get("dat_author", "ToSort Toolkit")
         dedupe = config.get("dedupe", True)
 
         self._log("=" * 50, "info")
-        self._log(f'Smart Merge — keyword: "{keyword}"', 'ok')
+        self._log(f"Smart Merge — keywords: {keywords}", "ok")
         self._log("=" * 50, "info")
 
-        if not folder or not keyword or not output:
-            self._log("Missing folder, keyword, or output path.", "err")
+        if not folder or not keywords or not output:
+            self._log("Missing folder, keyword(s), or output path.", "err")
             self._running = False
             self._emit("done", {"success": False})
             return
@@ -716,12 +847,14 @@ class DatMergerAPI:
         all_dats = self.scan_dats_in_folder(folder)
         self._log(f"  Found {len(all_dats)} DAT/XML file(s) total", "info")
 
-        # Filter by keyword (match against DAT name and filename)
-        matched = [
-            d for d in all_dats
-            if keyword in d['name'].lower() or keyword in d['filename'].lower()
-        ]
-        self._log(f'  Matched "{keyword}": {len(matched)} file(s)', 'ok')
+        # Filter by ANY keyword (match against DAT name and filename)
+        def matches_any(d):
+            nl = d["name"].lower()
+            fl = d["filename"].lower()
+            return any(kw in nl or kw in fl for kw in keywords)
+
+        matched = [d for d in all_dats if matches_any(d)]
+        self._log(f"  Matched {len(matched)} DAT(s) from {len(all_dats)} scanned", "ok")
 
         if not matched:
             self._log("No DATs matched the keyword.", "warn")
@@ -730,7 +863,8 @@ class DatMergerAPI:
             return
 
         for d in matched:
-            self._log(f"    {d['filename']}  [{d['name']}]  ({d['entries']} entries)", "dim")
+            self._log(f"    {d['filename']}", "ok")
+            self._log(f"      DAT name: {d['name']}", "dim")
 
         # Parse and merge matched DATs
         all_entries = []
@@ -742,6 +876,7 @@ class DatMergerAPI:
             try:
                 _, entries = parse_dat_file(Path(d['path']))
                 all_entries.extend(entries)
+                self._log(f"  Parsed: {d['filename']} — {len(entries)} entries added", "dim")
             except Exception as e:
                 self._log(f"  ERROR: {d['filename']}: {e}", "err")
 
@@ -762,7 +897,7 @@ class DatMergerAPI:
         self._progress(85, "Writing output...")
         out_header = DatHeader()
         out_header.name = dat_name
-        out_header.description = f"Smart merge: {keyword} ({len(merged)} entries)"
+        out_header.description = f"Smart merge: {keywords} ({len(merged)} entries)"
         out_header.author = dat_author
         out_header.version = time.strftime("%Y-%m-%d %H:%M")
 
@@ -805,18 +940,23 @@ class DatMergerAPI:
         self._stop.clear()
 
         folder = config.get("folder", "")
-        ext = config.get("extension", "").strip().lower().lstrip(".")
+        # Support multiple extensions (list or comma-separated string)
+        raw_ext = config.get("extensions", config.get("extension", ""))
+        if isinstance(raw_ext, list):
+            exts = [e.strip().lower().lstrip(".") for e in raw_ext if e.strip()]
+        else:
+            exts = [e.strip().lower().lstrip(".") for e in str(raw_ext).split(",") if e.strip()]
         output = config.get("output_path", "")
         dat_name = config.get("dat_name", "Extension Merged DAT")
         dat_author = config.get("dat_author", "ToSort Toolkit")
         dedupe = config.get("dedupe", True)
 
         self._log("=" * 50, "info")
-        self._log(f'Extension Merge — looking for .{ext}', 'ok')
+        self._log(f"Extension Merge — looking for: {["." + e for e in exts]}", "ok")
         self._log("=" * 50, "info")
 
-        if not folder or not ext or not output:
-            self._log("Missing folder, extension, or output path.", "err")
+        if not folder or not exts or not output:
+            self._log("Missing folder, extension(s), or output path.", "err")
             self._running = False
             self._emit("done", {"success": False})
             return
@@ -849,18 +989,23 @@ class DatMergerAPI:
             try:
                 _, entries = parse_dat_file(Path(fpath))
                 has_ext = False
+                matching_exts_found = set()
                 for entry in entries:
                     for rom in entry.roms:
                         rname = rom.get('name', '').lower()
-                        if rname.endswith('.' + ext):
-                            has_ext = True
-                            break
-                    if has_ext:
-                        break
+                        for ex in exts:
+                            if rname.endswith('.' + ex):
+                                has_ext = True
+                                matching_exts_found.add(ex)
                 if has_ext:
                     matched_entries.extend(entries)
                     matched_count += 1
-                    self._log(f"  MATCH: {Path(fpath).name} ({len(entries)} entries)", "ok")
+                    self._log(
+                        f"  MATCH: {Path(fpath).name} "
+                        f"({len(entries)} entries, "
+                        f"exts: {["." + x for x in matching_exts_found]})",
+                        "ok"
+                    )
             except Exception as e:
                 self._log(f"  ERROR: {Path(fpath).name}: {e}", "err")
 
@@ -869,10 +1014,10 @@ class DatMergerAPI:
             self._emit("done", {"success": False})
             return
 
-        self._log(f"  {matched_count} DAT(s) contain .{ext} files, {len(matched_entries)} total entries", "info")
+        self._log(f"  {matched_count} DAT(s) matched, {len(matched_entries)} total entries", "info")
 
         if not matched_entries:
-            self._log(f"No DATs contain .{ext} files.", "warn")
+            self._log(f"No DATs contain those extensions.", "warn")
             self._running = False
             self._emit("done", {"success": False})
             return
@@ -887,7 +1032,7 @@ class DatMergerAPI:
         self._progress(85, "Writing output...")
         out_header = DatHeader()
         out_header.name = dat_name
-        out_header.description = f"Extension merge: .{ext} ({len(merged)} entries)"
+        out_header.description = f"Extension merge: {exts} ({len(merged)} entries)"
         out_header.author = dat_author
         out_header.version = time.strftime("%Y-%m-%d %H:%M")
 
@@ -927,6 +1072,8 @@ class DatMergerAPI:
 
         files = config.get("files", [])
         output_txt = config.get("output_txt", "").strip()
+        auto_fix = config.get("auto_fix", False)
+        fix_output_dir = config.get("fix_output_dir", "").strip()
 
         self._log("=" * 50, "info")
         self._log(f"DAT Size Calculator — {len(files)} file(s)", "ok")
@@ -1139,6 +1286,8 @@ class DatMergerAPI:
 
         files = config.get("files", [])
         output_txt = config.get("output_txt", "").strip()
+        auto_fix = config.get("auto_fix", False)
+        fix_output_dir = config.get("fix_output_dir", "").strip()
 
         self._log("=" * 50, "info")
         self._log(f"DAT Integrity Check — {len(files)} file(s)", "ok")
@@ -1161,8 +1310,13 @@ class DatMergerAPI:
 
             issues = []
             try:
+                fsize = Path(fpath).stat().st_size
+                fsize_str = self._format_size(fsize)
+                self._log(f"  Parsing: {fname} ({fsize_str}) ...", "dim")
+                self._progress(pct, f"Parsing {fname} ({fsize_str})...")
                 header, entries = parse_dat_file(Path(fpath))
                 dat_name = header.name or fname
+                self._log(f"  Loaded: {dat_name} — {len(entries):,} entries", "dim")
 
                 if not header.name:
                     issues.append("WARNING: DAT has no name in header")
@@ -1175,8 +1329,13 @@ class DatMergerAPI:
                 missing_size = 0
                 zero_size = 0
                 total_roms = 0
+                chunk = max(1, len(entries) // 20)  # progress every 5%
 
-                for entry in entries:
+                for ei, entry in enumerate(entries):
+                    if ei % chunk == 0:
+                        pct2 = int((fi / max(len(files),1)) * 80) + int((ei / max(len(entries),1)) * (80 // max(len(files),1)))
+                        self._progress(min(pct2, 88), f"Checking {fname}: {ei}/{len(entries)} entries...")
+                    entry = entry  # keep original variable name below
                     # Check duplicate game names
                     name_counts[entry.name] = name_counts.get(entry.name, 0) + 1
 
@@ -1225,6 +1384,44 @@ class DatMergerAPI:
                 self._log(f"  {fname}: PARSE ERROR — {e}", "err")
                 all_issues.append({"file": fname, "dat_name": fname,
                                    "entries": 0, "roms": 0, "issues": issues})
+
+        # Auto-fix: if enabled, run each problematic DAT through internal deduper
+        if auto_fix and all_issues:
+            fix_dir = Path(fix_output_dir) if fix_output_dir else None
+            self._log("", "")
+            self._log(f"Auto-fixing {len(all_issues)} DAT(s)...", "info")
+            for item in all_issues:
+                if self._stop.is_set(): break
+                fpath = next((f for f in files if Path(f).name == item['file']), None)
+                if not fpath: continue
+                try:
+                    hdr, entries = parse_dat_file(Path(fpath))
+                    # Dedupe internally
+                    seen = {}
+                    unique = []
+                    for entry in entries:
+                        k = entry.hash_key()
+                        if k not in seen:
+                            seen[k] = True
+                            # Strip ROMs with no hash data
+                            clean_roms = [r for r in entry.roms
+                                          if r.get('crc') or r.get('sha1') or r.get('md5')]
+                            entry.roms = clean_roms
+                            # Remove artefact entries: no ROMs + name starts with quote
+                            _n = entry.name.strip()
+                            _bad = not clean_roms and _n and _n[0] in ('"', "'", '\\')
+                            if not _bad:
+                                unique.append(entry)
+                    # Determine output path
+                    if fix_dir:
+                        fix_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = fix_dir / Path(fpath).name
+                    else:
+                        out_path = Path(fpath)
+                    write_clrmamepro_dat(out_path, hdr, unique)
+                    self._log(f"  Fixed: {item['file']} ({len(entries)-len(unique)} issues removed)", "ok")
+                except Exception as e:
+                    self._log(f"  Fix failed: {item['file']}: {e}", "err")
 
         # Summary
         self._progress(95, "Done")
@@ -1291,6 +1488,7 @@ class DatMergerAPI:
         recursive = config.get("recursive", True)
         use_sha1 = config.get("use_sha1", True)
         use_md5 = config.get("use_md5", False)
+        archives_as_files = config.get("archives_as_files", True)
 
         self._log("=" * 50, "info")
         self._log("DAT Creator", "ok")
@@ -1328,6 +1526,36 @@ class DatMergerAPI:
             return
 
         # Hash each file and create entries
+        import zlib
+        ARCHIVE_EXTS = {'.zip', '.rar', '.7z', '.gz', '.tar'}
+
+        def hash_bytes(data: bytes) -> dict:
+            crc = zlib.crc32(data) & 0xFFFFFFFF
+            result = {'crc': format(crc, '08X'), 'size': str(len(data))}
+            if use_sha1:
+                result['sha1'] = hashlib.sha1(data).hexdigest()
+            if use_md5:
+                result['md5'] = hashlib.md5(data).hexdigest()
+            return result
+
+        def hash_file(fpath: Path) -> dict:
+            crc = 0
+            sha1_h = hashlib.sha1() if use_sha1 else None
+            md5_h = hashlib.md5() if use_md5 else None
+            size = 0
+            with open(fpath, 'rb') as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk: break
+                    size += len(chunk)
+                    crc = zlib.crc32(chunk, crc)
+                    if sha1_h: sha1_h.update(chunk)
+                    if md5_h: md5_h.update(chunk)
+            result = {'crc': format(crc & 0xFFFFFFFF, '08X'), 'size': str(size)}
+            if use_sha1: result['sha1'] = sha1_h.hexdigest()
+            if use_md5: result['md5'] = md5_h.hexdigest()
+            return result
+
         entries = []
         for i, fpath in enumerate(all_files):
             if self._stop.is_set(): break
@@ -1336,32 +1564,54 @@ class DatMergerAPI:
                 self._progress(pct, f"Hashing: {fpath.name} ({i}/{len(all_files)})")
 
             try:
-                size = fpath.stat().st_size
-                # CRC32 always
-                import zlib
-                crc = 0
-                sha1_h = hashlib.sha1() if use_sha1 else None
-                md5_h = hashlib.md5() if use_md5 else None
-                with open(fpath, 'rb') as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk: break
-                        crc = zlib.crc32(chunk, crc)
-                        if sha1_h: sha1_h.update(chunk)
-                        if md5_h: md5_h.update(chunk)
+                is_archive = fpath.suffix.lower() in ARCHIVE_EXTS
 
-                crc_str = format(crc & 0xFFFFFFFF, '08X')
-                rom = {
-                    'name': str(fpath.relative_to(folder)),
-                    'size': str(size),
-                    'crc': crc_str,
-                }
-                if use_sha1: rom['sha1'] = sha1_h.hexdigest()
-                if use_md5: rom['md5'] = md5_h.hexdigest()
+                if archives_as_files or not is_archive:
+                    # Treat as a single file - hash the whole thing
+                    hashes = hash_file(fpath)
+                    rom = {'name': fpath.name, **hashes}
+                    game_name = fpath.stem
+                    # Preserve filesystem mtime (critical for scene zips)
+                    file_mtime = fpath.stat().st_mtime
+                    entry = DatEntry(game_name, game_name, [rom], str(folder),
+                                     mtime=file_mtime)
+                    entries.append(entry)
+                else:
+                    # Extract and hash contents individually
+                    roms = []
+                    suf = fpath.suffix.lower()
+                    try:
+                        if suf == '.zip':
+                            import zipfile
+                            with zipfile.ZipFile(fpath, 'r') as zf:
+                                for name in zf.namelist():
+                                    info = zf.getinfo(name)
+                                    if info.is_dir(): continue
+                                    data = zf.read(name)
+                                    h = hash_bytes(data)
+                                    roms.append({'name': name, **h})
+                        elif suf == '.7z':
+                            try:
+                                import py7zr
+                                with py7zr.SevenZipFile(fpath, mode='r') as sz:
+                                    all_data = sz.readall()
+                                    for name, bio in all_data.items():
+                                        data = bio.read()
+                                        h = hash_bytes(data)
+                                        roms.append({'name': name, **h})
+                            except ImportError:
+                                # py7zr not available - fall back to file hash
+                                hashes = hash_file(fpath)
+                                roms.append({'name': fpath.name, **hashes})
+                    except Exception as ae:
+                        self._log(f"  WARN: could not open archive {fpath.name}: {ae} — hashing as file", "warn")
+                        hashes = hash_file(fpath)
+                        roms.append({'name': fpath.name, **hashes})
 
-                game_name = fpath.stem
-                entry = DatEntry(game_name, game_name, [rom], str(folder))
-                entries.append(entry)
+                    if roms:
+                        game_name = fpath.stem
+                        entry = DatEntry(game_name, game_name, roms, str(folder))
+                        entries.append(entry)
 
             except Exception as e:
                 self._log(f"  ERR: {fpath.name}: {e}", "err")
@@ -1420,6 +1670,7 @@ class DatMergerAPI:
         dest = Path(config.get("dest_folder", "")).expanduser()
         dry_run = config.get("dry_run", False)
         match_by = config.get("match_by", "crc")
+        delete_source = config.get("delete_source", False)
 
         self._log("=" * 50, "info")
         self._log("DAT Rebuilder", "ok")
@@ -1454,7 +1705,8 @@ class DatMergerAPI:
                         elif rom.get('crc'):
                             h = rom['crc'].upper()
                         if h:
-                            hash_index[h] = (entry.name, rom.get('name', ''))
+                            entry_mtime = getattr(entry, 'mtime', None)
+                            hash_index[h] = (entry.name, rom.get('name', ''), entry_mtime)
                             total_dat_roms += 1
                 self._log(f"  Loaded: {Path(dpath).name}", "ok")
             except Exception as e:
@@ -1506,7 +1758,7 @@ class DatMergerAPI:
                     file_hash = format(crc & 0xFFFFFFFF, '08X')
 
                 if file_hash in hash_index:
-                    game_name, rom_name = hash_index[file_hash]
+                    game_name, rom_name, stored_mtime = hash_index[file_hash]
                     # Move to dest/game_name/rom_name
                     game_dir = dest / game_name
                     game_dir.mkdir(parents=True, exist_ok=True)
@@ -1521,11 +1773,27 @@ class DatMergerAPI:
 
                     if not dry_run:
                         try:
-                            os.rename(str(fpath), str(dest_file))
-                        except OSError:
-                            import shutil
-                            shutil.copy2(str(fpath), str(dest_file))
-                            os.unlink(str(fpath))
+                            if delete_source:
+                                # Move (rename first for speed, copy+delete cross-drive)
+                                try:
+                                    os.rename(str(fpath), str(dest_file))
+                                except OSError:
+                                    import shutil
+                                    shutil.copy2(str(fpath), str(dest_file))
+                                    os.unlink(str(fpath))
+                            else:
+                                # Copy only — leave source intact
+                                import shutil
+                                shutil.copy2(str(fpath), str(dest_file))
+                        except Exception as move_err:
+                            self._log(f"  ERR moving {fpath.name}: {move_err}", "err")
+
+                        # Restore original mtime if available (scene zip preservation)
+                        if stored_mtime and dest_file.exists():
+                            try:
+                                os.utime(str(dest_file), (stored_mtime, stored_mtime))
+                            except Exception:
+                                pass  # mtime restore is best-effort
 
                     matched += 1
                     if matched % 100 == 0:
@@ -1538,7 +1806,12 @@ class DatMergerAPI:
                 self._log(f"  ERR: {fpath.name}: {e}", "err")
 
         self._progress(100, "Complete")
-        action = "Would move" if dry_run else "Moved"
+        if dry_run:
+            action = "Would match"
+        elif delete_source:
+            action = "Moved"
+        else:
+            action = "Copied"
         self._log("", "")
         self._log(f"Rebuild done — {action} {matched} matched, {unmatched} unmatched, {errors} errors.", "ok")
         self._running = False

@@ -161,8 +161,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <div class="panel-hdr"><div class="dot" style="background:var(--info)"></div>Smart Merge &mdash; by DAT Name Keyword</div>
         <div class="panel-body">
           <div class="row"><label>DAT Folder</label><input class="path-input" id="smart-folder" placeholder="Folder containing DAT/XML files to scan"/><button class="browse-btn" onclick="browseFolder('smart-folder')">Browse&hellip;</button></div>
-          <div class="row"><label>Keyword</label><input class="path-input" id="smart-keyword" placeholder='e.g. "Sinclair ZX Spectrum" or "Commodore 64"'/></div>
-          <div class="hint">Matches DATs whose name or filename contains the keyword. Use specific terms like "Commodore 64" to avoid matching "Commodore Amiga".</div>
+          <div class="row"><label>Keywords</label><input class="path-input" id="smart-keyword" placeholder="Comma-separated e.g.: Sinclair ZX Spectrum, Commodore 64"/></div>
+          <div class="hint">Matches DATs containing ANY keyword. Comma-separate for multiple terms. Use specific terms &mdash; "Commodore 64" will not match "Commodore Amiga".</div>
           <div class="row"><label>Output File</label><input class="path-input" id="smart-output" placeholder="D:\DATs\smart_merged.dat"/><button class="browse-btn" onclick="browseSave('smart-output')">Browse&hellip;</button></div>
           <div class="row"><label>DAT Name</label><input class="path-input" id="smart-name" value="Smart Merged DAT"/></div>
           <div class="row"><label>Author</label><input class="path-input" id="smart-author" value="ToSort Toolkit"/></div>
@@ -177,8 +177,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <div class="panel-hdr"><div class="dot" style="background:var(--info)"></div>Extension Merge &mdash; merge DATs containing a specific ROM extension</div>
         <div class="panel-body">
           <div class="row"><label>DAT Folder</label><input class="path-input" id="ext-folder" placeholder="Folder containing DAT/XML files to scan"/><button class="browse-btn" onclick="browseFolder('ext-folder')">Browse&hellip;</button></div>
-          <div class="row"><label>Extension</label><input class="path-input" id="ext-ext" placeholder='e.g. "tap" or ".d64" or "smc"' style="max-width:200px"/></div>
-          <div class="hint">Finds every DAT that contains ROMs with this extension, then merges them all into one.</div>
+          <div class="row"><label>Extensions</label><input class="path-input" id="ext-ext" placeholder="Comma-separated e.g.: tap, d64, tzx"/></div>
+          <div class="hint">Finds DATs containing ROMs with ANY of these extensions. Comma-separate for multiple. Dots optional.</div>
           <div class="row"><label>Output File</label><input class="path-input" id="ext-output" placeholder="D:\DATs\ext_merged.dat"/><button class="browse-btn" onclick="browseSave('ext-output')">Browse&hellip;</button></div>
           <div class="row"><label>DAT Name</label><input class="path-input" id="ext-name" value="Extension Merged DAT"/></div>
           <div class="row"><label>Author</label><input class="path-input" id="ext-author" value="ToSort Toolkit"/></div>
@@ -231,6 +231,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           </div>
           <div class="file-list" id="integrity-list"><div class="file-empty">Add DATs to check</div></div>
           <div class="row"><label>Save report to</label><input class="path-input" id="integrity-txt" placeholder="Optional .txt report path"/><button class="browse-btn" onclick="browseSave('integrity-txt','integrity_report.txt')">Browse&hellip;</button></div>
+          <div class="divider" style="margin:8px 0"></div>
+          <div style="font-size:11px;color:var(--text);font-weight:600;margin-bottom:6px">Auto-Fix Options</div>
+          <label class="opt" style="margin-bottom:6px"><input type="checkbox" id="integrity-autofix"> Auto-fix issues found (removes invalid entries, strips internal dupes)</label>
+          <div class="row" style="margin-top:4px"><label>Fixed DAT output</label><input class="path-input" id="integrity-fixdir" placeholder="Folder for fixed DATs (blank = overwrite originals)"/><button class="browse-btn" onclick="browseFolder('integrity-fixdir')">Browse&hellip;</button></div>
+          <div class="hint">Warning: leaving output blank will overwrite the original DAT files in place.</div>
         </div>
       </div>
     </div>
@@ -245,12 +250,17 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="row"><label>Output File</label><input class="path-input" id="create-output" placeholder="D:\DATs\my_collection.dat"/><button class="browse-btn" onclick="browseSave('create-output')">Browse&hellip;</button></div>
           <div class="row"><label>DAT Name</label><input class="path-input" id="create-name" value="My Collection" placeholder="Name shown in RomVault"/></div>
           <div class="row"><label>Author</label><input class="path-input" id="create-author" value="ToSort Toolkit"/></div>
-          <div style="padding:6px 0;display:flex;gap:16px">
+          <div style="padding:6px 0;display:flex;gap:16px;flex-wrap:wrap">
             <label class="opt"><input type="checkbox" id="create-recursive" checked> Scan subfolders</label>
             <label class="opt"><input type="checkbox" id="create-sha1" checked> Include SHA1</label>
             <label class="opt"><input type="checkbox" id="create-md5"> Include MD5</label>
           </div>
-          <div class="hint">CRC32 is always included. SHA1 recommended for RomVault compatibility.</div>
+          <div style="padding:4px 0;display:flex;gap:16px;flex-wrap:wrap">
+            <label class="opt"><input type="checkbox" id="create-as-files" checked> Treat archives as single files</label>
+            <label class="opt" id="create-contents-lbl" style="opacity:0.4"><input type="checkbox" id="create-contents" disabled> Hash archive contents individually (uncheck above)</label>
+          </div>
+          <div class="hint">CRC32 is always included. SHA1 recommended for RomVault compatibility.<br>
+            <b>Archives as files:</b> hash the .zip/.7z itself. <b>Contents mode:</b> open archives and hash each file inside — DAT then expects files to be rebuilt into archives.</div>
         </div>
       </div>
     </div>
@@ -270,8 +280,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="file-list" id="rebuild-dats" style="min-height:60px;max-height:120px"><div class="file-empty">Add DAT files to use as reference</div></div>
           <div class="row"><label>Source Folder</label><input class="path-input" id="rebuild-source" placeholder="Folder with loose/unsorted files"/><button class="browse-btn" onclick="browseFolder('rebuild-source')">Browse&hellip;</button></div>
           <div class="row"><label>Destination</label><input class="path-input" id="rebuild-dest" placeholder="Where matched files are moved (organised by game name)"/><button class="browse-btn" onclick="browseFolder('rebuild-dest')">Browse&hellip;</button></div>
-          <div style="padding:6px 0;display:flex;gap:16px">
+          <div style="padding:6px 0;display:flex;gap:16px;flex-wrap:wrap">
             <label class="opt"><input type="checkbox" id="rebuild-dry"> Dry run &mdash; list matches only</label>
+            <label class="opt"><input type="checkbox" id="rebuild-delete"> Remove source after rebuild</label>
             <span style="font-size:11px;color:var(--text2)">Match by:</span>
             <select id="rebuild-match" style="background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 8px;color:var(--text);font-family:var(--mono);font-size:11px">
               <option value="crc" selected>CRC32 (fastest)</option>
@@ -286,7 +297,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <!-- ═══ STATS + LOG (shared across all tabs) ═══ -->
     <div style="padding:0 14px 14px;display:flex;flex-direction:column;gap:12px;flex-shrink:0">
       <div class="panel" id="stats-panel" style="display:none">
-        <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>Results</div>
+        <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>Results
+          <button class="browse-btn" style="margin-left:auto;padding:2px 10px;font-size:10px;border-color:var(--danger);color:var(--danger)" onclick="clearStats()">&#10005; Dismiss</button>
+        </div>
         <div class="panel-body">
           <div class="stats-bar">
             <div class="stat"><span class="stat-val" id="st-input">0</span><span class="stat-label">Input</span></div>
@@ -468,7 +481,7 @@ function runActive() {
   } else if (activeTab === 'smart') {
     api.run_smart_merge({
       folder: document.getElementById('smart-folder').value.trim(),
-      keyword: document.getElementById('smart-keyword').value.trim(),
+      keywords: document.getElementById('smart-keyword').value.trim(),
       output_path: document.getElementById('smart-output').value.trim(),
       dat_name: document.getElementById('smart-name').value.trim() || 'Smart Merged DAT',
       dat_author: document.getElementById('smart-author').value.trim(),
@@ -477,7 +490,7 @@ function runActive() {
   } else if (activeTab === 'ext') {
     api.run_ext_merge({
       folder: document.getElementById('ext-folder').value.trim(),
-      extension: document.getElementById('ext-ext').value.trim(),
+      extensions: document.getElementById('ext-ext').value.trim(),
       output_path: document.getElementById('ext-output').value.trim(),
       dat_name: document.getElementById('ext-name').value.trim() || 'Extension Merged DAT',
       dat_author: document.getElementById('ext-author').value.trim(),
@@ -494,6 +507,8 @@ function runActive() {
     api.run_integrity_check({
       files: getList('integrity-list'),
       output_txt: document.getElementById('integrity-txt').value.trim(),
+      auto_fix: document.getElementById('integrity-autofix').checked,
+      fix_output_dir: document.getElementById('integrity-fixdir').value.trim(),
     });
   } else if (activeTab === 'create') {
     api.run_create_dat({
@@ -504,6 +519,7 @@ function runActive() {
       recursive: document.getElementById('create-recursive').checked,
       use_sha1: document.getElementById('create-sha1').checked,
       use_md5: document.getElementById('create-md5').checked,
+      archives_as_files: document.getElementById('create-as-files').checked,
     });
   } else if (activeTab === 'rebuild') {
     api.run_rebuild({
@@ -511,6 +527,7 @@ function runActive() {
       source_folder: document.getElementById('rebuild-source').value.trim(),
       dest_folder: document.getElementById('rebuild-dest').value.trim(),
       dry_run: document.getElementById('rebuild-dry').checked,
+      delete_source: document.getElementById('rebuild-delete').checked,
       match_by: document.getElementById('rebuild-match').value,
     });
   } else if (activeTab === 'size') {
@@ -526,32 +543,63 @@ function doStop() {
   addLog('Stop requested...', 'warn');
 }
 
+// ── Stats panel dismiss ──────────────────────────────────────────────────────
+function clearStats() {
+  document.getElementById('stats-panel').style.display = 'none';
+}
+
+// ── Archive toggle ────────────────────────────────────────────────────────────
+document.addEventListener('change', e => {
+  if (e.target.id === 'create-as-files') {
+    const contentsLbl = document.getElementById('create-contents-lbl');
+    const contentsCb  = document.getElementById('create-contents');
+    contentsLbl.style.opacity = e.target.checked ? '0.4' : '1';
+    contentsCb.disabled = e.target.checked;
+  }
+});
+
 // ── Drag and drop support ────────────────────────────────────────────────────
+// Note: file paths are provided by Python via DOMEventHandler (pywebviewFullPath)
+// The JS drag events only handle visual feedback - paths come through handlePythonDrop()
 document.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); });
-document.addEventListener('drop', e => {
-  e.preventDefault(); e.stopPropagation();
-  // Find the closest file-list element
-  const list = e.target.closest('.file-list');
-  if (!list) return;
-  const listId = list.id;
-  if (!listId) return;
-  const items = e.dataTransfer.files;
+document.addEventListener('drop',     e => { e.preventDefault(); e.stopPropagation(); });
+
+// Highlight drop targets on drag hover
+document.querySelectorAll('.file-list').forEach(el => {
+  el.addEventListener('dragenter', e => { e.preventDefault(); el.style.borderColor = 'var(--acc)'; el.style.background = 'rgba(74,240,160,0.05)'; });
+  el.addEventListener('dragleave', () => { el.style.borderColor = ''; el.style.background = ''; });
+  el.addEventListener('drop',      () => { el.style.borderColor = ''; el.style.background = ''; });
+});
+
+// Called by Python DOMEventHandler with full file paths
+window.handlePythonDrop = function(paths) {
+  // Find which list is in the active tab
+  const tabListMap = {
+    'merge': 'merge-list',
+    'diff':  'diff-list',
+    'smart': null,
+    'ext':   null,
+    'intdedupe': null,
+    'integrity': 'integrity-list',
+    'create': null,
+    'rebuild': 'rebuild-dats',
+    'size':  'size-list',
+  };
+  const listId = tabListMap[activeTab];
+  if (!listId) {
+    addLog('Drop files onto a file list area, or use the Add Files button.', 'warn');
+    return;
+  }
   const fl = getList(listId);
   let added = 0;
-  for (let i = 0; i < items.length; i++) {
-    const path = items[i].path || items[i].name;
-    if (path && (path.toLowerCase().endsWith('.dat') || path.toLowerCase().endsWith('.xml'))) {
-      if (!fl.includes(path)) { fl.push(path); added++; }
-    }
+  paths.forEach(p => {
+    if (!fl.includes(p)) { fl.push(p); added++; }
+  });
+  if (added > 0) {
+    renderList(listId);
+    addLog('Dropped ' + added + ' file(s) into ' + listId + '.', 'ok');
   }
-  if (added) { renderList(listId); addLog('Dropped ' + added + ' file(s).', 'ok'); }
-});
-// Highlight drop targets
-document.querySelectorAll('.file-list').forEach(el => {
-  el.addEventListener('dragenter', () => el.style.borderColor = 'var(--acc)');
-  el.addEventListener('dragleave', () => el.style.borderColor = '');
-  el.addEventListener('drop', () => el.style.borderColor = '');
-});
+};
 
 addLog('DAT Tools ready. Select a tab and configure. Drag & drop files onto lists.', 'info');
 </script>
