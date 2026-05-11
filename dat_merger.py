@@ -1569,8 +1569,12 @@ class DatMergerAPI:
                 if archives_as_files or not is_archive:
                     # Treat as a single file - hash the whole thing
                     hashes = hash_file(fpath)
-                    rom = {'name': fpath.name, **hashes}
-                    game_name = fpath.stem
+                    # Store relative path as ROM name to preserve folder structure
+                    # e.g. Roms/A/de/rom.zip -> A/de/rom.zip
+                    rel_path = str(fpath.relative_to(folder)).replace(os.sep, '/')
+                    rom = {'name': rel_path, **hashes}
+                    # Game name = relative path without extension
+                    game_name = str(Path(rel_path).with_suffix(''))
                     # Preserve filesystem mtime (critical for scene zips)
                     file_mtime = fpath.stat().st_mtime
                     entry = DatEntry(game_name, game_name, [rom], str(folder),
@@ -1583,13 +1587,45 @@ class DatMergerAPI:
                     try:
                         if suf == '.zip':
                             import zipfile
-                            with zipfile.ZipFile(fpath, 'r') as zf:
-                                for name in zf.namelist():
-                                    info = zf.getinfo(name)
-                                    if info.is_dir(): continue
-                                    data = zf.read(name)
-                                    h = hash_bytes(data)
-                                    roms.append({'name': name, **h})
+                            # Try standard zipfile first, fall back for ZSTD-compressed ZIPs
+                            try:
+                                zf_mod = zipfile
+                                # Try zipfile_zstd monkey-patch if available
+                                try:
+                                    import zipfile_zstd as zf_mod
+                                except ImportError:
+                                    pass
+                                with zf_mod.ZipFile(fpath, 'r') as zf:
+                                    for name in zf.namelist():
+                                        info = zf.getinfo(name)
+                                        if info.is_dir(): continue
+                                        data = zf.read(name)
+                                        h = hash_bytes(data)
+                                        roms.append({'name': name, **h})
+                            except Exception as zip_err:
+                                err_msg = str(zip_err).lower()
+                                if 'compression' in err_msg or 'not supported' in err_msg or 'method' in err_msg:
+                                    # ZSTD or unsupported compression — try 7z binary
+                                    _7z = _find_tool(['7z.exe', '7za.exe', '7z', '7za'])
+                                    if _7z:
+                                        import subprocess, tempfile, os as _os
+                                        with tempfile.TemporaryDirectory() as tmp:
+                                            subprocess.run([_7z, 'e', str(fpath), f'-o{tmp}', '-y'],
+                                                           capture_output=True)
+                                            for root, dirs, files in _os.walk(tmp):
+                                                for fn in files:
+                                                    fp2 = Path(root) / fn
+                                                    data = fp2.read_bytes()
+                                                    h = hash_bytes(data)
+                                                    roms.append({'name': fn, **h})
+                                    else:
+                                        raise RuntimeError(
+                                            f'ZSTD-compressed ZIP — install zipfile-zstd '
+                                            f'(pip install zipfile-zstd) or drop 7z.exe '
+                                            f'in the app folder'
+                                        )
+                                else:
+                                    raise  # re-raise non-compression errors
                         elif suf == '.7z':
                             try:
                                 import py7zr
@@ -1760,15 +1796,22 @@ class DatMergerAPI:
                 if file_hash in hash_index:
                     game_name, rom_name, stored_mtime = hash_index[file_hash]
                     # Move to dest/game_name/rom_name
-                    game_dir = dest / game_name
-                    game_dir.mkdir(parents=True, exist_ok=True)
-                    dest_file = game_dir / (rom_name or fpath.name)
+                    # rom_name may contain subfolders (e.g. A/de/rom.zip)
+                    # Rebuild exact folder structure under dest
+                    if rom_name and '/' in rom_name:
+                        # rom_name includes relative path — use it directly
+                        dest_file = dest / Path(rom_name)
+                    else:
+                        # No path info — use game_name folder + rom filename
+                        game_dir = dest / game_name
+                        dest_file = game_dir / (rom_name or fpath.name)
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
                     # Handle collision
                     if dest_file.exists():
                         stem, sfx = os.path.splitext(dest_file.name)
                         n = 1
                         while dest_file.exists():
-                            dest_file = game_dir / f"{stem}_{n}{sfx}"
+                            dest_file = dest_file.parent / f"{stem}_{n}{sfx}"
                             n += 1
 
                     if not dry_run:

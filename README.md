@@ -9,7 +9,14 @@ plus a full DAT file management suite.
 ## Quick Start
 
 1. Install Python 3.9+
-2. `pip install -r requirements.txt`
+2. Install required and optional Python packages:
+   ```
+   pip install -r requirements.txt
+   ```
+   For ZSTD-compressed ZIP support (recommended if your collection uses ZSTD ZIPs):
+   ```
+   pip install zipfile-zstd
+   ```
 3. Drop optional tools into the app folder (see below)
 4. `python main.py`
 
@@ -187,10 +194,18 @@ pip install -r requirements.txt
 
 | Package | Purpose | Required |
 |---|---|---|
-| pywebview | Desktop GUI window | Yes |
+| pywebview | Desktop GUI window | **Yes** |
 | py7zr | .7z extraction and DAT creator archive scan | Optional |
 | rarfile | .rar extraction (also needs UnRAR.exe) | Optional |
 | zstandard | .zst extraction | Optional |
+| zipfile-zstd | ZSTD-compressed .zip files (method 93) — **strongly recommended** if your collection uses ZSTD ZIPs | Optional |
+
+**Note on ZSTD ZIPs:** Many modern ROM collections use `.zip` files compressed with Zstandard (method 93).
+Python 3.13 and earlier do not support this natively. Install `zipfile-zstd` to enable the DAT Creator
+to scan inside these archives. Without it, ZSTD ZIPs will be hashed as whole files rather than by contents.
+```
+pip install zipfile-zstd
+```
 
 ---
 
