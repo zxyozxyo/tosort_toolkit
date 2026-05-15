@@ -17,15 +17,14 @@ import webview
 
 class DatEntry:
     """Represents a single game/set entry with its ROMs."""
-    __slots__ = ('name', 'description', 'roms', 'source_dat', 'mtime')
+    __slots__ = ('name', 'description', 'roms', 'source_dat')
 
     def __init__(self, name: str, description: str = "", roms: list = None,
-                 source_dat: str = "", mtime: float = None):
+                 source_dat: str = ""):
         self.name = name
         self.description = description or name
         self.roms = roms or []
         self.source_dat = source_dat
-        self.mtime = mtime  # filesystem mtime in seconds (Unix timestamp)
 
     def hash_key(self) -> str:
         """
@@ -61,6 +60,7 @@ class DatHeader:
         self.url = ""
         self.category = ""
         self.date = ""
+        self.forcepacking = ""  # "unzip" to tell RomVault not to repack files
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -168,11 +168,6 @@ def parse_clrmamepro(filepath: Path) -> tuple:
         block = "\n".join(game_lines)
         name = _extract_field(block, "name")
         desc = _extract_field(block, "description") or name
-        _mtime = None
-        comment = _extract_field(block, "comment")
-        if comment and comment.startswith("mtime="):
-            try: _mtime = float(comment[6:])
-            except ValueError: pass
 
         roms = []
         rp = 0
@@ -198,7 +193,7 @@ def parse_clrmamepro(filepath: Path) -> tuple:
 
         if name and name.strip():
             if roms or len(name) > 2:
-                return DatEntry(name.strip(), desc.strip(), roms, source, mtime=_mtime)
+                return DatEntry(name.strip(), desc.strip(), roms, source)
         return None
 
     def finish_header(hdr_lines):
@@ -352,32 +347,41 @@ def write_clrmamepro_dat(filepath: Path, header: DatHeader, entries: list):
         lines.append(f'\thomepage "{_escape_dat_string(header.homepage)}"')
     if header.url:
         lines.append(f'\turl "{_escape_dat_string(header.url)}"')
+    if getattr(header, 'forcepacking', ''):
+        lines.append(f'\tforcepacking "{header.forcepacking}"')
     lines.append(')')
     lines.append('')
 
     # Game entries
     # Filter: skip empty entries and entries with malformed names and no ROMs
     def _is_valid_entry(e):
-        if not e.name or not e.name.strip(): return False
+        if not e.name or not e.name.strip():
+            return False
         n = e.name.strip()
-        # Entries with no ROMs and names starting with quote/backslash are artefacts
         bad_starts = ('"', "'", '\\')
+        if not e.roms and n and n[0] in bad_starts:
+            return False
         return True
     valid_entries = [e for e in entries if _is_valid_entry(e)]
-    for entry in sorted(valid_entries, key=lambda e: e.name.lower()):
+    # Dedupe by name within the write — RomVault crashes on duplicate game names
+    seen_names = set()
+    unique_valid = []
+    for e in sorted(valid_entries, key=lambda e: e.name.lower()):
+        n = e.name.strip().lstrip('"\\').rstrip()
+        if n and n not in seen_names:
+            seen_names.add(n)
+            unique_valid.append(e)
+    for entry in unique_valid:
         lines.append('game (')
         # Strip any leading/trailing quote chars that crept in during parsing
         clean_name = entry.name.strip().lstrip('"\\').rstrip()
+        if not clean_name:  # skip if stripping left nothing
+            continue
         lines.append(f'\tname "{_escape_dat_string(clean_name)}"')
         if entry.description and entry.description != entry.name:
             lines.append(f'\tdescription "{_escape_dat_string(entry.description)}"')
-        # Write mtime as a dat comment field so rebuilder can restore it
-        if hasattr(entry, 'mtime') and entry.mtime:
-            import datetime as _dt
-            ts = _dt.datetime.fromtimestamp(entry.mtime).strftime('%Y-%m-%d %H:%M:%S')
-            lines.append(f'\tdate "{ts}"')
-            # Also store raw unix timestamp for precision
-            lines.append(f'\tcomment "mtime={entry.mtime:.3f}"')
+        # Note: mtime is stored in the sidecar .mtime.json file, NOT in the DAT
+        # RomVault rejects unknown fields like "date" and "comment" in game blocks
         for rom in sorted(entry.roms, key=lambda r: r.get('name', '')):
             parts = [f'name "{_escape_dat_string(rom.get("name", ""))}"']
             if rom.get('size'):
@@ -394,6 +398,7 @@ def write_clrmamepro_dat(filepath: Path, header: DatHeader, entries: list):
 
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1478,6 +1483,7 @@ class DatMergerAPI:
 
     def _create_dat_thread(self, config: dict):
         import hashlib
+        import re as _re
         self._running = True
         self._stop.clear()
 
@@ -1489,6 +1495,7 @@ class DatMergerAPI:
         use_sha1 = config.get("use_sha1", True)
         use_md5 = config.get("use_md5", False)
         archives_as_files = config.get("archives_as_files", True)
+        verbose = config.get("verbose", False)
 
         self._log("=" * 50, "info")
         self._log("DAT Creator", "ok")
@@ -1507,152 +1514,91 @@ class DatMergerAPI:
         if not output.lower().endswith('.dat'):
             output += '.dat'
 
-        # Collect files
+        # ── Group files by parent folder ─────────────────────────────────
+        # Each folder = one game entry; all files in it = ROM entries
+        # This matches scene DAT format: folder name as game, every file as ROM
         self._progress(5, "Collecting files...")
-        all_files = []
+        import zlib
+        from collections import defaultdict
+        import re as _re2
+
+        folder_files = defaultdict(list)
         if recursive:
             for root, dirs, files in os.walk(folder):
-                for f in files:
-                    all_files.append(Path(root) / f)
+                rp = Path(root)
+                for f in sorted(files):
+                    folder_files[rp].append(rp / f)
         else:
-            all_files = [f for f in folder.iterdir() if f.is_file()]
+            files_in_root = sorted([f for f in folder.iterdir() if f.is_file()])
+            if files_in_root:
+                folder_files[folder] = files_in_root
+            for d in sorted(folder.iterdir()):
+                if d.is_dir():
+                    for f in sorted(d.iterdir()):
+                        if f.is_file():
+                            folder_files[d].append(f)
 
-        self._log(f"  Found {len(all_files)} file(s)", "info")
+        total_files = sum(len(v) for v in folder_files.values())
+        self._log(f"  Found {total_files} file(s) in {len(folder_files)} folder(s)", "info")
 
-        if not all_files:
-            self._log("No files found.", "warn")
-            self._running = False
-            self._emit("done", {"success": False})
-            return
-
-        # Hash each file and create entries
-        import zlib
-        ARCHIVE_EXTS = {'.zip', '.rar', '.7z', '.gz', '.tar'}
-
-        def hash_bytes(data: bytes) -> dict:
-            crc = zlib.crc32(data) & 0xFFFFFFFF
-            result = {'crc': format(crc, '08X'), 'size': str(len(data))}
-            if use_sha1:
-                result['sha1'] = hashlib.sha1(data).hexdigest()
-            if use_md5:
-                result['md5'] = hashlib.md5(data).hexdigest()
-            return result
-
-        def hash_file(fpath: Path) -> dict:
+        def hash_one_file(fpath):
             crc = 0
             sha1_h = hashlib.sha1() if use_sha1 else None
-            md5_h = hashlib.md5() if use_md5 else None
+            md5_h  = hashlib.md5()  if use_md5  else None
             size = 0
-            with open(fpath, 'rb') as f:
+            with open(fpath, "rb") as _f:
                 while True:
-                    chunk = f.read(65536)
+                    chunk = _f.read(65536)
                     if not chunk: break
                     size += len(chunk)
                     crc = zlib.crc32(chunk, crc)
                     if sha1_h: sha1_h.update(chunk)
-                    if md5_h: md5_h.update(chunk)
-            result = {'crc': format(crc & 0xFFFFFFFF, '08X'), 'size': str(size)}
-            if use_sha1: result['sha1'] = sha1_h.hexdigest()
-            if use_md5: result['md5'] = md5_h.hexdigest()
+                    if md5_h:  md5_h.update(chunk)
+            result = {"crc": format(crc & 0xFFFFFFFF, "08X"), "size": str(size)}
+            if use_sha1: result["sha1"] = sha1_h.hexdigest()
+            if use_md5:  result["md5"]  = md5_h.hexdigest()
             return result
 
         entries = []
-        for i, fpath in enumerate(all_files):
+        n_processed = 0
+        total_folders = len(folder_files)
+
+        for fi, (fdir, ffiles) in enumerate(sorted(folder_files.items())):
             if self._stop.is_set(): break
-            if i % 50 == 0:
-                pct = 5 + int((i / len(all_files)) * 85)
-                self._progress(pct, f"Hashing: {fpath.name} ({i}/{len(all_files)})")
+            pct = 5 + int((fi / max(total_folders, 1)) * 88)
+            self._progress(pct, f"Processing: {fdir.name} ({fi+1}/{total_folders})")
 
+            # Game name = folder name relative to scan root
             try:
-                is_archive = fpath.suffix.lower() in ARCHIVE_EXTS
+                rel_dir = str(fdir.relative_to(folder)).replace(os.sep, "/")
+            except ValueError:
+                rel_dir = fdir.name
+            if rel_dir in (".", ""):
+                rel_dir = fdir.name
 
-                if archives_as_files or not is_archive:
-                    # Treat as a single file - hash the whole thing
-                    hashes = hash_file(fpath)
-                    # Store relative path as ROM name to preserve folder structure
-                    # e.g. Roms/A/de/rom.zip -> A/de/rom.zip
-                    rel_path = str(fpath.relative_to(folder)).replace(os.sep, '/')
-                    rom = {'name': rel_path, **hashes}
-                    # Game name = relative path without extension
-                    game_name = str(Path(rel_path).with_suffix(''))
-                    # Preserve filesystem mtime (critical for scene zips)
-                    file_mtime = fpath.stat().st_mtime
-                    entry = DatEntry(game_name, game_name, [rom], str(folder),
-                                     mtime=file_mtime)
-                    entries.append(entry)
-                else:
-                    # Extract and hash contents individually
-                    roms = []
-                    suf = fpath.suffix.lower()
-                    try:
-                        if suf == '.zip':
-                            import zipfile
-                            # Try standard zipfile first, fall back for ZSTD-compressed ZIPs
-                            try:
-                                zf_mod = zipfile
-                                # Try zipfile_zstd monkey-patch if available
-                                try:
-                                    import zipfile_zstd as zf_mod
-                                except ImportError:
-                                    pass
-                                with zf_mod.ZipFile(fpath, 'r') as zf:
-                                    for name in zf.namelist():
-                                        info = zf.getinfo(name)
-                                        if info.is_dir(): continue
-                                        data = zf.read(name)
-                                        h = hash_bytes(data)
-                                        roms.append({'name': name, **h})
-                            except Exception as zip_err:
-                                err_msg = str(zip_err).lower()
-                                if 'compression' in err_msg or 'not supported' in err_msg or 'method' in err_msg:
-                                    # ZSTD or unsupported compression — try 7z binary
-                                    _7z = _find_tool(['7z.exe', '7za.exe', '7z', '7za'])
-                                    if _7z:
-                                        import subprocess, tempfile, os as _os
-                                        with tempfile.TemporaryDirectory() as tmp:
-                                            subprocess.run([_7z, 'e', str(fpath), f'-o{tmp}', '-y'],
-                                                           capture_output=True)
-                                            for root, dirs, files in _os.walk(tmp):
-                                                for fn in files:
-                                                    fp2 = Path(root) / fn
-                                                    data = fp2.read_bytes()
-                                                    h = hash_bytes(data)
-                                                    roms.append({'name': fn, **h})
-                                    else:
-                                        raise RuntimeError(
-                                            f'ZSTD-compressed ZIP — install zipfile-zstd '
-                                            f'(pip install zipfile-zstd) or drop 7z.exe '
-                                            f'in the app folder'
-                                        )
-                                else:
-                                    raise  # re-raise non-compression errors
-                        elif suf == '.7z':
-                            try:
-                                import py7zr
-                                with py7zr.SevenZipFile(fpath, mode='r') as sz:
-                                    all_data = sz.readall()
-                                    for name, bio in all_data.items():
-                                        data = bio.read()
-                                        h = hash_bytes(data)
-                                        roms.append({'name': name, **h})
-                            except ImportError:
-                                # py7zr not available - fall back to file hash
-                                hashes = hash_file(fpath)
-                                roms.append({'name': fpath.name, **hashes})
-                    except Exception as ae:
-                        self._log(f"  WARN: could not open archive {fpath.name}: {ae} — hashing as file", "warn")
-                        hashes = hash_file(fpath)
-                        roms.append({'name': fpath.name, **hashes})
+            if verbose:
+                self._log(f"  Folder: {rel_dir} ({len(ffiles)} files)", "dim")
 
-                    if roms:
-                        game_name = fpath.stem
-                        entry = DatEntry(game_name, game_name, roms, str(folder))
-                        entries.append(entry)
+            roms = []
+            for fpath in ffiles:
+                if self._stop.is_set(): break
+                try:
+                    hashes = hash_one_file(fpath)
+                    roms.append({"name": fpath.name, **hashes})
+                    n_processed += 1
+                    if verbose:
+                        self._log(f"    {fpath.name}  crc={hashes['crc']}", "dim")
+                except Exception as he:
+                    self._log(f"  ERR: {fpath.name}: {he}", "err")
 
-            except Exception as e:
-                self._log(f"  ERR: {fpath.name}: {e}", "err")
+            if roms:
+                entry = DatEntry(rel_dir, rel_dir, roms, str(folder))
+                entries.append(entry)
 
-        self._log(f"  Hashed {len(entries)} file(s)", "ok")
+        self._log(
+            f"  Processed {n_processed} files across {total_folders} folder(s)",
+            "ok"
+        )
 
         # Write
         self._progress(92, "Writing DAT...")
@@ -1661,6 +1607,7 @@ class DatMergerAPI:
         out_header.description = f"Created from {folder.name} ({len(entries)} files)"
         out_header.author = dat_author
         out_header.version = time.strftime("%Y-%m-%d %H:%M")
+        out_header.forcepacking = "unzip"  # tell RomVault to leave files as-is
 
         try:
             Path(output).parent.mkdir(parents=True, exist_ok=True)
@@ -1676,7 +1623,7 @@ class DatMergerAPI:
         self._log(f"DAT created — {len(entries)} entries.", "ok")
         self._running = False
         self._emit("done", {"success": True, "stats": {
-            "total_input": len(all_files), "duplicates_removed": 0, "total_output": len(entries)
+            "total_input": n_processed, "duplicates_removed": 0, "total_output": len(entries)
         }})
 
     # ══════════════════════════════════════════════════════════════════
@@ -1741,14 +1688,16 @@ class DatMergerAPI:
                         elif rom.get('crc'):
                             h = rom['crc'].upper()
                         if h:
-                            entry_mtime = getattr(entry, 'mtime', None)
-                            hash_index[h] = (entry.name, rom.get('name', ''), entry_mtime)
+                            hash_index[h] = (entry.name, rom.get('name', ''))
                             total_dat_roms += 1
                 self._log(f"  Loaded: {Path(dpath).name}", "ok")
             except Exception as e:
                 self._log(f"  ERROR: {Path(dpath).name}: {e}", "err")
 
         self._log(f"  Hash index: {len(hash_index)} unique ROM hashes from {total_dat_roms} total", "info")
+        # Show first 5 entries in hash index for debugging
+        for k,v in list(hash_index.items())[:5]:
+            self._log(f"  Index sample: {k} -> {v[1]}", "dim")
 
         # Step 2: Scan source folder, hash each file, check against index
         self._progress(30, "Scanning source files...")
@@ -1793,8 +1742,10 @@ class DatMergerAPI:
                             crc = zlib.crc32(chunk, crc)
                     file_hash = format(crc & 0xFFFFFFFF, '08X')
 
+                if i < 3:
+                    self._log(f"  File hash: {fpath.name} = {file_hash}", "dim")
                 if file_hash in hash_index:
-                    game_name, rom_name, stored_mtime = hash_index[file_hash]
+                    game_name, rom_name = hash_index[file_hash]
                     # Move to dest/game_name/rom_name
                     # rom_name may contain subfolders (e.g. A/de/rom.zip)
                     # Rebuild exact folder structure under dest
@@ -1831,12 +1782,6 @@ class DatMergerAPI:
                         except Exception as move_err:
                             self._log(f"  ERR moving {fpath.name}: {move_err}", "err")
 
-                        # Restore original mtime if available (scene zip preservation)
-                        if stored_mtime and dest_file.exists():
-                            try:
-                                os.utime(str(dest_file), (stored_mtime, stored_mtime))
-                            except Exception:
-                                pass  # mtime restore is best-effort
 
                     matched += 1
                     if matched % 100 == 0:

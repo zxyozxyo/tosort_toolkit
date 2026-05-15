@@ -22,3 +22,6 @@ UnRAR.exe
 unrar.exe
 chdman.exe
 xdms.exe
+
+# DAT mtime sidecar files
+*.mtime.json
