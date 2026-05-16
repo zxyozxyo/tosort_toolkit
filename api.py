@@ -1611,21 +1611,24 @@ class ToSortAPI:
 
     def _watch_thread(self, config: dict):
         interval = int(config.get("interval_minutes", 30)) * 60
+        mins = config.get("interval_minutes", 30)
         self._log(
-            f"Watch mode active — pipeline will run every "
-            f"{config.get('interval_minutes', 30)} minute(s).",
+            f"Watch mode active — pipeline will run every {mins} minute(s). "
+            f"First run starting now...",
             "info"
         )
         while not self._watch_stop.is_set():
-            # Count down in 1-second ticks so the UI can show a countdown
+            # Run pipeline first
+            self._emit("watchFired", {})
+            self._log("Watch: starting pipeline run...", "info")
+            self._pipeline_thread(config)
+            if self._watch_stop.is_set():
+                break
+            # Then count down until next run
+            self._log(f"Watch: pipeline complete — next run in {mins} minute(s).", "info")
+            self._emit("watchWaiting", {"total": interval})
             for remaining in range(interval, 0, -1):
                 if self._watch_stop.is_set():
                     break
                 self._emit("watchTick", {"remaining": remaining, "total": interval})
                 time.sleep(1)
-            if self._watch_stop.is_set():
-                break
-            self._log("Watch timer fired — starting pipeline...", "info")
-            self._emit("watchFired", {})
-            # Run the pipeline with the stored config
-            self._pipeline_thread(config)

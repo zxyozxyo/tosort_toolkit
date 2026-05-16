@@ -1582,15 +1582,43 @@ class DatMergerAPI:
             roms = []
             for fpath in ffiles:
                 if self._stop.is_set(): break
-                try:
-                    hashes = hash_one_file(fpath)
-                    roms.append({"name": fpath.name, **hashes})
-                    n_processed += 1
-                    if verbose:
-                        self._log(f"    {fpath.name}  crc={hashes['crc']}", "dim")
-                except Exception as he:
-                    self._log(f"  ERR: {fpath.name}: {he}", "err")
+                suf = fpath.suffix.lower()
+                is_arc = suf in {'.zip', '.rar', '.7z', '.gz'}
 
+                if archives_as_files or not is_arc:
+                    # Hash the file as-is (always for non-archives,
+                    # and for archives when in archives-as-files mode)
+                    try:
+                        hashes = hash_one_file(fpath)
+                        roms.append({"name": fpath.name, **hashes})
+                        n_processed += 1
+                        if verbose:
+                            self._log(f"    {fpath.name}  crc={hashes['crc']}", "dim")
+                    except Exception as he:
+                        self._log(f"  ERR: {fpath.name}: {he}", "err")
+                else:
+                    # Contents mode — each archive becomes its OWN game entry
+                    # named after the archive (without extension)
+                    try:
+                        arc_roms = self._hash_archive_contents(fpath, verbose)
+                        if arc_roms:
+                            # Game name = parent folder path + archive stem
+                            arc_game = rel_dir + '/' + fpath.stem if rel_dir not in ('.','') else fpath.stem
+                            arc_entry = DatEntry(arc_game, arc_game, arc_roms, str(folder))
+                            entries.append(arc_entry)
+                            n_processed += len(arc_roms)
+                            if verbose:
+                                self._log(f"    {fpath.name} -> {len(arc_roms)} internal files", "dim")
+                        else:
+                            # Fallback: hash as file if unreadable
+                            hashes = hash_one_file(fpath)
+                            roms.append({"name": fpath.name, **hashes})
+                            n_processed += 1
+                    except Exception as he:
+                        self._log(f"  ERR: {fpath.name}: {he}", "err")
+
+            # Only add folder-level entry if it has roms
+            # (in contents mode, archives create their own entries above)
             if roms:
                 entry = DatEntry(rel_dir, rel_dir, roms, str(folder))
                 entries.append(entry)
@@ -1607,7 +1635,9 @@ class DatMergerAPI:
         out_header.description = f"Created from {folder.name} ({len(entries)} files)"
         out_header.author = dat_author
         out_header.version = time.strftime("%Y-%m-%d %H:%M")
-        out_header.forcepacking = "unzip"  # tell RomVault to leave files as-is
+        # Only set forcepacking unzip for archives-as-files mode
+        if archives_as_files:
+            out_header.forcepacking = "unzip"
 
         try:
             Path(output).parent.mkdir(parents=True, exist_ok=True)
@@ -1649,23 +1679,46 @@ class DatMergerAPI:
         self._stop.clear()
 
         dat_files = config.get("dat_files", [])
-        source = Path(config.get("source_folder", "")).expanduser()
-        dest = Path(config.get("dest_folder", "")).expanduser()
+        # Support multiple source folders
+        raw_sources = config.get("source_folders", config.get("source_folder", ""))
+        if isinstance(raw_sources, list):
+            source_folders = [Path(s).expanduser() for s in raw_sources if s.strip()]
+        else:
+            source_folders = [Path(raw_sources).expanduser()] if raw_sources.strip() else []
+        _dest_raw = config.get("dest_folder", "").strip()
+        if not _dest_raw:
+            self._log("No destination folder set.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+        dest = Path(_dest_raw).expanduser()
         dry_run = config.get("dry_run", False)
         match_by = config.get("match_by", "crc")
         delete_source = config.get("delete_source", False)
+        # rebuild_as_archives: if True, matched files are moved/copied as whole
+        # archive files (archives-as-files DATs). If False, files are rebuilt
+        # individually by internal hash into dest folder structure.
+        rebuild_as_archives = config.get("rebuild_as_archives", True)
+        cleanup_empty = config.get("cleanup_empty", True)
 
         self._log("=" * 50, "info")
         self._log("DAT Rebuilder", "ok")
         self._log("=" * 50, "info")
 
-        if not dat_files or not source.is_dir() or not dest:
-            self._log("Missing DAT files, source folder, or destination.", "err")
+        if not dat_files:
+            self._log("No DAT files selected.", "err")
+            self._running = False
+            self._emit("done", {"success": False})
+            return
+        if not source_folders:
+            self._log("No source folders set.", "err")
             self._running = False
             self._emit("done", {"success": False})
             return
 
-        dest.mkdir(parents=True, exist_ok=True)
+        # dest_root is the base — each DAT rebuilds into its own named subfolder
+        dest_root = dest
+        dest_root.mkdir(parents=True, exist_ok=True)
         if dry_run:
             self._log("Dry run — files will be listed but NOT moved.", "warn")
 
@@ -1678,6 +1731,11 @@ class DatMergerAPI:
             if self._stop.is_set(): break
             try:
                 _, entries = parse_dat_file(Path(dpath))
+                # Each DAT rebuilds into dest_root / DAT_stem subfolder
+                dat_stem = Path(dpath).stem
+                dest = dest_root / dat_stem
+                dest.mkdir(parents=True, exist_ok=True)
+                self._log(f"  Rebuilding to: {dat_stem}/", "dim")
                 for entry in entries:
                     for rom in entry.roms:
                         h = None
@@ -1688,7 +1746,8 @@ class DatMergerAPI:
                         elif rom.get('crc'):
                             h = rom['crc'].upper()
                         if h:
-                            hash_index[h] = (entry.name, rom.get('name', ''))
+                            # Store dest subdir so each DAT rebuilds to correct folder
+                            hash_index[h] = (entry.name, rom.get('name', ''), dest)
                             total_dat_roms += 1
                 self._log(f"  Loaded: {Path(dpath).name}", "ok")
             except Exception as e:
@@ -1697,17 +1756,54 @@ class DatMergerAPI:
         self._log(f"  Hash index: {len(hash_index)} unique ROM hashes from {total_dat_roms} total", "info")
         # Show first 5 entries in hash index for debugging
         for k,v in list(hash_index.items())[:5]:
-            self._log(f"  Index sample: {k} -> {v[1]}", "dim")
+            self._log(f"  Index sample: {k} -> {v[1]} [{v[2].name}]", "dim")
 
-        # Step 2: Scan source folder, hash each file, check against index
+        # Step 2: Scan all source folders
         self._progress(30, "Scanning source files...")
-        source_files = []
-        for root, dirs, files in os.walk(source):
-            rp = Path(root).resolve()
-            if rp == dest.resolve() or str(rp).startswith(str(dest.resolve())):
-                dirs.clear(); continue
-            for f in files:
-                source_files.append(Path(root) / f)
+        source_files = []  # list of (fpath, internal_name_or_None)
+        ARCHIVE_SCAN_EXTS = {".zip", ".rar", ".7z"}
+        for source in source_folders:
+            if not source.is_dir():
+                self._log(f"  WARN: source folder not found: {source}", "warn")
+                continue
+            for root, dirs, files in os.walk(source):
+                rp = Path(root).resolve()
+                if rp == dest_root.resolve() or str(rp).startswith(str(dest_root.resolve())):
+                    dirs.clear(); continue
+                for f in files:
+                    fp = Path(root) / f
+                    if not rebuild_as_archives and fp.suffix.lower() in ARCHIVE_SCAN_EXTS:
+                        # Scan internally — yield each internal file as a candidate
+                        try:
+                            if fp.suffix.lower() == ".zip":
+                                import zipfile as _zf
+                                zfm = _zf
+                                try:
+                                    import zipfile_zstd as zfm
+                                except ImportError: pass
+                                with zfm.ZipFile(fp, "r") as z:
+                                    for iname in z.namelist():
+                                        if not z.getinfo(iname).is_dir():
+                                            source_files.append((fp, iname))
+                            elif fp.suffix.lower() == ".7z":
+                                try:
+                                    import py7zr
+                                    with py7zr.SevenZipFile(fp, mode="r") as sz:
+                                        for iname in sz.getnames():
+                                            source_files.append((fp, iname))
+                                except ImportError: pass
+                            elif fp.suffix.lower() == ".rar":
+                                try:
+                                    import rarfile
+                                    with rarfile.RarFile(fp) as rf:
+                                        for iname in rf.namelist():
+                                            source_files.append((fp, iname))
+                                except ImportError: pass
+                        except Exception as ae:
+                            self._log(f"  WARN: could not scan {fp.name}: {ae}", "warn")
+                            source_files.append((fp, None))  # fallback: treat as file
+                    else:
+                        source_files.append((fp, None))
 
         self._log(f"  Source files: {len(source_files)}", "info")
 
@@ -1715,60 +1811,140 @@ class DatMergerAPI:
         unmatched = 0
         errors = 0
 
-        for i, fpath in enumerate(source_files):
+        for i, (fpath, internal_name) in enumerate(source_files):
             if self._stop.is_set(): break
             if i % 50 == 0:
                 pct = 30 + int((i / max(len(source_files), 1)) * 65)
                 self._progress(pct, f"Checking: {fpath.name} ({i}/{len(source_files)})")
 
             try:
-                # Hash the file
-                if match_by == 'sha1':
-                    h = hashlib.sha1()
-                    with open(fpath, 'rb') as f:
-                        for chunk in iter(lambda: f.read(65536), b""):
-                            h.update(chunk)
-                    file_hash = h.hexdigest().lower()
-                elif match_by == 'md5':
-                    h = hashlib.md5()
-                    with open(fpath, 'rb') as f:
-                        for chunk in iter(lambda: f.read(65536), b""):
-                            h.update(chunk)
-                    file_hash = h.hexdigest().lower()
-                else:  # crc
-                    crc = 0
-                    with open(fpath, 'rb') as f:
-                        for chunk in iter(lambda: f.read(65536), b""):
-                            crc = zlib.crc32(chunk, crc)
-                    file_hash = format(crc & 0xFFFFFFFF, '08X')
+                # Hash the file or internal archive entry
+                _internal_data = None
+                if internal_name and not rebuild_as_archives:
+                    # Read from inside archive for hashing
+                    try:
+                        if fpath.suffix.lower() == ".zip":
+                            import zipfile as _zf2
+                            zfm2 = _zf2
+                            try:
+                                import zipfile_zstd as zfm2
+                            except ImportError: pass
+                            with zfm2.ZipFile(fpath, "r") as z:
+                                _internal_data = z.read(internal_name)
+                        elif fpath.suffix.lower() == ".7z":
+                            import py7zr
+                            with py7zr.SevenZipFile(fpath, mode="r") as sz:
+                                _internal_data = sz.read([internal_name])[internal_name].read()
+                        elif fpath.suffix.lower() == ".rar":
+                            import rarfile
+                            with rarfile.RarFile(fpath) as rf:
+                                _internal_data = rf.read(internal_name)
+                    except Exception as ie:
+                        self._log(f"  ERR reading {fpath.name}/{internal_name}: {ie}", "err")
+                        errors += 1
+                        continue
+                    if match_by == "sha1":
+                        file_hash = hashlib.sha1(_internal_data).hexdigest().lower()
+                    elif match_by == "md5":
+                        file_hash = hashlib.md5(_internal_data).hexdigest().lower()
+                    else:
+                        file_hash = format(zlib.crc32(_internal_data) & 0xFFFFFFFF, "08X")
+                else:
+                    # Hash whole file
+                    if match_by == "sha1":
+                        h = hashlib.sha1()
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(65536), b""):
+                                h.update(chunk)
+                        file_hash = h.hexdigest().lower()
+                    elif match_by == "md5":
+                        h = hashlib.md5()
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(65536), b""):
+                                h.update(chunk)
+                        file_hash = h.hexdigest().lower()
+                    else:  # crc
+                        crc = 0
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(65536), b""):
+                                crc = zlib.crc32(chunk, crc)
+                        file_hash = format(crc & 0xFFFFFFFF, "08X")
 
                 if i < 3:
                     self._log(f"  File hash: {fpath.name} = {file_hash}", "dim")
                 if file_hash in hash_index:
-                    game_name, rom_name = hash_index[file_hash]
+                    game_name, rom_name, file_dest = hash_index[file_hash]
                     # Move to dest/game_name/rom_name
                     # rom_name may contain subfolders (e.g. A/de/rom.zip)
-                    # Rebuild exact folder structure under dest
+                    # Rebuild exact folder structure under file_dest (DAT named subdir)
                     if rom_name and '/' in rom_name:
-                        # rom_name includes relative path — use it directly
-                        dest_file = dest / Path(rom_name)
+                        dest_file = file_dest / Path(rom_name)
                     else:
-                        # No path info — use game_name folder + rom filename
-                        game_dir = dest / game_name
+                        game_dir = file_dest / game_name
                         dest_file = game_dir / (rom_name or fpath.name)
                     dest_file.parent.mkdir(parents=True, exist_ok=True)
-                    # Handle collision
+                    # Check if an identical file already exists at dest
+                    # Use size + CRC comparison — avoids rebuilding same file twice
+                    already_exists = False
                     if dest_file.exists():
-                        stem, sfx = os.path.splitext(dest_file.name)
-                        n = 1
-                        while dest_file.exists():
-                            dest_file = dest_file.parent / f"{stem}_{n}{sfx}"
-                            n += 1
+                        try:
+                            # Get the ROM size from hash_index for quick size check
+                            dest_size = dest_file.stat().st_size
+                            src_size  = fpath.stat().st_size
+                            if dest_size == src_size:
+                                # Same size — verify by CRC
+                                existing_crc = 0
+                                with open(dest_file, "rb") as _ef:
+                                    for _chunk in iter(lambda: _ef.read(65536), b""):
+                                        existing_crc = zlib.crc32(_chunk, existing_crc)
+                                existing_crc_str = format(existing_crc & 0xFFFFFFFF, "08X")
+                                src_crc = 0
+                                with open(fpath, "rb") as _sf:
+                                    for _chunk in iter(lambda: _sf.read(65536), b""):
+                                        src_crc = zlib.crc32(_chunk, src_crc)
+                                src_crc_str = format(src_crc & 0xFFFFFFFF, "08X")
+                                if existing_crc_str == src_crc_str:
+                                    already_exists = True
+                                else:
+                                    # Different file — rename
+                                    stem, sfx = os.path.splitext(dest_file.name)
+                                    n = 1
+                                    while dest_file.exists():
+                                        dest_file = dest_file.parent / f"{stem}_{n}{sfx}"
+                                        n += 1
+                            else:
+                                # Different size — rename
+                                stem, sfx = os.path.splitext(dest_file.name)
+                                n = 1
+                                while dest_file.exists():
+                                    dest_file = dest_file.parent / f"{stem}_{n}{sfx}"
+                                    n += 1
+                        except Exception:
+                            pass
+
+                    if already_exists:
+                        # File already correctly rebuilt — just delete source if needed
+                        if delete_source and not dry_run:
+                            try:
+                                os.unlink(str(fpath))
+                            except Exception:
+                                pass
+                        matched += 1
+                        continue
 
                     if not dry_run:
                         try:
-                            if delete_source:
-                                # Move (rename first for speed, copy+delete cross-drive)
+                            if _internal_data is not None:
+                                # Write extracted internal file to destination
+                                # Rebuild into a zip named after the source archive
+                                import zipfile as _zwf
+                                zip_dest = dest_file.parent / (fpath.stem + ".zip")
+                                zip_dest.parent.mkdir(parents=True, exist_ok=True)
+                                mode = "a" if zip_dest.exists() else "w"
+                                with _zwf.ZipFile(zip_dest, mode, 
+                                                  compression=_zwf.ZIP_DEFLATED) as zout:
+                                    zout.writestr(Path(internal_name).name, _internal_data)
+                            elif delete_source:
                                 try:
                                     os.rename(str(fpath), str(dest_file))
                                 except OSError:
@@ -1776,7 +1952,6 @@ class DatMergerAPI:
                                     shutil.copy2(str(fpath), str(dest_file))
                                     os.unlink(str(fpath))
                             else:
-                                # Copy only — leave source intact
                                 import shutil
                                 shutil.copy2(str(fpath), str(dest_file))
                         except Exception as move_err:
@@ -1800,6 +1975,25 @@ class DatMergerAPI:
             action = "Moved"
         else:
             action = "Copied"
+
+        # Clean up empty folders in source
+        if cleanup_empty and not dry_run and delete_source:
+            self._progress(98, "Cleaning empty folders...")
+            removed_dirs = 0
+            for source in source_folders:
+                if not source.is_dir(): continue
+                for root, dirs, files in os.walk(str(source), topdown=False):
+                    rp = Path(root)
+                    if rp == source: continue
+                    try:
+                        if not any(rp.iterdir()):
+                            rp.rmdir()
+                            removed_dirs += 1
+                    except Exception:
+                        pass
+            if removed_dirs:
+                self._log(f"  Removed {removed_dirs} empty folder(s) from source.", "dim")
+
         self._log("", "")
         self._log(f"Rebuild done — {action} {matched} matched, {unmatched} unmatched, {errors} errors.", "ok")
         self._running = False
@@ -1807,6 +2001,64 @@ class DatMergerAPI:
             "total_input": len(source_files), "duplicates_removed": unmatched,
             "total_output": matched,
         }})
+
+    def _hash_archive_contents(self, fpath, verbose=False) -> list:
+        """Open an archive and hash each file inside. Returns list of rom dicts."""
+        import hashlib as _hl, zlib as _zl, zipfile, tempfile, subprocess, os as _os
+        roms = []
+        suf = fpath.suffix.lower()
+
+        def hash_bytes(data):
+            crc = _zl.crc32(data) & 0xFFFFFFFF
+            return {
+                'crc': format(crc, '08X'),
+                'size': str(len(data)),
+                'sha1': _hl.sha1(data).hexdigest(),
+            }
+
+        try:
+            if suf == '.zip':
+                zf_mod = zipfile
+                try:
+                    import zipfile_zstd as zf_mod
+                except ImportError:
+                    pass
+                with zf_mod.ZipFile(fpath, 'r') as zf:
+                    for name in zf.namelist():
+                        info = zf.getinfo(name)
+                        if info.is_dir(): continue
+                        data = zf.read(name)
+                        h = hash_bytes(data)
+                        roms.append({'name': Path(name).name, **h})
+                        if verbose:
+                            self._log(f"      {Path(name).name}  crc={h['crc']}", 'dim')
+            elif suf == '.7z':
+                try:
+                    import py7zr
+                    with py7zr.SevenZipFile(fpath, mode='r') as sz:
+                        for name, bio in sz.readall().items():
+                            data = bio.read()
+                            h = hash_bytes(data)
+                            roms.append({'name': Path(name).name, **h})
+                except ImportError:
+                    pass
+            elif suf == '.rar':
+                _unrar = _find_tool(['UnRAR.exe','unrar.exe','UnRAR','unrar'])
+                if _unrar:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        subprocess.run(
+                            [_unrar, 'x', '-inul', '-y', str(fpath), tmp+_os.sep],
+                            capture_output=True
+                        )
+                        for root, dirs, files in _os.walk(tmp):
+                            for fn in files:
+                                fp2 = Path(root)/fn
+                                data = fp2.read_bytes()
+                                h = hash_bytes(data)
+                                roms.append({'name': fn, **h})
+        except Exception as e:
+            self._log(f"  WARN: could not scan {fpath.name}: {e}", 'warn')
+        return roms
 
     @staticmethod
     def _format_size(nbytes: int) -> str:

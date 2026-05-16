@@ -13,6 +13,10 @@
   --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;--border:#2a3045;
   --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
 }
+[data-theme="light"]{--bg0:#f0f2f5;--bg1:#ffffff;--bg2:#e8eaed;--bg3:#d8dbe0;--acc:#1a8a5a;--acc2:#1a8a5a;--warn:#d4780a;--danger:#c0392b;--info:#2471a3;--text:#1a1d23;--text2:#5a6478;--text3:#8a94a8;--border:#c8cdd8;}
+[data-theme="amber"]{--bg0:#0f0c06;--bg1:#1a1508;--bg2:#241e0c;--bg3:#2e2710;--acc:#f0b030;--acc2:#c08010;--warn:#f07030;--danger:#e04040;--info:#60b0f0;--text:#e8d8a0;--text2:#a09060;--text3:#606040;--border:#3a3010;}
+[data-theme="slate"]{--bg0:#0a0c10;--bg1:#12151c;--bg2:#1a1e28;--bg3:#222738;--acc:#60a0f8;--acc2:#4080d8;--warn:#f0c030;--danger:#f04060;--info:#60d0f0;--text:#c0ccdc;--text2:#7080a0;--text3:#404860;--border:#252a38;}
+[data-theme="red"]{--bg0:#0f0808;--bg1:#1a1010;--bg2:#241818;--bg3:#2e2020;--acc:#f04060;--acc2:#c02040;--warn:#f08030;--danger:#f04040;--info:#60a0f0;--text:#e8c8c8;--text2:#a07070;--text3:#605050;--border:#3a2020;}
 html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
 #app{display:flex;flex-direction:column;height:100vh}
 .titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;user-select:none}
@@ -247,7 +251,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <div class="panel-body">
           <div class="hint" style="margin-bottom:8px">Point at a folder, hash every file, generate a CLRMamePro DAT. Useful for creating DATs of your own collections.</div>
           <div class="row"><label>Source Folder</label><input class="path-input" id="create-folder" placeholder="Folder containing files to catalogue"/><button class="browse-btn" onclick="browseFolder('create-folder')">Browse&hellip;</button></div>
-          <div class="row"><label>Output File</label><input class="path-input" id="create-output" placeholder="D:\DATs\my_collection.dat"/><button class="browse-btn" onclick="browseSave('create-output')">Browse&hellip;</button></div>
+          <div class="row"><label>Output File</label><input class="path-input" id="create-output" placeholder="D:\DATs\my_collection.dat" oninput="autoFillDatName()"/><button class="browse-btn" onclick="browseAndFillDat()">Browse&hellip;</button></div>
           <div class="row"><label>DAT Name</label><input class="path-input" id="create-name" value="My Collection" placeholder="Name shown in RomVault"/></div>
           <div class="row"><label>Author</label><input class="path-input" id="create-author" value="ToSort Toolkit"/></div>
           <div style="padding:6px 0;display:flex;gap:16px;flex-wrap:wrap">
@@ -268,27 +272,39 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     <!-- ═══ TAB: REBUILDER ═══ -->
     <div class="tab-body" id="tab-rebuild">
       <div class="panel">
-        <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>DAT Rebuilder &mdash; sort files into sets using DATs</div>
+        <div class="panel-hdr"><div class="dot" style="background:var(--acc)"></div>DAT Rebuilder</div>
         <div class="panel-body">
-          <div class="hint" style="margin-bottom:8px">Load one or more DATs as reference, scan a source folder, and move any matching files to the destination organised by game name. Unmatched files are left in place.</div>
-          <div style="font-size:11px;color:var(--text2);margin-bottom:6px">Reference DATs</div>
+          <div class="hint" style="margin-bottom:8px">Load one or more DATs, scan a source folder, move matched files to destination. Each DAT rebuilds into its own named subfolder. Unmatched files are left in place.</div>
+          <div style="font-size:11px;color:var(--text2);font-weight:600;margin-bottom:4px">Reference DATs</div>
           <div class="btn-row">
             <button class="browse-btn" onclick="addFiles('rebuild-dats')">+ Add DATs</button>
             <button class="browse-btn" onclick="addFolder('rebuild-dats')">+ Add Folder of DATs</button>
             <button class="browse-btn" onclick="clearList('rebuild-dats')" style="margin-left:auto;border-color:var(--danger);color:var(--danger)">Clear</button>
           </div>
           <div class="file-list" id="rebuild-dats" style="min-height:60px;max-height:120px"><div class="file-empty">Add DAT files to use as reference</div></div>
-          <div class="row"><label>Source Folder</label><input class="path-input" id="rebuild-source" placeholder="Folder with loose/unsorted files"/><button class="browse-btn" onclick="browseFolder('rebuild-source')">Browse&hellip;</button></div>
-          <div class="row"><label>Destination</label><input class="path-input" id="rebuild-dest" placeholder="Where matched files are moved (organised by game name)"/><button class="browse-btn" onclick="browseFolder('rebuild-dest')">Browse&hellip;</button></div>
-          <div style="padding:6px 0;display:flex;gap:16px;flex-wrap:wrap">
-            <label class="opt"><input type="checkbox" id="rebuild-dry"> Dry run &mdash; list matches only</label>
+          <div style="font-size:11px;color:var(--text2);font-weight:600;margin:6px 0 4px">Source Folders</div>
+          <div class="btn-row">
+            <button class="browse-btn" onclick="addRebuildSource()">+ Add Source Folder</button>
+            <button class="browse-btn" onclick="clearList('rebuild-sources')" style="margin-left:auto;border-color:var(--danger);color:var(--danger)">Clear</button>
+          </div>
+          <div class="file-list" id="rebuild-sources" style="min-height:50px;max-height:100px"><div class="file-empty">Add source folders to scan</div></div>
+          <div class="row"><label>Destination Root</label><input class="path-input" id="rebuild-dest" placeholder="Root folder — each DAT rebuilds into its own named subfolder here"/><button class="browse-btn" onclick="browseFolder('rebuild-dest')">Browse&hellip;</button></div>
+          <div style="padding:8px 0 4px;border-top:1px solid var(--border);margin-top:6px">
+            <div style="font-size:11px;color:var(--text2);font-weight:600;margin-bottom:6px">Archive matching mode</div>
+            <label class="opt" style="margin-bottom:5px"><input type="radio" name="rebuild-arcmode" id="rebuild-arc-files" value="files" checked> <b>Treat archives as files</b> &mdash; match whole archive files by CRC (use with archives-as-files DATs)</label>
+            <label class="opt"><input type="radio" name="rebuild-arcmode" id="rebuild-arc-internal" value="internal"> <b>Scan archives internally</b> &mdash; match by internal file hashes (use with contents-scanned DATs)</label>
+          </div>
+          <div style="padding:8px 0 4px;border-top:1px solid var(--border);margin-top:6px;display:flex;gap:20px;flex-wrap:wrap;align-items:center">
+            <div style="font-size:11px;color:var(--text2);font-weight:600">Options</div>
+            <label class="opt"><input type="checkbox" id="rebuild-dry"> Dry run &mdash; list only</label>
             <label class="opt"><input type="checkbox" id="rebuild-delete"> Remove source after rebuild</label>
-            <span style="font-size:11px;color:var(--text2)">Match by:</span>
-            <select id="rebuild-match" style="background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 8px;color:var(--text);font-family:var(--mono);font-size:11px">
-              <option value="crc" selected>CRC32 (fastest)</option>
-              <option value="sha1">SHA1 (most accurate)</option>
-              <option value="md5">MD5</option>
-            </select>
+            <label class="opt"><input type="checkbox" id="rebuild-cleanup" checked> Delete empty source folders after rebuild</label>
+          </div>
+          <div style="padding:6px 0 2px;display:flex;gap:12px;align-items:center">
+            <div style="font-size:11px;color:var(--text2);font-weight:600">Match by</div>
+            <label class="opt"><input type="radio" name="rebuild-match" value="crc" checked> CRC32 (fastest)</label>
+            <label class="opt"><input type="radio" name="rebuild-match" value="sha1"> SHA1 (most accurate)</label>
+            <label class="opt"><input type="radio" name="rebuild-match" value="md5"> MD5</label>
           </div>
         </div>
       </div>
@@ -524,11 +540,13 @@ function runActive() {
   } else if (activeTab === 'rebuild') {
     api.run_rebuild({
       dat_files: getList('rebuild-dats'),
-      source_folder: document.getElementById('rebuild-source').value.trim(),
+      source_folders: getList('rebuild-sources'),
       dest_folder: document.getElementById('rebuild-dest').value.trim(),
       dry_run: document.getElementById('rebuild-dry').checked,
       delete_source: document.getElementById('rebuild-delete').checked,
-      match_by: document.getElementById('rebuild-match').value,
+      cleanup_empty: document.getElementById('rebuild-cleanup').checked,
+      rebuild_as_archives: document.querySelector('input[name="rebuild-arcmode"]:checked').value === 'files',
+      match_by: document.querySelector('input[name="rebuild-match"]:checked').value,
     });
   } else if (activeTab === 'size') {
     api.run_size_calc({
@@ -538,12 +556,54 @@ function runActive() {
   }
 }
 
+async function addRebuildSource() {
+  try {
+    const result = await window.pywebview.api.browse_folder();
+    if (result) {
+      const list = getList('rebuild-sources');
+      if (!list.includes(result)) { list.push(result); renderRebuildSources(); }
+    }
+  } catch(e) { addLog('Error: ' + e, 'err'); }
+}
+function renderRebuildSources() {
+  const el = document.getElementById('rebuild-sources');
+  const list = getList('rebuild-sources');
+  if (!list.length) { el.innerHTML = '<div class="file-empty">Add source folders to scan</div>'; return; }
+  el.innerHTML = '';
+  list.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.className = 'file-item';
+    d.innerHTML = `<span class="fname" title="${f}">${f}</span><span class="fdel" onclick="removeRebuildSource(${i})">&times;</span>`;
+    el.appendChild(d);
+  });
+}
+function removeRebuildSource(i) { getList('rebuild-sources').splice(i,1); renderRebuildSources(); }
+
 function doStop() {
   window.pywebview.api.stop();
   addLog('Stop requested...', 'warn');
 }
 
 // ── Stats panel dismiss ──────────────────────────────────────────────────────
+// ── DAT Creator auto-fill name from output path ─────────────────────────────
+async function browseAndFillDat() {
+  await browseSave('create-output');
+  autoFillDatName();
+}
+
+function autoFillDatName() {
+  const out = document.getElementById('create-output').value.trim();
+  if (!out) return;
+  const name_field = document.getElementById('create-name');
+  const author_field = document.getElementById('create-author');
+  // Extract filename without extension
+  const stem = out.split(/[\\/]/).pop().replace(/\.dat$/i, '');
+  if (!name_field.value || name_field.value === 'My Collection')
+    name_field.value = stem;
+  if (!author_field.value || author_field.value === 'ToSort Toolkit')
+    author_field.value = 'ToSort Toolkit';
+}
+
 function clearStats() {
   document.getElementById('stats-panel').style.display = 'none';
 }
@@ -601,6 +661,11 @@ window.handlePythonDrop = function(paths) {
   }
 };
 
+// Restore theme from main window
+(function() {
+  const saved = localStorage.getItem('rv_theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+})();
 addLog('DAT Tools ready. Select a tab and configure. Drag & drop files onto lists.', 'info');
 </script>
 </body>
