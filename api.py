@@ -8,6 +8,11 @@ import shutil
 import threading
 import hashlib
 import zipfile
+# Monkey-patch zipfile to support ZSTD compression (method 93)
+try:
+    import zipfile_zstd  # noqa: F401 — import for side effect only
+except ImportError:
+    pass
 import tarfile
 import time
 import json
