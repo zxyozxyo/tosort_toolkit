@@ -514,6 +514,7 @@ async function browse(inputId) {
 }
 
 // ─── Log ──────────────────────────────────────────────────────────────────────
+const MAX_LOG_LINES = 500;
 function addLog(msg, cls) {
   const log = document.getElementById('log');
   const d = document.createElement('div');
@@ -521,6 +522,10 @@ function addLog(msg, cls) {
   const ts = new Date().toLocaleTimeString('en-GB');
   d.textContent = '[' + ts + '] ' + msg;
   log.appendChild(d);
+  // Trim old entries to prevent out-of-memory on long runs
+  while (log.childElementCount > MAX_LOG_LINES) {
+    log.removeChild(log.firstChild);
+  }
   log.scrollTop = log.scrollHeight;
 }
 

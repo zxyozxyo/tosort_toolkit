@@ -425,12 +425,15 @@ async function browseSave(inputId, defaultName) {
 }
 
 // ── Log + Progress ───────────────────────────────────────────────────────────
+const MAX_LOG_LINES = 500;
 function addLog(msg, cls) {
   const log = document.getElementById('log');
   const d = document.createElement('div');
   d.className = 'll' + (cls ? ' ll-' + cls : '');
   d.textContent = '[' + new Date().toLocaleTimeString('en-GB') + '] ' + msg;
-  log.appendChild(d); log.scrollTop = log.scrollHeight;
+  log.appendChild(d);
+  while (log.childElementCount > MAX_LOG_LINES) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
 }
 function clearLog() { document.getElementById('log').innerHTML = ''; }
 function setProgress(pct, label) {
