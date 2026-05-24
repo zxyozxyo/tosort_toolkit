@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>IA Uploader</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;--border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+[data-theme="light"]{--bg0:#f0f2f5;--bg1:#fff;--bg2:#e8eaed;--bg3:#d8dbe0;--acc:#1a8a5a;--acc2:#1a8a5a;--text:#1a1d23;--text2:#5a6478;--text3:#8a94a8;--border:#c8cdd8;}
+[data-theme="amber"]{--bg0:#0f0c06;--bg1:#1a1508;--bg2:#241e0c;--bg3:#2e2710;--acc:#f0b030;--acc2:#c08010;--text:#e8d8a0;--text2:#a09060;--text3:#606040;--border:#3a3010;}
+[data-theme="slate"]{--bg0:#0a0c10;--bg1:#12151c;--bg2:#1a1e28;--bg3:#222738;--acc:#60a0f8;--acc2:#4080d8;--text:#c0ccdc;--text2:#7080a0;--text3:#404860;--border:#252a38;}
+[data-theme="red"]{--bg0:#0f0808;--bg1:#1a1010;--bg2:#241818;--bg3:#2e2020;--acc:#f04060;--acc2:#c02040;--text:#e8c8c8;--text2:#a07070;--text3:#605050;--border:#3a2020;}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:12px;display:flex;flex-direction:column}
+
+/* Titlebar */
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:5px 10px;display:flex;align-items:center;gap:8px;flex-shrink:0;min-height:32px}
+.titlebar-title{font-weight:700;font-size:12px;color:var(--acc);letter-spacing:1px;flex:1}
+
+/* Main scroll area */
+.main{flex:1;overflow-y:scroll;overflow-x:hidden;padding:8px;display:flex;flex-direction:column;gap:6px}
+.main::-webkit-scrollbar{width:6px}
+.main::-webkit-scrollbar-track{background:var(--bg0)}
+.main::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* Panels */
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:5px;overflow:hidden;flex-shrink:0}
+.panel-hdr{background:var(--bg2);padding:4px 10px;font-size:10px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:5px;letter-spacing:.5px;text-transform:uppercase;cursor:pointer;user-select:none}
+.panel-hdr:hover{color:var(--text)}
+.panel-body{padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+.panel-body.collapsed{display:none}
+
+/* Form elements */
+.row{display:flex;align-items:center;gap:6px}
+.lbl{font-size:10px;color:var(--text2);min-width:90px;flex-shrink:0}
+.txt{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:4px 7px;color:var(--text);font-family:var(--mono);font-size:11px}
+.txt:focus{outline:none;border-color:var(--acc)}
+.sel{background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:4px 7px;color:var(--text);font-size:11px;cursor:pointer}
+.ta{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:5px 7px;color:var(--text);font-family:var(--font);font-size:11px;resize:vertical;min-height:50px}
+.ta:focus{outline:none;border-color:var(--acc)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+
+/* Buttons */
+.btn{background:transparent;border:1px solid var(--border);border-radius:3px;padding:3px 10px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;transition:all .12s;white-space:nowrap}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn-acc{border-color:var(--acc);color:var(--acc)}
+.btn-acc:hover{background:rgba(74,240,160,.1)}
+.btn-danger{border-color:var(--danger);color:var(--danger)}
+.btn-danger:hover{background:rgba(240,64,64,.1)}
+.btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
+
+/* File list */
+.file-list{background:var(--bg0);border:1px solid var(--border);border-radius:3px;height:120px;overflow-y:auto;padding:2px}
+.file-list::-webkit-scrollbar{width:5px}
+.file-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.file-item{display:flex;align-items:center;gap:5px;padding:2px 5px;border-radius:2px;font-size:10px;font-family:var(--mono)}
+.file-item:hover{background:var(--bg2)}
+.file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.file-sz{color:var(--text3);min-width:55px;text-align:right;flex-shrink:0}
+.file-st{width:50px;text-align:right;flex-shrink:0;font-size:10px}
+.file-st.uploading{color:var(--info)}.file-st.done{color:var(--acc)}.file-st.error{color:var(--danger)}
+.file-del{color:var(--text3);cursor:pointer;padding:0 3px;flex-shrink:0}
+.file-del:hover{color:var(--danger)}
+.file-empty{color:var(--text3);font-size:10px;padding:6px;text-align:center}
+
+/* Progress */
+.prog-wrap{background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:6px 10px;display:flex;flex-direction:column;gap:5px}
+.prog-bar-bg{height:6px;background:var(--bg2);border-radius:3px;overflow:hidden}
+.prog-bar{height:100%;background:var(--acc);border-radius:3px;transition:width .4s}
+.prog-stats{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;font-family:var(--mono);color:var(--text2)}
+.prog-stat{display:flex;flex-direction:column;gap:1px}
+.prog-stat span:first-child{font-size:9px;color:var(--text3);text-transform:uppercase}
+.prog-stat span:last-child{color:var(--text)}
+
+/* Active uploads */
+.active-uploads{display:flex;flex-direction:column;gap:3px;max-height:100px;overflow-y:auto}
+.active-uploads::-webkit-scrollbar{width:4px}
+.active-uploads::-webkit-scrollbar-thumb{background:var(--border)}
+.upload-item{font-size:10px;font-family:var(--mono);color:var(--text2)}
+.ubar-bg{height:3px;background:var(--bg2);border-radius:2px;overflow:hidden;margin-top:2px}
+.ubar{height:100%;background:var(--info);border-radius:2px;transition:width .3s}
+.ubar.done{background:var(--acc)}
+
+/* Log */
+.log-w{background:var(--bg0);border:1px solid var(--border);border-radius:3px;height:130px;overflow-y:auto;padding:3px 6px;font-family:var(--mono);font-size:10px}
+.log-w::-webkit-scrollbar{width:5px}
+.log-w::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.ll{padding:1px 0;line-height:1.4}
+.ll-ok{color:var(--acc)}.ll-err{color:var(--danger)}.ll-warn{color:var(--warn)}.ll-dim{color:var(--text3)}.ll-info{color:var(--info)}
+
+.dot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex-shrink:0}
+.pill{font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:var(--bg3);color:var(--text2)}
+.pill-run{background:rgba(64,160,240,.2);color:var(--info)}
+.pill-ok{background:rgba(74,240,160,.2);color:var(--acc)}
+.pill-err{background:rgba(240,64,64,.2);color:var(--danger)}
+.opt{display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;color:var(--text2)}
+.opt input{accent-color:var(--acc)}
+.hint{font-size:10px;color:var(--text3);line-height:1.4}
+.warn-box{background:rgba(240,160,48,.08);border:1px solid rgba(240,160,48,.3);border-radius:3px;padding:5px 8px;font-size:10px;color:var(--warn)}
+.chevron{margin-left:auto;font-size:10px;transition:transform .2s}
+.collapsed-hdr .chevron{transform:rotate(-90deg)}
+</style>
+</head>
+<body>
+
+<div class="titlebar">
+  <div class="dot"></div>
+  <div class="titlebar-title">◈ Internet Archive Uploader</div>
+  <span id="pill-status" class="pill">IDLE</span>
+</div>
+
+<div class="main">
+
+  <!-- Credentials -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('cred')">
+      <div class="dot" style="background:var(--warn)"></div>Credentials
+      <span class="chevron" id="chev-cred">▾</span>
+    </div>
+    <div class="panel-body" id="body-cred">
+      <div id="ia-warn" style="display:none" class="warn-box">⚠ internetarchive not installed — run: pip install internetarchive</div>
+      <div class="row">
+        <span class="lbl">Access Key</span>
+        <input class="txt" id="cred-access" type="password" placeholder="IA S3 access key"/>
+        <button class="btn" onclick="toggleShow('cred-access',this)">Show</button>
+      </div>
+      <div class="row">
+        <span class="lbl">Secret Key</span>
+        <input class="txt" id="cred-secret" type="password" placeholder="IA S3 secret key"/>
+        <button class="btn" onclick="toggleShow('cred-secret',this)">Show</button>
+      </div>
+      <div class="row">
+        <button class="btn btn-acc" onclick="saveCreds()">Save</button>
+        <span class="hint">Keys saved locally in ia_credentials.json (gitignored). Get yours at archive.org/account/s3.php</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Item + Metadata combined -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('meta')">
+      <div class="dot" style="background:var(--info)"></div>Item &amp; Metadata
+      <span class="chevron" id="chev-meta">▾</span>
+    </div>
+    <div class="panel-body" id="body-meta">
+      <div class="row">
+        <span class="lbl">Identifier</span>
+        <input class="txt" id="item-id" placeholder="my-rom-collection-2024" oninput="autoTitle()"/>
+        <button class="btn" onclick="fetchMeta()">Fetch</button>
+      </div>
+      <div class="two-col">
+        <div class="row"><span class="lbl">Title</span><input class="txt" id="md-title" placeholder="Title"/></div>
+        <div class="row"><span class="lbl">Creator</span><input class="txt" id="md-creator" placeholder="Creator"/></div>
+        <div class="row"><span class="lbl">Date</span><input class="txt" id="md-date" placeholder="YYYY"/></div>
+        <div class="row"><span class="lbl">Language</span><input class="txt" id="md-lang" placeholder="eng"/></div>
+        <div class="row">
+          <span class="lbl">Media Type</span>
+          <select class="sel" id="md-type">
+            <option value="software">software</option>
+            <option value="image">image</option>
+            <option value="audio">audio</option>
+            <option value="video">video</option>
+            <option value="texts">texts</option>
+            <option value="data">data</option>
+          </select>
+        </div>
+        <div class="row"><span class="lbl">Collection</span><input class="txt" id="md-coll" value="opensource"/></div>
+      </div>
+      <div class="row"><span class="lbl">Subjects</span><input class="txt" id="md-subj" placeholder="games, roms, retro (comma separated)"/></div>
+      <div class="row"><span class="lbl">License URL</span><input class="txt" id="md-lic" placeholder="https://creativecommons.org/licenses/by/4.0/"/></div>
+      <div class="row"><span class="lbl">Description</span><textarea class="ta" id="md-desc" placeholder="Item description..."></textarea></div>
+    </div>
+  </div>
+
+  <!-- Files -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('files')">
+      <div class="dot"></div>Files
+      <span id="files-sum" style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400"></span>
+      <span class="chevron" id="chev-files">▾</span>
+    </div>
+    <div class="panel-body" id="body-files">
+      <div class="row">
+        <button class="btn" onclick="addFiles()">+ Files</button>
+        <button class="btn" onclick="addFolder()">+ Folder</button>
+        <button class="btn btn-danger" onclick="clearFiles()" style="margin-left:auto">Clear</button>
+      </div>
+      <div class="file-list" id="file-list"><div class="file-empty">Add files or a folder</div></div>
+    </div>
+  </div>
+
+  <!-- Options + Upload combined -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('upload')">
+      <div class="dot" style="background:var(--acc)"></div>Upload
+      <span class="chevron" id="chev-upload">▾</span>
+    </div>
+    <div class="panel-body" id="body-upload">
+      <div class="row" style="gap:14px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:10px;color:var(--text2)">Threads</span>
+          <select class="sel" id="opt-threads">
+            <option value="1">1</option>
+            <option value="2" selected>2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
+        </div>
+        <label class="opt"><input type="checkbox" id="opt-checksum" checked> Checksum</label>
+        <label class="opt"><input type="checkbox" id="opt-derive"> Queue derive</label>
+      </div>
+
+      <!-- Overall progress -->
+      <div class="prog-wrap">
+        <div class="prog-bar-bg"><div class="prog-bar" id="prog-bar" style="width:0%"></div></div>
+        <div class="prog-stats">
+          <div class="prog-stat"><span>Files</span><span id="st-files">0/0</span></div>
+          <div class="prog-stat"><span>Size</span><span id="st-bytes">0B/0B</span></div>
+          <div class="prog-stat"><span>Speed</span><span id="st-speed">—</span></div>
+          <div class="prog-stat"><span>ETA</span><span id="st-eta">—</span></div>
+          <div class="prog-stat"><span>Done</span><span id="st-pct">0%</span></div>
+        </div>
+      </div>
+
+      <!-- Active file uploads -->
+      <div class="active-uploads" id="active-uploads"></div>
+
+      <div class="row" style="gap:6px">
+        <button class="btn btn-acc" id="btn-upload" onclick="startUpload()">▶ Upload</button>
+        <button class="btn btn-danger" id="btn-stop" onclick="stopUpload()" disabled>■ Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('log')">
+      <div class="dot"></div>Log
+      <button class="btn" style="margin-left:auto;padding:1px 7px;font-size:9px" onclick="event.stopPropagation();clearLog()">Clear</button>
+      <span class="chevron" id="chev-log">▾</span>
+    </div>
+    <div class="panel-body" id="body-log" style="padding:5px 8px">
+      <div class="log-w" id="log"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let fileList = [];
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('pywebviewready', async () => {
+  const theme = localStorage.getItem('rv_theme');
+  if (theme) document.documentElement.setAttribute('data-theme', theme);
+  const ok = await window.pywebview.api.check_ia_installed();
+  if (!ok) document.getElementById('ia-warn').style.display = 'block';
+  const creds = await window.pywebview.api.load_credentials();
+  if (creds.access_key) document.getElementById('cred-access').value = creds.access_key;
+  if (creds.secret_key) document.getElementById('cred-secret').value = creds.secret_key;
+});
+
+// ── Panel collapse ────────────────────────────────────────────────────────────
+function togglePanel(id) {
+  const body = document.getElementById('body-' + id);
+  const chev = document.getElementById('chev-' + id);
+  const collapsed = body.classList.toggle('collapsed');
+  if (chev) chev.style.transform = collapsed ? 'rotate(-90deg)' : '';
+}
+
+// ── Python events ─────────────────────────────────────────────────────────────
+window.iaEvent = function(event, data) {
+  if (event === 'log') {
+    addLog(data.msg, data.cls);
+  } else if (event === 'uploadStatus') {
+    const pill = document.getElementById('pill-status');
+    const bup  = document.getElementById('btn-upload');
+    const bst  = document.getElementById('btn-stop');
+    if (data.state === 'running') {
+      pill.textContent = 'UPLOADING'; pill.className = 'pill pill-run';
+      bup.disabled = true; bst.disabled = false;
+    } else {
+      const err = data.state === 'error' || data.failed > 0;
+      pill.textContent = data.state === 'error' ? 'ERROR' : err ? 'DONE (errors)' : 'DONE';
+      pill.className = 'pill ' + (err ? 'pill-err' : 'pill-ok');
+      bup.disabled = false; bst.disabled = true;
+    }
+  } else if (event === 'fileStatus') {
+    setFileStatus(data.name, data.status);
+  } else if (event === 'fileProgress') {
+    updateActiveFile(data.name, data.bytes_done, data.total, data.pct, data.speed);
+  } else if (event === 'overallProgress') {
+    document.getElementById('prog-bar').style.width  = data.pct + '%';
+    document.getElementById('st-files').textContent  = data.done + '/' + data.total;
+    document.getElementById('st-bytes').textContent  = fmtSz(data.bytes_done) + '/' + fmtSz(data.total_bytes);
+    document.getElementById('st-speed').textContent  = fmtSz(data.speed) + '/s';
+    document.getElementById('st-eta').textContent    = fmtEta(data.eta);
+    document.getElementById('st-pct').textContent    = data.pct + '%';
+  }
+};
+
+// ── Files ─────────────────────────────────────────────────────────────────────
+async function addFiles() {
+  const paths = await window.pywebview.api.browse_files();
+  if (!paths || !paths.length) return;
+  for (const p of paths) {
+    if (!fileList.find(f => f.path === p))
+      fileList.push({name: p.split(/[\\/]/).pop(), path: p, size: 0});
+  }
+  renderFiles();
+}
+async function addFolder() {
+  const folder = await window.pywebview.api.browse_folder();
+  if (!folder) return;
+  const files = await window.pywebview.api.get_folder_files(folder);
+  for (const f of files)
+    if (!fileList.find(x => x.path === f.path))
+      fileList.push({name: f.rel || f.name, path: f.path, size: f.size});
+  renderFiles();
+}
+function clearFiles() { fileList = []; renderFiles(); }
+function removeFile(i) { fileList.splice(i, 1); renderFiles(); }
+function renderFiles() {
+  const el = document.getElementById('file-list');
+  const total = fileList.reduce((s,f) => s+(f.size||0), 0);
+  document.getElementById('files-sum').textContent =
+    fileList.length ? `${fileList.length} file(s)  ${fmtSz(total)}` : '';
+  if (!fileList.length) {
+    el.innerHTML = '<div class="file-empty">Add files or a folder</div>'; return;
+  }
+  el.innerHTML = '';
+  fileList.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.className = 'file-item'; d.id = 'fi-' + i;
+    d.innerHTML = `<span class="file-name" title="${f.path}">${f.name}</span>`
+      + `<span class="file-sz">${f.size ? fmtSz(f.size) : '—'}</span>`
+      + `<span class="file-st" id="fst-${i}"></span>`
+      + `<span class="file-del" onclick="removeFile(${i})">×</span>`;
+    el.appendChild(d);
+  });
+}
+function setFileStatus(name, status) {
+  document.querySelectorAll('.file-item').forEach(el => {
+    if (el.querySelector('.file-name').textContent === name ||
+        el.querySelector('.file-name').title.endsWith(name)) {
+      const st = el.querySelector('[id^="fst-"]');
+      if (st) { st.textContent = status==='done'?'✓':status==='error'?'✗':status; st.className='file-st '+status; }
+    }
+  });
+}
+
+// ── Active upload progress ────────────────────────────────────────────────────
+function updateActiveFile(name, done, total, pct, speed) {
+  const key = 'af_' + name.replace(/[^a-z0-9]/gi,'_');
+  let el = document.getElementById(key);
+  const container = document.getElementById('active-uploads');
+  if (!el) { el = document.createElement('div'); el.id = key; el.className = 'upload-item'; container.appendChild(el); }
+  el.innerHTML = `<div style="display:flex;justify-content:space-between">`
+    + `<span style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%">${name}</span>`
+    + `<span>${fmtSz(done)}/${fmtSz(total)} · ${fmtSz(speed)}/s</span></div>`
+    + `<div class="ubar-bg"><div class="ubar${pct>=100?' done':''}" style="width:${pct}%"></div></div>`;
+  if (pct >= 100) setTimeout(() => el.parentNode && el.parentNode.removeChild(el), 2000);
+}
+
+// ── Credentials ───────────────────────────────────────────────────────────────
+function toggleShow(id, btn) {
+  const el = document.getElementById(id);
+  el.type = el.type === 'password' ? 'text' : 'password';
+  btn.textContent = el.type === 'password' ? 'Show' : 'Hide';
+}
+async function saveCreds() {
+  const a = document.getElementById('cred-access').value.trim();
+  const s = document.getElementById('cred-secret').value.trim();
+  if (!a||!s) { addLog('Enter both keys.','warn'); return; }
+  const ok = await window.pywebview.api.save_credentials(a, s);
+  addLog(ok ? 'Credentials saved.' : 'Save failed.', ok ? 'ok' : 'err');
+}
+
+// ── Metadata ──────────────────────────────────────────────────────────────────
+function autoTitle() {
+  const id = document.getElementById('item-id').value.trim();
+  const t = document.getElementById('md-title');
+  if (!t.value && id) t.value = id.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+}
+async function fetchMeta() {
+  const id = document.getElementById('item-id').value.trim();
+  if (!id) { addLog('Enter an identifier.','warn'); return; }
+  addLog('Fetching: ' + id + '...', 'info');
+  const a = document.getElementById('cred-access').value.trim();
+  const s = document.getElementById('cred-secret').value.trim();
+  const md = await window.pywebview.api.fetch_item_metadata(id, a, s);
+  if (md.error) { addLog('Error: '+md.error,'err'); return; }
+  if (!md.exists) { addLog('Item does not exist yet.','warn'); return; }
+  document.getElementById('md-title').value   = md.title||'';
+  document.getElementById('md-desc').value    = md.description||'';
+  document.getElementById('md-creator').value = md.creator||'';
+  document.getElementById('md-date').value    = md.date||'';
+  document.getElementById('md-lang').value    = md.language||'';
+  document.getElementById('md-subj').value    = Array.isArray(md.subject)?md.subject.join(', '):(md.subject||'');
+  document.getElementById('md-coll').value    = md.collection||'opensource';
+  document.getElementById('md-lic').value     = md.licenseurl||'';
+  if (md.mediatype) document.getElementById('md-type').value = md.mediatype;
+  addLog('Metadata loaded.','ok');
+}
+
+// ── Upload ────────────────────────────────────────────────────────────────────
+async function startUpload() {
+  if (!fileList.length) { addLog('No files.','warn'); return; }
+  const id = document.getElementById('item-id').value.trim();
+  if (!id) { addLog('Enter an identifier.','warn'); return; }
+  const subj = document.getElementById('md-subj').value.split(',').map(s=>s.trim()).filter(Boolean);
+  document.getElementById('prog-bar').style.width='0%';
+  document.getElementById('active-uploads').innerHTML='';
+  await window.pywebview.api.start_upload({
+    access_key:   document.getElementById('cred-access').value.trim(),
+    secret_key:   document.getElementById('cred-secret').value.trim(),
+    identifier:   id,
+    files:        fileList.map(f=>f.path),
+    concurrency:  parseInt(document.getElementById('opt-threads').value),
+    checksum:     document.getElementById('opt-checksum').checked,
+    queue_derive: document.getElementById('opt-derive').checked,
+    metadata: {
+      title:       document.getElementById('md-title').value.trim(),
+      description: document.getElementById('md-desc').value.trim(),
+      creator:     document.getElementById('md-creator').value.trim(),
+      date:        document.getElementById('md-date').value.trim(),
+      language:    document.getElementById('md-lang').value.trim(),
+      subject:     subj,
+      mediatype:   document.getElementById('md-type').value,
+      collection:  document.getElementById('md-coll').value.trim()||'opensource',
+      licenseurl:  document.getElementById('md-lic').value.trim(),
+    }
+  });
+}
+async function stopUpload() {
+  document.getElementById('btn-stop').disabled = true;
+  await window.pywebview.api.stop_upload();
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function fmtSz(n) {
+  if (!n && n!==0) return '—';
+  const u=['B','KB','MB','GB','TB']; let i=0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++;}
+  return n.toFixed(1)+' '+u[i];
+}
+function fmtEta(s) {
+  if (!s||s<=0) return '—';
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+  return h>0?`${h}h${m}m`:m>0?`${m}m${sec}s`:`${sec}s`;
+}
+function addLog(msg,cls) {
+  const log=document.getElementById('log');
+  const d=document.createElement('div');
+  d.className='ll'+(cls?' ll-'+cls:'');
+  d.textContent='['+new Date().toLocaleTimeString('en-GB')+'] '+msg;
+  log.appendChild(d);
+  while(log.childElementCount>300) log.removeChild(log.firstChild);
+  log.scrollTop=log.scrollHeight;
+}
+function clearLog(){document.getElementById('log').innerHTML='';}
+</script>
+</body>
+</html>

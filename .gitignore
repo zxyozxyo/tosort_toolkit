@@ -28,3 +28,5 @@ xdms.exe
 
 # Optional tool binaries
 7zr.exe
+ia_credentials.json
+tosort_settings_export.json

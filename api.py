@@ -236,7 +236,22 @@ def archive_contains_archive(path: Path) -> bool:
         elif suf == ".rar":
             if not HAS_RAR:
                 return False
+            import re as _re_n
+            _name_l = path.name.lower()
+            # Skip nested check for multi-part RAR sets — they open all parts
+            # and internal content files would be false positives
+            if _re_n.search(r"\.part0*\d+\.rar$", _name_l):
+                return False  # multi-part new-style RAR
+            # Also skip if it's an old-style multi-volume (game.rar + game.r00)
+            _r00_sibling = path.with_suffix(".r00")
+            if _r00_sibling.exists():
+                return False  # multi-volume old-style RAR
             with rarfile.RarFile(path) as rf:
+                try:
+                    if rf.needs_password():
+                        return False
+                except Exception:
+                    pass
                 return any(is_archive(Path(n)) for n in rf.namelist())
     except Exception:
         pass
@@ -315,7 +330,13 @@ def extract_archive(src: Path, dest_dir: Path, overwrite: bool = False) -> list:
     suf = src.suffix.lower()
 
     if suf == ".zip":
-        with zipfile.ZipFile(src, "r") as zf:
+        # Try zipfile_zstd first (supports method 93/ZSTD), fall back to standard zipfile
+        _zf_mod = zipfile
+        try:
+            import zipfile_zstd as _zf_mod  # explicit import overrides module-level patch
+        except ImportError:
+            pass
+        with _zf_mod.ZipFile(src, "r") as zf:
             for member in zf.infolist():
                 out = dest_dir / member.filename
                 if out.exists() and not overwrite:
@@ -484,6 +505,11 @@ class ToSortAPI:
     # ------------------------------------------------------------------ #
     #  Browse dialog                                                       #
     # ------------------------------------------------------------------ #
+    def open_ia_uploader(self):
+        """Open IA Uploader window — handler set by main.py."""
+        if callable(getattr(self, "_ia_uploader_fn", None)):
+            self._ia_uploader_fn()
+
     def open_dat_merger_window(self):
         """Open the DAT merger window from JS."""
         if hasattr(self, "open_dat_merger") and callable(self.open_dat_merger):
@@ -629,9 +655,20 @@ class ToSortAPI:
                 break
             for _f in _files:
                 _fp = Path(_root) / _f
-                if _fp.suffix.lower() in fmt_set:
-                    archives.append(_fp)
+                _suf = _fp.suffix.lower()
+                if _suf not in fmt_set:
+                    continue
+                # Skip RAR continuation parts — only extract from first part (.rar)
+                import re as _re_ext
+                _fname_l = _fp.name.lower()
+                if _re_ext.search(r"\.[rstu]\d{2,3}$", _fname_l):
+                    continue  # .r00-.r99, .s00-.s99 etc
+                m = _re_ext.search(r"\.part0*(\d+)\.rar$", _fname_l)
+                if m and int(m.group(1)) >= 2:
+                    continue  # .part2.rar, .part10.rar etc
+                archives.append(_fp)
 
+        self._log(f"  Found {len(archives)} archive(s) to process", "dim")
         if not archives:
             self._log("No matching archives found.", "warn")
             self._progress(mod_idx, 100, "Nothing to do")
@@ -640,6 +677,30 @@ class ToSortAPI:
         self._log(f"Found {len(archives)} archive(s) in: {src_dir}")
 
         n_ok = n_nested = n_bad = n_pw = 0
+
+        def delete_rar_parts(arc: Path):
+            """Delete all continuation parts of a multi-part RAR after extraction."""
+            import re as _re_dp
+            stem = arc.stem  # e.g. "game" from "game.rar"
+            parent = arc.parent
+            deleted = 0
+            # Old style: game.r00-game.r99, game.s00-game.s99 etc
+            for f in parent.iterdir():
+                if _re_dp.search(r"\.[rstu]\d{2,3}$", f.name.lower()):
+                    if f.stem.lower() == stem.lower() or \
+                       _re_dp.sub(r"\.[rstu]\d{2,3}$", "", f.name.lower()) == stem.lower():
+                        try: f.unlink(); deleted += 1
+                        except Exception: pass
+            # New style: game.part02.rar-game.part99.rar
+            m = _re_dp.match(r"^(.+)\.part0*1\.rar$", arc.name.lower())
+            if m:
+                base = m.group(1)
+                for f in parent.iterdir():
+                    pm = _re_dp.match(r"^(.+)\.part0*(\d+)\.rar$", f.name.lower())
+                    if pm and pm.group(1) == base and int(pm.group(2)) >= 2:
+                        try: f.unlink(); deleted += 1
+                        except Exception: pass
+            return deleted
 
         def move_bad(arc: Path, reason: str):
             """Move a problem archive to bad_dst, or just log if no dest set."""
@@ -740,6 +801,11 @@ class ToSortAPI:
 
                 if del_after and arc.suffix.lower() not in no_del_exts:
                     arc.unlink()
+                    # Also delete continuation parts for multi-part RARs
+                    if arc.suffix.lower() == ".rar":
+                        _nd = delete_rar_parts(arc)
+                        if _nd:
+                            self._log(f"    Deleted {_nd} continuation part(s)", "dim")
                     self._log(f"  DEL  {arc.name}", "warn")
                 elif del_after and arc.suffix.lower() in no_del_exts:
                     self._log(f"  KEEP {arc.name} (no-delete rule)", "dim")
@@ -753,18 +819,33 @@ class ToSortAPI:
                 if is_password_error(e):
                     move_bad(arc, "password protected")
                 elif is_compression_error(e) and arc.suffix.lower() == ".zip":
-                    # ZSTD or unsupported compression — retry with zipfile_zstd
-                    try:
-                        import zipfile_zstd  # ensure patch is applied
-                        arc_out   = out_dir / arc.stem
-                        extracted = extract_archive(arc, arc_out, overwrite=overwrite)
-                        self._log(f"  OK (zstd)  {arc.name}  ({len(extracted)} file(s))", "ok")
-                        n_ok += 1
-                        if del_after and arc.suffix.lower() not in no_del_exts:
-                            arc.unlink()
-                    except Exception as e2:
-                        self._log(f"  SKIP  {arc.name}: ZSTD extraction failed: {e2}", "err")
-                        self._log(f"        (install zipfile-zstd: pip install zipfile-zstd)", "dim")
+                    # ZSTD or unsupported compression — try 7z.exe binary
+                    _7z = _find_7z_binary()
+                    if _7z:
+                        try:
+                            import subprocess as _sp
+                            arc_out = out_dir / arc.stem
+                            arc_out.mkdir(parents=True, exist_ok=True)
+                            result = _sp.run(
+                                [_7z, "x", str(arc), f"-o{arc_out}", "-y", "-p"],
+                                capture_output=True, text=True, timeout=300
+                            )
+                            if result.returncode == 0:
+                                extracted = [str(f) for f in arc_out.rglob("*") if f.is_file()]
+                                self._log(f"  OK (7z)  {arc.name}  ({len(extracted)} file(s))", "ok")
+                                n_ok += 1
+                                if del_after and arc.suffix.lower() not in no_del_exts:
+                                    arc.unlink()
+                            elif any(k in (result.stdout+result.stderr).lower()
+                                     for k in ("password","encrypted")):
+                                move_bad(arc, "password protected")
+                            else:
+                                move_bad(arc, f"7z failed: {result.stderr[:80]}")
+                        except Exception as e2:
+                            move_bad(arc, f"extraction failed: {e2}")
+                    else:
+                        self._log(f"  SKIP  {arc.name}: ZSTD compression not supported.", "err")
+                        self._log(f"        Drop 7zr.exe in app folder for ZSTD zip support.", "dim")
                 elif is_corrupt_error(e):
                     move_bad(arc, f"corrupt/bad: {e}")
                 elif "WinError 32" in str(e) or "being used by another process" in str(e):
@@ -1189,11 +1270,20 @@ class ToSortAPI:
                 ".zip", ".rar", ".7z", ".zst", ".gz", ".tar",
                 ".tgz", ".tar.gz",
             }
-            # Also skip multi-part RAR continuations
+            # Also skip multi-part RAR continuations — BUT only if a matching .rar exists
+            # (avoids treating MAME .s** .t** .u** files as RAR parts)
             import re as _re2
             _fname_l = src_path.name.lower()
-            _is_rar_cont = bool(_re2.search(r"\.[rstu]\d{2,3}$", _fname_l)) or \
-                           bool(_re2.search(r"\.part0*[2-9]\d*\.rar$", _fname_l))
+            _is_rar_ext = bool(_re2.search(r"\.[rstu]\d{2,3}$", _fname_l)) or \
+                          bool(_re2.search(r"\.part0*[2-9]\d*\.rar$", _fname_l))
+            if _is_rar_ext:
+                # Only treat as RAR continuation if a .rar with same stem exists
+                _rar_sibling = src_path.with_suffix(".rar")
+                _stem = _re2.sub(r"\.[rstu]\d{2,3}$", "", src_path.name)
+                _rar_sibling2 = src_path.parent / (_stem + ".rar")
+                _is_rar_cont = _rar_sibling.exists() or _rar_sibling2.exists()
+            else:
+                _is_rar_cont = False
             if raw_ext in SORTER_SKIP_EXTS or _is_rar_cont:
                 if verbose:
                     self._log(f"  SKIP (archive — left for extractor): {src_path.name}", "dim")
@@ -1682,6 +1772,18 @@ class ToSortAPI:
             except Exception:
                 pass
         return {}
+
+    def export_settings_appdir(self) -> dict:
+        """Export settings to app folder without any file dialog."""
+        try:
+            app_dir = Path(__file__).parent
+            export_path = app_dir / "tosort_settings_export.json"
+            ok = self.export_settings(str(export_path))
+            if ok:
+                return {"ok": True, "path": str(export_path)}
+            return {"ok": False, "error": "export_settings returned False"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def export_settings(self, path: str) -> bool:
         """Export all settings to a user-chosen JSON file."""
