@@ -87,6 +87,13 @@ except ImportError:
     HAS_ZST = False
 
 
+def _find_7z_binary() -> str:
+    """Find 7z, 7za, or 7zr binary in app folder or PATH.
+    7zr.exe is the standalone version — handles .7z only but that's fine here.
+    """
+    return _find_tool(["7z.exe", "7za.exe", "7zr.exe", "7z", "7za", "7zr"])
+
+
 def _find_tool(names: list) -> str:
     """Search app folder then PATH for a list of executable names."""
     import shutil as _sh
@@ -202,10 +209,15 @@ def safe_dest(dest_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Archive helpers
 # ---------------------------------------------------------------------------
-ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".zst", ".tar", ".tar.gz", ".tgz"}
+ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".zst", ".tar", ".tar.gz", ".tgz", ".gz"}
+# Nested detection uses a stricter set — .gz alone is NOT a "nested archive"
+NESTED_DETECT_EXTS = {".zip", ".rar", ".7z", ".zst"}
 
 def is_archive(path: Path) -> bool:
-    return path.suffix.lower() in ARCHIVE_EXTS or \
+    """Used for nested archive detection — only real containers count.
+    Does NOT include .gz alone since that would cause false positives.
+    """
+    return path.suffix.lower() in NESTED_DETECT_EXTS or \
            "".join(path.suffixes[-2:]).lower() in {".tar.gz", ".tar.bz2"}
 
 def archive_contains_archive(path: Path) -> bool:
@@ -215,7 +227,8 @@ def archive_contains_archive(path: Path) -> bool:
         if suf == ".zip":
             with zipfile.ZipFile(path, "r") as zf:
                 return any(
-                    is_archive(Path(n)) for n in zf.namelist()
+                    is_archive(Path(n)) or Path(n).suffix.lower() == ".iso"
+                    for n in zf.namelist()
                 )
         elif suf == ".7z" and HAS_7Z:
             with py7zr.SevenZipFile(path, mode="r") as sz:
@@ -273,7 +286,7 @@ def extract_rar_native(src: Path, dest_dir: Path, overwrite: bool = False) -> li
         str(src),
         str(dest_dir) + os.sep,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
     # UnRAR exit codes: 0=OK, 1=warning, 3=CRC error, others=failure
     if result.returncode in (0, 1):
@@ -313,9 +326,40 @@ def extract_archive(src: Path, dest_dir: Path, overwrite: bool = False) -> list:
     elif suf == ".7z":
         if not HAS_7Z:
             raise RuntimeError("py7zr not installed - cannot extract .7z files.")
-        with py7zr.SevenZipFile(src, mode="r") as sz:
-            sz.extractall(path=dest_dir)
-            extracted = [str(dest_dir / n) for n in sz.getnames()]
+        # Try py7zr first; fall back to 7z.exe binary for unsupported methods
+        # (BCJ2 filter, complex filter cascades etc.)
+        try:
+            with py7zr.SevenZipFile(src, mode="r") as sz:
+                sz.extractall(path=dest_dir)
+                extracted = [str(dest_dir / n) for n in sz.getnames()]
+        except Exception as py7zr_err:
+            # Check if it's an unsupported method error
+            err_msg = str(py7zr_err).lower()
+            if any(k in err_msg for k in ("not supported", "bcj", "filter", "cascade", "method")):
+                # Fall back to 7z.exe binary
+                _7z_bin = _find_7z_binary()
+                if _7z_bin:
+                    import subprocess
+                    result = subprocess.run(
+                        [_7z_bin, "x", str(src), f"-o{dest_dir}", "-y", "-p"],
+                        capture_output=True, text=True,
+                        timeout=300
+                    )
+                    combined = (result.stdout + result.stderr).lower()
+                    if result.returncode == 0:
+                        extracted = [str(f) for f in dest_dir.rglob("*") if f.is_file()]
+                    elif any(k in combined for k in ("password", "encrypted", "wrong password", "enter password")):
+                        raise RuntimeError("password protected")
+                    else:
+                        raise RuntimeError(f"7z.exe failed (code {result.returncode}): {result.stderr[:200]}")
+                else:
+                    raise RuntimeError(
+                        f"py7zr cannot handle this 7z compression method. "
+                        f"Drop 7z.exe in the app folder to enable full 7z support. "
+                        f"({py7zr_err})"
+                    )
+            else:
+                raise  # re-raise non-method errors
 
     elif suf == ".rar":
         extracted = extract_rar_native(src, dest_dir, overwrite=overwrite)
@@ -331,6 +375,35 @@ def extract_archive(src: Path, dest_dir: Path, overwrite: bool = False) -> list:
         with open(src, "rb") as f_in, open(out_path, "wb") as f_out:
             dctx.copy_stream(f_in, f_out)
         extracted.append(str(out_path))
+
+    elif suf == ".tar":
+        import tarfile as _tf
+        with _tf.open(src, "r:") as tf:
+            tf.extractall(path=dest_dir)
+            extracted = [str(dest_dir / m.name) for m in tf.getmembers() if m.isfile()]
+
+    elif suf in (".gz", ".tgz") or src.name.lower().endswith(".tar.gz"):
+        import tarfile as _tf
+        name_lower = src.name.lower()
+        if name_lower.endswith(".tar.gz") or suf == ".tgz":
+            # .tar.gz or .tgz — decompress and untar in one step
+            with _tf.open(src, "r:gz") as tf:
+                tf.extractall(path=dest_dir)
+                extracted = [str(dest_dir / m.name) for m in tf.getmembers() if m.isfile()]
+        elif suf == ".gz":
+            # Could be .tar.gz or plain .gz — try tar first
+            try:
+                with _tf.open(src, "r:gz") as tf:
+                    tf.extractall(path=dest_dir)
+                    extracted = [str(dest_dir / m.name) for m in tf.getmembers() if m.isfile()]
+            except _tf.TarError:
+                # Plain .gz single file
+                import gzip, shutil
+                out_name = src.stem  # strip .gz
+                out_path = dest_dir / out_name
+                with gzip.open(src, "rb") as f_in, open(out_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                extracted = [str(out_path)]
 
     elif suf == ".iso":
         extracted = extract_iso(src, dest_dir)
@@ -446,6 +519,10 @@ class ToSortAPI:
         t.start()
 
     def _pipeline_thread(self, config: dict):
+        # Guard against concurrent pipeline runs (e.g. watch firing while running)
+        if self._running:
+            self._log("Pipeline already running — skipping this watch trigger.", "warn")
+            return
         self._running = True
         self._stop_flag.clear()
         self._skip_flag.clear()
@@ -526,7 +603,7 @@ class ToSortAPI:
         nested_dst = Path(cfg.get("nested_dest", "")).expanduser()
         out_dir    = Path(cfg.get("out") or cfg.get("src", "")).expanduser()
         bad_dst    = Path(cfg.get("bad_dest", "")).expanduser() if cfg.get("bad_dest") else None
-        fmt_set      = set(cfg.get("fmts", [".zip", ".rar", ".7z", ".zst"]))
+        fmt_set      = set(cfg.get("fmts", [".zip", ".rar", ".7z", ".zst", ".gz", ".tgz", ".tar"]))
         del_after    = cfg.get("del_after", False)
         overwrite    = cfg.get("overwrite", False)
         # Formats that should never be deleted even if del_after is on
@@ -544,11 +621,16 @@ class ToSortAPI:
             self._progress(mod_idx, 100, "Error")
             return
 
-        # Collect matching archives
-        archives = [
-            f for f in src_dir.rglob("*")
-            if f.is_file() and f.suffix.lower() in fmt_set
-        ]
+        # Collect matching archives using os.walk (interruptible)
+        archives = []
+        self._progress(mod_idx, 1, "Scanning for archives...")
+        for _root, _dirs, _files in os.walk(src_dir):
+            if self._stop_flag.is_set():
+                break
+            for _f in _files:
+                _fp = Path(_root) / _f
+                if _fp.suffix.lower() in fmt_set:
+                    archives.append(_fp)
 
         if not archives:
             self._log("No matching archives found.", "warn")
@@ -585,9 +667,17 @@ class ToSortAPI:
 
         def is_corrupt_error(e: Exception) -> bool:
             msg = str(e).lower()
+            # Exclude compression method errors — those are handled separately
+            if "compression method is not supported" in msg or "compressor" in msg:
+                return False
             return any(k in msg for k in ("crc", "corrupt", "bad archive", "invalid",
                                           "unexpected end", "not a zip", "not a rar",
                                           "broken", "truncated", "bad magic"))
+
+        def is_compression_error(e: Exception) -> bool:
+            msg = str(e).lower()
+            return "compression method is not supported" in msg or \
+                   "compressor" in msg or "method is not supported" in msg
 
         # --- STEP 1: identify and move nested archives ---
         self._log("Scanning for nested archives...", "info")
@@ -655,15 +745,34 @@ class ToSortAPI:
                     self._log(f"  KEEP {arc.name} (no-delete rule)", "dim")
 
             except Exception as e:
+                err_str = str(e)
+                # WinError 32 = file locked by another process — leave in place
+                if "WinError 32" in err_str or "being used by another process" in err_str:
+                    self._log(f"  SKIP  {arc.name}: file locked (in use) — left in place", "warn")
+                    continue
                 if is_password_error(e):
                     move_bad(arc, "password protected")
+                elif is_compression_error(e) and arc.suffix.lower() == ".zip":
+                    # ZSTD or unsupported compression — retry with zipfile_zstd
+                    try:
+                        import zipfile_zstd  # ensure patch is applied
+                        arc_out   = out_dir / arc.stem
+                        extracted = extract_archive(arc, arc_out, overwrite=overwrite)
+                        self._log(f"  OK (zstd)  {arc.name}  ({len(extracted)} file(s))", "ok")
+                        n_ok += 1
+                        if del_after and arc.suffix.lower() not in no_del_exts:
+                            arc.unlink()
+                    except Exception as e2:
+                        self._log(f"  SKIP  {arc.name}: ZSTD extraction failed: {e2}", "err")
+                        self._log(f"        (install zipfile-zstd: pip install zipfile-zstd)", "dim")
                 elif is_corrupt_error(e):
                     move_bad(arc, f"corrupt/bad: {e}")
+                elif "WinError 32" in str(e) or "being used by another process" in str(e):
+                    # File locked — leave in place
+                    self._log(f"  SKIP  {arc.name}: file locked (in use) — left in place", "warn")
                 else:
-                    # Non-corrupt failure (permissions, disk full, etc)
-                    # Log it but do NOT move to bad archives — it may be fine
-                    self._log(f"  SKIP  {arc.name}: {e}", "err")
-                    self._log(f"        (archive left in place — try manually)", "dim")
+                    # All other failures — move to bad archives
+                    move_bad(arc, f"extraction failed: {str(e)[:100]}")
 
             self._progress(mod_idx, 35 + int(((i + 1) / max(len(clean), 1)) * 60), f"Done: {arc.name}")
 
@@ -1000,33 +1109,40 @@ class ToSortAPI:
             if not root or not root.is_dir():
                 return counts
             try:
-                with os.scandir(root) as bucket_it:
-                    for bucket in bucket_it:
-                        if not bucket.is_dir(follow_symlinks=False): continue
-                        with os.scandir(bucket.path) as ext_it:
-                            for ed in ext_it:
-                                if not ed.is_dir(follow_symlinks=False): continue
-                                base = _re.sub(r"_\d+$", "", ed.name)
-                                n = sum(1 for _ in os.scandir(ed.path))
-                                counts[base] = counts.get(base, 0) + n
+                buckets = [b for b in os.scandir(root) if b.is_dir(follow_symlinks=False)]
+                for bi, bucket in enumerate(buckets):
+                    if self._stop_flag.is_set(): return counts
+                    self._progress(mod_idx, 2, f"Recounting... {bucket.name} ({bi+1}/{len(buckets)})")
+                    with os.scandir(bucket.path) as ext_it:
+                        for ed in ext_it:
+                            if self._stop_flag.is_set(): return counts
+                            if not ed.is_dir(follow_symlinks=False): continue
+                            base = _re.sub(r"_\d+$", "", ed.name)
+                            n = sum(1 for _ in os.scandir(ed.path))
+                            counts[base] = counts.get(base, 0) + n
             except Exception:
                 pass
             return counts
 
         # ── Recount both destinations ──────────────────────────────────
         self._log("Recounting destination folders...", "info")
-        self._progress(mod_idx, 2, "Recounting...")
+        self._progress(mod_idx, 2, "Recounting general destination...")
+        self._log(f"  Counting: {gen_dir}", "dim")
         gen_counts = recount(gen_dir)
-        rom_counts = recount(rom_dir) if rom_enable else {}
-        self._log(
-            f"  General: {len(gen_counts)} ext bucket(s)  "
-            + (f"  ROM: {len(rom_counts)} ext bucket(s)" if rom_enable else ""),
-            "dim"
-        )
+        self._log(f"  General: {len(gen_counts)} ext bucket(s)", "dim")
+        if rom_enable:
+            self._progress(mod_idx, 3, "Recounting ROM destination...")
+            self._log(f"  Counting: {rom_dir}", "dim")
+            rom_counts = recount(rom_dir)
+            self._log(f"  ROM: {len(rom_counts)} ext bucket(s)", "dim")
+        else:
+            rom_counts = {}
 
         # ── Collect all files ──────────────────────────────────────────
         self._progress(mod_idx, 5, "Collecting files...")
+        self._log("  Scanning source folder for files...", "dim")
         all_files = []
+        _n_scanned = 0
         for root, dirs, files in os.walk(src_dir):
             rp = Path(root).resolve()
             if rp == gen_dir.resolve() or str(rp).startswith(str(gen_dir.resolve())):
@@ -1036,6 +1152,9 @@ class ToSortAPI:
                     dirs.clear(); continue
             for f in files:
                 all_files.append(Path(root) / f)
+                _n_scanned += 1
+                if _n_scanned % 10000 == 0:
+                    self._progress(mod_idx, 5, f"Collecting files... {_n_scanned:,} found")
 
         if not all_files:
             self._log("No files found in source folder.", "warn")
@@ -1045,16 +1164,40 @@ class ToSortAPI:
 
         total_moved = total_rom = total_comp = total_gen = total_err = 0
 
+        _last_dir = None
+        _last_dir = None
         for i, src_path in enumerate(all_files):
             if self._stop_flag.is_set() or self._skip_flag.is_set():
                 break
 
-            if i % 50 == 0:  # throttle GUI updates for speed
-                pct = 5 + int((i / len(all_files)) * 93)
-                self._progress(mod_idx, pct, f"Sorting: {src_path.name} ({i}/{len(all_files)})")
+            # Log when entering a new source subfolder
+            if src_path.parent != _last_dir:
+                _last_dir = src_path.parent
+                pct = 5 + int((i / max(len(all_files),1)) * 93)
+                self._progress(mod_idx, pct, f"Sorting: {src_path.parent.name}/ ({i}/{len(all_files)})")
+                if verbose:
+                    self._log(f"  [{i+1}/{len(all_files)}] {src_path.parent.name}/", "dim")
+            elif i % 500 == 0 and i > 0:
+                pct = 5 + int((i / max(len(all_files),1)) * 93)
+                self._progress(mod_idx, pct, f"Sorting: {src_path.parent.name}/ ({i}/{len(all_files)})")
 
             raw_ext = src_path.suffix.lower()
             ext_key = raw_ext[1:] if raw_ext else "no_ext"
+
+            # ── SKIP archives — leave them for Module 1 extractor ──
+            SORTER_SKIP_EXTS = {
+                ".zip", ".rar", ".7z", ".zst", ".gz", ".tar",
+                ".tgz", ".tar.gz",
+            }
+            # Also skip multi-part RAR continuations
+            import re as _re2
+            _fname_l = src_path.name.lower()
+            _is_rar_cont = bool(_re2.search(r"\.[rstu]\d{2,3}$", _fname_l)) or \
+                           bool(_re2.search(r"\.part0*[2-9]\d*\.rar$", _fname_l))
+            if raw_ext in SORTER_SKIP_EXTS or _is_rar_cont:
+                if verbose:
+                    self._log(f"  SKIP (archive — left for extractor): {src_path.name}", "dim")
+                continue
 
             # Classify
             is_rom  = rom_enable and ext_key in ROM_EXTS
@@ -1563,29 +1706,56 @@ class ToSortAPI:
         except Exception:
             return None
 
+    def focus_main_window(self):
+        """No-op — kept for JS compatibility."""
+        return True
+
     def browse_save_file(self, default_name: str = "settings.json"):
-        """Open save dialog."""
-        import webview as _wv
-        result = self._window.create_file_dialog(
-            _wv.SAVE_DIALOG,
-            save_filename=default_name,
-            file_types=('JSON Files (*.json)',)
-        )
-        if result:
-            return result if isinstance(result, str) else result[0] if result else None
-        return None
+        """Open save dialog using Windows native dialog via ctypes.
+        Avoids PyWebView multi-window focus issues.
+        """
+        try:
+            import ctypes
+            from ctypes import windll, wintypes
+            import os
+            buf = ctypes.create_unicode_buffer(default_name, 32768)
+            ofn = ctypes.c_void_p
+            # Use simple tkinter fallback which works cross-platform
+            raise NotImplementedError("use tkinter")
+        except Exception:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.lift()
+                root.attributes("-topmost", True)
+                path = filedialog.asksaveasfilename(
+                    initialfile=default_name,
+                    defaultextension=".json",
+                    filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+                )
+                root.destroy()
+                return path if path else None
+            except Exception:
+                return None
 
     def browse_open_file(self):
-        """Open file dialog for JSON."""
-        import webview as _wv
-        result = self._window.create_file_dialog(
-            _wv.OPEN_DIALOG,
-            allow_multiple=False,
-            file_types=('JSON Files (*.json)',)
-        )
-        if result and len(result) > 0:
-            return result[0]
-        return None
+        """Open file dialog using tkinter — avoids PyWebView multi-window issues."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.lift()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+            )
+            root.destroy()
+            return path if path else None
+        except Exception:
+            return None
 
     def save_settings(self, settings: dict) -> bool:
         """Called by JS on close / field change. Persists GUI state."""
@@ -1601,17 +1771,31 @@ class ToSortAPI:
     #  WATCH FOLDER — background timer                                    #
     # ------------------------------------------------------------------ #
     def start_watch(self, config: dict):
-        """Start the watch timer. config includes interval_minutes."""
+        """Start the watch timer. Guards against multiple simultaneous instances."""
+        # Stop any existing watch thread first
+        if hasattr(self, "_watch_stop") and self._watch_stop:
+            self._watch_stop.set()
+        # Small delay to let existing thread see the stop signal
+        time.sleep(0.2)
         self._watch_stop = threading.Event()
         t = threading.Thread(
             target=self._watch_thread, args=(config,), daemon=True
         )
+        t.daemon = True
         t.start()
         return True
 
     def stop_watch(self):
-        if hasattr(self, "_watch_stop"):
+        """Stop watch mode and any running pipeline cleanly."""
+        if hasattr(self, "_watch_stop") and self._watch_stop:
             self._watch_stop.set()
+        # Also stop any running pipeline
+        if hasattr(self, "_stop_flag"):
+            self._stop_flag.set()
+        # Reset running state and notify GUI
+        self._running = False
+        self._emit("globalStatus", {"state": "stopped"})
+        self._emit("watchTick", {"remaining": 0, "total": 1})
         return True
 
     def _watch_thread(self, config: dict):

@@ -25,3 +25,6 @@ xdms.exe
 
 # DAT mtime sidecar files
 *.mtime.json
+
+# Optional tool binaries
+7zr.exe

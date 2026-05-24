@@ -258,6 +258,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
               <label class="opt"><input type="checkbox" id="m0-rar" checked> .rar</label>
               <label class="opt"><input type="checkbox" id="m0-7z" checked> .7z</label>
               <label class="opt"><input type="checkbox" id="m0-zst" checked> .zst (ZSTD)</label>
+              <label class="opt"><input type="checkbox" id="m0-gz" checked> .gz / .tar.gz</label>
+              <label class="opt"><input type="checkbox" id="m0-tar" checked> .tar</label>
               <label class="opt"><input type="checkbox" id="m0-iso"> .iso</label>
               <label class="opt"><input type="checkbox" id="m0-chd"> .chd</label>
               <label class="opt"><input type="checkbox" id="m0-dms"> .dms (Amiga)</label>
@@ -584,8 +586,9 @@ window.pyEvent = function(event, data) {
       setGlobalStatus(data.state);
       if (data.state === 'done' || data.state === 'stopped') {
         pipelineRunning = false;
-        document.getElementById('btn-start').disabled = false;
+        if (!watchArmed) document.getElementById('btn-start').disabled = false;
         document.getElementById('btn-stop').disabled = true;
+        document.getElementById('watch-arm-btn').disabled = false;
         document.getElementById('footer-status').textContent =
           data.state === 'stopped' ? 'Stopped by user.' : 'All modules complete.';
       }
@@ -596,6 +599,7 @@ window.pyEvent = function(event, data) {
 // ─── START ────────────────────────────────────────────────────────────────────
 function startPipeline() {
   if (pipelineRunning) return;
+  if (watchArmed) { addLog('Disarm Watch mode before starting manually.', 'warn'); return; }
   pipelineRunning = true;
   document.getElementById('btn-start').disabled = true;
   document.getElementById('btn-stop').disabled = false;
@@ -615,13 +619,16 @@ function toggleStopMenu() {
 
 function doSkip() {
   document.getElementById('stop-menu').classList.remove('open');
-  addLog('Skipping to next module…', 'warn');
+  addLog('Skipping to next module… (waiting for current operation to finish)', 'warn');
   window.pywebview.api.stop_current();
 }
 
 function doStopAll() {
   document.getElementById('stop-menu').classList.remove('open');
-  addLog('Terminating pipeline…', 'err');
+  addLog('Terminating pipeline… (waiting for current operation to finish)', 'err');
+  // Disable stop button to prevent spamming
+  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('footer-status').textContent = 'Stopping...';
   window.pywebview.api.stop_all();
 }
 
@@ -741,6 +748,10 @@ function toggleWatch() {
     pill.textContent = 'ARMED';
     pill.className   = 'pill pill-running pill-blink';
     addLog('Watch mode armed — interval: ' + mins + ' min.', 'info');
+    // Disable manual Start/Stop while Watch is armed
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled  = true;
+    document.getElementById('btn-start').title    = 'Disarm Watch mode first';
   } else {
     window.pywebview.api.stop_watch();
     btn.textContent  = '\u25B6 Arm Watch';
@@ -750,6 +761,13 @@ function toggleWatch() {
     pill.className   = 'pill pill-idle';
     cd.textContent   = '';
     addLog('Watch mode disarmed.', 'warn');
+    // Force reset all button and pipeline state
+    pipelineRunning = false;
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-start').title    = '';
+    document.getElementById('btn-stop').disabled  = true;
+    document.getElementById('watch-arm-btn').disabled = false;
+    setGlobalStatus('idle');
   }
 }
 
@@ -840,6 +858,8 @@ function buildConfig() {
   if (document.getElementById('m0-rar').checked) fmts.push('.rar');
   if (document.getElementById('m0-7z').checked)  fmts.push('.7z');
   if (document.getElementById('m0-zst').checked) fmts.push('.zst');
+  if (document.getElementById('m0-gz').checked)  { fmts.push('.gz'); fmts.push('.tgz'); }
+  if (document.getElementById('m0-tar').checked) fmts.push('.tar');
   if (document.getElementById('m0-iso').checked) fmts.push('.iso');
   if (document.getElementById('m0-chd').checked) fmts.push('.chd');
   if (document.getElementById('m0-dms').checked) fmts.push('.dms');
@@ -906,22 +926,23 @@ function setTheme(theme) {
 
 async function exportSettings() {
   try {
-    const path = await window.pywebview.api.browse_save_file("tosort_settings.json");
+    const path = await window.pywebview.api.browse_save_file('tosort_settings.json');
     if (path) {
       const ok = await window.pywebview.api.export_settings(path);
-      addLog(ok ? "Settings exported: " + path : "Export failed.", ok ? "ok" : "err");
+      addLog(ok ? 'Settings exported: ' + path : 'Export failed.', ok ? 'ok' : 'err');
     }
-  } catch(e) { addLog("Export error: " + e, "err"); }
+  } catch(e) { addLog('Export error: ' + e, 'err'); }
 }
 async function importSettings() {
   try {
+    // Browse for the JSON file using open dialog
     const path = await window.pywebview.api.browse_open_file();
     if (path) {
       const s = await window.pywebview.api.import_settings(path);
-      if (s) { applySettings(s); addLog("Settings imported: " + path, "ok"); }
-      else { addLog("Import failed.", "err"); }
+      if (s) { applySettings(s); addLog('Settings imported: ' + path, 'ok'); }
+      else { addLog('Import failed.', 'err'); }
     }
-  } catch(e) { addLog("Import error: " + e, "err"); }
+  } catch(e) { addLog('Import error: ' + e, 'err'); }
 }
 
 // ─── DAT Merger window ──────────────────────────────────────────────────────
