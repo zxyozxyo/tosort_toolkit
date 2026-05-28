@@ -2,34 +2,52 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
 
-# Runtime files
+# Runtime / auto-generated files
 settings.json
 dedupe_progress.json
 tosort_report_*.txt
+tosort_settings_export.json
+
+# IA credentials — never commit these
+ia_credentials.json
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS junk
 Thumbs.db
 .DS_Store
 desktop.ini
+ehthumbs.db
 
-# Tools (user drops these in locally)
+# Tool binaries — user drops these in locally, not tracked in repo
 UnRAR.exe
 unrar.exe
+unrar
 chdman.exe
+chdman
 xdms.exe
+xdms
+7z.exe
+7za.exe
+7zr.exe
+7z
+7za
+7zr
+rar.exe
+rar
+WinRAR.exe
 
 # DAT mtime sidecar files
 *.mtime.json
 
-# Optional tool binaries
-7zr.exe
-7z.exe
-rar.exe
-7za.exe
-ia_credentials.json
-tosort_settings_export.json
+# Logs
+*.log
