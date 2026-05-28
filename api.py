@@ -178,14 +178,28 @@ def extract_dms(src: Path, dest_dir: Path) -> list:
         dest = safe_dest(dest_dir / src.name)
         shutil.copy2(str(src), str(dest))
         return [str(dest)]
+    # xdms syntax: xdms u <src> <dest_dir>  (extracts to directory)
+    # Some versions: xdms u <src> +<dest_dir>
+    dest_dir.mkdir(parents=True, exist_ok=True)
     out_path = safe_dest(dest_dir / src.with_suffix('.adf').name)
+    # Try standard syntax first
     result = subprocess.run(
-        [tool, 'u', str(src), str(out_path)],
-        capture_output=True, text=True
+        [tool, 'u', str(src), str(dest_dir) + os.sep],
+        capture_output=True, text=True,
+        stdin=subprocess.DEVNULL
     )
     if result.returncode != 0:
-        raise RuntimeError(f'xdms failed: {result.stderr[:200]}')
-    return [str(out_path)]
+        # Try alternate syntax with output file
+        result = subprocess.run(
+            [tool, 'u', str(src), str(out_path)],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f'xdms failed (code {result.returncode}): {result.stderr[:200]} {result.stdout[:200]}')
+    # Find extracted files
+    extracted = [str(f) for f in dest_dir.iterdir() if f.is_file()]
+    return extracted if extracted else [str(out_path)]
 
 
 
@@ -629,6 +643,7 @@ class ToSortAPI:
         nested_dst = Path(cfg.get("nested_dest", "")).expanduser()
         out_dir    = Path(cfg.get("out") or cfg.get("src", "")).expanduser()
         bad_dst    = Path(cfg.get("bad_dest", "")).expanduser() if cfg.get("bad_dest") else None
+        pw_dst     = Path(cfg.get("pw_dest", "")).expanduser() if cfg.get("pw_dest") else None
         fmt_set      = set(cfg.get("fmts", [".zip", ".rar", ".7z", ".zst", ".gz", ".tgz", ".tar"]))
         del_after    = cfg.get("del_after", False)
         overwrite    = cfg.get("overwrite", False)
@@ -703,23 +718,28 @@ class ToSortAPI:
             return deleted
 
         def move_bad(arc: Path, reason: str):
-            """Move a problem archive to bad_dst, or just log if no dest set."""
+            """Move a problem archive to appropriate folder."""
             nonlocal n_bad, n_pw
-            tag = "[PW]" if "password" in reason.lower() else "[BAD]"
-            if "password" in reason.lower():
+            is_pw = "password" in reason.lower()
+            tag = "[PW]" if is_pw else "[BAD]"
+            if is_pw:
                 n_pw += 1
+                dst = pw_dst if pw_dst else bad_dst
+                folder_name = "_Passworded" if pw_dst else "_BadArchives"
             else:
                 n_bad += 1
-            if bad_dst:
-                bad_dst.mkdir(parents=True, exist_ok=True)
-                dest = safe_dest(bad_dst / arc.name)
+                dst = bad_dst
+                folder_name = "_BadArchives"
+            if dst:
+                dst.mkdir(parents=True, exist_ok=True)
+                dest = safe_dest(dst / arc.name)
                 try:
                     fast_move(arc, dest)
-                    self._log(f"  {tag}  {arc.name}  →  _BadArchives/  ({reason})", "warn")
+                    self._log(f"  {tag}  {arc.name}  →  {folder_name}/  ({reason})", "warn")
                 except Exception as me:
                     self._log(f"  {tag}  {arc.name}  could not move: {me}", "err")
             else:
-                self._log(f"  {tag}  {arc.name}  ({reason})  — no bad-archive folder set", "warn")
+                self._log(f"  {tag}  {arc.name}  ({reason})  — no destination folder set", "warn")
 
         def is_password_error(e: Exception) -> bool:
             msg = str(e).lower()
@@ -1206,18 +1226,24 @@ class ToSortAPI:
             return counts
 
         # ── Recount both destinations ──────────────────────────────────
-        self._log("Recounting destination folders...", "info")
-        self._progress(mod_idx, 2, "Recounting general destination...")
-        self._log(f"  Counting: {gen_dir}", "dim")
-        gen_counts = recount(gen_dir)
-        self._log(f"  General: {len(gen_counts)} ext bucket(s)", "dim")
-        if rom_enable:
-            self._progress(mod_idx, 3, "Recounting ROM destination...")
-            self._log(f"  Counting: {rom_dir}", "dim")
-            rom_counts = recount(rom_dir)
-            self._log(f"  ROM: {len(rom_counts)} ext bucket(s)", "dim")
-        else:
+        skip_recount = cfg.get("skip_recount", False)
+        if skip_recount:
+            self._log("Recount skipped (disabled in settings).", "dim")
+            gen_counts = {}
             rom_counts = {}
+        else:
+            self._log("Recounting destination folders...", "info")
+            self._progress(mod_idx, 2, "Recounting general destination...")
+            self._log(f"  Counting: {gen_dir}", "dim")
+            gen_counts = recount(gen_dir)
+            self._log(f"  General: {len(gen_counts)} ext bucket(s)", "dim")
+            if rom_enable:
+                self._progress(mod_idx, 3, "Recounting ROM destination...")
+                self._log(f"  Counting: {rom_dir}", "dim")
+                rom_counts = recount(rom_dir)
+                self._log(f"  ROM: {len(rom_counts)} ext bucket(s)", "dim")
+            else:
+                rom_counts = {}
 
         # ── Collect all files ──────────────────────────────────────────
         self._progress(mod_idx, 5, "Collecting files...")

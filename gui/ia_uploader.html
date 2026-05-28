@@ -89,7 +89,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 .ubar.done{background:var(--acc)}
 
 /* Log */
-.log-w{background:var(--bg0);border:1px solid var(--border);border-radius:3px;height:130px;overflow-y:auto;padding:3px 6px;font-family:var(--mono);font-size:10px}
+.log-w{background:var(--bg0);border:1px solid var(--border);border-radius:3px;height:130px;overflow-y:auto;padding:3px 6px;font-family:var(--mono);font-size:10px;user-select:text;-webkit-user-select:text;cursor:text}
 .log-w::-webkit-scrollbar{width:5px}
 .log-w::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 .ll{padding:1px 0;line-height:1.4}
@@ -117,6 +117,68 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 </div>
 
 <div class="main">
+
+  <!-- Pre-processor -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('prep')">
+      <div class="dot" style="background:var(--warn)"></div>Pre-process for Upload
+      <span style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400">Group loose archives into letter folders ready for IA</span>
+      <span class="chevron" id="chev-prep">▾</span>
+    </div>
+    <div class="panel-body collapsed" id="body-prep">
+      <div class="row">
+        <span class="lbl">Source</span>
+        <input class="txt" id="prep-src" placeholder="Folder containing archives to process"/>
+        <button class="btn" onclick="browsePrep('prep-src')">Browse</button>
+      </div>
+      <div class="row">
+        <span class="lbl">Mode</span>
+        <select class="sel" id="prep-mode" onchange="togglePrepDst()">
+          <option value="copy">Copy to destination (keep originals)</option>
+          <option value="move">Move in-place (modify source)</option>
+        </select>
+      </div>
+      <div class="row" id="prep-dst-row">
+        <span class="lbl">Destination</span>
+        <input class="txt" id="prep-dst" placeholder="Output folder (copy mode)"/>
+        <button class="btn" onclick="browsePrep('prep-dst')">Browse</button>
+      </div>
+      <div class="row" style="gap:14px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:10px;color:var(--text2)">Size limit</span>
+          <select class="sel" id="prep-size">
+            <option value="536870912">500 MB</option>
+            <option value="1073741824">1 GB</option>
+            <option value="2147483648" selected>2 GB</option>
+            <option value="4294967296">4 GB</option>
+            <option value="8589934592">8 GB</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:10px;color:var(--text2)">Format</span>
+          <select class="sel" id="prep-fmt">
+            <option value="zip">ZIP</option>
+            <option value="rar" selected>RAR</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:2px">
+        Archives grouped by first letter (A-Z), numbers → 0-9, symbols → MISC. 
+        Each group split into A, A2, A3 etc. if over size limit.
+        Requires rar.exe or 7z.exe in app folder for RAR output.
+      </div>
+      <!-- Progress -->
+      <div class="prog-wrap" id="prep-prog-wrap" style="display:none">
+        <div class="prog-bar-bg"><div class="prog-bar" id="prep-bar" style="width:0%;background:var(--warn)"></div></div>
+        <span id="prep-prog-label" style="font-size:10px;color:var(--text2)"></span>
+      </div>
+      <div class="log-w" id="prep-log" style="height:100px;display:none"></div>
+      <div class="row" style="gap:6px">
+        <button class="btn" id="btn-prep" style="border-color:var(--warn);color:var(--warn)" onclick="startPrep()">▶ Run Pre-process</button>
+        <button class="btn btn-danger" id="btn-prep-stop" onclick="stopPrep()" disabled>■ Stop</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Credentials -->
   <div class="panel">
@@ -207,10 +269,16 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <div style="display:flex;align-items:center;gap:6px">
           <span style="font-size:10px;color:var(--text2)">Threads</span>
           <select class="sel" id="opt-threads">
-            <option value="1">1</option>
-            <option value="2" selected>2</option>
+            <option value="1" selected>1 (recommended for new items)</option>
+            <option value="2">2</option>
             <option value="3">3</option>
             <option value="4">4</option>
+            <option value="5">5</option>
+            <option value="6">6</option>
+            <option value="7">7</option>
+            <option value="8">8</option>
+            <option value="10">10</option>
+            <option value="12">12</option>
           </select>
         </div>
         <label class="opt"><input type="checkbox" id="opt-checksum" checked> Checksum</label>
@@ -232,9 +300,29 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
       <!-- Active file uploads -->
       <div class="active-uploads" id="active-uploads"></div>
 
-      <div class="row" style="gap:6px">
+      <div class="row" style="gap:6px;align-items:center">
         <button class="btn btn-acc" id="btn-upload" onclick="startUpload()">▶ Upload</button>
-        <button class="btn btn-danger" id="btn-stop" onclick="stopUpload()" disabled>■ Stop</button>
+        <div style="position:relative;display:inline-block">
+          <button class="btn btn-danger" id="btn-stop" onclick="toggleStopMenu()" disabled>■ Stop ▾</button>
+          <div id="stop-menu" style="display:none;position:absolute;bottom:110%;left:0;background:var(--bg2);border:1px solid var(--border);border-radius:4px;min-width:200px;z-index:99">
+            <div onclick="stopGraceful()" style="padding:6px 10px;cursor:pointer;font-size:11px;color:var(--warn)" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">⏸ Finish current uploads then stop</div>
+            <div onclick="stopInstant()" style="padding:6px 10px;cursor:pointer;font-size:11px;color:var(--danger)" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">■ Stop immediately</div>
+          </div>
+        </div>
+        <span style="font-size:10px;color:var(--text2);margin-left:8px">Threads:</span>
+        <select class="sel" id="opt-threads-live" onchange="updateThreads(this.value)" style="padding:2px 6px">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+          <option value="7">7</option>
+          <option value="8">8</option>
+            <option value="10">10</option>
+            <option value="12">12</option>
+        </select>
+        <span style="font-size:9px;color:var(--text3)">(takes effect after current file)</span>
       </div>
     </div>
   </div>
@@ -262,6 +350,12 @@ window.addEventListener('pywebviewready', async () => {
   if (theme) document.documentElement.setAttribute('data-theme', theme);
   const ok = await window.pywebview.api.check_ia_installed();
   if (!ok) document.getElementById('ia-warn').style.display = 'block';
+  // Reset thread count to 1 on each session start
+  // Use timeout to override any browser form autocomplete
+  setTimeout(() => {
+    document.getElementById('opt-threads').value = '1';
+    document.getElementById('opt-threads-live').value = '1';
+  }, 500);
   const creds = await window.pywebview.api.load_credentials();
   if (creds.access_key) document.getElementById('cred-access').value = creds.access_key;
   if (creds.secret_key) document.getElementById('cred-secret').value = creds.secret_key;
@@ -300,7 +394,7 @@ window.iaEvent = function(event, data) {
     document.getElementById('prog-bar').style.width  = data.pct + '%';
     document.getElementById('st-files').textContent  = data.done + '/' + data.total;
     document.getElementById('st-bytes').textContent  = fmtSz(data.bytes_done) + '/' + fmtSz(data.total_bytes);
-    document.getElementById('st-speed').textContent  = fmtSz(data.speed) + '/s';
+    document.getElementById('st-speed').textContent  = fmtSpeed(data.speed);
     document.getElementById('st-eta').textContent    = fmtEta(data.eta);
     document.getElementById('st-pct').textContent    = data.pct + '%';
   }
@@ -364,7 +458,7 @@ function updateActiveFile(name, done, total, pct, speed) {
   if (!el) { el = document.createElement('div'); el.id = key; el.className = 'upload-item'; container.appendChild(el); }
   el.innerHTML = `<div style="display:flex;justify-content:space-between">`
     + `<span style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%">${name}</span>`
-    + `<span>${fmtSz(done)}/${fmtSz(total)} · ${fmtSz(speed)}/s</span></div>`
+    + `<span>${fmtSz(done)}/${fmtSz(total)} · ${fmtSpeed(speed)}/s</span></div>`
     + `<div class="ubar-bg"><div class="ubar${pct>=100?' done':''}" style="width:${pct}%"></div></div>`;
   if (pct >= 100) setTimeout(() => el.parentNode && el.parentNode.removeChild(el), 2000);
 }
@@ -439,17 +533,119 @@ async function startUpload() {
     }
   });
 }
+function toggleStopMenu() {
+  const m = document.getElementById('stop-menu');
+  m.style.display = m.style.display === 'none' ? 'block' : 'none';
+}
+async function stopGraceful() {
+  document.getElementById('stop-menu').style.display = 'none';
+  addLog('Stopping after current uploads complete...', 'warn');
+  await window.pywebview.api.stop_upload_graceful();
+}
+async function stopInstant() {
+  document.getElementById('stop-menu').style.display = 'none';
+  document.getElementById('btn-stop').disabled = true;
+  addLog('Stopping immediately...', 'err');
+  window.pywebview.api.stop_upload();
+  // Force reset GUI after 3 seconds regardless of backend state
+  setTimeout(() => {
+    document.getElementById('btn-upload').disabled = false;
+    document.getElementById('btn-stop').disabled = true;
+    document.getElementById('pill-status').textContent = 'STOPPED';
+    document.getElementById('pill-status').className = 'pill';
+  }, 3000);
+}
+async function updateThreads(val) {
+  document.getElementById('opt-threads').value = val;
+  await window.pywebview.api.set_concurrency(parseInt(val));
+  addLog('Concurrency changed to ' + val + ' thread(s) — takes effect after current file.', 'dim');
+}
+// Sync live thread selector with main selector
+document.addEventListener('change', e => {
+  if (e.target.id === 'opt-threads') {
+    const live = document.getElementById('opt-threads-live');
+    if (live) live.value = e.target.value;
+  }
+});
+// Close stop menu on outside click
+document.addEventListener('click', e => {
+  if (!e.target.closest('#btn-stop') && !e.target.closest('#stop-menu')) {
+    const m = document.getElementById('stop-menu');
+    if (m) m.style.display = 'none';
+  }
+});
 async function stopUpload() {
   document.getElementById('btn-stop').disabled = true;
   await window.pywebview.api.stop_upload();
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+// ── Pre-processor ─────────────────────────────────────────────────────────────
+function togglePrepDst() {
+  const mode = document.getElementById('prep-mode').value;
+  document.getElementById('prep-dst-row').style.display = mode === 'copy' ? '' : 'none';
+}
+async function browsePrep(id) {
+  const path = await window.pywebview.api.browse_folder_prep();
+  if (path) document.getElementById(id).value = path;
+}
+async function startPrep() {
+  const src = document.getElementById('prep-src').value.trim();
+  if (!src) { addPrepLog('Select a source folder.', 'warn'); return; }
+  document.getElementById('prep-prog-wrap').style.display = '';
+  document.getElementById('prep-log').style.display = '';
+  document.getElementById('btn-prep').disabled = true;
+  document.getElementById('btn-prep-stop').disabled = false;
+  await window.pywebview.api.start_prep({
+    src:        src,
+    dst:        document.getElementById('prep-dst').value.trim(),
+    mode:       document.getElementById('prep-mode').value,
+    size_limit: parseInt(document.getElementById('prep-size').value),
+    format:     document.getElementById('prep-fmt').value,
+  });
+}
+async function stopPrep() {
+  document.getElementById('btn-prep-stop').disabled = true;
+  await window.pywebview.api.stop_prep();
+}
+window.prepEvent = function(event, data) {
+  if (event === 'prepLog') {
+    addPrepLog(data.msg, data.cls);
+  } else if (event === 'prepProgress') {
+    document.getElementById('prep-bar').style.width = data.pct + '%';
+    document.getElementById('prep-prog-label').textContent = data.label || '';
+  } else if (event === 'prepStatus') {
+    const running = data.state === 'running';
+    document.getElementById('btn-prep').disabled = running;
+    document.getElementById('btn-prep-stop').disabled = !running;
+    if (data.state === 'done') {
+      addPrepLog('Done — ' + (data.created||0) + ' archive(s) created, ' + (data.errors||0) + ' error(s).', data.errors ? 'warn' : 'ok');
+    }
+  }
+};
+function addPrepLog(msg, cls) {
+  const log = document.getElementById('prep-log');
+  if (!log) return;
+  const d = document.createElement('div');
+  d.className = 'll' + (cls ? ' ll-' + cls : '');
+  d.textContent = '[' + new Date().toLocaleTimeString('en-GB') + '] ' + msg;
+  log.appendChild(d);
+  while (log.childElementCount > 200) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+
 function fmtSz(n) {
   if (!n && n!==0) return '—';
   const u=['B','KB','MB','GB','TB']; let i=0;
   while(n>=1024&&i<u.length-1){n/=1024;i++;}
   return n.toFixed(1)+' '+u[i];
+}
+function fmtSpeed(bytesPerSec) {
+  // Always show in KB/s for consistency
+  if (!bytesPerSec && bytesPerSec !== 0) return '—';
+  const kbs = bytesPerSec / 1024;
+  if (kbs < 1024) return kbs.toFixed(1) + ' KB/s';
+  return (kbs / 1024).toFixed(2) + ' MB/s';
 }
 function fmtEta(s) {
   if (!s||s<=0) return '—';
