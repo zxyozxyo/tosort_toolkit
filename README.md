@@ -10,8 +10,6 @@ A PyWebView desktop application for cleaning and managing ROM collections with R
 Python 3.10 or later recommended.
 
 ### Python Libraries
-Install all required libraries with:
-
 ```
 pip install pywebview py7zr rarfile zstandard internetarchive requests
 ```
@@ -25,20 +23,61 @@ pip install pywebview py7zr rarfile zstandard internetarchive requests
 | `internetarchive` | Internet Archive upload API |
 | `requests` | HTTP for IA uploads |
 
-### Optional Tool Binaries
-Place these in the same folder as `main.py`:
+---
+
+## Folder Structure
+
+```
+tosort_toolkit/
+├── main.py               # Entry point
+├── api.py                # Main pipeline backend
+├── dat_merger.py         # DAT tools backend
+├── ia_uploader.py        # IA uploader backend
+├── ia_prepper.py         # IA archive pre-processor
+├── ia_folder_packer.py   # IA folder packer
+├── rclone_gui.py         # RClone uploader GUI
+├── gui/                  # HTML frontends
+│   ├── index.html
+│   ├── dat_merger.html
+│   ├── ia_uploader.html
+│   └── ia_folder_packer.html
+├── apps/                 # Drop tool binaries here (gitignored)
+│   ├── rar.exe
+│   ├── 7z.exe
+│   ├── 7za.exe
+│   ├── UnRAR.exe
+│   ├── chdman.exe
+│   └── xdms.exe
+└── rclone/               # Drop rclone files here (gitignored)
+    ├── rclone.exe
+    └── rclone.conf       # Auto-created when saving credentials
+```
+
+---
+
+## Tool Binaries
+
+Place binaries in the `apps/` subfolder (created manually). All scripts search `apps/` automatically.
 
 | File | Purpose | Where to get |
 |---|---|---|
-| `UnRAR.exe` | RAR extraction (required for RAR files) | rarlab.com |
-| `7z.exe` | 7z extraction + RAR/ZIP creation for prepper | 7-zip.org |
-| `7za.exe` | Standalone 7z (alternative to 7z.exe) | 7-zip.org |
-| `7zr.exe` | Minimal 7z (handles .7z only, cannot create RAR) | 7-zip.org |
-| `rar.exe` | Native RAR creation for prepper | rarlab.com (WinRAR) |
+| `rar.exe` | RAR creation (required for RAR output) | rarlab.com |
+| `UnRAR.exe` | RAR extraction | rarlab.com |
+| `7z.exe` | 7z/ZIP extraction and creation | 7-zip.org |
+| `7za.exe` | Standalone 7z (alternative) | 7-zip.org |
+| `7zr.exe` | Minimal 7z (.7z only, cannot create RAR) | 7-zip.org |
 | `chdman.exe` | CHD file handling | MAME project |
 | `xdms.exe` | Amiga DMS extraction | Various Amiga sources |
 
-**Note:** For the IA Prepper RAR output, you need either `rar.exe` or `7z.exe`/`7za.exe`. `7zr.exe` alone cannot create RAR archives.
+**Notes:**
+- For RAR output in the IA pre-processors, `rar.exe` is preferred. `7z.exe` can create RAR but requires the optional RAR plugin (most builds don't include it).
+- `7zr.exe` alone cannot create RAR archives — use `7z.exe` or `rar.exe`.
+
+---
+
+## RClone Setup
+
+Place `rclone.exe` in the `rclone/` subfolder (created manually). The `rclone.conf` file is auto-created there when you save credentials in the RClone GUI.
 
 ---
 
@@ -50,20 +89,16 @@ python main.py
 
 ---
 
-## Windows Files (gitignored)
-These files are gitignored and must be added manually to the app folder:
+## Gitignored Files
+These are never committed and must be set up locally:
 
 ```
-settings.json               # Auto-saved settings
-ia_credentials.json         # IA S3 API keys
-tosort_settings_export.json # Exported settings backup
-7zr.exe
-UnRAR.exe
-chdman.exe
-xdms.exe
-7z.exe
-7za.exe
-rar.exe
+apps/                     # All tool binaries
+rclone/                   # rclone.exe and rclone.conf
+settings.json             # Auto-saved pipeline settings
+ia_credentials.json       # IA S3 keys for Python uploader
+ia_folder_packer.json     # Folder packer saved settings
+tosort_settings_export.json
 ```
 
 ---
@@ -74,121 +109,106 @@ rar.exe
 
 **Module 1 — Archive Extractor**
 Recursively extracts archives from a source folder.
-- Supported formats: ZIP, RAR, 7z, ZSTD, GZ/TAR.GZ, TGZ, TAR, ISO, CHD, DMS
-- Nested archive detection and extraction
-- Bad archive → `_BadArchives` folder
-- Password-protected archives → configurable `_Passworded` folder (falls back to `_BadArchives`)
-- Multi-part RAR support (.part01.rar or .rar + .r00 style)
-- ZSTD ZIP support via 7z.exe fallback
-- BCJ2/complex 7z filter support via 7z.exe fallback
+- Supported: ZIP, RAR, 7z, ZSTD, GZ/TAR.GZ, TGZ, TAR, ISO, CHD, DMS
+- Nested archive detection
+- Bad archives → `_BadArchives` folder
+- Password archives → configurable `_Passworded` folder
+- Multi-part RAR support
+- ZSTD ZIP and BCJ2/complex 7z via 7z.exe fallback
 
 **Module 2 — File Sorter**
 Sorts extracted files into destination buckets by extension.
-- Single destination or two-destination mode (General + ROM)
+- Single or two-destination mode (General + ROM)
 - ROM extension awareness
-- Skips archives (left for extractor)
-- MAME file awareness (.u01, .s00 etc. not treated as RAR parts unless .rar sibling exists)
+- MAME file detection
 - Per-folder progress logging
-- Skip recount option for faster starts on large destinations
+- Skip recount option for faster starts
 
 **Watch Mode**
 Monitors source folder and runs pipeline automatically on new files.
 
 **Settings**
-- Export settings to `tosort_settings_export.json` in app folder
-- Import settings from JSON file
+- Export to `tosort_settings_export.json`
+- Import from JSON file
 - Auto-saves to `settings.json`
 
 ---
 
 ### DAT Tools (dat_merger.html)
-Nine-tab DAT management suite:
-- DAT Merger — combine multiple DAT files
-- DAT Splitter — split DATs by platform/region
-- DAT Cleaner — remove unwanted entries
-- DAT Rebuilder — rebuild ROM sets from DATs
-- DAT Creator (File-based) — create DATs from files
-- DAT Creator (Folder-based) — create scene-format DATs from folder structure
-- Header Editor — edit DAT metadata
-- Diff Tool — compare two DATs
-- Batch Rename — rename files by DAT
+Nine-tab DAT management suite: Merger, Splitter, Cleaner, Rebuilder, DAT Creator (file-based), DAT Creator (folder-based), Header Editor, Diff Tool, Batch Rename.
 
 ---
 
 ### Internet Archive Uploader (ia_uploader.html)
-Upload collections to archive.org.
+Upload collections directly to archive.org using the IA S3 API.
 
-**Setup**
-1. Get your S3 API keys from: `archive.org/account/s3.php`
-2. Enter keys in the Credentials panel and click Save
+**Setup:** Get S3 keys from `archive.org/account/s3.php` and enter in the Credentials panel.
 
-**Pre-process Panel**
-Groups loose archives into letter-named RAR/ZIP files before upload — ideal for large collections like TOSEC where thousands of loose files would stall IA folders.
-- Source folder → recursively finds leaf folders containing archives
-- Groups by first character: A-Z, 0-9, MISC
-- Splits into A, A2, A3 etc. if group exceeds size limit
-- Output format: RAR (requires rar.exe or 7z.exe) or ZIP
-- Copy mode: mirrors structure to destination, originals untouched
-- Move mode: works in-place, originals deleted after archiving
+**Features:**
+- 1–12 concurrent upload threads
+- Skip detection (pre-fetches IA file list)
+- Stall detection (30s no-progress abort)
+- Rate limit handling (auto-retry on 503/429)
+- Graceful or instant stop
+- Live thread count adjustment
 
-**Upload Panel**
-- Upload to new or existing IA items
-- Fetch existing metadata with the Fetch button
-- 1-12 concurrent upload threads
-- Skip detection: pre-fetches IA file list, skips already-uploaded files (by filename)
-- Stall detection: aborts files with no progress for 30 seconds
-- Rate limit handling: auto-waits 60s and retries on 503/429
-- Bucket deleted detection: stops upload if IA removes the item
-- Stop options: graceful (finish current) or instant (abort all)
-- Live thread count adjustment mid-upload
+**IA Pre-processor (within IA Uploader)**
+Groups loose archives into letter-named RAR/ZIP files before upload — ideal for large TOSEC sets.
+- Groups by first character: A–Z, 0–9, MISC
+- Splits into `A`, `A_2`, `A_3` etc. when group exceeds size limit
+- Copy mode or move mode
+- RAR or ZIP output
+- Full Unicode filename support (ø, ü, accented chars etc.)
+- Network share safe (list files written to local temp)
 
-**IA Upload Tips**
-- IA throttles each connection to ~500 KB/s — use multiple threads for better throughput
-- New items: start with 1 thread to avoid rate limiting during item creation
-- Existing items: 4-8 threads typically gives best throughput
-- A VPN can improve per-connection speeds from some regions
-- Queue derive OFF recommended for ROM/archive collections
+---
+
+### IA Folder Packer (ia_folder_packer.html)
+Packs each leaf folder containing archives into a single archive.
+
+Intelligently finds the deepest folder containing archives and packs the whole folder as one file, preserving relative structure.
+
+**Example:**
+```
+TOSEC/Commodore/C64/Games/[D64]/  →  [D64].rar
+TOSEC/Commodore/[D64]/            →  [D64].rar
+```
+
+- Copy mode: output mirrors structure under destination, originals untouched
+- Move mode: archives created alongside source folder, originals deleted
+- RAR or ZIP output
+- Unicode filename support
+- Network share safe
+
+---
+
+### RClone IA Uploader (rclone_gui.html)
+Standalone rclone wrapper for IA uploads. Accessible from the main titlebar or run independently with `python rclone_gui.py`.
+
+**Setup:** Enter IA S3 keys and click Save Credentials — writes `rclone/rclone.conf` automatically.
+
+**Features:**
+- 1–12 transfer threads
+- Derive toggle (written to rclone.conf)
+- Verbose selector (-v or -vv)
+- Wait-archive timer
+- Checksum toggle
+- Fetch button (pulls existing IA item metadata)
+- Restart button (stop + change settings + resume, rclone skips already-uploaded files)
+- Full rclone log output with colour coding
+
+**Speed:** rclone typically achieves significantly higher throughput than the Python uploader due to more efficient connection handling.
 
 ---
 
 ## Internet Archive Identifier Rules
-- 5-100 characters
+- 5–100 characters
 - Letters, numbers, dots, hyphens, underscores only
 - Must start with a letter or number
-- Must be globally unique on archive.org
-- Check availability: `archive.org/details/your-identifier`
+- Globally unique on archive.org
+- Check: `archive.org/details/your-identifier`
 
 ---
 
 ## Themes
-Five themes available via the dropdown in the main titlebar:
-Dark (default), Amber, Slate Blue, Red, Light
-
-Theme preference is saved to localStorage and restored on next launch including DAT Tools and IA Uploader windows.
-
----
-
-## Architecture
-
-```
-main.py              Entry point, opens all windows
-api.py               Main pipeline backend
-dat_merger.py        DAT tools backend  
-ia_uploader.py       IA uploader backend
-ia_prepper.py        IA pre-processor backend
-gui/index.html       Main pipeline GUI
-gui/dat_merger.html  DAT tools GUI
-gui/ia_uploader.html IA uploader + pre-processor GUI
-```
-
----
-
-## Changelog highlights
-- Multi-part RAR extraction and cleanup
-- ZSTD ZIP and BCJ2 7z fallback via 7z.exe
-- DMS extraction with multiple argument patterns
-- MAME file detection (.u01/.s00 etc.)
-- IA uploader with concurrent uploads and progress tracking
-- IA pre-processor for grouping loose archives
-- Password archive folder separation
-- Skip recount toggle for faster sorter starts
+Dark (default), Amber, Slate Blue, Red, Light — saved to localStorage.

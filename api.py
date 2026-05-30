@@ -57,6 +57,7 @@ try:
         r'C:\Program Files (x86)\WinRAR\UnRAR.exe',
         r'C:\Program Files\WinRAR\Rar.exe',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'UnRAR.exe'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'apps', 'UnRAR.exe'),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'unrar.exe'),
     ]
     for _c in _UNRAR_CANDIDATES:
@@ -95,13 +96,19 @@ def _find_7z_binary() -> str:
 
 
 def _find_tool(names: list) -> str:
-    """Search app folder then PATH for a list of executable names."""
+    """Search app folder, apps/ subfolder, then PATH for tool binaries."""
     import shutil as _sh
     app_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [
+        app_dir,
+        os.path.join(app_dir, "apps"),
+        os.path.join(app_dir, "rclone"),
+    ]
     for name in names:
-        local = os.path.join(app_dir, name)
-        if os.path.isfile(local):
-            return local
+        for d in search_dirs:
+            local = os.path.join(d, name)
+            if os.path.isfile(local):
+                return local
         found = _sh.which(name)
         if found:
             return found
@@ -137,7 +144,7 @@ def extract_chd(src: Path, dest_dir: Path) -> list:
     # Try to detect CHD type and extract to appropriate format
     # First run info to determine type
     info = subprocess.run([chdman, 'info', '-i', str(src)],
-                          capture_output=True, text=True)
+                          capture_output=True, encoding="utf-8", errors="replace")
     chd_type = 'cdrom'  # default
     for line in info.stdout.splitlines():
         if 'CD-ROM' in line or 'cdrom' in line.lower():
@@ -153,7 +160,7 @@ def extract_chd(src: Path, dest_dir: Path) -> list:
     cmd_map  = {'cdrom': 'extractcd', 'hd': 'extracthd', 'dvd': 'extractdvd'}
     cmd = [chdman, cmd_map.get(chd_type, 'extractcd'),
            '-i', str(src), '-o', str(out_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError(f'chdman failed: {result.stderr[:200]}')
     extracted = [str(out_path)]
@@ -185,14 +192,14 @@ def extract_dms(src: Path, dest_dir: Path) -> list:
     # Try standard syntax first
     result = subprocess.run(
         [tool, 'u', str(src), str(dest_dir) + os.sep],
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8", errors="replace",
         stdin=subprocess.DEVNULL
     )
     if result.returncode != 0:
         # Try alternate syntax with output file
         result = subprocess.run(
             [tool, 'u', str(src), str(out_path)],
-            capture_output=True, text=True,
+            capture_output=True, encoding="utf-8", errors="replace",
             stdin=subprocess.DEVNULL
         )
     if result.returncode != 0:
@@ -315,7 +322,7 @@ def extract_rar_native(src: Path, dest_dir: Path, overwrite: bool = False) -> li
         str(src),
         str(dest_dir) + os.sep,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
 
     # UnRAR exit codes: 0=OK, 1=warning, 3=CRC error, others=failure
     if result.returncode in (0, 1):
@@ -377,7 +384,7 @@ def extract_archive(src: Path, dest_dir: Path, overwrite: bool = False) -> list:
                     import subprocess
                     result = subprocess.run(
                         [_7z_bin, "x", str(src), f"-o{dest_dir}", "-y", "-p"],
-                        capture_output=True, text=True,
+                        capture_output=True, encoding="utf-8", errors="replace",
                         timeout=300
                     )
                     combined = (result.stdout + result.stderr).lower()
@@ -848,7 +855,7 @@ class ToSortAPI:
                             arc_out.mkdir(parents=True, exist_ok=True)
                             result = _sp.run(
                                 [_7z, "x", str(arc), f"-o{arc_out}", "-y", "-p"],
-                                capture_output=True, text=True, timeout=300
+                                capture_output=True, encoding="utf-8", errors="replace", timeout=300
                             )
                             if result.returncode == 0:
                                 extracted = [str(f) for f in arc_out.rglob("*") if f.is_file()]

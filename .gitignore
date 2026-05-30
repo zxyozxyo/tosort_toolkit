@@ -12,9 +12,12 @@ settings.json
 dedupe_progress.json
 tosort_report_*.txt
 tosort_settings_export.json
+ia_folder_packer.json
 
-# IA credentials — never commit these
+# Credentials — never commit these
 ia_credentials.json
+rclone_ia.json
+rclone.conf
 
 # IDE
 .vscode/
@@ -28,7 +31,13 @@ Thumbs.db
 desktop.ini
 ehthumbs.db
 
-# Tool binaries — user drops these in locally, not tracked in repo
+# apps/ folder — user drops binaries here locally, not tracked
+apps/
+
+# rclone/ folder — user drops rclone.exe and config here locally
+rclone/
+
+# Tool binaries in root (legacy location, also ignored)
 UnRAR.exe
 unrar.exe
 unrar
@@ -45,9 +54,15 @@ xdms
 rar.exe
 rar
 WinRAR.exe
+rclone.exe
 
 # DAT mtime sidecar files
 *.mtime.json
 
 # Logs
 *.log
+
+# Temp list files (created during archive operations)
+_filelist_.lst
+_prep_*.lst
+_fp_*.lst

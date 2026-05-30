@@ -61,11 +61,12 @@ class IAPrepperAPI:
         if not self._window:
             return
         try:
-            import json as _j
-            payload = _j.dumps(data, ensure_ascii=True).replace("'", "\\'")
-            self._window.evaluate_js(
-                f"window.prepEvent('{event}', JSON.parse('{payload}'))"
-            )
+            import json as _j, base64 as _b64
+            b64 = _b64.b64encode(
+                _j.dumps(data, ensure_ascii=False).encode("utf-8")
+            ).decode("ascii")
+            js = "(function(){var d=JSON.parse(atob('"+b64+"'));window.prepEvent('"+event+"',d);})()"
+            self._window.evaluate_js(js)
         except Exception:
             pass
 
@@ -94,9 +95,9 @@ class IAPrepperAPI:
 
         src_dir    = Path(config.get("src", "")).expanduser()
         dst_dir    = Path(config.get("dst", "")).expanduser() if config.get("dst") else None
-        mode       = config.get("mode", "copy")  # "copy" or "move"
-        size_limit = int(config.get("size_limit", 2 * 1024**3))  # bytes
-        fmt        = config.get("format", "zip").lower()  # "rar" or "zip"
+        mode       = config.get("mode", "copy")
+        size_limit = int(config.get("size_limit", 2 * 1024**3))
+        fmt        = config.get("format", "zip").lower()
 
         if not src_dir.is_dir():
             self._log(f"ERROR: Source folder not found: {src_dir}", "err")
@@ -110,14 +111,20 @@ class IAPrepperAPI:
             self._emit("prepStatus", {"state": "error"})
             return
 
-        # Find RAR/ZIP tool
         _rar = self._find_tool(["rar.exe", "rar", "WinRAR.exe"])
-        _7z  = self._find_tool(["7z.exe", "7za.exe", "7zr.exe", "7z", "7za"])
+        # Prefer 7z.exe/7za.exe over 7zr.exe — 7zr cannot create RAR
+        _7z  = self._find_tool(["7z.exe", "7za.exe", "7z", "7za"])
+        if not _7z:  # fall back to 7zr only if nothing else found
+            _7z = self._find_tool(["7zr.exe", "7zr"])
 
-        if fmt == "rar" and not _rar:
-            if _7z:
-                self._log("rar.exe not found — falling back to 7z for RAR creation.", "warn")
-                _rar = None
+        if fmt == "rar":
+            if _rar:
+                # Use rar.exe — 7z RAR creation requires optional plugin
+                self._log(f"Using rar.exe for RAR creation: {_rar}", "dim")
+                _7z_for_rar = None  # signal to use rar path
+            elif _7z:
+                self._log(f"rar.exe not found — trying 7z for RAR: {_7z}", "warn")
+                _7z_for_rar = _7z
             else:
                 self._log("ERROR: No archiver found. Drop rar.exe or 7z.exe in app folder.", "err")
                 self._running = False
@@ -149,108 +156,107 @@ class IAPrepperAPI:
             if self._stop_flag.is_set():
                 break
 
-            pct = int((n_done / total) * 100)
-            self._progress(pct, f"Processing: {folder.name}/")
-            self._log(f"\nFolder: {folder}", "info")
-
-            # Relative path from source root
             try:
-                rel = folder.relative_to(src_dir)
-            except ValueError:
-                rel = Path(folder.name)
+                pct = int((n_done / total) * 100)
+                self._progress(pct, f"Processing: {folder.name}/")
+                self._log(f"\nFolder: {folder}", "info")
 
-            # Determine working dir
-            # Include the source root folder name so structure is preserved
-            if mode == "copy":
-                work_dir = dst_dir / src_dir.name / rel
-                work_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                work_dir = folder
+                # Relative path from source root
+                try:
+                    rel = folder.relative_to(src_dir)
+                except ValueError:
+                    rel = Path(folder.name)
 
-            # Get all archives in this folder
-            archives = sorted([
-                f for f in folder.iterdir()
-                if f.is_file() and f.suffix.lower() in ARCHIVE_EXTS
-            ], key=lambda x: x.name.lower())
+                # Determine working dir
+                if mode == "copy":
+                    work_dir = dst_dir / src_dir.name / rel
+                    work_dir.mkdir(parents=True, exist_ok=True)
+                else:
+                    work_dir = folder
 
-            if not archives:
-                n_done += 1
-                continue
+                # Get all archives in this folder
+                archives = sorted([
+                    f for f in folder.iterdir()
+                    if f.is_file() and f.suffix.lower() in ARCHIVE_EXTS
+                ], key=lambda x: x.name.lower())
 
-            self._log(f"  {len(archives)} archive(s) — grouping by letter...", "dim")
+                if not archives:
+                    n_done += 1
+                    continue
 
-            # Group by letter
-            groups: dict = {}  # letter -> list of Path
-            for arc in archives:
-                letter = get_letter_group(arc.name)
-                groups.setdefault(letter, []).append(arc)
+                self._log(f"  {len(archives)} archive(s) — grouping by letter...", "dim")
 
-            # Process each letter group
-            for letter in sorted(groups.keys()):
-                if self._stop_flag.is_set():
-                    break
+                # Group by letter
+                groups: dict = {}
+                for arc in archives:
+                    letter = get_letter_group(arc.name)
+                    groups.setdefault(letter, []).append(arc)
 
-                files = groups[letter]
-                # Split into size-limited batches
-                batches = self._split_by_size(files, size_limit)
-
-                for batch_idx, batch in enumerate(batches):
+                # Process each letter group
+                for letter in sorted(groups.keys()):
                     if self._stop_flag.is_set():
                         break
 
-                    # Determine archive name
-                    suffix = str(batch_idx + 1) if batch_idx > 0 else ""
-                    arc_stem = f"{letter}{suffix}"
-                    arc_name = f"{arc_stem}.{fmt}"
-                    arc_path = work_dir / arc_name
+                    files = groups[letter]
+                    batches = self._split_by_size(files, size_limit)
+                    self._log(f"  letter={letter} files={len(files)} batches={len(batches)}", "dim")
 
-                    batch_size = sum(f.stat().st_size for f in batch)
-                    self._log(
-                        f"  Creating {arc_name}  "
-                        f"({len(batch)} files, {self._fmt_size(batch_size)})", "dim"
-                    )
+                    for batch_idx, batch in enumerate(batches):
+                        if self._stop_flag.is_set():
+                            break
 
-                    # Copy files to work_dir first if copy mode
-                    files_to_archive = []
-                    if mode == "copy":
-                        for f in batch:
-                            dst_f = work_dir / f.name
-                            if not dst_f.exists():
-                                shutil.copy2(f, dst_f)
-                            files_to_archive.append(dst_f)
-                    else:
-                        files_to_archive = batch
+                        suffix = f"_{batch_idx + 1}" if batch_idx > 0 else ""
+                        arc_stem = f"{letter}{suffix}"
+                        arc_name = f"{arc_stem}.{fmt}"
+                        arc_path = work_dir / arc_name
 
-                    # Create archive
-                    try:
-                        ok = self._create_archive(
-                            arc_path, files_to_archive, fmt, _rar, _7z
+                        batch_size = sum(f.stat().st_size for f in batch)
+                        self._log(
+                            f"  Creating {arc_name}  "
+                            f"({len(batch)} files, {self._fmt_size(batch_size)})", "dim"
                         )
-                        # arc_path may have changed to .zip by fallback
-                        actual_arc = arc_path.with_suffix(".zip") \
-                            if not arc_path.exists() and arc_path.with_suffix(".zip").exists() \
-                            else arc_path
-                        if ok and actual_arc.exists():
-                            n_created += 1
-                            self._log(f"  ✓ {actual_arc.name}  ({self._fmt_size(actual_arc.stat().st_size)})", "ok")
-                            # Delete source files after archiving (both modes)
-                            for f in files_to_archive:
-                                try:
-                                    if f.exists():
-                                        f.unlink()
-                                except Exception:
-                                    pass
-                        else:
-                            n_errors += 1
-                            self._log(f"  ✗ Failed: {arc_name} — check archiver is in app folder", "err")
-                    except Exception as e:
-                        n_errors += 1
-                        self._log(f"  ✗ Error creating {arc_name}: {e}", "err")
 
-            n_done += 1
+                        files_to_archive = []
+                        if mode == "copy":
+                            for f in batch:
+                                dst_f = work_dir / f.name
+                                if not dst_f.exists():
+                                    shutil.copy2(f, dst_f)
+                                files_to_archive.append(dst_f)
+                        else:
+                            files_to_archive = batch
+
+                        try:
+                            ok = self._create_archive(
+                                arc_path, files_to_archive, fmt, _rar, _7z
+                            )
+                            actual_arc = arc_path.with_suffix(".zip") \
+                                if not arc_path.exists() and arc_path.with_suffix(".zip").exists() \
+                                else arc_path
+                            if ok and actual_arc.exists():
+                                n_created += 1
+                                self._log(f"  ✓ {actual_arc.name}  ({self._fmt_size(actual_arc.stat().st_size)})", "ok")
+                                for f in files_to_archive:
+                                    try:
+                                        if f.exists():
+                                            f.unlink()
+                                    except Exception:
+                                        pass
+                            else:
+                                n_errors += 1
+                                self._log(f"  ✗ Failed: {arc_name} — archiver returned no output", "err")
+                        except Exception as e:
+                            n_errors += 1
+                            self._log(f"  ✗ Error creating {arc_name}: {e!r}", "err")
+
+                n_done += 1
+
+            except Exception as folder_err:
+                self._log(f"  ERROR processing folder {folder.name}: {folder_err!r}", "err")
+                n_done += 1
 
         self._log(
-            f"\nDone — {n_created} archive(s) created, {n_errors} error(s)", 
+            f"\nDone — {n_created} archive(s) created, {n_errors} error(s)",
             "ok" if not n_errors else "warn"
         )
         self._progress(100, "Complete")
@@ -258,6 +264,7 @@ class IAPrepperAPI:
         self._emit("prepStatus", {
             "state": "done", "created": n_created, "errors": n_errors
         })
+
 
     def _split_by_size(self, files: list, limit: int) -> list:
         """Split file list into batches not exceeding size limit."""
@@ -279,69 +286,102 @@ class IAPrepperAPI:
 
     def _create_archive(self, arc_path: Path, files: list,
                         fmt: str, rar_bin: str, z_bin: str) -> bool:
-        """Create a RAR or ZIP archive containing the given files."""
+        """Create archive using response file to avoid Windows cmd line length limits."""
         import subprocess
         if not files:
             return False
 
-        # All files should be in the same directory
         work_dir = files[0].parent
         file_names = [f.name for f in files]
 
-        if fmt == "rar" and rar_bin:
-            cmd = [rar_bin, "a", "-ep", "-m0", str(arc_path)] + file_names
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                cwd=str(work_dir), stdin=subprocess.DEVNULL
-            )
-            return result.returncode == 0
-        elif z_bin:
-            # 7zr.exe cannot create RAR — only 7z.exe/7za.exe can
-            # If only 7zr available and format is RAR, fall back to ZIP
-            z_name = Path(z_bin).name.lower()
-            actual_fmt = fmt
-            if fmt == "rar" and "7zr" in z_name:
-                self._log("  7zr.exe cannot create RAR — using ZIP instead (drop 7z.exe for RAR)", "warn")
-                actual_fmt = "zip"
-                arc_path = arc_path.with_suffix(".zip")
-            if actual_fmt == "rar":
-                cmd = [z_bin, "a", "-trar", "-mx0", str(arc_path)] + file_names
+        # Write list file to local temp dir — avoids permission errors on
+        # network shares and keeps network folders clean
+        import tempfile as _tf
+        _tmp = Path(_tf.gettempdir())
+        list_file = _tmp / f"_prep_{arc_path.stem[:40]}.lst"
+        list_file.write_bytes(
+            b'\xff\xfe' + '\n'.join(file_names).encode('utf-16-le')
+        )
+
+        try:
+            if fmt == 'rar' and rar_bin:
+                # rar.exe @listfile syntax
+                cmd = [rar_bin, 'a', '-ep', '-m0', str(arc_path), f'@{list_file}']
+                result = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    cwd=str(work_dir), stdin=subprocess.DEVNULL,
+                    creationflags=0x08000000 if os.name == 'nt' else 0
+                )
+                if result.returncode != 0 or not arc_path.exists():
+                    err = (result.stderr or result.stdout or b'')[:200].decode('utf-8', 'replace')
+                    self._log(f'  rar.exe rc={result.returncode}: {err}', 'err')
+                    return False
+                return True
+
+            elif z_bin:
+                z_name = Path(z_bin).name.lower()
+                actual_fmt = fmt
+                if fmt == 'rar' and '7zr' in z_name:
+                    self._log('  7zr.exe cannot create RAR — using ZIP instead', 'warn')
+                    actual_fmt = 'zip'
+                    arc_path = arc_path.with_suffix('.zip')
+                # 7z also supports @listfile
+                if actual_fmt == 'rar':
+                    cmd = [z_bin, 'a', '-trar', '-mx0', str(arc_path), f'@{list_file}']
+                else:
+                    cmd = [z_bin, 'a', '-tzip', '-mx0', str(arc_path), f'@{list_file}']
+                result = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    cwd=str(work_dir), stdin=subprocess.DEVNULL,
+                    creationflags=0x08000000 if os.name == 'nt' else 0
+                )
+                if result.returncode != 0:
+                    err = (result.stderr or result.stdout or b'')[:200].decode('utf-8', 'replace')
+                    self._log(f'  7z error: {err}', 'err')
+                    import zipfile as _zf
+                    zip_path = arc_path.with_suffix('.zip')
+                    with _zf.ZipFile(zip_path, 'w', _zf.ZIP_STORED) as zf:
+                        for fn in file_names:
+                            fp = work_dir / fn
+                            if fp.exists():
+                                zf.write(fp, fn)
+                    self._log(f'  Fell back to Python ZIP: {zip_path.name}', 'warn')
+                    return zip_path.exists()
+                return True
+
             else:
-                cmd = [z_bin, "a", "-tzip", "-mx0", str(arc_path)] + file_names
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                cwd=str(work_dir), stdin=subprocess.DEVNULL
-            )
-            if result.returncode != 0:
-                self._log(f"  7z error: {result.stderr[:200] or result.stdout[:200]}", "err")
-                # Fall back to Python zip
                 import zipfile as _zf
-                zip_path = arc_path.with_suffix(".zip")
-                with _zf.ZipFile(zip_path, "w", _zf.ZIP_STORED) as zf:
-                    for f_path in [work_dir / fn for fn in file_names]:
-                        if f_path.exists():
-                            zf.write(f_path, f_path.name)
-                self._log(f"  Fell back to Python ZIP: {zip_path.name}", "warn")
+                zip_path = arc_path.with_suffix('.zip')
+                with _zf.ZipFile(zip_path, 'w', _zf.ZIP_STORED) as zf:
+                    for fn in file_names:
+                        fp = work_dir / fn
+                        if fp.exists():
+                            zf.write(fp, fn)
                 return zip_path.exists()
-            return True
-        else:
-            # Python zipfile fallback — no external tool
-            import zipfile as _zf
-            zip_path = arc_path.with_suffix(".zip")
-            with _zf.ZipFile(zip_path, "w", _zf.ZIP_STORED) as zf:
-                for f_path in [work_dir / fn for fn in file_names]:
-                    if f_path.exists():
-                        zf.write(f_path, f_path.name)
-            return zip_path.exists()
+
+        finally:
+            try:
+                list_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     @staticmethod
     def _find_tool(candidates: list) -> str:
         import shutil as _sh
         app_dir = Path(__file__).parent
+        # Search app dir and common subfolders
+        search_dirs = [
+            app_dir,
+            app_dir / "apps",
+            app_dir / "app",
+            app_dir / "tools",
+            app_dir / "bin",
+        ]
         for name in candidates:
-            local = app_dir / name
-            if local.exists():
-                return str(local)
+            for d in search_dirs:
+                local = d / name
+                if local.exists():
+                    return str(local)
             found = _sh.which(name)
             if found:
                 return found

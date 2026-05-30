@@ -164,6 +164,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     <select id="theme-select" onchange="setTheme(this.value)" style="background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:3px 8px;color:var(--text2);font-size:11px;cursor:pointer"><option value="">Dark</option><option value="amber">Amber</option><option value="slate">Slate Blue</option><option value="red">Red</option><option value="light">Light</option></select>
     <button class="browse-btn" id="dat-merger-btn" onclick="openDatMerger()" style="border-color:var(--info);color:var(--info);padding:4px 14px;font-size:11px">&#9830; DAT Tools</button>
     <button class="browse-btn" onclick="openIAUploader()" style="border-color:var(--acc);color:var(--acc);padding:4px 14px;font-size:11px">&#9650; IA Uploader</button>
+    <button class="browse-btn" onclick="openRClone()" style="border-color:var(--warn);color:var(--warn);padding:4px 14px;font-size:11px">&#9650; RClone</button>
+    <button class="browse-btn" onclick="openFolderPacker()" style="border-color:#a06af0;color:#a06af0;padding:4px 14px;font-size:11px">&#9632; Folder Packer</button>
     <span id="global-pill" class="pill pill-idle">IDLE</span>
   </div>
 
@@ -958,6 +960,16 @@ async function importSettings() {
 }
 
 // ─── DAT Merger window ──────────────────────────────────────────────────────
+function openFolderPacker() {
+  try { window.pywebview.api.open_folder_packer(); }
+  catch(e) { addLog("Could not open Folder Packer: " + e, "err"); }
+}
+
+function openRClone() {
+  try { window.pywebview.api.open_rclone(); }
+  catch(e) { addLog("Could not open RClone: " + e, "err"); }
+}
+
 function openIAUploader() {
   try { window.pywebview.api.open_ia_uploader(); }
   catch(e) { addLog('Could not open IA Uploader: ' + e, 'err'); }
