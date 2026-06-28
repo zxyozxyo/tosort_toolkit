@@ -12,6 +12,7 @@ from dat_merger import DatMergerAPI
 from ia_uploader import IAUploaderAPI
 from rclone_gui import RCloneAPI
 from ia_folder_packer import IAFolderPackerAPI
+from scene_recreator import SceneRecreatorAPI
 
 _dat_api = None
 _ia_api  = None
@@ -37,7 +38,7 @@ def open_folder_packer():
     """Open IA Folder Packer window."""
     _fp_api = IAFolderPackerAPI()
     fp_window = webview.create_window(
-        title="IA Folder Packer \u2014 ToSort Toolkit",
+        title="IA Prep Packer: Folder Packer \u2014 ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "ia_folder_packer.html"),
         js_api=_fp_api,
         width=800,
@@ -48,11 +49,27 @@ def open_folder_packer():
     _fp_api.set_window(fp_window)
 
 
+def open_scene_recreator():
+    """Open Scene ZIP Recreator window."""
+    _sr_api = SceneRecreatorAPI()
+    sr_window = webview.create_window(
+        title="Scene ZIP Recreator \u2014 ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "scene_recreator.html"),
+        js_api=_sr_api,
+        width=900,
+        height=900,
+        min_size=(700, 600),
+        background_color="#0d0f12",
+    )
+    _sr_api.set_window(sr_window)
+
+
 def open_rclone():
     """Open RClone IA Uploader window."""
     _rc_api = RCloneAPI()
+    _rc_api.open_folder_packer = open_folder_packer
     rc_window = webview.create_window(
-        title="RClone IA Uploader \u2014 ToSort Toolkit",
+        title="IA RClone Uploader \u2014 ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "rclone_gui.html"),
         js_api=_rc_api,
         width=900,
@@ -67,6 +84,14 @@ def open_ia_uploader():
     """Open or re-create the IA Uploader window."""
     global _ia_api
     _ia_api = IAUploaderAPI()
+    # The Letter-Split packing strategy (originally the standalone IA
+    # Prepper, embedded directly in this window) has moved into the IA
+    # Folder Packer tool as a selectable mode. The uploader GUI's old
+    # "IA Prep Packer" panel was replaced with a button that opens the
+    # Folder Packer window directly, using the same launcher function
+    # the main menu uses — wired onto this API instance the same way
+    # ToSortAPI's button wiring works below in main().
+    _ia_api.open_folder_packer = open_folder_packer
     ia_window = webview.create_window(
         title="Internet Archive Uploader \u2014 ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "ia_uploader.html"),
@@ -87,6 +112,7 @@ def main():
     api.open_ia_uploader = open_ia_uploader
     api.open_rclone        = open_rclone
     api.open_folder_packer = open_folder_packer
+    api.open_scene_recreator = open_scene_recreator
 
     window = webview.create_window(
         title="ToSort Toolkit \u2014 RomVault Cleaning Pipeline",

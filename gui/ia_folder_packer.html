@@ -54,7 +54,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 
 <div class="titlebar">
   <div class="dot"></div>
-  <div class="titlebar-title">◈ IA Folder Packer</div>
+  <div class="titlebar-title">◈ IA Prep Packer — Folder Packer</div>
   <span id="pill" class="pill">IDLE</span>
 </div>
 
@@ -66,7 +66,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
     <div class="panel-body">
       <div class="row">
         <span class="lbl">Source Folder</span>
-        <input class="txt" id="src" placeholder="Root folder to scan for archive folders"/>
+        <input class="txt" id="src" placeholder="Root folder to scan"/>
         <button class="btn" onclick="browseSrc()">Browse</button>
       </div>
       <div class="row">
@@ -74,9 +74,43 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <input class="txt" id="dst" placeholder="Output folder (copy mode only)"/>
         <button class="btn" onclick="browseDst()">Browse</button>
       </div>
-      <div class="hint">
-        Scans source recursively for leaf folders containing archives and packs each one into a single archive.
-        Example: <code>TOSEC/C64/Games/[D64]/</code> → <code>[D64].rar</code>
+    </div>
+  </div>
+
+  <!-- Pack strategy -->
+  <div class="panel">
+    <div class="panel-hdr"><div class="dot" style="background:var(--warn)"></div>Pack Strategy</div>
+    <div class="panel-body">
+      <div class="row" style="gap:16px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:10px;color:var(--text2)">Strategy</span>
+          <select class="sel" id="pack_mode" onchange="onPackModeChange()">
+            <option value="leaf" selected>Leaf Folder — pack whole folder as-is</option>
+            <option value="letter_split">Letter Split — group by A-Z, size-limit batches</option>
+            <option value="depth">Folder Depth — pack at a set depth, size-limit batches</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint" id="strategy-hint">
+        <strong style="color:var(--warn)">Leaf Folder</strong> — Packs each entire leaf folder into one archive named after the folder. Use this when the last folder contains loose files (not archives) that need bundling together. Example: <code>TOSEC/C64/Games/[D64]/</code> → <code>[D64].zip</code> containing all files inside that folder.
+      </div>
+
+      <!-- Depth-mode-only field -->
+      <div class="row" id="depth-row" style="display:none;gap:6px;align-items:center">
+        <span style="font-size:10px;color:var(--text2)">Folder depth</span>
+        <input class="txt" type="number" id="depth" value="2" min="1" style="width:60px;flex:none"/>
+        <span class="hint" style="margin:0">levels down from Source Folder — each folder found at that depth is packed as one unit (including everything nested under it)</span>
+      </div>
+
+      <!-- Letter-split / Depth shared field -->
+      <div class="row" id="size-limit-row" style="display:none;gap:6px;align-items:center">
+        <span style="font-size:10px;color:var(--text2)">Max size per archive</span>
+        <input class="txt" type="number" id="size_limit_value" value="2" min="0.1" step="0.1" style="width:70px;flex:none"/>
+        <select class="sel" id="size_limit_unit" style="flex:none">
+          <option value="1073741824" selected>GB</option>
+          <option value="1048576">MB</option>
+        </select>
+        <span class="hint" style="margin:0">batches exceeding this get split, appending _2, _3, etc. to the name</span>
       </div>
     </div>
   </div>
@@ -94,13 +128,16 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
           </select>
         </div>
         <div style="display:flex;align-items:center;gap:6px">
-          <span style="font-size:10px;color:var(--text2)">Mode</span>
-          <select class="sel" id="mode" onchange="onModeChange()">
+          <span style="font-size:10px;color:var(--text2)">File mode</span>
+          <select class="sel" id="file_mode" onchange="onFileModeChange()">
             <option value="copy" selected>Copy (keep originals)</option>
             <option value="move">Move (delete originals)</option>
           </select>
         </div>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text2);cursor:pointer;margin-top:2px">
+        <input type="checkbox" id="skip_existing"/> Skip already-packed files (resume an interrupted run without re-creating or re-deleting anything)
+      </label>
       <div class="hint" id="mode-hint">Copy mode: packs into destination folder, originals untouched.</div>
     </div>
   </div>
@@ -114,6 +151,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <div style="font-size:10px;font-family:var(--mono);color:var(--text2);margin-top:3px" id="prog-label">—</div>
       </div>
       <div class="row" style="gap:6px">
+        <button class="btn" id="btn-preview" onclick="previewPack()">👁 Preview (first 10)</button>
         <button class="btn btn-acc" id="btn-start" onclick="startPack()">▶ Start Packing</button>
         <button class="btn btn-danger" id="btn-stop" onclick="stopPack()" disabled>■ Stop</button>
       </div>
@@ -136,11 +174,26 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 <script>
 window.addEventListener('pywebviewready', async () => {
   const cfg = await window.pywebview.api.load_config();
-  if (cfg.src)    document.getElementById('src').value = cfg.src;
-  if (cfg.dst)    document.getElementById('dst').value = cfg.dst;
-  if (cfg.format) document.getElementById('format').value = cfg.format;
-  if (cfg.mode)   document.getElementById('mode').value = cfg.mode;
-  onModeChange();
+  if (cfg.src)       document.getElementById('src').value = cfg.src;
+  if (cfg.dst)       document.getElementById('dst').value = cfg.dst;
+  if (cfg.format)    document.getElementById('format').value = cfg.format;
+  if (cfg.file_mode) document.getElementById('file_mode').value = cfg.file_mode;
+  if (cfg.mode)      document.getElementById('pack_mode').value = cfg.mode;
+  if (cfg.depth)      document.getElementById('depth').value = cfg.depth;
+  if (cfg.size_limit) {
+    // Stored in bytes — display as GB if it divides cleanly, else MB
+    const gb = cfg.size_limit / 1073741824;
+    if (gb >= 1) {
+      document.getElementById('size_limit_value').value = gb;
+      document.getElementById('size_limit_unit').value = '1073741824';
+    } else {
+      document.getElementById('size_limit_value').value = (cfg.size_limit / 1048576).toFixed(1);
+      document.getElementById('size_limit_unit').value = '1048576';
+    }
+  }
+  if (cfg.skip_existing) document.getElementById('skip_existing').checked = true;
+  onFileModeChange();
+  onPackModeChange();
 });
 
 window.fpEvent = function(event, data) {
@@ -166,17 +219,34 @@ window.fpEvent = function(event, data) {
   }
 };
 
-function onModeChange() {
-  const mode = document.getElementById('mode').value;
+function onFileModeChange() {
+  const fileMode = document.getElementById('file_mode').value;
   const dst  = document.getElementById('dst');
   const hint = document.getElementById('mode-hint');
-  if (mode === 'copy') {
+  if (fileMode === 'copy') {
     dst.disabled = false;
     hint.textContent = 'Copy mode: packs into destination folder, originals untouched.';
   } else {
     dst.disabled = true;
     hint.textContent = 'Move mode: packs in-place alongside source folder, originals deleted after packing.';
   }
+}
+
+const STRATEGY_HINTS = {
+  leaf: 'Packs each entire leaf folder into one archive named after the folder. Use this when the last folder contains loose files (not archives) that need bundling together. Example: <code>TOSEC/C64/Games/[D64]/</code> → <code>[D64].zip</code> containing all files inside that folder.',
+  letter_split: 'Finds folders with loose archives, groups them by first letter (A, B, C... 0-9, MISC), and splits each letter into batches under the size limit — <code>A.zip</code>, <code>A_2.zip</code>, <code>A_3.zip</code> etc.',
+  depth: 'Looks the given number of folder levels down from Source Folder and treats each folder found there as one packing unit (everything nested under it included), splitting into size-limited batches named after the folder — <code>FOLDERNAME.zip</code>, <code>FOLDERNAME_2.zip</code> etc.',
+};
+
+function onPackModeChange() {
+  const mode = document.getElementById('pack_mode').value;
+  document.getElementById('strategy-hint').innerHTML =
+    `<strong style="color:var(--warn)">${
+      mode === 'leaf' ? 'Leaf Folder' : mode === 'letter_split' ? 'Letter Split' : 'Folder Depth'
+    }</strong> — ` + STRATEGY_HINTS[mode];
+  document.getElementById('depth-row').style.display = mode === 'depth' ? 'flex' : 'none';
+  document.getElementById('size-limit-row').style.display =
+    (mode === 'letter_split' || mode === 'depth') ? 'flex' : 'none';
 }
 
 async function browseSrc() {
@@ -188,27 +258,88 @@ async function browseDst() {
   if (p) document.getElementById('dst').value = p;
 }
 
-async function startPack() {
+function buildPackConfig() {
   const src = document.getElementById('src').value.trim();
   const dst = document.getElementById('dst').value.trim();
-  const mode = document.getElementById('mode').value;
-  if (!src) { addLog('Select a source folder.', 'warn'); return; }
-  if (mode === 'copy' && !dst) { addLog('Select a destination folder for copy mode.', 'warn'); return; }
-
-  await window.pywebview.api.save_config({
+  const fileMode = document.getElementById('file_mode').value;
+  const packMode = document.getElementById('pack_mode').value;
+  const sizeLimitBytes = Math.round(
+    parseFloat(document.getElementById('size_limit_value').value || '2') *
+    parseInt(document.getElementById('size_limit_unit').value || '1073741824')
+  );
+  const depth = parseInt(document.getElementById('depth').value || '2');
+  return {
     src, dst,
     format: document.getElementById('format').value,
-    mode,
-  });
+    file_mode: fileMode,
+    mode: packMode,
+    depth,
+    size_limit: sizeLimitBytes,
+    skip_existing: document.getElementById('skip_existing').checked,
+  };
+}
+
+function fmtSzLocal(n) {
+  if (!n && n !== 0) return '—';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+
+async function previewPack() {
+  const config = buildPackConfig();
+  if (!config.src) { addLog('Select a source folder.', 'warn'); return; }
+
+  document.getElementById('btn-preview').disabled = true;
+  addLog('', '');
+  addLog('━━━ PREVIEW (no files will be created/moved) ━━━', 'info');
+
+  const result = await window.pywebview.api.preview_pack(config, 10);
+  document.getElementById('btn-preview').disabled = false;
+
+  if (!result) { addLog('Preview failed — no response.', 'err'); return; }
+  if (result.error) { addLog('Preview error: ' + result.error, 'err'); return; }
+
+  if (result.total_units === 0) {
+    addLog('No matching folders found for this source/strategy.', 'warn');
+    return;
+  }
+
+  const modeLabel = result.mode === 'leaf' ? 'Leaf Folder'
+                   : result.mode === 'letter_split' ? 'Letter Split' : 'Folder Depth';
+  addLog(`Strategy: ${modeLabel} — ${result.total_units} folder(s) match, showing first ${result.shown}:`, 'dim');
+
+  for (const item of result.items) {
+    if (item.archives.length === 0) {
+      addLog(`  ${item.unit}/  →  (no files — nothing would be created)`, 'dim');
+      continue;
+    }
+    addLog(`  ${item.unit}/`, 'info');
+    for (const arc of item.archives) {
+      if (arc.skip) {
+        addLog(`      ⏭ ${arc.name}   (already exists — would be SKIPPED)`, 'dim');
+      } else {
+        addLog(`      → ${arc.name}   (${arc.files} file${arc.files === 1 ? '' : 's'}, ${fmtSzLocal(arc.size)})`, 'ok');
+      }
+    }
+  }
+  if (result.total_units > result.shown) {
+    addLog(`  ... and ${result.total_units - result.shown} more folder(s) not shown`, 'dim');
+  }
+  addLog('━━━ END PREVIEW ━━━', 'info');
+}
+
+async function startPack() {
+  const config = buildPackConfig();
+  if (!config.src) { addLog('Select a source folder.', 'warn'); return; }
+  if (config.file_mode === 'copy' && !config.dst) { addLog('Select a destination folder for copy mode.', 'warn'); return; }
+
+  await window.pywebview.api.save_config(config);
 
   document.getElementById('prog-bar').style.width = '0%';
   document.getElementById('prog-label').textContent = '—';
 
-  await window.pywebview.api.start_pack({
-    src, dst,
-    format: document.getElementById('format').value,
-    mode,
-  });
+  await window.pywebview.api.start_pack(config);
 }
 
 async function stopPack() {

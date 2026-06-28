@@ -3,8 +3,6 @@ Internet Archive Uploader Backend
 Handles concurrent uploads with per-file progress tracking.
 """
 
-from ia_prepper import IAPrepperAPI as _PrepMixin
-
 import os
 import time
 import threading
@@ -142,6 +140,7 @@ class IAUploaderAPI:
         secret_key  = config.get("secret_key", "")
         identifier  = config.get("identifier", "").strip()
         files       = config.get("files", [])
+        src_folder  = config.get("src_folder", "")  # root folder for relative paths
         metadata    = config.get("metadata", {})
         concurrency = max(1, min(12, int(config.get("concurrency", 1))))
         checksum    = config.get("checksum", True)
@@ -270,7 +269,16 @@ class IAUploaderAPI:
             if self._stop_flag.is_set():
                 return (fpath, False, "stopped")
 
-            fname = fpath.name
+            # Check file still exists before proceeding
+            if not fpath.exists():
+                self._log(f"  ⚠ SKIP: {fpath.name} — file not found (moved/deleted?)", "warn")
+                return (fpath, False, "not found")
+
+            # Use relative path from source folder to preserve directory structure
+            if src_folder and fpath.is_relative_to(Path(src_folder)):
+                fname = str(fpath.relative_to(Path(src_folder))).replace("\\", "/")
+            else:
+                fname = fpath.name
             fname_l = fname.lower()
             fsize = fpath.stat().st_size
             file_start = time.time()
@@ -286,7 +294,7 @@ class IAUploaderAPI:
                 self._log(f"  ↷ SKIP: {fname} — already exists on IA", "dim")
                 with lock:
                     bytes_done_total[0] += fsize
-                self._emit("fileStatus", {"name": fname, "status": "done", "pct": 100})
+                self._emit("fileStatus", {"name": fname, "status": "already", "pct": 100})
                 return (fpath, True, "skipped")
 
             self._log(f"  → Uploading: {fname}  ({self._fmt_size(fsize)})", "dim")
@@ -582,21 +590,19 @@ class IAUploaderAPI:
         except Exception:
             return ""
 
-    # ── Pre-processor delegation ────────────────────────────────────────
-    def _get_prepper(self):
-        if not hasattr(self, "_prepper"):
-            self._prepper = _PrepMixin()
-            self._prepper.set_window(self._window)
-        return self._prepper
-
-    def start_prep(self, config: dict):
-        return self._get_prepper().start_prep(config)
-
-    def stop_prep(self):
-        return self._get_prepper().stop_prep()
-
-    def browse_folder_prep(self) -> str:
-        return self._get_prepper().browse_folder()
+    def open_folder_packer(self):
+        """
+        Opens the IA Folder Packer window (where archive grouping/
+        letter-split/depth-based packing now lives). Normally wired
+        onto this instance by main.py at window-creation time — this
+        fallback just logs a clear message rather than raising if
+        somehow called before that wiring happened (e.g. the script
+        run standalone outside the main app).
+        """
+        self._log(
+            "Could not open Folder Packer — this only works when launched "
+            "via the main ToSort Toolkit app.", "warn"
+        )
 
     def browse_files(self) -> list:
         try:

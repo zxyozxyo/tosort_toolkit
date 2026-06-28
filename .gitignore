@@ -13,6 +13,8 @@ dedupe_progress.json
 tosort_report_*.txt
 tosort_settings_export.json
 ia_folder_packer.json
+scene_recreator.json
+reference_fingerprint_db.json
 
 # Credentials — never commit these
 ia_credentials.json

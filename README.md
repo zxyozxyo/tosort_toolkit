@@ -36,11 +36,14 @@ tosort_toolkit/
 ├── ia_prepper.py         # IA archive pre-processor
 ├── ia_folder_packer.py   # IA folder packer
 ├── rclone_gui.py         # RClone uploader GUI
+├── scene_recreator.py    # Scene ZIP recreator/repair tool
 ├── gui/                  # HTML frontends
 │   ├── index.html
 │   ├── dat_merger.html
 │   ├── ia_uploader.html
-│   └── ia_folder_packer.html
+│   ├── ia_folder_packer.html
+│   ├── rclone_gui.html
+│   └── scene_recreator.html
 ├── apps/                 # Drop tool binaries here (gitignored)
 │   ├── rar.exe
 │   ├── 7z.exe
@@ -207,6 +210,34 @@ Standalone rclone wrapper for IA uploads. Accessible from the main titlebar or r
 - Must start with a letter or number
 - Globally unique on archive.org
 - Check: `archive.org/details/your-identifier`
+
+---
+
+### Scene ZIP Recreator (scene_recreator.html)
+
+Repairs old scene `.zip` releases to byte-match a DAT-listed CRC32/MD5/SHA1 target without ever touching the original file. All work is performed on a copy in the output folder.
+
+**Matching:** Three-way name matching against DAT entries — exact filename, no-extension, and normalised (strip region/flags). Supports CLRMamePro and Logiqx XML DAT formats.
+
+**Repair techniques attempted in order:**
+1. EOCD comment strip — removes topsite tagline grow-appends
+2. FAT-front / Unix-tail truncation + EOCD rebuild
+3. Line-ending normalisation (CRLF↔LF) on `.nfo`/`.diz` entries
+4. Junk-file removal — re-zips without grow-appended entries
+5. Compression-setting variations (STORE, DEFLATE levels 0–9) on full rebuild
+6. Faithful rebuild — reuses original header fields (version, flags, DOS timestamp, attributes) across all entry orderings and compression levels
+7. Heuristic junk removal — flags injected FTP-script/topsite/courier entries by name pattern and folder name (`adverts/` etc.), tries every non-empty subset of candidates
+8. Strip to essentials — keeps only the largest entry plus `.nfo`/`.diz`, tries both line-ending variants across full search space
+9. Foreign-packer diagnosis — checks internal CRC32 consistency; distinguishes "probably fine, can't byte-match" (different original packer) from "actually broken content"
+
+**Reference fingerprinting:** Supply one or more folders of known-good DAT-verified scene ZIPs. The tool learns each release group's packer fingerprint (compression level/strategy, entry ordering, header metadata, expected file set) and tries the learned fingerprint first — typically 1–4 attempts instead of dozens. Also catches injected files by direct comparison against verified references, even when name-pattern heuristics would miss them.
+
+**Settings saved to `scene_recreator.json` (gitignored):**
+- Source folder, DAT folder, reference folders, destination folder
+- Dry-run mode, move vs copy mode
+- Use fingerprint DB toggle, auto-retry excluding suspect references toggle
+
+**Reference fingerprint database:** `reference_fingerprint_db.json` — auto-built from reference scans, gitignored (can be large).
 
 ---
 

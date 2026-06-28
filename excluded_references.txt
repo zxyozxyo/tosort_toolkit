@@ -1,0 +1,7 @@
+# One reference filename per line (case-insensitive). Lines starting
+# with # are comments and are ignored. Any filename listed here will
+# never be used as a reference, even if it correctly verifies against
+# the DAT's listed CRC/MD5/SHA1 -- use this for the rare case where the
+# DAT's own "official" hash for a release already includes injected
+# junk that isn't detectable by name pattern alone.
+mir-1407.zip

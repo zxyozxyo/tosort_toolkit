@@ -65,10 +65,11 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 .file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
 .file-sz{color:var(--text3);min-width:55px;text-align:right;flex-shrink:0}
 .file-st{width:50px;text-align:right;flex-shrink:0;font-size:10px}
-.file-st.uploading{color:var(--info)}.file-st.done{color:var(--acc)}.file-st.error{color:var(--danger)}
+.file-st.uploading{color:var(--info)}.file-st.done{color:var(--acc)}.file-st.already{color:var(--warn)}.file-st.error{color:var(--danger)}
 .file-del{color:var(--text3);cursor:pointer;padding:0 3px;flex-shrink:0}
 .file-del:hover{color:var(--danger)}
 .file-empty{color:var(--text3);font-size:10px;padding:6px;text-align:center}
+.file-list-hdr span:hover{color:var(--acc)}
 
 /* Progress */
 .prog-wrap{background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:6px 10px;display:flex;flex-direction:column;gap:5px}
@@ -118,65 +119,17 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 
 <div class="main">
 
-  <!-- Pre-processor -->
+  <!-- Folder Packer launcher -->
   <div class="panel">
-    <div class="panel-hdr" onclick="togglePanel('prep')">
-      <div class="dot" style="background:var(--warn)"></div>Pre-process for Upload
-      <span style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400">Group loose archives into letter folders ready for IA</span>
-      <span class="chevron" id="chev-prep">▾</span>
-    </div>
-    <div class="panel-body collapsed" id="body-prep">
-      <div class="row">
-        <span class="lbl">Source</span>
-        <input class="txt" id="prep-src" placeholder="Folder containing archives to process"/>
-        <button class="btn" onclick="browsePrep('prep-src')">Browse</button>
-      </div>
-      <div class="row">
-        <span class="lbl">Mode</span>
-        <select class="sel" id="prep-mode" onchange="togglePrepDst()">
-          <option value="copy">Copy to destination (keep originals)</option>
-          <option value="move">Move in-place (modify source)</option>
-        </select>
-      </div>
-      <div class="row" id="prep-dst-row">
-        <span class="lbl">Destination</span>
-        <input class="txt" id="prep-dst" placeholder="Output folder (copy mode)"/>
-        <button class="btn" onclick="browsePrep('prep-dst')">Browse</button>
-      </div>
-      <div class="row" style="gap:14px;flex-wrap:wrap">
-        <div style="display:flex;align-items:center;gap:6px">
-          <span style="font-size:10px;color:var(--text2)">Size limit</span>
-          <select class="sel" id="prep-size">
-            <option value="536870912">500 MB</option>
-            <option value="1073741824">1 GB</option>
-            <option value="2147483648" selected>2 GB</option>
-            <option value="4294967296">4 GB</option>
-            <option value="8589934592">8 GB</option>
-          </select>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px">
-          <span style="font-size:10px;color:var(--text2)">Format</span>
-          <select class="sel" id="prep-fmt">
-            <option value="zip">ZIP</option>
-            <option value="rar" selected>RAR</option>
-          </select>
-        </div>
-      </div>
-      <div class="hint" style="margin-top:2px">
-        Archives grouped by first letter (A-Z), numbers → 0-9, symbols → MISC. 
-        Each group split into A, A2, A3 etc. if over size limit.
-        Requires rar.exe or 7z.exe in app folder for RAR output.
-      </div>
-      <!-- Progress -->
-      <div class="prog-wrap" id="prep-prog-wrap" style="display:none">
-        <div class="prog-bar-bg"><div class="prog-bar" id="prep-bar" style="width:0%;background:var(--warn)"></div></div>
-        <span id="prep-prog-label" style="font-size:10px;color:var(--text2)"></span>
-      </div>
-      <div class="log-w" id="prep-log" style="height:100px;display:none"></div>
-      <div class="row" style="gap:6px">
-        <button class="btn" id="btn-prep" style="border-color:var(--warn);color:var(--warn)" onclick="startPrep()">▶ Run Pre-process</button>
-        <button class="btn btn-danger" id="btn-prep-stop" onclick="stopPrep()" disabled>■ Stop</button>
-      </div>
+    <div class="panel-body" style="flex-direction:row;align-items:center;gap:10px">
+      <div class="dot" style="background:var(--warn)"></div>
+      <span style="font-size:10px;color:var(--text3);flex:1">
+        Need to group loose archives or pack whole folders before uploading?
+        Use the <strong style="color:var(--warn)">IA Folder Packer</strong> —
+        letter-grouping, whole-folder, and depth-based packing strategies all
+        live there now.
+      </span>
+      <button class="btn" style="border-color:var(--warn);color:var(--warn)" onclick="window.pywebview.api.open_folder_packer()">Open Folder Packer</button>
     </div>
   </div>
 
@@ -252,7 +205,15 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
       <div class="row">
         <button class="btn" onclick="addFiles()">+ Files</button>
         <button class="btn" onclick="addFolder()">+ Folder</button>
-        <button class="btn btn-danger" onclick="clearFiles()" style="margin-left:auto">Clear</button>
+        <span id="clear-toast" style="font-size:9px;color:var(--acc);opacity:0;transition:opacity .3s;margin-left:auto"></span>
+        <button class="btn" id="btn-clear-uploaded" style="border-color:var(--warn);color:var(--warn)" onclick="clearUploadedFiles()">Clear Uploaded</button>
+        <button class="btn btn-danger" id="btn-clear-all" onclick="confirmClearFiles()">Clear All</button>
+      </div>
+      <div class="file-list-hdr" style="display:flex;align-items:center;gap:5px;padding:2px 5px;font-size:9px;color:var(--text3);font-family:var(--mono);cursor:pointer;user-select:none">
+        <span style="flex:1" data-sort="name" data-label="Name" onclick="sortFiles('name')">Name</span>
+        <span style="min-width:55px;text-align:right" data-sort="size" data-label="Size" onclick="sortFiles('size')">Size</span>
+        <span style="width:50px;text-align:right" data-sort="status" data-label="Status" onclick="sortFiles('status')">Status</span>
+        <span style="width:14px"></span>
       </div>
       <div class="file-list" id="file-list"><div class="file-empty">Add files or a folder</div></div>
     </div>
@@ -343,6 +304,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 
 <script>
 let fileList = [];
+let srcFolder = "";  // root folder for relative path uploads
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 window.addEventListener('pywebviewready', async () => {
@@ -370,6 +332,8 @@ function togglePanel(id) {
 }
 
 // ── Python events ─────────────────────────────────────────────────────────────
+let isUploading = false;
+
 window.iaEvent = function(event, data) {
   if (event === 'log') {
     addLog(data.msg, data.cls);
@@ -377,6 +341,7 @@ window.iaEvent = function(event, data) {
     const pill = document.getElementById('pill-status');
     const bup  = document.getElementById('btn-upload');
     const bst  = document.getElementById('btn-stop');
+    isUploading = data.state === 'running';
     if (data.state === 'running') {
       pill.textContent = 'UPLOADING'; pill.className = 'pill pill-run';
       bup.disabled = true; bst.disabled = false;
@@ -413,41 +378,157 @@ async function addFiles() {
 async function addFolder() {
   const folder = await window.pywebview.api.browse_folder();
   if (!folder) return;
+  srcFolder = folder;  // remember root for relative path uploads
   const files = await window.pywebview.api.get_folder_files(folder);
-  for (const f of files)
+  for (const f of files) {
+    // Normalize to forward slashes — the backend always sends
+    // fileStatus/fileProgress events using forward-slash relative
+    // paths (fname.replace("\\", "/")) regardless of OS, so the
+    // displayed name must match that exactly or the "uploaded" marker
+    // silently never finds the right row to update on Windows, where
+    // Path.relative_to() produces backslash-separated paths.
+    const relNorm = f.rel ? f.rel.replace(/\\/g, '/') : f.rel;
     if (!fileList.find(x => x.path === f.path))
-      fileList.push({name: f.rel || f.name, path: f.path, size: f.size});
+      fileList.push({name: relNorm || f.name, path: f.path, size: f.size, rel: relNorm});
+  }
   renderFiles();
 }
 function clearFiles() { fileList = []; renderFiles(); }
-function removeFile(i) { fileList.splice(i, 1); renderFiles(); }
-function renderFiles() {
-  const el = document.getElementById('file-list');
-  const total = fileList.reduce((s,f) => s+(f.size||0), 0);
-  document.getElementById('files-sum').textContent =
-    fileList.length ? `${fileList.length} file(s)  ${fmtSz(total)}` : '';
-  if (!fileList.length) {
-    el.innerHTML = '<div class="file-empty">Add files or a folder</div>'; return;
+
+function confirmClearFiles() {
+  if (fileList.length === 0) return;
+  if (confirm(`Clear all ${fileList.length} file(s) from the list? This does not affect anything already uploaded — it only clears this display.`)) {
+    clearFiles();
   }
-  el.innerHTML = '';
-  fileList.forEach((f, i) => {
-    const d = document.createElement('div');
-    d.className = 'file-item'; d.id = 'fi-' + i;
-    d.innerHTML = `<span class="file-name" title="${f.path}">${f.name}</span>`
-      + `<span class="file-sz">${f.size ? fmtSz(f.size) : '—'}</span>`
-      + `<span class="file-st" id="fst-${i}"></span>`
-      + `<span class="file-del" onclick="removeFile(${i})">×</span>`;
-    el.appendChild(d);
+}
+
+function showClearToast(msg) {
+  const t = document.getElementById('clear-toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(showClearToast._t);
+  showClearToast._t = setTimeout(() => { t.style.opacity = '0'; }, 2200);
+}
+
+function clearUploadedFiles() {
+  const before = fileList.length;
+  // Clears BOTH freshly-uploaded-this-run files AND files the backend
+  // found already existing on IA (skipped, never re-uploaded) — both
+  // represent files that don't need any further action
+  fileList = fileList.filter(f => f.status !== 'done' && f.status !== 'already');
+  const removed = before - fileList.length;
+  renderFiles();
+  showClearToast(removed > 0 ? `Cleared ${removed} file${removed === 1 ? '' : 's'}` : 'Nothing to clear');
+  addLog(
+    removed > 0
+      ? `Cleared ${removed} uploaded file${removed === 1 ? '' : 's'} from the list (newly uploaded + already on IA).`
+      : 'No uploaded files to clear.',
+    removed > 0 ? 'ok' : 'dim'
+  );
+}
+// Removes by PATH, not positional index — once the list can be sorted,
+// a row's displayed position no longer matches its index in fileList,
+// so removeFile must look the entry up by its actual identity instead
+function removeFile(path) {
+  fileList = fileList.filter(f => f.path !== path);
+  renderFiles();
+}
+
+function updateFilesSummary() {
+  const sum = document.getElementById('files-sum');
+  if (fileList.length === 0) { sum.textContent = ''; return; }
+  const totalSize = fileList.reduce((a, f) => a + (f.size || 0), 0);
+  // "Remaining" = still needs to be uploaded — done and already-on-IA
+  // files are genuinely finished, but an errored file still needs
+  // uploading (it just hasn't succeeded yet), so it stays counted
+  const remaining = fileList.filter(f => f.status !== 'done' && f.status !== 'already');
+  const remainingSize = remaining.reduce((a, f) => a + (f.size || 0), 0);
+  if (remaining.length === fileList.length) {
+    sum.textContent = `${fileList.length} file(s)  ${fmtSz(totalSize)}`;
+  } else {
+    sum.textContent = `${remaining.length} of ${fileList.length} file(s) remaining  ${fmtSz(remainingSize)} of ${fmtSz(totalSize)}`;
+  }
+}
+
+let sortKey = null;     // 'name' | 'size' | 'status' | null (insertion order)
+let sortDir = 1;        // 1 = asc, -1 = desc
+const STATUS_ORDER = { error: 0, uploading: 1, '': 2, done: 3, already: 4 };
+
+function sortFiles(key) {
+  if (sortKey === key) sortDir = -sortDir;
+  else { sortKey = key; sortDir = 1; }
+  renderFiles();
+}
+
+function getSortedFileList() {
+  if (!sortKey) return fileList;
+  const arr = fileList.map((f, i) => ({ f, i }));
+  arr.sort((a, b) => {
+    let cmp = 0;
+    if (sortKey === 'name') {
+      cmp = a.f.name.localeCompare(b.f.name, undefined, { sensitivity: 'base' });
+    } else if (sortKey === 'size') {
+      cmp = (a.f.size || 0) - (b.f.size || 0);
+    } else if (sortKey === 'status') {
+      const sa = STATUS_ORDER[a.f.status || ''] ?? 2;
+      const sb = STATUS_ORDER[b.f.status || ''] ?? 2;
+      cmp = sa - sb;
+    }
+    if (cmp === 0) cmp = a.i - b.i; // stable: preserve original order for ties
+    return cmp * sortDir;
+  });
+  return arr.map(x => x.f);
+}
+
+function updateSortHeaderIndicators() {
+  document.querySelectorAll('.file-list-hdr [data-sort]').forEach(h => {
+    const k = h.dataset.sort;
+    h.textContent = h.dataset.label + (sortKey === k ? (sortDir === 1 ? ' ▲' : ' ▼') : '');
   });
 }
+
+function renderFiles() {
+  const el = document.getElementById('file-list');
+  updateFilesSummary();
+  if (!fileList.length) {
+    el.innerHTML = '<div class="file-empty">Add files or a folder</div>';
+    updateSortHeaderIndicators();
+    return;
+  }
+  el.innerHTML = '';
+  const sorted = getSortedFileList();
+  sorted.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.className = 'file-item'; d.id = 'fi-' + i;
+    d.dataset.fname = f.name;
+    const stClass = f.status || '';
+    const stText = stClass === 'done' ? '✓' : stClass === 'already' ? '✓ existing' : stClass === 'error' ? '✗' : '';
+    d.innerHTML = `<span class="file-name" title="${f.path}">${f.name}</span>`
+      + `<span class="file-sz">${f.size ? fmtSz(f.size) : '—'}</span>`
+      + `<span class="file-st ${stClass}" id="fst-${i}">${stText}</span>`
+      + `<span class="file-del" onclick="removeFile('${f.path.replace(/'/g, "\\'")}')">×</span>`;
+    el.appendChild(d);
+  });
+  updateSortHeaderIndicators();
+}
 function setFileStatus(name, status) {
+  const entry = fileList.find(f => f.name === name);
+  if (entry) entry.status = status;
   document.querySelectorAll('.file-item').forEach(el => {
-    if (el.querySelector('.file-name').textContent === name ||
-        el.querySelector('.file-name').title.endsWith(name)) {
+    if (el.dataset.fname === name) {
       const st = el.querySelector('[id^="fst-"]');
-      if (st) { st.textContent = status==='done'?'✓':status==='error'?'✗':status; st.className='file-st '+status; }
+      if (st) {
+        st.textContent = status==='done'?'✓':status==='already'?'✓ existing':status==='error'?'✗':status;
+        st.className='file-st '+status;
+      }
     }
   });
+  // Only a status that means "no longer pending" changes the
+  // remaining count — live progress ticks don't move it
+  if (status === 'done' || status === 'already' || status === 'error') {
+    updateFilesSummary();
+  }
 }
 
 // ── Active upload progress ────────────────────────────────────────────────────
@@ -517,6 +598,7 @@ async function startUpload() {
     secret_key:   document.getElementById('cred-secret').value.trim(),
     identifier:   id,
     files:        fileList.map(f=>f.path),
+    src_folder:   srcFolder,
     concurrency:  parseInt(document.getElementById('opt-threads').value),
     checksum:     document.getElementById('opt-checksum').checked,
     queue_derive: document.getElementById('opt-derive').checked,
@@ -580,59 +662,6 @@ async function stopUpload() {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
-// ── Pre-processor ─────────────────────────────────────────────────────────────
-function togglePrepDst() {
-  const mode = document.getElementById('prep-mode').value;
-  document.getElementById('prep-dst-row').style.display = mode === 'copy' ? '' : 'none';
-}
-async function browsePrep(id) {
-  const path = await window.pywebview.api.browse_folder_prep();
-  if (path) document.getElementById(id).value = path;
-}
-async function startPrep() {
-  const src = document.getElementById('prep-src').value.trim();
-  if (!src) { addPrepLog('Select a source folder.', 'warn'); return; }
-  document.getElementById('prep-prog-wrap').style.display = '';
-  document.getElementById('prep-log').style.display = '';
-  document.getElementById('btn-prep').disabled = true;
-  document.getElementById('btn-prep-stop').disabled = false;
-  await window.pywebview.api.start_prep({
-    src:        src,
-    dst:        document.getElementById('prep-dst').value.trim(),
-    mode:       document.getElementById('prep-mode').value,
-    size_limit: parseInt(document.getElementById('prep-size').value),
-    format:     document.getElementById('prep-fmt').value,
-  });
-}
-async function stopPrep() {
-  document.getElementById('btn-prep-stop').disabled = true;
-  await window.pywebview.api.stop_prep();
-}
-window.prepEvent = function(event, data) {
-  if (event === 'prepLog') {
-    addPrepLog(data.msg, data.cls);
-  } else if (event === 'prepProgress') {
-    document.getElementById('prep-bar').style.width = data.pct + '%';
-    document.getElementById('prep-prog-label').textContent = data.label || '';
-  } else if (event === 'prepStatus') {
-    const running = data.state === 'running';
-    document.getElementById('btn-prep').disabled = running;
-    document.getElementById('btn-prep-stop').disabled = !running;
-    if (data.state === 'done') {
-      addPrepLog('Done — ' + (data.created||0) + ' archive(s) created, ' + (data.errors||0) + ' error(s).', data.errors ? 'warn' : 'ok');
-    }
-  }
-};
-function addPrepLog(msg, cls) {
-  const log = document.getElementById('prep-log');
-  if (!log) return;
-  const d = document.createElement('div');
-  d.className = 'll' + (cls ? ' ll-' + cls : '');
-  d.textContent = '[' + new Date().toLocaleTimeString('en-GB') + '] ' + msg;
-  log.appendChild(d);
-  while (log.childElementCount > 200) log.removeChild(log.firstChild);
-  log.scrollTop = log.scrollHeight;
-}
 
 function fmtSz(n) {
   if (!n && n!==0) return '—';

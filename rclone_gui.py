@@ -162,7 +162,7 @@ class RCloneAPI:
         transfers  = int(config.get("transfers", 4))
         checkhash  = config.get("checkhash", False)
         wait_arch  = config.get("wait_archive", "5m0s")
-        verbose    = config.get("verbose", "-v")   # "-v" or "-vv"
+        verbose    = config.get("verbose", "-vv")  # "-v" or "-vv" — -vv needed for "Unchanged skipping" file-status tracking
         derive     = config.get("derive", False)
         metadata   = config.get("metadata", {})
 
@@ -200,7 +200,6 @@ class RCloneAPI:
             "--config", str(conf),
             "--transfers", str(transfers),
             "--no-check-certificate",
-            "--metadata",
             "--progress",
             "--stats", "2s",
             verbose,
@@ -209,7 +208,7 @@ class RCloneAPI:
         if not checkhash:
             cmd.append("--internetarchive-disable-checksum")
 
-        # derive is controlled via rclone.conf (set when saving credentials)
+        # derive: controlled via rclone.conf derive= setting
         if wait_arch and derive:
             cmd += ["--internetarchive-wait-archive", wait_arch]
 
@@ -218,9 +217,9 @@ class RCloneAPI:
                 if isinstance(v, list):
                     for vi in v:
                         if vi:
-                            cmd += ["--metadata-set", f"{k}={vi}"]
+                            cmd += ["--internetarchive-item-metadata", f"{k}={vi}"]
                 else:
-                    cmd += ["--metadata-set", f"{k}={v}"]
+                    cmd += ["--internetarchive-item-metadata", f"{k}={v}"]
 
         cmd += [src, f"archive:{identifier}"]
 
@@ -228,6 +227,9 @@ class RCloneAPI:
         self._log(f"  Source:     {src}", "dim")
         self._log(f"  Identifier: {identifier}", "dim")
         self._log(f"  Transfers:  {transfers}  Verbose: {verbose}  Derive: {derive}", "dim")
+        for _mk, _mv in metadata.items():
+            if _mv:
+                self._log(f"  Meta: {_mk} = {_mv}", "dim")
         self._log(f"  Command:    {' '.join(cmd[:6])}...", "dim")
         self._log("", "")
 
@@ -252,18 +254,46 @@ class RCloneAPI:
                 if not line:
                     continue
 
-                # Parse for stats and active file tracking
+                # Parse for stats and active file tracking — every line
+                # must be parsed regardless of whether it gets logged
                 self._parse_line(line)
 
-                # Log colouring
+                # Log filtering — at -vv rclone emits a continuous
+                # flood of DEBUG lines (Sizes identical, size = N OK,
+                # Unchanged skipping, Checks: N/N, Checking:, etc.)
+                # that are useful for diagnosing broken transfers but
+                # make the visible log panel unreadable for a normal
+                # monitoring view. Use an allowlist: only show lines
+                # that are genuinely worth a user's attention, and
+                # suppress the rest silently (parsing above still sees
+                # everything for file-queue status tracking).
+
+                # Always suppress: progress-panel lines (handled by
+                # the stats widget), per-file check/transfer progress
+                # lines, and all DEBUG-level lines (they're only
+                # needed by the parser, not for human reading)
+                if "Transferred:" in line:
+                    continue
+                if line.strip().startswith("*"):
+                    continue
+                if " DEBUG " in line or "DEBUG : " in line:
+                    continue
+                # Suppress noisy periodic stats blocks
+                if line.strip().startswith("Checks:"):
+                    continue
+                if line.strip().startswith("Elapsed time:"):
+                    continue
+                if line.strip() in ("Checking:", "Transferring:"):
+                    continue
+                if "Listed " in line and "Checks:" in line:
+                    continue
+
+                # Everything that made it past the suppressors gets a
+                # colour and goes to the log panel
                 cls = "dim"
-                if "Transferred:" in line and "ETA" in line:
-                    continue  # shown in progress panel
-                elif line.startswith("*") and ("%" in line or "transferring" in line):
-                    continue  # shown in active panel
-                elif "ERROR" in line or "error" in line.lower():
+                if "ERROR" in line or " error" in line.lower():
                     cls = "err"
-                elif "Copied" in line or "copied" in line:
+                elif "Copied" in line:
                     cls = "ok"
                 elif "NOTICE" in line:
                     cls = "warn"
@@ -293,7 +323,8 @@ class RCloneAPI:
             self._proc = None
 
     def _parse_line(self, line: str):
-        """Parse stats lines for progress panel."""
+        """Parse stats lines for progress panel, and per-file transfer
+        lines for the live file-queue display."""
         try:
             # Transferred: prefix format
             m = re.search(
@@ -316,9 +347,86 @@ class RCloneAPI:
                     "done": m2.group(1), "total": m2.group(2),
                     "pct": int(m2.group(3)), "speed": m2.group(4), "eta": m2.group(5),
                 })
+                return
+
+            self._parse_file_line(line)
         except Exception:
             pass
 
+    def _parse_file_line(self, line: str):
+        """
+        Extracts per-file transfer status for the live file-queue
+        display. rclone reports per-file activity in two DIFFERENT
+        styles that need to be handled separately:
+
+        1. --progress's "Transferring:" block lines, prefixed with
+           "*" — these can have the filename TRUNCATED in the middle
+           with an ellipsis for long paths (e.g.
+           "Games/RPGs/D&D 5th Edi…10/Human Paladin 10.pdf"), so they
+           are ONLY used for live in-progress percentage updates via a
+           best-effort prefix/suffix match — never for marking a file
+           definitively done, since a truncated name can't be trusted
+           to uniquely and exactly identify the real file.
+
+           Examples:
+             " * file.zip: transferring"
+             " * file.zip:  45% /120.000Mi, 5.234Mi/s, 1m30s"
+
+        2. -v's plain INFO/ERROR log lines — these carry the FULL,
+           untruncated relative path, and are the only signal trusted
+           for marking a file definitively done or errored.
+
+           Examples:
+             "2026/06/21 10:00:00 INFO  : sub/file.zip: Copied (new)"
+             "2026/06/21 10:00:00 ERROR : sub/file.zip: Failed to copy: ..."
+        """
+        # Style 2 first (more specific, untruncated, authoritative for
+        # completion) — matches a line containing "INFO"/"ERROR"/"NOTICE"
+        # followed by " : name: rest". Real-world testing showed rclone
+        # logs "Unchanged skipping" at DEBUG level even under plain -v
+        # (not just -vv as might be assumed) — DEBUG is included here
+        # specifically to catch that, but the level alone is NOT used
+        # to decide anything; only the matched `rest` text below
+        # determines what (if anything) gets emitted, so other noisy
+        # DEBUG lines ("Sizes identical", "size = ... OK", etc.) are
+        # correctly ignored rather than misread as a status change.
+        m = re.match(r'^\S+\s+\S+\s+(DEBUG|INFO|ERROR|NOTICE)\s*:\s+(.+?):\s+(.*)$', line)
+        if m:
+            level, name, rest = m.group(1), m.group(2), m.group(3)
+            name = name.replace("\\", "/")
+            if level == "ERROR":
+                self._emit("fileStatus", {"name": name, "status": "error"})
+            elif "Copied" in rest or "Deleted" in rest:
+                self._emit("fileStatus", {"name": name, "status": "done"})
+            elif "Unchanged skipping" in rest:
+                # File already matches what's on the remote — rclone
+                # correctly didn't re-upload it, since it was already
+                # there from a previous run. Distinct status from
+                # "done" (newly uploaded THIS run) so the queue can
+                # show the difference and both can still be cleared
+                # together via "Clear Uploaded".
+                self._emit("fileStatus", {"name": name, "status": "already"})
+            return
+
+        # Style 1: progress-block lines, prefixed with "*"
+        stripped = line.strip()
+        if not stripped.startswith('*'):
+            return
+        body = stripped[1:].strip()
+
+        # "name: transferring" (just started, 0%)
+        m2 = re.match(r'^(.+?):\s*transferring\s*$', body, re.IGNORECASE)
+        if m2:
+            self._emit("fileProgress", {"name": m2.group(1).replace("\\", "/"), "pct": 0})
+            return
+
+        # "name: NN% /size, speed, eta"
+        m3 = re.match(r'^(.+?):\s*(\d+)%\s*/', body)
+        if m3:
+            self._emit("fileProgress", {
+                "name": m3.group(1).replace("\\", "/"), "pct": int(m3.group(2))
+            })
+            return
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -332,6 +440,48 @@ class RCloneAPI:
                 if local.exists():
                     return str(local)
         return shutil.which("rclone") or ""
+
+    def open_folder_packer(self):
+        """
+        Opens the IA Folder Packer window. Normally wired onto this
+        instance by main.py at window-creation time — this fallback
+        just logs a clear message rather than raising if somehow
+        called before that wiring happened (e.g. the script run
+        standalone outside the main app).
+        """
+        self._log(
+            "Could not open Folder Packer — this only works when launched "
+            "via the main ToSort Toolkit app.", "warn"
+        )
+
+    def get_folder_files(self, folder: str) -> list:
+        """
+        Return {name, rel, size} for every file under `folder`,
+        recursively — used to populate the file-queue display BEFORE
+        the upload starts, so the person can see what's about to be
+        transferred. `rel` is the path relative to `folder` with
+        forward slashes (normalised the same way rclone reports
+        filenames), matching the IA uploader's get_folder_files
+        convention so the same display/matching logic works the same
+        way across both uploaders. This is a pure directory listing —
+        no hashing, no network calls — so it stays fast even on very
+        large folders.
+        """
+        result = []
+        try:
+            base = Path(folder)
+            for root, dirs, files in os.walk(folder):
+                for f in sorted(files):
+                    fp = Path(root) / f
+                    try:
+                        size = fp.stat().st_size
+                    except Exception:
+                        size = 0
+                    rel = str(fp.relative_to(base)).replace("\\", "/")
+                    result.append({"name": fp.name, "rel": rel, "path": str(fp), "size": size})
+        except Exception:
+            pass
+        return result
 
     def browse_folder(self) -> str:
         try:
@@ -350,7 +500,7 @@ class RCloneAPI:
 def main():
     api = RCloneAPI()
     window = webview.create_window(
-        title="RClone IA Uploader",
+        title="IA RClone Uploader",
         url=str(Path(__file__).parent / "gui" / "rclone_gui.html"),
         js_api=api,
         width=900,

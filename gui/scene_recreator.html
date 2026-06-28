@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Scene ZIP Recreator</title>
+<link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;--border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:12px;display:flex;flex-direction:column}
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:5px 10px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.titlebar-title{font-weight:700;font-size:13px;color:var(--acc);letter-spacing:1px;flex:1}
+.main{flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:6px}
+.main::-webkit-scrollbar{width:6px}
+.main::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:5px;overflow:hidden;flex-shrink:0}
+.panel-hdr{background:var(--bg2);padding:5px 10px;font-size:10px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:5px;letter-spacing:.5px;text-transform:uppercase}
+.panel-body{padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+.row{display:flex;align-items:center;gap:6px}
+.lbl{font-size:10px;color:var(--text2);min-width:90px;flex-shrink:0}
+.txt{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:4px 7px;color:var(--text);font-family:var(--mono);font-size:11px}
+.txt:focus{outline:none;border-color:var(--acc)}
+.btn{background:transparent;border:1px solid var(--border);border-radius:3px;padding:3px 10px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;transition:all .12s;white-space:nowrap}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn-acc{border-color:var(--acc);color:var(--acc)}
+.btn-acc:hover{background:rgba(74,240,160,.1)}
+.btn-danger{border-color:var(--danger);color:var(--danger)}
+.btn-danger:hover{background:rgba(240,64,64,.1)}
+.btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
+.hint{font-size:10px;color:var(--text3);line-height:1.5}
+.ref-item{display:flex;align-items:center;gap:6px}
+.ref-item .txt{font-size:10px}
+.ref-item .btn-remove{border-color:var(--danger);color:var(--danger);padding:3px 8px;flex-shrink:0}
+.ref-item .btn-remove:hover{background:rgba(240,64,64,.1)}
+.ref-empty{font-size:10px;color:var(--text3);font-style:italic;padding:2px 0}
+.opt{display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;color:var(--text2)}
+.opt input{accent-color:var(--acc)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex-shrink:0}
+.pill{font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:var(--bg3);color:var(--text2)}
+.pill-run{background:rgba(64,160,240,.2);color:var(--info)}
+.pill-ok{background:rgba(74,240,160,.2);color:var(--acc)}
+.pill-err{background:rgba(240,64,64,.2);color:var(--danger)}
+.prog-wrap{background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:6px 10px;display:flex;flex-direction:column;gap:5px}
+.prog-bar-bg{height:6px;background:var(--bg2);border-radius:3px;overflow:hidden}
+.prog-bar{height:100%;background:var(--acc);border-radius:3px;transition:width .5s}
+.log-w{background:var(--bg0);border:1px solid var(--border);border-radius:3px;height:380px;overflow-y:auto;padding:3px 6px;font-family:var(--mono);font-size:10px;user-select:text;-webkit-user-select:text}
+.log-w::-webkit-scrollbar{width:5px}
+.log-w::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.ll{padding:1px 0;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+.ll-ok{color:var(--acc)}.ll-err{color:var(--danger)}.ll-warn{color:var(--warn)}.ll-dim{color:var(--text3)}.ll-info{color:var(--info)}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px}
+.stat-box{background:var(--bg0);border:1px solid var(--border);border-radius:3px;padding:6px 8px;text-align:center}
+.stat-box .num{font-size:16px;font-weight:700;font-family:var(--mono)}
+.stat-box .lbl2{font-size:9px;color:var(--text3);text-transform:uppercase;margin-top:2px}
+.stat-clickable{cursor:pointer;transition:all .12s}
+.stat-clickable:hover{border-color:var(--acc)}
+.stat-clickable.active{border-color:var(--acc);background:rgba(74,240,160,.06)}
+.detail-list{background:var(--bg0);border:1px solid var(--border);border-radius:3px;max-height:220px;overflow-y:auto;padding:4px 8px;font-family:var(--mono);font-size:10px;user-select:text;-webkit-user-select:text}
+.detail-list::-webkit-scrollbar{width:5px}
+.detail-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.detail-row{padding:2px 0;border-bottom:1px solid var(--border);line-height:1.4}
+.detail-row:last-child{border-bottom:none}
+.detail-row .fname{color:var(--text)}
+.detail-row .meta{color:var(--text3);margin-left:6px}
+.detail-empty{font-size:10px;color:var(--text3);font-style:italic;padding:6px}
+</style>
+</head>
+<body>
+
+<div class="titlebar">
+  <div class="dot"></div>
+  <div class="titlebar-title">◈ Scene ZIP Recreator</div>
+  <span id="pill" class="pill">IDLE</span>
+</div>
+
+<div class="main">
+
+  <!-- Source / DAT / Output -->
+  <div class="panel">
+    <div class="panel-hdr"><div class="dot" style="background:var(--info)"></div>Folders</div>
+    <div class="panel-body">
+      <div class="row">
+        <span class="lbl">Scene ZIPs</span>
+        <input class="txt" id="src" placeholder="Folder to scan recursively for .zip files"/>
+        <button class="btn" onclick="browseSrc()">Browse</button>
+      </div>
+      <div class="row">
+        <span class="lbl">DAT folder</span>
+        <input class="txt" id="dat_dir" placeholder="Folder containing one or more DAT/XML files"/>
+        <button class="btn" onclick="browseDat()">Browse</button>
+      </div>
+      <div class="row" style="align-items:flex-start">
+        <span class="lbl" style="padding-top:4px">Reference (optional)</span>
+        <div style="flex:1;display:flex;flex-direction:column;gap:4px">
+          <div id="ref-list" style="display:flex;flex-direction:column;gap:4px"></div>
+          <button class="btn" style="align-self:flex-start" onclick="addRefFolder()">+ Add reference folder</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="lbl">Output</span>
+        <input class="txt" id="dst" placeholder="Where fixed/matching copies are written"/>
+        <button class="btn" onclick="browseDst()">Browse</button>
+      </div>
+      <div class="hint">
+        Originals in the Scene ZIPs folder are <strong style="color:var(--acc)">never modified</strong>.
+        All repair work happens on copies written to the Output folder.
+        Reference folder files are also never modified — they're copied to a temp
+        location before any inspection. Reference zips are matched against the DAT
+        the same way as the main scan (literal name, release name, or date-stripped
+        release name), then CRC/MD5/SHA1-verified before being trusted as a reference.
+        Each verified reference teaches the tool that release group's actual packer
+        settings (compression level/strategy, entry order) AND its exact set of
+        legitimate entry names — any file in a broken zip absent from every verified
+        reference for that group is treated as junk regardless of its name, catching
+        injected files that pattern-matching alone would miss. Both are tried first —
+        much faster and more reliable than blind searching — before falling back to
+        the general techniques. You can add several reference folders (e.g. specific
+        subfolders) instead of one huge parent folder, to speed up the scan.
+      </div>
+    </div>
+  </div>
+
+  <!-- Options -->
+  <div class="panel">
+    <div class="panel-hdr"><div class="dot"></div>Options</div>
+    <div class="panel-body">
+      <label class="opt"><input type="checkbox" id="dry_run"> Dry run (detect &amp; report only, write nothing)</label>
+      <div class="row" style="gap:8px">
+        <label class="opt" style="flex:1"><input type="checkbox" id="use_fp_db" checked> Use fingerprint database (skip re-scanning groups already learned in a previous run)</label>
+        <button class="btn btn-danger" style="padding:1px 8px;font-size:9px" onclick="resetFingerprintDb()">Reset DB</button>
+      </div>
+      <label class="opt"><input type="checkbox" id="auto_retry" checked> Auto-retry unresolved files by excluding suspect references (catches a poisoned DAT-verified reference)</label>
+      <div class="row" style="gap:16px;margin-top:2px">
+        <span style="font-size:10px;color:var(--text2)">Confirmed files:</span>
+        <label class="opt"><input type="radio" name="move_mode" id="mode_copy" value="copy" checked> Copy (keep originals)</label>
+        <label class="opt"><input type="radio" name="move_mode" id="mode_move" value="move"> Move (remove from source)</label>
+      </div>
+      <div class="hint">
+        Techniques tried in order per file: EOCD comment strip → grow-append truncation →
+        line-ending fix (.nfo/.diz) → junk-file removal → compression variants (STORE +
+        DEFLATE levels 0-9) → faithful rebuild (original headers preserved, searches entry
+        order + ALL compression levels 0-9 + zlib strategy) → heuristic junk removal (strips
+        likely FTP-script adverts/courier tags by name pattern, including folder names) →
+        strip to essentials (last resort: keeps only the largest file + .nfo/.diz, discards
+        everything else regardless of name) → foreign-packer diagnosis. Every structural
+        technique re-runs the full order/compression/strategy search (plus any learned group
+        fingerprints) rather than trying one default rebuild, since the right fix is often a
+        structural change AND a specific compression setting together. Matching stops at the
+        first technique that hits the DAT's target CRC32, then MD5/SHA1 are verified before
+        accepting the fix. If nothing matches but every entry's internal CRC checks out, it's
+        flagged as "likely foreign packer" — content is probably correct but was packed by a
+        tool whose exact compressed bytes can't be reproduced.
+      </div>
+      <div class="hint">
+        Output is organised by DAT release name: <code>output/&lt;game name&gt;/&lt;filename&gt;</code>.
+        Sidecar .nfo/.diz files next to a confirmed .zip are also checked — if the DAT's
+        same release block has a hash entry for them they're verified/fixed and placed
+        alongside the .zip; otherwise they're left untouched in source.
+        Only hash-confirmed files are moved or copied — unresolved files always stay in place.
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div class="panel">
+    <div class="panel-hdr"><div class="dot" style="background:var(--info)"></div>Progress</div>
+    <div class="panel-body">
+      <div class="prog-wrap">
+        <div class="prog-bar-bg"><div class="prog-bar" id="prog-bar" style="width:0%"></div></div>
+        <div style="font-size:10px;font-family:var(--mono);color:var(--text2);margin-top:3px" id="prog-label">—</div>
+      </div>
+      <div class="row" style="gap:6px">
+        <button class="btn btn-acc" id="btn-start" onclick="startRun()">▶ Start</button>
+        <button class="btn" id="btn-skip" onclick="skipFile()" disabled>⏭ Skip file</button>
+        <button class="btn btn-danger" id="btn-stop" onclick="stopRun()" disabled>■ Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats (shown after run) -->
+  <div class="panel" id="stats-panel" style="display:none">
+    <div class="panel-hdr">
+      <div class="dot" style="background:var(--acc)"></div>Results <span style="font-size:9px;color:var(--text3);font-weight:400;text-transform:none;margin-left:6px">(click a box for details)</span>
+      <button class="btn" style="margin-left:auto;padding:1px 7px;font-size:9px" onclick="clearResults()">Clear</button>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-box stat-clickable" data-cat="already_match"><div class="num" id="st-match" style="color:var(--acc)">0</div><div class="lbl2">Already Match</div></div>
+        <div class="stat-box stat-clickable" data-cat="fixed"><div class="num" id="st-fixed" style="color:var(--info)">0</div><div class="lbl2">Fixed</div></div>
+        <div class="stat-box stat-clickable" data-cat="unresolved"><div class="num" id="st-unresolved" style="color:var(--danger)">0</div><div class="lbl2">Unresolved</div></div>
+        <div class="stat-box stat-clickable" data-cat="foreign_packer"><div class="num" id="st-foreign" style="color:var(--warn)">0</div><div class="lbl2">Foreign Packer</div></div>
+        <div class="stat-box stat-clickable" data-cat="no_dat_entry"><div class="num" id="st-nodat" style="color:var(--text3)">0</div><div class="lbl2">No DAT Entry</div></div>
+        <div class="stat-box stat-clickable" data-cat="leftovers_only"><div class="num" id="st-leftovers" style="color:var(--warn)">0</div><div class="lbl2">Leftovers Only</div></div>
+        <div class="stat-box stat-clickable" data-cat="skipped"><div class="num" id="st-skipped" style="color:var(--warn)">0</div><div class="lbl2">Skipped</div></div>
+        <div class="stat-box stat-clickable" data-cat="sidecar_matched"><div class="num" id="st-sidecar-match" style="color:var(--acc)">0</div><div class="lbl2">Sidecar Match</div></div>
+        <div class="stat-box stat-clickable" data-cat="sidecar_fixed"><div class="num" id="st-sidecar-fixed" style="color:var(--info)">0</div><div class="lbl2">Sidecar Fixed</div></div>
+      </div>
+      <div id="stat-detail" style="display:none;margin-top:8px"></div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <div class="dot"></div>Log
+      <button class="btn" style="margin-left:auto;padding:1px 7px;font-size:9px" onclick="clearLog()">Clear</button>
+    </div>
+    <div class="panel-body" style="padding:5px 8px">
+      <div class="log-w" id="log"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let refFolders = [];
+let lastDetails = {};
+
+window.addEventListener('pywebviewready', async () => {
+  const cfg = await window.pywebview.api.load_config();
+  if (cfg.src)     document.getElementById('src').value = cfg.src;
+  if (cfg.dat_dir) document.getElementById('dat_dir').value = cfg.dat_dir;
+  if (cfg.dst)      document.getElementById('dst').value = cfg.dst;
+  if (cfg.dry_run)  document.getElementById('dry_run').checked = cfg.dry_run;
+  if (cfg.use_fingerprint_db === false) document.getElementById('use_fp_db').checked = false;
+  if (cfg.auto_retry_excluding_suspect_refs === false) document.getElementById('auto_retry').checked = false;
+  if (cfg.move_mode) document.getElementById('mode_move').checked = true;
+  else document.getElementById('mode_copy').checked = true;
+
+  // Load reference folders — supports the new list format and the
+  // older single ref_dir key for backwards compatibility with configs
+  // saved before multi-folder support was added.
+  if (Array.isArray(cfg.ref_dirs)) {
+    refFolders = cfg.ref_dirs.filter(Boolean);
+  } else if (cfg.ref_dir) {
+    refFolders = [cfg.ref_dir];
+  }
+  renderRefFolders();
+
+  // Wire up the clickable stat boxes once, at load time
+  document.querySelectorAll('.stat-clickable').forEach(box => {
+    box.addEventListener('click', () => showStatDetail(box.dataset.cat, box));
+  });
+});
+
+window.srEvent = function(event, data) {
+  if (event === 'log') {
+    addLog(data.msg, data.cls);
+  } else if (event === 'progress') {
+    document.getElementById('prog-bar').style.width = data.pct + '%';
+    document.getElementById('prog-label').textContent = data.label || '—';
+  } else if (event === 'status') {
+    const pill = document.getElementById('pill');
+    const bst  = document.getElementById('btn-start');
+    const bsp  = document.getElementById('btn-stop');
+    const bsk  = document.getElementById('btn-skip');
+    if (data.state === 'running') {
+      pill.textContent = 'RUNNING'; pill.className = 'pill pill-run';
+      bst.disabled = true; bsp.disabled = false; bsk.disabled = false;
+      document.getElementById('stats-panel').style.display = 'none';
+      document.getElementById('stat-detail').style.display = 'none';
+    } else if (data.state === 'done') {
+      pill.textContent = 'DONE'; pill.className = 'pill pill-ok';
+      bst.disabled = false; bsp.disabled = true; bsk.disabled = true;
+      lastDetails = data.details || {};
+      if (data.stats) {
+        document.getElementById('stats-panel').style.display = '';
+        document.getElementById('st-match').textContent = data.stats.already_match ?? 0;
+        document.getElementById('st-fixed').textContent = data.stats.fixed ?? 0;
+        document.getElementById('st-unresolved').textContent = data.stats.unresolved ?? 0;
+        document.getElementById('st-foreign').textContent = data.stats.foreign_packer ?? 0;
+        document.getElementById('st-nodat').textContent = data.stats.no_dat_entry ?? 0;
+        document.getElementById('st-leftovers').textContent = data.stats.leftovers_only ?? 0;
+        document.getElementById('st-skipped').textContent = data.stats.skipped ?? 0;
+        document.getElementById('st-sidecar-match').textContent = data.stats.sidecar_matched ?? 0;
+        document.getElementById('st-sidecar-fixed').textContent = data.stats.sidecar_fixed ?? 0;
+      }
+      document.querySelectorAll('.stat-clickable').forEach(b => b.classList.remove('active'));
+      document.getElementById('stat-detail').style.display = 'none';
+    } else {
+      pill.textContent = 'ERROR'; pill.className = 'pill pill-err';
+      bst.disabled = false; bsp.disabled = true; bsk.disabled = true;
+    }
+  }
+};
+
+function showStatDetail(cat, boxEl) {
+  const detailEl = document.getElementById('stat-detail');
+  const alreadyActive = boxEl.classList.contains('active');
+  document.querySelectorAll('.stat-clickable').forEach(b => b.classList.remove('active'));
+
+  if (alreadyActive) {
+    // Clicking the same box again collapses the detail view
+    detailEl.style.display = 'none';
+    return;
+  }
+
+  boxEl.classList.add('active');
+  const items = lastDetails[cat] || [];
+  detailEl.innerHTML = '';
+
+  // Build the plain-text lines once, shared by both the on-screen
+  // rows and the copy button, so what gets copied always matches
+  // exactly what's displayed
+  const lines = items.map(item => {
+    const metaParts = [];
+    if (item.technique) metaParts.push('via ' + item.technique);
+    if (item.game_name) metaParts.push(item.game_name);
+    if (item.in_zip) metaParts.push('extracted from zip');
+    if (item.diagnosis) metaParts.push(item.diagnosis);
+    if (item.entries) metaParts.push('contains: ' + item.entries.join(', '));
+    const fname = item.file || '(unknown)';
+    return metaParts.length ? `${fname} — ${metaParts.join(' — ')}` : fname;
+  });
+
+  const headerRow = document.createElement('div');
+  headerRow.style.display = 'flex';
+  headerRow.style.alignItems = 'center';
+  headerRow.style.gap = '8px';
+  headerRow.style.marginBottom = '4px';
+
+  const header = document.createElement('div');
+  header.style.fontSize = '10px';
+  header.style.color = 'var(--text2)';
+  header.style.flex = '1';
+  header.textContent = items.length + ' file' + (items.length === 1 ? '' : 's');
+  headerRow.appendChild(header);
+
+  if (items.length > 0) {
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'btn';
+    copyBtn.style.padding = '1px 8px';
+    copyBtn.style.fontSize = '9px';
+    copyBtn.textContent = '⎘ Copy';
+    copyBtn.onclick = async () => {
+      const text = lines.join('\n');
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          // Fallback for webview environments without the Clipboard API
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+        copyBtn.textContent = '✓ Copied';
+      } catch (e) {
+        copyBtn.textContent = '✕ Failed';
+      }
+      setTimeout(() => { copyBtn.textContent = '⎘ Copy'; }, 1500);
+    };
+    headerRow.appendChild(copyBtn);
+  }
+
+  // Move/Copy to folder — only offered where items carry a 'path'
+  // (currently just leftovers-only files), since these are the
+  // original on-disk files being relocated as-is, not a rebuilt
+  // result tied to the normal output folder
+  if (items.length > 0 && items.some(item => item.path)) {
+    const moveBtn = document.createElement('button');
+    moveBtn.className = 'btn';
+    moveBtn.style.padding = '1px 8px';
+    moveBtn.style.fontSize = '9px';
+    moveBtn.textContent = '→ Move to folder';
+    moveBtn.onclick = () => relocateDetailFiles(cat, true);
+    headerRow.appendChild(moveBtn);
+
+    const copyToBtn = document.createElement('button');
+    copyToBtn.className = 'btn';
+    copyToBtn.style.padding = '1px 8px';
+    copyToBtn.style.fontSize = '9px';
+    copyToBtn.textContent = '⎘ Copy to folder';
+    copyToBtn.onclick = () => relocateDetailFiles(cat, false);
+    headerRow.appendChild(copyToBtn);
+  }
+  detailEl.appendChild(headerRow);
+
+  const list = document.createElement('div');
+  list.className = 'detail-list';
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'detail-empty';
+    empty.textContent = 'No files in this category.';
+    list.appendChild(empty);
+  } else {
+    items.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'detail-row';
+      const fname = document.createElement('span');
+      fname.className = 'fname';
+      fname.textContent = item.file || '(unknown)';
+      row.appendChild(fname);
+
+      const metaParts = [];
+      if (item.technique) metaParts.push('via ' + item.technique);
+      if (item.game_name) metaParts.push(item.game_name);
+      if (item.in_zip) metaParts.push('extracted from zip');
+      if (item.diagnosis) metaParts.push(item.diagnosis);
+      if (item.entries) metaParts.push('contains: ' + item.entries.join(', '));
+      if (metaParts.length) {
+        const meta = document.createElement('span');
+        meta.className = 'meta';
+        meta.textContent = metaParts.join(' — ');
+        row.appendChild(meta);
+      }
+      list.appendChild(row);
+    });
+  }
+  detailEl.appendChild(list);
+  detailEl.style.display = '';
+}
+
+
+async function browseSrc() {
+  const p = await window.pywebview.api.browse_folder();
+  if (p) document.getElementById('src').value = p;
+}
+async function browseDat() {
+  const p = await window.pywebview.api.browse_folder();
+  if (p) document.getElementById('dat_dir').value = p;
+}
+async function addRefFolder() {
+  const p = await window.pywebview.api.browse_folder();
+  if (p && !refFolders.includes(p)) {
+    refFolders.push(p);
+    renderRefFolders();
+  }
+}
+function removeRefFolder(index) {
+  refFolders.splice(index, 1);
+  renderRefFolders();
+}
+function renderRefFolders() {
+  const list = document.getElementById('ref-list');
+  list.innerHTML = '';
+  if (refFolders.length === 0) {
+    const d = document.createElement('div');
+    d.className = 'ref-empty';
+    d.textContent = 'No reference folders added — fingerprinting is skipped if none are set.';
+    list.appendChild(d);
+    return;
+  }
+  refFolders.forEach((folder, i) => {
+    const row = document.createElement('div');
+    row.className = 'ref-item';
+    const input = document.createElement('input');
+    input.className = 'txt';
+    input.value = folder;
+    input.readOnly = true;
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-remove';
+    btn.textContent = '✕';
+    btn.onclick = () => removeRefFolder(i);
+    row.appendChild(input);
+    row.appendChild(btn);
+    list.appendChild(row);
+  });
+}
+async function browseDst() {
+  const p = await window.pywebview.api.browse_folder();
+  if (p) document.getElementById('dst').value = p;
+}
+
+async function startRun() {
+  const src     = document.getElementById('src').value.trim();
+  const dat_dir = document.getElementById('dat_dir').value.trim();
+  const ref_dirs = refFolders.slice();
+  const dst     = document.getElementById('dst').value.trim();
+  const dry_run = document.getElementById('dry_run').checked;
+  const move_mode = document.getElementById('mode_move').checked;
+  const use_fingerprint_db = document.getElementById('use_fp_db').checked;
+  const auto_retry_excluding_suspect_refs = document.getElementById('auto_retry').checked;
+
+  if (!src)     { addLog('Select the Scene ZIPs folder.', 'warn'); return; }
+  if (!dat_dir) { addLog('Select the DAT folder.', 'warn'); return; }
+  if (!dry_run && !dst) { addLog('Select an Output folder (or enable Dry Run).', 'warn'); return; }
+
+  await window.pywebview.api.save_config({ src, dat_dir, ref_dirs, dst, dry_run, move_mode, use_fingerprint_db, auto_retry_excluding_suspect_refs });
+
+  document.getElementById('prog-bar').style.width = '0%';
+  document.getElementById('prog-label').textContent = '—';
+
+  await window.pywebview.api.start_run({ src, dat_dir, ref_dirs, dst, dry_run, move_mode, use_fingerprint_db, auto_retry_excluding_suspect_refs });
+}
+
+async function stopRun() {
+  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('btn-skip').disabled = true;
+  await window.pywebview.api.stop_run();
+}
+
+async function skipFile() {
+  await window.pywebview.api.skip_current_file();
+}
+
+async function resetFingerprintDb() {
+  const ok = confirm(
+    'Delete the fingerprint database? Every learned release-group convention ' +
+    'will be forgotten, and the next reference scan will start completely fresh ' +
+    '(slower, but harmless — references are re-verified the same safe way either way).'
+  );
+  if (!ok) return;
+  await window.pywebview.api.reset_fingerprint_db();
+}
+
+async function relocateDetailFiles(cat, move) {
+  const items = (lastDetails[cat] || []).filter(item => item.path);
+  if (items.length === 0) return;
+
+  const dest = await window.pywebview.api.browse_folder();
+  if (!dest) return;
+
+  const verb = move ? 'move' : 'copy';
+  const ok = confirm(
+    `${move ? 'Move' : 'Copy'} ${items.length} file${items.length === 1 ? '' : 's'} to:\n${dest}` +
+    (move ? '\n\nThis removes them from the original scan folder.' : '')
+  );
+  if (!ok) return;
+
+  const paths = items.map(item => item.path);
+  const result = await window.pywebview.api.relocate_files(paths, dest, move);
+  if (result) {
+    const done = move ? result.moved : result.copied;
+    const failedCount = (result.failed || []).length;
+    addLog(
+      `${move ? 'Moved' : 'Copied'} ${done} file(s) to ${dest}` +
+      (failedCount ? ` — ${failedCount} failed (see log above)` : ''),
+      failedCount ? 'warn' : 'ok'
+    );
+  }
+}
+
+function addLog(msg, cls) {
+  if (msg === undefined || msg === null) return;
+  const log = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = 'll' + (cls ? ' ll-' + cls : '');
+  d.textContent = msg === '' ? '' : '[' + new Date().toLocaleTimeString('en-GB') + '] ' + msg;
+  log.appendChild(d);
+  while (log.childElementCount > 3000) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+function clearLog() { document.getElementById('log').innerHTML = ''; }
+
+function clearResults() {
+  document.getElementById('stats-panel').style.display = 'none';
+  document.getElementById('stat-detail').style.display = 'none';
+  document.getElementById('stat-detail').innerHTML = '';
+  document.querySelectorAll('.stat-clickable').forEach(b => b.classList.remove('active'));
+  lastDetails = {};
+}
+</script>
+</body>
+</html>

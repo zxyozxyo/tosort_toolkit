@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RClone IA Uploader</title>
+<title>IA RClone Uploader</title>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -69,17 +69,42 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 .log-w::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 .ll{padding:1px 0;line-height:1.4}
 .ll-ok{color:var(--acc)}.ll-err{color:var(--danger)}.ll-warn{color:var(--warn)}.ll-dim{color:var(--text3)}.ll-info{color:var(--info)}
+.file-list{background:var(--bg0);border:1px solid var(--border);border-radius:3px;height:140px;overflow-y:auto;padding:2px}
+.file-list::-webkit-scrollbar{width:5px}
+.file-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.file-item{display:flex;align-items:center;gap:5px;padding:2px 5px;border-radius:2px;font-size:10px;font-family:var(--mono)}
+.file-item:hover{background:var(--bg2)}
+.file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.file-sz{color:var(--text3);min-width:55px;text-align:right;flex-shrink:0}
+.file-st{width:50px;text-align:right;flex-shrink:0;font-size:10px}
+.file-st.queued{color:var(--text3)}.file-st.uploading{color:var(--info)}.file-st.done{color:var(--acc)}.file-st.already{color:var(--warn)}.file-st.error{color:var(--danger)}
+.file-empty{color:var(--text3);font-size:10px;padding:6px;text-align:center}
+.file-list-hdr span:hover{color:var(--acc)}
 </style>
 </head>
 <body>
 
 <div class="titlebar">
   <div class="dot"></div>
-  <div class="titlebar-title">◈ RClone IA Uploader</div>
+  <div class="titlebar-title">◈ IA RClone Uploader</div>
   <span id="pill" class="pill">IDLE</span>
 </div>
 
 <div class="main">
+
+  <!-- Folder Packer launcher -->
+  <div class="panel">
+    <div class="panel-body" style="flex-direction:row;align-items:center;gap:10px">
+      <div class="dot" style="background:var(--warn)"></div>
+      <span style="font-size:10px;color:var(--text3);flex:1">
+        Need to group loose archives or pack whole folders before uploading?
+        Use the <strong style="color:var(--warn)">IA Folder Packer</strong> —
+        letter-grouping, whole-folder, and depth-based packing strategies all
+        live there now.
+      </span>
+      <button class="btn" style="border-color:var(--warn);color:var(--warn)" onclick="window.pywebview.api.open_folder_packer()">Open Folder Packer</button>
+    </div>
+  </div>
 
   <!-- Setup -->
   <div class="panel">
@@ -115,12 +140,12 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
     <div class="panel-body" id="body-item">
       <div class="row">
         <span class="lbl">Source Folder</span>
-        <input class="txt" id="src" placeholder="Local folder to upload"/>
+        <input class="txt" id="src" placeholder="Local folder to upload" onchange="scanSourceFiles()"/>
         <button class="btn" onclick="browseSrc()">Browse</button>
       </div>
       <div class="row">
         <span class="lbl">Identifier</span>
-        <input class="txt" id="identifier" placeholder="archive.org/details/your-identifier" oninput="autoTitle()"/>
+        <input class="txt" id="identifier" placeholder="archive.org/details/your-identifier" oninput="autoTitle(); validateId(this)"/>
         <button class="btn" onclick="fetchMeta()">Fetch</button>
       </div>
       <div class="hint">Identifier rules: 5-100 chars, letters/numbers/dots/hyphens/underscores, must be unique on IA.</div>
@@ -193,8 +218,8 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <div style="display:flex;align-items:center;gap:6px">
           <span style="font-size:10px;color:var(--text2)">Log level</span>
           <select class="sel" id="verbose">
-            <option value="-v" selected>-v (normal)</option>
-            <option value="-vv">-vv (verbose)</option>
+            <option value="-v">-v (normal)</option>
+            <option value="-vv" selected>-vv (verbose, needed for file-list status tracking)</option>
           </select>
         </div>
       </div>
@@ -203,6 +228,28 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <b>Wait archive</b> — how long rclone waits for IA to process after upload.
         <b>Checksum</b> — disabled by default (--internetarchive-disable-checksum) as IA recommends.
       </div>
+    </div>
+  </div>
+
+  <!-- Files queue -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <div class="dot" style="background:var(--acc)"></div>Files
+      <span id="files-sum" style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400"></span>
+    </div>
+    <div class="panel-body">
+      <div class="row">
+        <span style="font-size:9px;color:var(--text3)">Populated automatically from the Source folder above.</span>
+        <span id="clear-toast" style="font-size:9px;color:var(--acc);opacity:0;transition:opacity .3s;margin-left:auto"></span>
+        <button class="btn" id="btn-clear-uploaded" style="border-color:var(--warn);color:var(--warn)" onclick="clearUploadedFiles()">Clear Uploaded</button>
+        <button class="btn btn-danger" id="btn-clear-all" onclick="confirmClearFiles()">Clear All</button>
+      </div>
+      <div class="file-list-hdr" style="display:flex;align-items:center;gap:5px;padding:2px 5px;font-size:9px;color:var(--text3);font-family:var(--mono);cursor:pointer;user-select:none">
+        <span style="flex:1" data-sort="name" data-label="Name" onclick="sortFiles('name')">Name</span>
+        <span style="min-width:55px;text-align:right" data-sort="size" data-label="Size" onclick="sortFiles('size')">Size</span>
+        <span style="width:50px;text-align:right" data-sort="status" data-label="Status" onclick="sortFiles('status')">Status</span>
+      </div>
+      <div class="file-list" id="file-list"><div class="file-empty">Set a source folder above to populate the list</div></div>
     </div>
   </div>
 
@@ -222,8 +269,6 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
           <div class="prog-stat"><span>Done</span><span id="st-pct">0%</span></div>
         </div>
       </div>
-      <!-- Current transfers -->
-      <div id="active-files" style="display:flex;flex-direction:column;gap:2px;max-height:140px;overflow-y:auto;font-family:var(--mono);font-size:10px"></div>
       <div class="row" style="gap:6px;align-items:center">
         <button class="btn btn-acc" id="btn-start" onclick="startUpload()">▶ Start Upload</button>
         <button class="btn btn-danger" id="btn-stop" onclick="stopUpload()" disabled>■ Stop</button>
@@ -284,9 +329,16 @@ window.addEventListener('pywebviewready', async () => {
   if (cfg.md_collection) document.getElementById('md-collection').value = cfg.md_collection;
   if (cfg.md_subject) document.getElementById('md-subject').value = cfg.md_subject;
   if (cfg.md_desc)    document.getElementById('md-desc').value = cfg.md_desc;
+
+  // Auto-populate the file queue if a source folder was restored from
+  // a previous session, so the list isn't empty until Start/Scan is
+  // pressed manually
+  if (cfg.src) await scanSourceFiles();
 });
 
 // ── Python events ─────────────────────────────────────────────────────────────
+let isUploading = false;
+
 window.rcEvent = function(event, data) {
   if (event === 'log') {
     addLog(data.msg, data.cls);
@@ -294,6 +346,16 @@ window.rcEvent = function(event, data) {
     const pill = document.getElementById('pill');
     const bst  = document.getElementById('btn-start');
     const bsp  = document.getElementById('btn-stop');
+    const bca  = document.getElementById('btn-clear-all');
+    const bcu  = document.getElementById('btn-clear-uploaded');
+    isUploading = data.state === 'running';
+    // Clearing the list while a transfer is actively running is what
+    // caused the file-list confusion — the queue and rclone's own
+    // progress would fall out of sync. Disabling both clear actions
+    // for the duration of a run (Scan Source no longer exists as a
+    // manual trigger at all) removes the chance of that happening.
+    bca.disabled = isUploading;
+    bcu.disabled = isUploading;
     if (data.state === 'running') {
       pill.textContent = 'UPLOADING'; pill.className = 'pill pill-run';
       bst.disabled = true; bsp.disabled = false;
@@ -316,25 +378,205 @@ window.rcEvent = function(event, data) {
     document.getElementById('st-speed').textContent = data.speed || '—';
     document.getElementById('st-eta').textContent   = data.eta || '—';
     document.getElementById('st-pct').textContent   = (data.pct || 0) + '%';
+  } else if (event === 'fileStatus') {
+    // Authoritative — full untruncated path, from -v INFO/ERROR lines
+    setFileStatus(data.name, data.status);
+  } else if (event === 'fileProgress') {
+    // Best-effort — may be a truncated name from --progress lines
+    const match = findQueuedFile(data.name);
+    if (match) setFileStatus(match.name, 'uploading', data.pct);
   }
 };
 
 
 
-function updateActiveFile(name, pct, size, speed, eta, isDone) {
-  const key = 'af_' + name.replace(/[^a-z0-9]/gi, '_').substring(0, 50);
-  const container = document.getElementById('active-files');
-  let el = document.getElementById(key);
-  if (!el) {
-    el = document.createElement('div');
-    el.id = key;
-    container.appendChild(el);
+// ── File queue ────────────────────────────────────────────────────────────────
+let fileList = [];
+let lastScannedSrc = '';
+let sortKey = null;     // 'name' | 'size' | 'status' | null (insertion order)
+let sortDir = 1;        // 1 = asc, -1 = desc
+
+function fmtSz(n) {
+  if (!n && n !== 0) return '—';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+
+async function scanSourceFiles() {
+  const src = document.getElementById('src').value.trim();
+  if (!src) { addLog('Set a source folder first.', 'warn'); return; }
+  addLog('Scanning source folder...', 'dim');
+  const files = await window.pywebview.api.get_folder_files(src);
+  fileList = files.map(f => ({ name: f.rel, path: f.path, size: f.size, status: 'queued' }));
+  lastScannedSrc = src;
+  renderFiles();
+  addLog(`Found ${fileList.length} file(s) in ${src}`, fileList.length ? 'ok' : 'warn');
+}
+
+function updateFilesSummary() {
+  const sum = document.getElementById('files-sum');
+  if (fileList.length === 0) { sum.textContent = ''; return; }
+  const totalSize = fileList.reduce((a, f) => a + (f.size || 0), 0);
+  // "Remaining" = still needs to be uploaded — done and already-on-
+  // remote files are genuinely finished, but an errored file still
+  // needs uploading (rclone just hasn't succeeded with it yet), so it
+  // stays counted as remaining rather than being treated as resolved
+  const remaining = fileList.filter(f => f.status !== 'done' && f.status !== 'already');
+  const remainingSize = remaining.reduce((a, f) => a + (f.size || 0), 0);
+  if (remaining.length === fileList.length) {
+    // Nothing processed yet — just show the total, no need for a
+    // redundant "X remaining of X" before anything has happened
+    sum.textContent = `${fileList.length} file(s), ${fmtSz(totalSize)}`;
+  } else {
+    sum.textContent = `${remaining.length} of ${fileList.length} file(s) remaining, ${fmtSz(remainingSize)} of ${fmtSz(totalSize)}`;
   }
-  const done = isDone || pct >= 100;
-  el.style.cssText = `padding:2px 4px;border-radius:2px;color:${done?'var(--acc)':(pct<=5?'var(--info)':' var(--text)}')};`;
-  const prefix = done ? '✓' : (pct <= 5 ? '→' : '↑');
-  el.textContent = `${prefix} ${name}`;
-  if (done) setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 5000);
+}
+
+// Status sort priority — groups errors and not-yet-done files toward
+// one end, finished (done/already) toward the other, so "sort by
+// error" and "sort by uploaded" are both just this same Status column,
+// clicked once for one direction and twice for the other
+const STATUS_ORDER = { error: 0, uploading: 1, queued: 2, done: 3, already: 4 };
+
+function sortFiles(key) {
+  if (sortKey === key) {
+    sortDir = -sortDir;
+  } else {
+    sortKey = key;
+    sortDir = 1;
+  }
+  renderFiles();
+}
+
+function getSortedFileList() {
+  if (!sortKey) return fileList;
+  const arr = fileList.map((f, i) => ({ f, i })); // stable sort via original index tiebreak
+  arr.sort((a, b) => {
+    let cmp = 0;
+    if (sortKey === 'name') {
+      cmp = a.f.name.localeCompare(b.f.name, undefined, { sensitivity: 'base' });
+    } else if (sortKey === 'size') {
+      cmp = (a.f.size || 0) - (b.f.size || 0);
+    } else if (sortKey === 'status') {
+      const sa = STATUS_ORDER[a.f.status] ?? 2;
+      const sb = STATUS_ORDER[b.f.status] ?? 2;
+      cmp = sa - sb;
+    }
+    if (cmp === 0) cmp = a.i - b.i; // stable: preserve original order for ties
+    return cmp * sortDir;
+  });
+  return arr.map(x => x.f);
+}
+
+function renderFiles() {
+  const el = document.getElementById('file-list');
+  if (fileList.length === 0) {
+    el.innerHTML = '<div class="file-empty">Set a source folder above to populate the list</div>';
+    updateFilesSummary();
+    return;
+  }
+  updateFilesSummary();
+  el.innerHTML = '';
+  const sorted = getSortedFileList();
+  // Use each file's position in the SORTED view for its DOM id/lookup,
+  // but status updates match by name (dataset.fname), so sort order
+  // never breaks live status updates arriving mid-upload
+  sorted.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.className = 'file-item'; d.id = 'fi-' + i;
+    d.dataset.fname = f.name;
+    const stClass = f.status || 'queued';
+    const stText = stClass === 'done' ? '✓' : stClass === 'already' ? '✓ existing' : stClass === 'error' ? '✗'
+                 : stClass === 'uploading' ? (f.pct != null ? f.pct + '%' : '…') : '—';
+    d.innerHTML = `<span class="file-name" title="${f.path}">${f.name}</span>`
+      + `<span class="file-sz">${fmtSz(f.size)}</span>`
+      + `<span class="file-st ${stClass}" id="fst-${i}">${stText}</span>`;
+    el.appendChild(d);
+  });
+  updateSortHeaderIndicators();
+}
+
+function updateSortHeaderIndicators() {
+  document.querySelectorAll('.file-list-hdr [data-sort]').forEach(h => {
+    const k = h.dataset.sort;
+    h.textContent = h.dataset.label + (sortKey === k ? (sortDir === 1 ? ' ▲' : ' ▼') : '');
+  });
+}
+
+function confirmClearFiles() {
+  if (isUploading) { addLog('Cannot clear the list while an upload is running.', 'warn'); return; }
+  if (fileList.length === 0) return;
+  if (confirm(`Clear all ${fileList.length} file(s) from the list? This does not affect anything already uploaded — it only clears this display.`)) {
+    clearFiles();
+  }
+}
+
+function clearFiles() { fileList = []; renderFiles(); }
+
+function showClearToast(msg) {
+  const t = document.getElementById('clear-toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(showClearToast._t);
+  showClearToast._t = setTimeout(() => { t.style.opacity = '0'; }, 2200);
+}
+
+function clearUploadedFiles() {
+  if (isUploading) { addLog('Cannot clear the list while an upload is running.', 'warn'); return; }
+  const before = fileList.length;
+  // Clears BOTH freshly-uploaded-this-run files AND files that were
+  // already present on the remote from a previous run (rclone's
+  // "Unchanged skipping") — both represent files that don't need any
+  // further action, just reported via different rclone log lines
+  fileList = fileList.filter(f => f.status !== 'done' && f.status !== 'already');
+  const removed = before - fileList.length;
+  renderFiles();
+  showClearToast(removed > 0 ? `Cleared ${removed} file${removed === 1 ? '' : 's'}` : 'Nothing to clear');
+  addLog(
+    removed > 0
+      ? `Cleared ${removed} uploaded file${removed === 1 ? '' : 's'} from the list (newly uploaded + already on remote).`
+      : 'No uploaded files to clear.',
+    removed > 0 ? 'ok' : 'dim'
+  );
+}
+
+function setFileStatus(name, status, pct) {
+  const entry = fileList.find(f => f.name === name);
+  if (entry) {
+    entry.status = status;
+    if (pct != null) entry.pct = pct;
+  }
+  const idx = fileList.indexOf(entry);
+  if (idx === -1) return;
+  const st = document.getElementById('fst-' + idx);
+  const row = document.getElementById('fi-' + idx);
+  if (st) {
+    st.textContent = status === 'done' ? '✓' : status === 'already' ? '✓ existing' : status === 'error' ? '✗'
+                    : status === 'uploading' ? (pct != null ? pct + '%' : '…') : '—';
+    st.className = 'file-st ' + status;
+  }
+  if (row) row.dataset.fname = name;
+  // Only a status that means "no longer pending" (done/already/error)
+  // changes the remaining count — live progress ticks (status
+  // "uploading") don't move the count, since the file isn't finished
+  if (status === 'done' || status === 'already' || status === 'error') {
+    updateFilesSummary();
+  }
+}
+
+// Truncation-tolerant lookup for rclone's --progress lines, which can
+// truncate long paths in the middle with "…" — exact completion lines
+// (-v INFO/ERROR) always carry the full path and never need this.
+function findQueuedFile(reportedName) {
+  if (!reportedName.includes('…')) {
+    return fileList.find(f => f.name === reportedName);
+  }
+  const idx = reportedName.indexOf('…');
+  const prefix = reportedName.slice(0, idx);
+  const suffix = reportedName.slice(idx + 1);
+  return fileList.find(f => f.name.startsWith(prefix) && f.name.endsWith(suffix));
 }
 
 // ── Panel toggle ──────────────────────────────────────────────────────────────
@@ -380,8 +622,18 @@ async function saveConf() {
 // ── Source ────────────────────────────────────────────────────────────────────
 async function browseSrc() {
   const p = await window.pywebview.api.browse_folder();
-  if (p) document.getElementById('src').value = p;
+  if (p) {
+    document.getElementById('src').value = p;
+    await scanSourceFiles();
+  }
 }
+function validateId(el) {
+  const v = el.value.trim();
+  const ok = v.length >= 5 && v.length <= 100
+    && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(v);
+  el.style.borderColor = v.length === 0 ? '' : (ok ? 'var(--acc)' : 'var(--danger)');
+}
+
 async function onDeriveChange() {
   // Rewrite rclone.conf with updated derive setting
   const acc = document.getElementById('access-key').value.trim();
@@ -425,6 +677,25 @@ async function startUpload() {
   const id  = document.getElementById('identifier').value.trim();
   if (!src) { addLog('Select a source folder.', 'warn'); return; }
   if (!id)  { addLog('Enter an identifier.', 'warn'); return; }
+  // Validate IA identifier rules
+  if (id.length < 5 || id.length > 100) {
+    addLog('Identifier must be 5-100 characters.', 'err'); return;
+  }
+  if (!/^[a-zA-Z0-9]/.test(id)) {
+    addLog('Identifier must start with a letter or number (not _ . - etc).', 'err'); return;
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) {
+    addLog('Identifier may only contain letters, numbers, dots, hyphens and underscores.', 'err'); return;
+  }
+
+  // Populate the file queue automatically if it's empty or was scanned
+  // from a different source folder — keeps the displayed queue in
+  // sync with what's actually about to be uploaded without requiring
+  // a manual "Scan Source" click every time
+  if (fileList.length === 0 || lastScannedSrc !== src) {
+    await scanSourceFiles();
+    lastScannedSrc = src;
+  }
 
   // Save settings
   await window.pywebview.api.save_config({
