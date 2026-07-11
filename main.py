@@ -13,9 +13,32 @@ from ia_uploader import IAUploaderAPI
 from rclone_gui import RCloneAPI
 from ia_folder_packer import IAFolderPackerAPI
 from scene_recreator import SceneRecreatorAPI
+from misc_tools import MiscToolsAPI
+from srrdb_tool import SrrdbToolAPI
 
 _dat_api = None
 _ia_api  = None
+
+
+def open_tosort():
+    """Open the ToSort Pipeline window."""
+    _api = ToSortAPI()
+    _api.open_dat_merger      = open_dat_merger
+    _api._ia_uploader_fn      = open_ia_uploader
+    _api.open_ia_uploader     = open_ia_uploader
+    _api.open_rclone          = open_rclone
+    _api.open_folder_packer   = open_folder_packer
+    _api.open_scene_recreator = open_scene_recreator
+    w = webview.create_window(
+        title="ToSort Pipeline — ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "index.html"),
+        js_api=_api,
+        width=1050,
+        height=800,
+        min_size=(800, 600),
+        background_color="#0d0f12",
+    )
+    _api.set_window(w)
 
 
 def open_dat_merger():
@@ -23,7 +46,7 @@ def open_dat_merger():
     global _dat_api
     _dat_api = DatMergerAPI()
     dat_window = webview.create_window(
-        title="DAT Tools \u2014 ToSort Toolkit",
+        title="DAT Tools — ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "dat_merger.html"),
         js_api=_dat_api,
         width=960,
@@ -38,7 +61,7 @@ def open_folder_packer():
     """Open IA Folder Packer window."""
     _fp_api = IAFolderPackerAPI()
     fp_window = webview.create_window(
-        title="IA Prep Packer: Folder Packer \u2014 ToSort Toolkit",
+        title="IA Prep Packer: Folder Packer — ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "ia_folder_packer.html"),
         js_api=_fp_api,
         width=800,
@@ -53,7 +76,7 @@ def open_scene_recreator():
     """Open Scene ZIP Recreator window."""
     _sr_api = SceneRecreatorAPI()
     sr_window = webview.create_window(
-        title="Scene ZIP Recreator \u2014 ToSort Toolkit",
+        title="Scene ZIP Recreator — ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "scene_recreator.html"),
         js_api=_sr_api,
         width=900,
@@ -69,7 +92,7 @@ def open_rclone():
     _rc_api = RCloneAPI()
     _rc_api.open_folder_packer = open_folder_packer
     rc_window = webview.create_window(
-        title="IA RClone Uploader \u2014 ToSort Toolkit",
+        title="IA RClone Uploader — ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "rclone_gui.html"),
         js_api=_rc_api,
         width=900,
@@ -84,16 +107,9 @@ def open_ia_uploader():
     """Open or re-create the IA Uploader window."""
     global _ia_api
     _ia_api = IAUploaderAPI()
-    # The Letter-Split packing strategy (originally the standalone IA
-    # Prepper, embedded directly in this window) has moved into the IA
-    # Folder Packer tool as a selectable mode. The uploader GUI's old
-    # "IA Prep Packer" panel was replaced with a button that opens the
-    # Folder Packer window directly, using the same launcher function
-    # the main menu uses — wired onto this API instance the same way
-    # ToSortAPI's button wiring works below in main().
     _ia_api.open_folder_packer = open_folder_packer
     ia_window = webview.create_window(
-        title="Internet Archive Uploader \u2014 ToSort Toolkit",
+        title="Internet Archive Uploader — ToSort Toolkit",
         url=os.path.join(os.path.dirname(__file__), "gui", "ia_uploader.html"),
         js_api=_ia_api,
         width=900,
@@ -104,26 +120,65 @@ def open_ia_uploader():
     _ia_api.set_window(ia_window)
 
 
-def main():
-    api = ToSortAPI()
-    api.open_dat_merger  = open_dat_merger
-    # Wire IA uploader — sets the function so JS api call works
-    api._ia_uploader_fn  = open_ia_uploader
-    api.open_ia_uploader = open_ia_uploader
-    api.open_rclone        = open_rclone
-    api.open_folder_packer = open_folder_packer
-    api.open_scene_recreator = open_scene_recreator
-
-    window = webview.create_window(
-        title="ToSort Toolkit \u2014 RomVault Cleaning Pipeline",
-        url=os.path.join(os.path.dirname(__file__), "gui", "index.html"),
-        js_api=api,
-        width=1050,
-        height=800,
-        min_size=(800, 600),
+def open_srrdb_tool():
+    """Open srrdb Scene Rebuilder window."""
+    _srr_api = SrrdbToolAPI()
+    srr_window = webview.create_window(
+        title="srrdb Scene Rebuilder — ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "srrdb_tool.html"),
+        js_api=_srr_api,
+        width=980,
+        height=780,
+        min_size=(700, 550),
         background_color="#0d0f12",
     )
+    _srr_api.set_window(srr_window)
 
+
+def open_misc_tools():
+    """Open Miscellaneous Tools window."""
+    _misc_api = MiscToolsAPI()
+    misc_window = webview.create_window(
+        title="Miscellaneous Tools — ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "misc_tools.html"),
+        js_api=_misc_api,
+        width=820,
+        height=820,
+        min_size=(600, 500),
+        background_color="#0d0f12",
+    )
+    _misc_api.set_window(misc_window)
+
+
+class LauncherAPI:
+    """Minimal API exposed to the home/launcher page."""
+    def __init__(self):
+        self._window = None
+
+    def set_window(self, w):
+        self._window = w
+
+    def open_tosort(self):        open_tosort()
+    def open_dat_merger(self):    open_dat_merger()
+    def open_ia_uploader(self):   open_ia_uploader()
+    def open_folder_packer(self): open_folder_packer()
+    def open_rclone(self):        open_rclone()
+    def open_scene_recreator(self): open_scene_recreator()
+    def open_misc_tools(self):    open_misc_tools()
+    def open_srrdb_tool(self):    open_srrdb_tool()
+
+
+def main():
+    api = LauncherAPI()
+    window = webview.create_window(
+        title="ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "home.html"),
+        js_api=api,
+        width=920,
+        height=620,
+        min_size=(700, 480),
+        background_color="#0d0f12",
+    )
     api.set_window(window)
     webview.start(debug=False)
 

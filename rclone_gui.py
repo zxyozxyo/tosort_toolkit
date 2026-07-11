@@ -20,6 +20,8 @@ class RCloneAPI:
         self._proc = None
         self._stop_flag = threading.Event()
         self._running = False
+        self._fixdat_names: set = set()
+        self._fixdat_path: str = ""
 
     def set_window(self, w):
         self._window = w
@@ -55,10 +57,97 @@ class RCloneAPI:
             p = Path(__file__).parent / "rclone_ia.json"
             if p.exists():
                 with open(p) as f:
-                    return json.load(f)
+                    cfg = json.load(f)
+                # Auto-restore fixdat if path was saved
+                fixdat_path = cfg.get("fixdat_path", "")
+                if fixdat_path and Path(fixdat_path).exists():
+                    names = self._parse_fixdat(fixdat_path)
+                    if names:
+                        self._fixdat_names = names
+                        self._fixdat_path = fixdat_path
+                return cfg
         except Exception:
             pass
         return {}
+
+    # ── Fixdat filter ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_fixdat(path: str) -> set:
+        """Parse Logiqx XML fixdat, return set of game name strings."""
+        names = set()
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.parse(path).getroot()
+            for game in root.iter("game"):
+                n = game.get("name", "").strip()
+                if n:
+                    names.add(n)
+        except Exception:
+            pass
+        return names
+
+    def browse_fixdat(self) -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                filetypes=[("DAT files", "*.dat *.xml"), ("All files", "*.*")]
+            )
+            root.destroy()
+            return path if path else ""
+        except Exception:
+            return ""
+
+    def load_fixdat(self, path: str) -> dict:
+        if not path or not Path(path).exists():
+            return {"ok": False, "error": "File not found"}
+        try:
+            names = self._parse_fixdat(path)
+            if not names:
+                return {"ok": False, "error": "No game entries found in fixdat"}
+            self._fixdat_names = names
+            self._fixdat_path = path
+            # Persist alongside other rclone settings
+            try:
+                cfg_path = Path(__file__).parent / "rclone_ia.json"
+                cfg = {}
+                if cfg_path.exists():
+                    with open(cfg_path) as f:
+                        cfg = json.load(f)
+                cfg["fixdat_path"] = path
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+            except Exception:
+                pass
+            return {"ok": True, "count": len(names), "path": path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def clear_fixdat(self) -> bool:
+        self._fixdat_names = set()
+        self._fixdat_path = ""
+        try:
+            cfg_path = Path(__file__).parent / "rclone_ia.json"
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                cfg["fixdat_path"] = ""
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+        return True
+
+    def get_fixdat_status(self) -> dict:
+        return {
+            "active": bool(self._fixdat_names),
+            "count": len(self._fixdat_names),
+            "path": self._fixdat_path,
+        }
 
     def write_rclone_conf(self, access_key: str, secret_key: str, derive: bool = False) -> dict:
         _rclone_dir = Path(__file__).parent / "rclone"
@@ -220,6 +309,19 @@ class RCloneAPI:
                             cmd += ["--internetarchive-item-metadata", f"{k}={vi}"]
                 else:
                     cmd += ["--internetarchive-item-metadata", f"{k}={v}"]
+
+        # Apply fixdat filter — add --exclude for each incomplete file found in source
+        if self._fixdat_names:
+            try:
+                excluded_count = 0
+                for entry in Path(src).iterdir():
+                    if entry.is_file() and entry.stem in self._fixdat_names:
+                        cmd += ["--exclude", entry.name]
+                        excluded_count += 1
+                if excluded_count:
+                    self._log(f"  Fixdat filter: {excluded_count} incomplete file(s) will be skipped", "warn")
+            except Exception:
+                pass
 
         cmd += [src, f"archive:{identifier}"]
 
@@ -478,7 +580,8 @@ class RCloneAPI:
                     except Exception:
                         size = 0
                     rel = str(fp.relative_to(base)).replace("\\", "/")
-                    result.append({"name": fp.name, "rel": rel, "path": str(fp), "size": size})
+                    excluded = fp.stem in self._fixdat_names if self._fixdat_names else False
+                    result.append({"name": fp.name, "rel": rel, "path": str(fp), "size": size, "excluded": excluded})
         except Exception:
             pass
         return result

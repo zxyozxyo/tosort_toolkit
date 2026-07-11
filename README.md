@@ -1,6 +1,6 @@
 # ToSort Toolkit
 
-A PyWebView desktop application for cleaning and managing ROM collections with RomVault, managing DAT files, and uploading collections to the Internet Archive.
+A PyWebView desktop application for cleaning and managing ROM and scene release collections. Includes tools for RomVault integration, DAT file management, Internet Archive uploading, and scene RAR reconstruction.
 
 ---
 
@@ -12,7 +12,13 @@ Python 3.10 or later recommended.
 ### Python Libraries
 ```
 pip install pywebview py7zr rarfile zstandard internetarchive requests
+pip install pyReScene
 ```
+
+> **Note:** `pyReScene` is not available under the name `rescene`. Install using the exact command above or via the direct wheel if PyPI fails:
+> ```
+> pip install https://github.com/srrDB/pyrescene/releases/download/0.7/pyReScene-0.7-py3-none-any.whl
+> ```
 
 | Library | Purpose |
 |---|---|
@@ -22,6 +28,7 @@ pip install pywebview py7zr rarfile zstandard internetarchive requests
 | `zstandard` | ZSTD compressed file support |
 | `internetarchive` | Internet Archive upload API |
 | `requests` | HTTP for IA uploads |
+| `pyReScene` | Scene SRR parsing and RAR reconstruction |
 
 ---
 
@@ -29,31 +36,37 @@ pip install pywebview py7zr rarfile zstandard internetarchive requests
 
 ```
 tosort_toolkit/
-├── main.py               # Entry point
-├── api.py                # Main pipeline backend
-├── dat_merger.py         # DAT tools backend
-├── ia_uploader.py        # IA uploader backend
-├── ia_prepper.py         # IA archive pre-processor
-├── ia_folder_packer.py   # IA folder packer
-├── rclone_gui.py         # RClone uploader GUI
-├── scene_recreator.py    # Scene ZIP recreator/repair tool
-├── gui/                  # HTML frontends
-│   ├── index.html
-│   ├── dat_merger.html
-│   ├── ia_uploader.html
+├── main.py                  # Entry point — launcher hub
+├── api.py                   # ToSort pipeline backend
+├── dat_merger.py            # DAT tools backend
+├── ia_uploader.py           # IA uploader backend
+├── ia_prepper.py            # IA archive pre-processor
+├── ia_folder_packer.py      # IA folder packer
+├── rclone_gui.py            # RClone uploader backend
+├── scene_recreator.py       # Scene ZIP recreator/repair tool
+├── srrdb_tool.py            # srrdb.com scene RAR rebuilder
+├── misc_tools.py            # Miscellaneous utilities backend
+├── gui/                     # HTML frontends
+│   ├── home.html            # Launcher hub (main entry page)
+│   ├── index.html           # ToSort pipeline
+│   ├── dat_merger.html      # DAT tools
+│   ├── ia_uploader.html     # IA uploader
 │   ├── ia_folder_packer.html
-│   ├── rclone_gui.html
-│   └── scene_recreator.html
-├── apps/                 # Drop tool binaries here (gitignored)
+│   ├── rclone_gui.html      # RClone IA uploader
+│   ├── scene_recreator.html # Scene ZIP recreator
+│   ├── srrdb_tool.html      # srrdb scene RAR rebuilder
+│   └── misc_tools.html      # Miscellaneous utilities
+├── apps/                    # Drop tool binaries here (gitignored)
 │   ├── rar.exe
 │   ├── 7z.exe
 │   ├── 7za.exe
 │   ├── UnRAR.exe
 │   ├── chdman.exe
-│   └── xdms.exe
-└── rclone/               # Drop rclone files here (gitignored)
+│   ├── xdms.exe
+│   └── winrar_pack-4.20/    # Legacy WinRAR installers for compressed scene RARs
+└── rclone/                  # Drop rclone files here (gitignored)
     ├── rclone.exe
-    └── rclone.conf       # Auto-created when saving credentials
+    └── rclone.conf          # Auto-created when saving credentials
 ```
 
 ---
@@ -73,8 +86,9 @@ Place binaries in the `apps/` subfolder (created manually). All scripts search `
 | `xdms.exe` | Amiga DMS extraction | Various Amiga sources |
 
 **Notes:**
-- For RAR output in the IA pre-processors, `rar.exe` is preferred. `7z.exe` can create RAR but requires the optional RAR plugin (most builds don't include it).
+- For RAR output in the IA pre-processors, `rar.exe` is preferred.
 - `7zr.exe` alone cannot create RAR archives — use `7z.exe` or `rar.exe`.
+- The `apps/winrar_pack-4.20/` subfolder contains WinRAR setup packages for legacy RAR versions. These are only required for reconstructing compressed scene RARs (rare for video releases). Standard uncompressed scene RARs do not need them — pyReScene handles those natively.
 
 ---
 
@@ -90,23 +104,38 @@ Place `rclone.exe` in the `rclone/` subfolder (created manually). The `rclone.co
 python main.py
 ```
 
+The app opens to the **hub launcher page** — click any card to open that tool. Each tool opens in its own window; the hub stays open as a menu.
+
 ---
 
 ## Gitignored Files
 These are never committed and must be set up locally:
 
 ```
-apps/                     # All tool binaries
-rclone/                   # rclone.exe and rclone.conf
-settings.json             # Auto-saved pipeline settings
-ia_credentials.json       # IA S3 keys for Python uploader
-ia_folder_packer.json     # Folder packer saved settings
+apps/                         # All tool binaries
+rclone/                       # rclone.exe and rclone.conf
+settings.json                 # Auto-saved pipeline settings
+ia_credentials.json           # IA S3 keys for Python uploader
+ia_uploader.json              # IA uploader saved settings (fixdat path etc.)
+ia_folder_packer.json         # Folder packer saved settings
+rclone_ia.json                # RClone uploader saved settings (fixdat path etc.)
+scene_recreator.json          # Scene recreator saved settings
+srrdb_tool.json               # srrdb rebuilder saved settings
+reference_fingerprint_db.json # Scene recreator fingerprint DB (auto-generated, can be large)
 tosort_settings_export.json
 ```
 
 ---
 
 ## Features
+
+---
+
+### Launcher Hub (home.html)
+
+The main entry point — a card-based launcher that opens each tool in its own window. Hover over a card for a description. Supports five themes (Dark, Amber, Slate, Red, Light) via the Theme button; the selected theme persists across sessions and is shared across all tool windows.
+
+---
 
 ### Main Pipeline (index.html)
 
@@ -138,11 +167,13 @@ Monitors source folder and runs pipeline automatically on new files.
 ---
 
 ### DAT Tools (dat_merger.html)
+
 Nine-tab DAT management suite: Merger, Splitter, Cleaner, Rebuilder, DAT Creator (file-based), DAT Creator (folder-based), Header Editor, Diff Tool, Batch Rename.
 
 ---
 
 ### Internet Archive Uploader (ia_uploader.html)
+
 Upload collections directly to archive.org using the IA S3 API.
 
 **Setup:** Get S3 keys from `archive.org/account/s3.php` and enter in the Credentials panel.
@@ -154,6 +185,10 @@ Upload collections directly to archive.org using the IA S3 API.
 - Rate limit handling (auto-retry on 503/429)
 - Graceful or instant stop
 - Live thread count adjustment
+- Spaces in identifiers are automatically converted to underscores
+
+**Fixdat Filter**
+Load a RomVault fixdat XML to exclude incomplete ROM sets from the upload queue. Files listed in the fixdat (incomplete) are skipped; files not listed (complete sets) upload normally. The fixdat path is saved between sessions (`ia_uploader.json`). Excluded files are shown greyed out in the file list before uploading.
 
 **IA Pre-processor (within IA Uploader)**
 Groups loose archives into letter-named RAR/ZIP files before upload — ideal for large TOSEC sets.
@@ -161,15 +196,15 @@ Groups loose archives into letter-named RAR/ZIP files before upload — ideal fo
 - Splits into `A`, `A_2`, `A_3` etc. when group exceeds size limit
 - Copy mode or move mode
 - RAR or ZIP output
-- Full Unicode filename support (ø, ü, accented chars etc.)
-- Network share safe (list files written to local temp)
+- Full Unicode filename support
 
 ---
 
 ### IA Folder Packer (ia_folder_packer.html)
+
 Packs each leaf folder containing archives into a single archive.
 
-Intelligently finds the deepest folder containing archives and packs the whole folder as one file, preserving relative structure.
+Finds the deepest folder containing archives and packs it as one file, preserving relative structure.
 
 **Example:**
 ```
@@ -181,12 +216,12 @@ TOSEC/Commodore/[D64]/            →  [D64].rar
 - Move mode: archives created alongside source folder, originals deleted
 - RAR or ZIP output
 - Unicode filename support
-- Network share safe
 
 ---
 
 ### RClone IA Uploader (rclone_gui.html)
-Standalone rclone wrapper for IA uploads. Accessible from the main titlebar or run independently with `python rclone_gui.py`.
+
+Standalone rclone wrapper for IA uploads.
 
 **Setup:** Enter IA S3 keys and click Save Credentials — writes `rclone/rclone.conf` automatically.
 
@@ -199,17 +234,12 @@ Standalone rclone wrapper for IA uploads. Accessible from the main titlebar or r
 - Fetch button (pulls existing IA item metadata)
 - Restart button (stop + change settings + resume, rclone skips already-uploaded files)
 - Full rclone log output with colour coding
+- Spaces in identifiers are automatically converted to underscores
+
+**Fixdat Filter**
+Same RomVault fixdat filtering as the IA Uploader. Loads a fixdat XML and passes matching filenames to rclone as `--exclude` flags so they are skipped server-side. The fixdat path is saved between sessions (`rclone_ia.json`).
 
 **Speed:** rclone typically achieves significantly higher throughput than the Python uploader due to more efficient connection handling.
-
----
-
-## Internet Archive Identifier Rules
-- 5–100 characters
-- Letters, numbers, dots, hyphens, underscores only
-- Must start with a letter or number
-- Globally unique on archive.org
-- Check: `archive.org/details/your-identifier`
 
 ---
 
@@ -230,16 +260,105 @@ Repairs old scene `.zip` releases to byte-match a DAT-listed CRC32/MD5/SHA1 targ
 8. Strip to essentials — keeps only the largest entry plus `.nfo`/`.diz`, tries both line-ending variants across full search space
 9. Foreign-packer diagnosis — checks internal CRC32 consistency; distinguishes "probably fine, can't byte-match" (different original packer) from "actually broken content"
 
-**Reference fingerprinting:** Supply one or more folders of known-good DAT-verified scene ZIPs. The tool learns each release group's packer fingerprint (compression level/strategy, entry ordering, header metadata, expected file set) and tries the learned fingerprint first — typically 1–4 attempts instead of dozens. Also catches injected files by direct comparison against verified references, even when name-pattern heuristics would miss them.
+**Reference fingerprinting:** Supply folders of known-good DAT-verified scene ZIPs. The tool learns each release group's packer fingerprint (compression level/strategy, entry ordering, header metadata, expected file set) and tries the learned fingerprint first — typically 1–4 attempts instead of dozens. Also catches injected files by direct comparison, even when name-pattern heuristics would miss them.
 
-**Settings saved to `scene_recreator.json` (gitignored):**
-- Source folder, DAT folder, reference folders, destination folder
-- Dry-run mode, move vs copy mode
-- Use fingerprint DB toggle, auto-retry excluding suspect references toggle
+**Settings saved to `scene_recreator.json` (gitignored).**
 
-**Reference fingerprint database:** `reference_fingerprint_db.json` — auto-built from reference scans, gitignored (can be large).
+---
+
+### srrdb Scene Rebuilder (srrdb_tool.html)
+
+Downloads SRR files from [srrdb.com](https://www.srrdb.com) and reconstructs byte-perfect original scene RAR releases from unpacked content files.
+
+**Requires:** `pip install pyReScene`
+
+#### What is an SRR?
+
+An SRR (Scene Rebuilder Resource) file stores all original RAR block headers, file metadata and stored scene files (NFO, SFV, SRS) without the actual content. Combined with the original content file (the video, ISO etc.), pyReScene can reconstruct the exact original RAR set byte-for-byte.
+
+#### Usage — Single Folder
+
+1. Select the **Source** folder containing your unpacked content file(s) (e.g. `movie.avi`)
+2. The app auto-detects the release name from any NFO or SFV present, or falls back to the folder name
+3. Click **Search** to query srrdb.com — select the correct result from the list
+4. Set an **output folder**
+5. Click **Process**
+
+The tool will:
+- Download the SRR from srrdb.com
+- Extract stored files (NFO, SFV) directly to the output folder
+- Reconstruct the original RAR volumes
+- Create the scene sample if an SRS file is present and `Create sample` is ticked
+
+#### Usage — Batch (Subfolders)
+
+Switch to **Batch** mode and select a folder containing multiple release subfolders. The app scans each subfolder, auto-detects release names, and builds a queue. Click **Auto-Search All** to verify and fill release names from srrdb.com, then **Process** to run them in sequence.
+
+#### Output Structure
+
+```
+output_folder/
+└── Release.Name-GRP/
+    ├── release.name-grp.nfo      ← from SRR stored files
+    ├── release.name-grp.sfv      ← from SRR stored files
+    ├── release.name-grp.rar      ← reconstructed
+    ├── release.name-grp.r00      ← reconstructed
+    ├── ...
+    └── Sample/
+        └── release.name-grp.sample.avi  ← created from SRS + content
+```
+
+#### Notes
+
+- **No Rar.exe required** for the vast majority of scene releases. Standard uncompressed video scene RARs are reconstructed natively by pyReScene in pure Python.
+- **Compressed RARs** (rare): require the exact original Rar.exe version. Legacy WinRAR installers are included in `apps/winrar_pack-4.20/` for reference.
+- The SRS stored file (scene sample script) is extracted automatically from the SRR. Sample creation additionally requires the full video file to be present as content.
+- SRR downloads are cached in the output folder — re-running the same release skips the download.
+
+---
+
+### Miscellaneous Tools (misc_tools.html)
+
+A collection of small utility scripts.
+
+#### Move to Folder
+
+Moves each file in a selected folder into a subfolder named after it (without the extension). Useful when preparing fixdats for RomVault to avoid filename collisions.
+
+**Example:**
+```
+Before:  games/bobgame.zip
+After:   games/bobgame/bobgame.zip
+```
+
+#### Extras Collector
+
+Recursively scans a source folder tree and **copies** scene extras into a mirrored structure at the destination. The source files are never moved or modified.
+
+**Collected file types:** `.nfo`, `.diz`, `.jpg`, `.jpeg`, `.png`, `.sfv`, `.nzb`
+
+**Collected subfolders:** `Proof/`, `Sample/`
+
+The full folder structure from the source root is preserved at the destination:
+```
+Source/3DS_2011/bob_game/bob_game.nfo  →  Destination/3DS_2011/bob_game/bob_game.nfo
+Source/3DS_2011/bob_game/Proof/        →  Destination/3DS_2011/bob_game/Proof/
+```
+
+**Pack output (optional):** Each collected game folder can optionally be compressed into a ZIP or RAR archive (requires `7z.exe` or `Rar.exe` in `apps/`). The original folder is removed after successful packing.
+
+---
+
+## Internet Archive Identifier Rules
+- 5–100 characters
+- Letters, numbers, dots, hyphens, underscores only
+- Must start with a letter or number
+- Globally unique on archive.org
+- Spaces are automatically converted to underscores when typed
+- Check availability: `archive.org/details/your-identifier`
 
 ---
 
 ## Themes
-Dark (default), Amber, Slate Blue, Red, Light — saved to localStorage.
+
+Dark (default), Amber, Slate Blue, Red, Light — selectable from the Theme button on the launcher hub. Choice is saved to browser localStorage and applied across all tool windows.

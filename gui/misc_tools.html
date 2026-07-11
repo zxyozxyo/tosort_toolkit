@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Miscellaneous Tools — ToSort Toolkit</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@400;500;600&display=swap');
+
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;
+  --border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+[data-theme="light"]{--bg0:#f0f2f5;--bg1:#ffffff;--bg2:#e8eaed;--bg3:#d8dbe0;--acc:#1a8a5a;--acc2:#1a8a5a;--warn:#d4780a;--danger:#c0392b;--info:#2471a3;--text:#1a1d23;--text2:#5a6478;--text3:#8a94a8;--border:#c8cdd8}
+[data-theme="amber"]{--bg0:#0f0c06;--bg1:#1a1508;--bg2:#241e0c;--bg3:#2e2710;--acc:#f0b030;--acc2:#c08010;--warn:#f07030;--danger:#e04040;--info:#60b0f0;--text:#e8d8a0;--text2:#a09060;--text3:#606040;--border:#3a3010}
+[data-theme="slate"]{--bg0:#0a0c10;--bg1:#12151c;--bg2:#1a1e28;--bg3:#222738;--acc:#60a0f8;--acc2:#4080d8;--warn:#f0c030;--danger:#f04060;--info:#60d0f0;--text:#c0ccdc;--text2:#7080a0;--text3:#404860;--border:#252a38}
+[data-theme="red"]{--bg0:#0f0808;--bg1:#1a1010;--bg2:#241818;--bg3:#2e2020;--acc:#f04060;--acc2:#c02040;--warn:#f08030;--danger:#f04040;--info:#60a0f0;--text:#e8c8c8;--text2:#a07070;--text3:#605050;--border:#3a2020}
+
+html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
+#app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:10px;-webkit-app-region:drag;user-select:none;flex-shrink:0}
+.logo{font-family:var(--mono);font-size:13px;color:var(--acc);letter-spacing:2px}
+.sub{font-size:10px;color:var(--text2)}
+
+.panels{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;display:flex;flex-direction:column;gap:12px}
+
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:6px;overflow:hidden;flex-shrink:0}
+.panel-hdr{background:var(--bg2);padding:7px 12px;font-size:10px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:6px;letter-spacing:.5px;text-transform:uppercase;cursor:pointer;user-select:none}
+.panel-hdr:hover{color:var(--text)}
+.panel-hdr .dot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex-shrink:0}
+.panel-hdr .chevron{margin-left:auto;transition:.15s}
+.panel-body{padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.panel-body.collapsed{display:none}
+
+.row{display:flex;align-items:center;gap:8px}
+.lbl{font-size:11px;color:var(--text2);min-width:90px;flex-shrink:0}
+.txt{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:5px 8px;color:var(--text);font-family:var(--font);font-size:12px;outline:none}
+.txt:focus{border-color:var(--acc)}
+.hint{font-size:10px;color:var(--text3);line-height:1.5;padding:2px 0}
+
+.btn{padding:4px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;transition:.12s;flex-shrink:0}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn-go{border-color:var(--acc2);color:var(--acc);font-weight:600;padding:6px 20px}
+.btn-go:hover{background:var(--acc2);color:#000}
+.btn-stop{border-color:var(--danger);color:var(--danger)}
+.btn-stop:hover{background:var(--danger);color:#fff}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+
+.sel{background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:4px 8px;color:var(--text);font-family:var(--font);font-size:11px;outline:none;cursor:pointer}
+.sel:focus{border-color:var(--acc)}
+
+/* Log */
+.log-w{height:220px;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-family:var(--mono);font-size:11px;line-height:1.6;user-select:text}
+.log-w .info{color:var(--text)}
+.log-w .dim{color:var(--text3)}
+.log-w .ok{color:var(--acc)}
+.log-w .warn{color:var(--warn)}
+.log-w .err{color:var(--danger)}
+
+/* Status pill */
+.pill{display:inline-block;padding:2px 10px;border-radius:10px;font-size:10px;font-family:var(--mono);border:1px solid var(--border);color:var(--text2);margin-left:auto}
+.pill.running{border-color:var(--warn);color:var(--warn)}
+.pill.done{border-color:var(--acc);color:var(--acc)}
+.pill.error{border-color:var(--danger);color:var(--danger)}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div class="titlebar">
+    <div>
+      <div class="logo">MISCELLANEOUS TOOLS</div>
+      <div class="sub">ToSort Toolkit — Utilities</div>
+    </div>
+  </div>
+
+  <div class="panels">
+
+    <!-- ── Move to Folder ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('mtf')">
+        <div class="dot" style="background:var(--info)"></div>
+        Move to Folder
+        <span class="chevron" id="chev-mtf">▾</span>
+      </div>
+      <div class="panel-body" id="body-mtf">
+        <div class="hint">Moves each file in the selected folder into a subfolder named after it (without extension). Useful for organising RomVault fixdats to avoid name collisions.</div>
+        <div class="row">
+          <span class="lbl">Folder</span>
+          <input class="txt" id="mtf-folder" placeholder="Folder containing files to organise" readonly/>
+          <button class="btn" onclick="browseMtf()">Browse</button>
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn btn-go" id="btn-mtf-go" onclick="runMoveToFolder()" disabled>Go</button>
+        </div>
+        <div class="log-w" id="mtf-log"></div>
+      </div>
+    </div>
+
+    <!-- ── Extras Collector ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('ext')">
+        <div class="dot" style="background:var(--warn)"></div>
+        Extras Collector
+        <span id="ext-pill" class="pill" style="font-size:9px">idle</span>
+        <span class="chevron" id="chev-ext">▾</span>
+      </div>
+      <div class="panel-body" id="body-ext">
+        <div class="hint">Recursively scans a source folder and copies extras (.nfo, .diz, .jpg, .png, .sfv, .nzb) and Proof/Sample subfolders into named folders at the destination. Original files are never modified.</div>
+
+        <div class="row">
+          <span class="lbl">Source</span>
+          <input class="txt" id="ext-src" placeholder="Folder to scan recursively"/>
+          <button class="btn" onclick="browseExt('src')">Browse</button>
+        </div>
+        <div class="row">
+          <span class="lbl">Destination</span>
+          <input class="txt" id="ext-dst" placeholder="Where to copy extras"/>
+          <button class="btn" onclick="browseExt('dst')">Browse</button>
+        </div>
+        <div class="row">
+          <span class="lbl">Pack output</span>
+          <select class="sel" id="ext-pack">
+            <option value="none">Leave as folders</option>
+            <option value="zip">ZIP each folder</option>
+            <option value="rar">RAR each folder</option>
+          </select>
+          <span style="font-size:10px;color:var(--text3);margin-left:6px">Requires 7z.exe / Rar.exe in apps/</span>
+        </div>
+        <div class="row" style="justify-content:flex-end;gap:8px">
+          <button class="btn btn-stop" id="btn-ext-stop" onclick="stopExtras()" style="display:none">Stop</button>
+          <button class="btn btn-go" id="btn-ext-go" onclick="startExtras()">Start</button>
+        </div>
+        <div class="log-w" id="ext-log"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('pywebviewready', () => {
+  const theme = localStorage.getItem('rv_theme');
+  if (theme) document.documentElement.setAttribute('data-theme', theme);
+});
+
+// ── Panel collapse ────────────────────────────────────────────────────────────
+function togglePanel(id) {
+  const body = document.getElementById('body-' + id);
+  const chev = document.getElementById('chev-' + id);
+  const collapsed = body.classList.toggle('collapsed');
+  if (chev) chev.style.transform = collapsed ? 'rotate(-90deg)' : '';
+}
+
+// ── Python events ─────────────────────────────────────────────────────────────
+window.miscEvent = function(event, data) {
+  if (event === 'log') {
+    const logId = data.target === 'mtf' ? 'mtf-log' : 'ext-log';
+    addLog(logId, data.msg, data.cls);
+  } else if (event === 'status') {
+    const pill = document.getElementById('ext-pill');
+    const go   = document.getElementById('btn-ext-go');
+    const stop = document.getElementById('btn-ext-stop');
+    pill.className = 'pill ' + (data.state === 'running' ? 'running' : data.state === 'done' ? 'done' : data.state === 'error' ? 'error' : '');
+    pill.textContent = data.state;
+    const running = data.state === 'running';
+    go.style.display   = running ? 'none' : '';
+    stop.style.display = running ? ''     : 'none';
+  }
+};
+
+function addLog(logId, msg, cls) {
+  const el = document.getElementById(logId);
+  if (!el) return;
+  if (!msg) { el.appendChild(document.createElement('br')); el.scrollTop = el.scrollHeight; return; }
+  const d = document.createElement('div');
+  d.className = cls || 'info';
+  d.textContent = msg;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Move to Folder ────────────────────────────────────────────────────────────
+async function browseMtf() {
+  const path = await window.pywebview.api.browse_folder();
+  if (!path) return;
+  document.getElementById('mtf-folder').value = path;
+  document.getElementById('btn-mtf-go').disabled = false;
+}
+
+async function runMoveToFolder() {
+  const folder = document.getElementById('mtf-folder').value.trim();
+  if (!folder) return;
+  const log = document.getElementById('mtf-log');
+  log.innerHTML = '';
+  document.getElementById('btn-mtf-go').disabled = true;
+  const res = await window.pywebview.api.move_to_folder(folder);
+  document.getElementById('btn-mtf-go').disabled = false;
+  if (!res.ok) addLog('mtf-log', 'ERROR: ' + res.error, 'err');
+}
+
+// Override miscEvent log routing when Move to Folder is running
+// (Move to Folder is synchronous so logs come back in the result — no streaming needed)
+
+// ── Extras Collector ──────────────────────────────────────────────────────────
+async function browseExt(field) {
+  const path = await window.pywebview.api.browse_folder();
+  if (!path) return;
+  document.getElementById('ext-' + field).value = path;
+}
+
+async function startExtras() {
+  const src  = document.getElementById('ext-src').value.trim();
+  const dst  = document.getElementById('ext-dst').value.trim();
+  const pack = document.getElementById('ext-pack').value;
+  if (!src) { addLog('ext-log', 'Set a source folder.', 'warn'); return; }
+  if (!dst) { addLog('ext-log', 'Set a destination folder.', 'warn'); return; }
+  document.getElementById('ext-log').innerHTML = '';
+  await window.pywebview.api.start_extras_collect({ src, dst, pack_mode: pack });
+}
+
+async function stopExtras() {
+  await window.pywebview.api.stop_extras_collect();
+}
+</script>
+</body>
+</html>

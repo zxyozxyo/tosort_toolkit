@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>srrdb Scene Rebuilder — ToSort Toolkit</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@400;500;600&display=swap');
+
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;--border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+[data-theme="amber"]{--bg0:#0f0c06;--bg1:#1a1508;--bg2:#241e0c;--bg3:#2e2710;--acc:#f0b030;--acc2:#c08010;--warn:#f07030;--danger:#e04040;--info:#60b0f0;--text:#e8d8a0;--text2:#a09060;--text3:#606040;--border:#3a3010}
+[data-theme="slate"]{--bg0:#0a0c10;--bg1:#12151c;--bg2:#1a1e28;--bg3:#222738;--acc:#60a0f8;--acc2:#4080d8;--warn:#f0c030;--danger:#f04060;--info:#60d0f0;--text:#c0ccdc;--text2:#7080a0;--text3:#404860;--border:#252a38}
+[data-theme="red"]{--bg0:#0f0808;--bg1:#1a1010;--bg2:#241818;--bg3:#2e2020;--acc:#f04060;--acc2:#c02040;--warn:#f08030;--danger:#f04040;--info:#60a0f0;--text:#e8c8c8;--text2:#a07070;--text3:#605050;--border:#3a2020}
+[data-theme="light"]{--bg0:#f0f2f5;--bg1:#ffffff;--bg2:#e8eaed;--bg3:#d8dbe0;--acc:#1a8a5a;--acc2:#1a8a5a;--warn:#d4780a;--danger:#c0392b;--info:#2471a3;--text:#1a1d23;--text2:#5a6478;--text3:#8a94a8;--border:#c8cdd8}
+
+html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
+#app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+/* Title bar */
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 14px;display:flex;align-items:center;gap:10px;-webkit-app-region:drag;user-select:none;flex-shrink:0}
+.logo{font-family:var(--mono);font-size:13px;color:var(--acc);letter-spacing:2px}
+.sub{font-size:10px;color:var(--text2)}
+.tb-right{margin-left:auto;-webkit-app-region:no-drag}
+
+/* Layout */
+.body{flex:1;display:flex;overflow:hidden}
+.left-col{width:340px;flex-shrink:0;display:flex;flex-direction:column;overflow-y:auto;border-right:1px solid var(--border);padding:10px;gap:8px}
+.right-col{flex:1;display:flex;flex-direction:column;overflow:hidden;padding:10px;gap:8px}
+
+/* Panels */
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:6px;overflow:hidden;flex-shrink:0}
+.phdr{background:var(--bg2);padding:6px 10px;font-size:10px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:6px;letter-spacing:.5px;text-transform:uppercase}
+.phdr .dot{width:6px;height:6px;border-radius:50%;background:var(--acc);flex-shrink:0}
+.pbody{padding:9px 10px;display:flex;flex-direction:column;gap:7px}
+
+/* Form elements */
+.row{display:flex;align-items:center;gap:6px}
+.lbl{font-size:11px;color:var(--text2);min-width:72px;flex-shrink:0}
+.txt{flex:1;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:4px 8px;color:var(--text);font-family:var(--font);font-size:12px;outline:none}
+.txt:focus{border-color:var(--acc)}
+.txt::placeholder{color:var(--text3)}
+.hint{font-size:10px;color:var(--text3);line-height:1.5}
+
+.btn{padding:3px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;transition:.12s;flex-shrink:0;white-space:nowrap}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn:disabled{opacity:.35;pointer-events:none}
+.btn-go{border-color:var(--acc2);color:var(--acc);font-weight:600;padding:5px 18px}
+.btn-go:hover{background:var(--acc2);color:#000}
+.btn-stop{border-color:var(--danger);color:var(--danger)}
+.btn-stop:hover{background:var(--danger);color:#fff}
+.btn-sm{padding:2px 8px;font-size:10px}
+
+.chk-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer}
+.chk-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
+.sel{background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-family:var(--font);font-size:11px;outline:none;cursor:pointer}
+.sel:focus{border-color:var(--acc)}
+
+/* Mode toggle */
+.mode-tabs{display:flex;gap:0;border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.mode-tab{flex:1;text-align:center;padding:4px 8px;font-size:11px;cursor:pointer;color:var(--text2);background:var(--bg2);border:none;font-family:var(--font);transition:.12s}
+.mode-tab.active{background:var(--acc2);color:#000;font-weight:600}
+
+/* Search results list */
+.results-list{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;margin-top:2px}
+.result-item{padding:5px 8px;border-radius:4px;cursor:pointer;border:1px solid transparent;transition:.1s;display:flex;align-items:center;gap:8px}
+.result-item:hover{background:var(--bg2);border-color:var(--border)}
+.result-item.selected{background:var(--bg3);border-color:var(--acc)}
+.ri-name{flex:1;font-size:11px;color:var(--text);word-break:break-all}
+.ri-date{font-size:10px;color:var(--text3);flex-shrink:0}
+.ri-flags{display:flex;gap:4px;flex-shrink:0}
+.flag{font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid var(--border);color:var(--text3)}
+.flag.on{border-color:var(--acc);color:var(--acc)}
+
+/* Batch queue table */
+.queue{flex:1;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px}
+.queue-hdr,.queue-row{display:grid;grid-template-columns:1fr 1fr 56px 60px;gap:0;align-items:center}
+.queue-hdr{background:var(--bg2);padding:4px 8px;font-size:10px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.4px;position:sticky;top:0;z-index:1}
+.queue-row{padding:5px 8px;border-bottom:1px solid var(--border);font-size:11px}
+.queue-row:last-child{border-bottom:none}
+.queue-row:hover{background:var(--bg2)}
+.qr-name{color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:4px}
+.qr-rel{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:4px}
+.qr-rel input{background:none;border:none;color:var(--text);font-family:var(--font);font-size:11px;width:100%;outline:none}
+.qr-rel input:focus{border-bottom:1px solid var(--acc)}
+.qr-status{font-family:var(--mono);font-size:9px;text-align:center}
+.qs-pending{color:var(--text3)}
+.qs-running{color:var(--warn)}
+.qs-done{color:var(--acc)}
+.qs-error{color:var(--danger)}
+.qs-skipped{color:var(--text3)}
+
+/* Status pill */
+.pill{display:inline-block;padding:1px 8px;border-radius:8px;font-size:9px;font-family:var(--mono);border:1px solid var(--border);color:var(--text2);margin-left:auto}
+.pill.running{border-color:var(--warn);color:var(--warn)}
+.pill.done{border-color:var(--acc);color:var(--acc)}
+.pill.error{border-color:var(--danger);color:var(--danger)}
+
+/* Log */
+.log-w{flex:1;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-family:var(--mono);font-size:11px;line-height:1.6;user-select:text;min-height:120px}
+.log-w .info{color:var(--text)}
+.log-w .dim{color:var(--text3)}
+.log-w .ok{color:var(--acc)}
+.log-w .warn{color:var(--warn)}
+.log-w .err{color:var(--danger)}
+
+/* Rescene check banner */
+.banner{padding:6px 10px;font-size:11px;border-radius:4px;border:1px solid var(--warn);color:var(--warn);background:rgba(240,160,48,.06)}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div class="titlebar">
+    <div>
+      <div class="logo">SRRDB SCENE REBUILDER</div>
+      <div class="sub">Download SRR · Reconstruct RARs · Create Samples</div>
+    </div>
+    <div class="tb-right">
+      <span id="status-pill" class="pill">idle</span>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <!-- ── Left column ─────────────────────────────────────── -->
+    <div class="left-col">
+
+      <!-- rescene banner (shown if not installed) -->
+      <div class="banner" id="rescene-banner" style="display:none">
+        ⚠ pyReScene not found — run: <b>pip install pyReScene</b>
+      </div>
+
+      <!-- Source -->
+      <div class="panel">
+        <div class="phdr"><div class="dot" style="background:var(--info)"></div>Source</div>
+        <div class="pbody">
+          <div class="mode-tabs" id="mode-tabs">
+            <button class="mode-tab active" onclick="setMode('single')">Single Folder</button>
+            <button class="mode-tab"        onclick="setMode('batch')">Batch (Subfolders)</button>
+          </div>
+          <div class="row">
+            <span class="lbl">Folder</span>
+            <input class="txt" id="src-folder" placeholder="Source folder" readonly/>
+            <button class="btn btn-sm" onclick="browseSource()">Browse</button>
+          </div>
+          <!-- Single mode: content folder (the unpacked files) -->
+          <div id="single-content-row" class="row">
+            <span class="lbl">Content</span>
+            <input class="txt" id="content-dir" placeholder="Folder with unpacked files (optional)"/>
+            <button class="btn btn-sm" onclick="browseContent()">Browse</button>
+          </div>
+          <div class="hint" id="src-hint" style="display:none"></div>
+        </div>
+      </div>
+
+      <!-- Search (single mode) -->
+      <div class="panel" id="search-panel">
+        <div class="phdr"><div class="dot" style="background:var(--acc)"></div>srrdb.com Search</div>
+        <div class="pbody">
+          <div class="row">
+            <input class="txt" id="search-input" placeholder="Release name or keywords…" onkeydown="if(event.key==='Enter')doSearch()"/>
+            <button class="btn btn-sm" id="btn-search" onclick="doSearch()">Search</button>
+            <button class="btn btn-sm" id="btn-crc-search" onclick="doCrcSearch()" title="Search srrdb.com by CRC32 from SFV file — most accurate" style="border-color:var(--info);color:var(--info)">CRC</button>
+          </div>
+          <div style="font-size:10px;color:var(--text3);line-height:1.5;padding:1px 0 2px">
+            Tip: spaces &amp; underscores → dots automatically. Partial names work. <b style="color:var(--info)">CRC</b> searches by SFV hash (most accurate if SFV present).
+          </div>
+          <div id="search-echo" style="font-size:10px;color:var(--text3);display:none">
+            Searched: <span id="echo-query" style="color:var(--info)"></span>
+          </div>
+          <div id="results-list" class="results-list"></div>
+          <div id="selected-release" style="font-size:10px;color:var(--acc);display:none;word-break:break-all">
+            ✓ Selected: <span id="sel-name"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Output -->
+      <div class="panel">
+        <div class="phdr"><div class="dot" style="background:var(--warn)"></div>Output</div>
+        <div class="pbody">
+          <div class="row">
+            <span class="lbl">Dest</span>
+            <input class="txt" id="dest-dir" placeholder="Output folder"/>
+            <button class="btn btn-sm" onclick="browseDest()">Browse</button>
+          </div>
+          <label class="chk-row">
+            <input type="checkbox" id="do-sample" checked> Create sample (if SRS available)
+          </label>
+          <label class="chk-row" id="row-extract-iso" style="margin-left:1.4em; font-size:0.85em; opacity:0.75">
+            <input type="checkbox" id="extract-iso-m2ts"> Extract M2TS from ISO for Blu-ray samples
+            <span style="opacity:0.6"> — slow, needs ~same disk space as the video stream</span>
+          </label>
+          <div class="row">
+            <span class="lbl">Max candidates</span>
+            <select class="sel" id="max-test" style="width:70px">
+              <option value="3">3</option>
+              <option value="5">5</option>
+              <option value="10">10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+            </select>
+            <span style="font-size:10px;color:var(--text3)">to score when auto-matching ambiguous results</span>
+          </div>
+          <div id="rar-setup-row" class="row" style="display:none">
+            <span class="lbl" style="color:var(--text3);font-size:10px">RAR versions</span>
+            <span id="rar-version-info" style="flex:1;font-size:10px;color:var(--text3)"></span>
+            <button class="btn btn-sm" id="btn-setup-rar" onclick="doSetupRar()" title="Extract rar_X.YY.exe from each WinRAR installer in apps/winrar_pack-4.20/">Setup RAR versions</button>
+          </div>
+          <div class="row" style="justify-content:flex-end;gap:6px;margin-top:2px">
+            <button class="btn btn-stop" id="btn-stop" onclick="doStop()" style="display:none">Stop</button>
+            <button class="btn btn-go" id="btn-go" onclick="doProcess()">Process</button>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /left-col -->
+
+    <!-- ── Right column ────────────────────────────────────── -->
+    <div class="right-col">
+
+      <!-- Batch queue (hidden in single mode) -->
+      <div class="panel" id="batch-panel" style="display:none;flex:0 0 auto">
+        <div class="phdr">
+          <div class="dot" style="background:var(--warn)"></div>
+          Release Queue
+          <button class="btn btn-sm" style="margin-left:auto" onclick="autoSearchAll()">Auto-Search All</button>
+          <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
+        </div>
+        <div style="padding:6px 10px">
+          <div class="queue" id="queue" style="max-height:260px">
+            <div class="queue-hdr">
+              <div>Folder</div>
+              <div>Release Name</div>
+              <div>Flags</div>
+              <div>Status</div>
+            </div>
+            <div id="queue-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Log -->
+      <div class="panel" style="flex:1;display:flex;flex-direction:column;min-height:0">
+        <div class="phdr">
+          <div class="dot" style="background:var(--text3)"></div>
+          Log
+          <button class="btn btn-sm" style="margin-left:auto" onclick="clearLog()">Clear</button>
+        </div>
+        <div class="pbody" style="flex:1;min-height:0;padding-bottom:10px">
+          <div class="log-w" id="log"></div>
+        </div>
+      </div>
+
+    </div><!-- /right-col -->
+
+  </div><!-- /body -->
+
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let mode = 'single';
+let selectedRelease = '';
+let batchJobs = [];   // [{path, name, release, candidates, hasNFO, hasSRS, status}]
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('pywebviewready', async () => {
+  const t = localStorage.getItem('rv_theme');
+  if (t) document.documentElement.setAttribute('data-theme', t);
+
+  const rc = await window.pywebview.api.check_rescene();
+  if (!rc.rescene) {
+    document.getElementById('rescene-banner').style.display = '';
+    document.getElementById('btn-go').disabled = true;
+  } else {
+    const via = rc.import_ok ? `pyReScene ${rc.version || ''}` : `srr script (${rc.srr_script})`;
+    log(`rescene ready — ${via}`, 'dim');
+    if (!rc.srs) log('srs script not found — sample creation unavailable', 'warn');
+  }
+
+  // RAR version setup row
+  if (rc.has_pack || (rc.rar_versions && rc.rar_versions.length > 0)) {
+    const row = document.getElementById('rar-setup-row');
+    const info = document.getElementById('rar-version-info');
+    row.style.display = '';
+    if (rc.rar_versions && rc.rar_versions.length > 0) {
+      info.textContent = `${rc.rar_versions.length} version(s) ready`;
+      info.style.color = 'var(--acc)';
+    } else {
+      info.textContent = 'pack found — click to extract';
+    }
+  }
+});
+
+// Grey out the ISO M2TS option when "Create sample" is unchecked
+(function() {
+  const chkSample = document.getElementById('do-sample');
+  const rowIso    = document.getElementById('row-extract-iso');
+  const chkIso    = document.getElementById('extract-iso-m2ts');
+  function syncIsoRow() {
+    const on = chkSample.checked;
+    rowIso.style.opacity = on ? '0.75' : '0.35';
+    chkIso.disabled = !on;
+  }
+  chkSample.addEventListener('change', syncIsoRow);
+  syncIsoRow();
+})();
+
+// ── Events from Python ────────────────────────────────────────────────────────
+window.srrEvent = function(event, data) {
+  if (event === 'log') {
+    addLog(data.msg, data.cls);
+  } else if (event === 'status') {
+    const pill = document.getElementById('status-pill');
+    const go   = document.getElementById('btn-go');
+    const stop = document.getElementById('btn-stop');
+    pill.className = 'pill ' + (data.state === 'running' ? 'running' : data.state === 'done' ? 'done' : '');
+    pill.textContent = data.state;
+    const running = data.state === 'running';
+    go.style.display   = running ? 'none' : '';
+    stop.style.display = running ? '' : 'none';
+  } else if (event === 'job_done') {
+    // Update batch queue row
+    const job = batchJobs.find(j => j.release === data.release);
+    if (job) {
+      job.status = data.ok ? 'done' : (data.stopped ? 'skipped' : 'error');
+      renderQueue();
+    }
+  } else if (event === 'batch_progress') {
+    document.getElementById('status-pill').textContent = `${data.current}/${data.total}`;
+  }
+};
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+function log(msg, cls) { addLog(msg, cls); }
+function addLog(msg, cls) {
+  const el = document.getElementById('log');
+  if (!msg) { el.appendChild(document.createElement('br')); el.scrollTop = el.scrollHeight; return; }
+  const d = document.createElement('div');
+  d.className = cls || 'info';
+  d.textContent = msg;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+function clearLog() { document.getElementById('log').innerHTML = ''; }
+
+// ── Mode switching ────────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.mode-tab').forEach((t, i) => {
+    t.classList.toggle('active', (i === 0) === (m === 'single'));
+  });
+  document.getElementById('search-panel').style.display     = m === 'single' ? '' : 'none';
+  document.getElementById('single-content-row').style.display = m === 'single' ? '' : 'none';
+  document.getElementById('batch-panel').style.display      = m === 'batch'  ? '' : 'none';
+
+  // Re-scan if folder already set
+  const src = document.getElementById('src-folder').value;
+  if (src) scanSource(src);
+}
+
+// ── Browse ────────────────────────────────────────────────────────────────────
+async function browseSource() {
+  const p = await window.pywebview.api.browse_folder();
+  if (!p) return;
+  document.getElementById('src-folder').value = p;
+  scanSource(p);
+}
+async function browseContent() {
+  const p = await window.pywebview.api.browse_folder();
+  if (!p) return;
+  document.getElementById('content-dir').value = p;
+}
+async function browseDest() {
+  const p = await window.pywebview.api.browse_folder();
+  if (!p) return;
+  document.getElementById('dest-dir').value = p;
+}
+
+// ── Source scanning ───────────────────────────────────────────────────────────
+async function scanSource(folder) {
+  const hint = document.getElementById('src-hint');
+  if (mode === 'single') {
+    const info = await window.pywebview.api.scan_folder(folder);
+    if (!info.ok) return;
+    document.getElementById('search-input').value = info.release_guess;
+    // Also pre-fill content dir if files found there
+    if (info.media.length > 0) {
+      document.getElementById('content-dir').value = folder;
+    }
+    hint.textContent = `${info.media.length} media, ${info.nfos.length} NFO, ${info.sfvs.length} SFV`;
+    hint.style.display = '';
+    selectedRelease = '';
+    document.getElementById('selected-release').style.display = 'none';
+    document.getElementById('results-list').innerHTML = '';
+  } else {
+    // Batch: scan subfolders
+    hint.style.display = 'none';
+    log(`Scanning subfolders in ${folder}…`, 'dim');
+    const subs = await window.pywebview.api.scan_subfolders(folder);
+    batchJobs = subs.map(s => ({
+      path:       s.path,
+      name:       s.name,
+      release:    s.release_guess,
+      candidates: [],
+      hasNFO:     s.has_nfo,
+      hasSRS:     false,
+      status:     'pending',
+    }));
+    renderQueue();
+    log(`Found ${batchJobs.length} subfolder(s)`, 'info');
+  }
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+async function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) return;
+  const btn = document.getElementById('btn-search');
+  btn.disabled = true; btn.textContent = '…';
+  const res = await window.pywebview.api.search_srrdb(q);
+  btn.disabled = false; btn.textContent = 'Search';
+  if (!res.ok) { log(`Search error: ${res.error}`, 'err'); return; }
+  showSearchResult(res);
+}
+
+async function doCrcSearch() {
+  const src = document.getElementById('src-folder').value.trim();
+  if (!src) { log('Set a source folder first — needs an SFV file inside.', 'warn'); return; }
+  const btn = document.getElementById('btn-crc-search');
+  btn.disabled = true; btn.textContent = '…';
+  const res = await window.pywebview.api.search_from_folder(src);
+  btn.disabled = false; btn.textContent = 'CRC';
+  if (!res.ok) { log(`CRC search error: ${res.error}`, 'err'); return; }
+  showSearchResult(res);
+}
+
+function showSearchResult(res) {
+  const echo = document.getElementById('search-echo');
+  const methodLabel = res.by_crc ? `CRC32` : (res.method || 'name');
+  document.getElementById('echo-query').textContent = `${res.query || ''} [${methodLabel}]`;
+  echo.style.display = '';
+  log(`${res.count} result(s) — ${res.query || ''} [${methodLabel}]`, res.by_crc ? 'ok' : 'dim');
+  renderResults(res.results);
+}
+
+function renderResults(results) {
+  const el = document.getElementById('results-list');
+  el.innerHTML = '';
+  if (!results.length) {
+    el.innerHTML = '<div style="padding:6px;font-size:11px;color:var(--text3)">No results.</div>';
+    return;
+  }
+  results.forEach(r => {
+    const d = document.createElement('div');
+    d.className = 'result-item';
+    d.innerHTML = `
+      <div class="ri-name">${r.release}</div>
+      <div class="ri-date">${r.date}</div>
+      <div class="ri-flags">
+        <span class="flag ${r.hasNFO ? 'on' : ''}">NFO</span>
+        <span class="flag ${r.hasSRS ? 'on' : ''}">SRS</span>
+      </div>`;
+    d.onclick = () => selectResult(r, d);
+    el.appendChild(d);
+  });
+  // Auto-select single result
+  if (results.length === 1) selectResult(results[0], el.firstChild);
+}
+
+function selectResult(r, el) {
+  document.querySelectorAll('.result-item').forEach(x => x.classList.remove('selected'));
+  el.classList.add('selected');
+  selectedRelease = r.release;
+  document.getElementById('sel-name').textContent = r.release;
+  document.getElementById('selected-release').style.display = '';
+  log(`Selected: ${r.release}`, 'dim');
+}
+
+// ── Batch queue ───────────────────────────────────────────────────────────────
+function renderQueue() {
+  const body = document.getElementById('queue-body');
+  body.innerHTML = '';
+  batchJobs.forEach((job, i) => {
+    const cls = {pending:'qs-pending',running:'qs-running',done:'qs-done',error:'qs-error',skipped:'qs-skipped'}[job.status] || 'qs-pending';
+    const row = document.createElement('div');
+    row.className = 'queue-row';
+    row.innerHTML = `
+      <div class="qr-name" title="${job.path}">${job.name}</div>
+      <div class="qr-rel"><input value="${esc(job.release)}" onchange="batchJobs[${i}].release=this.value" title="Edit release name"/></div>
+      <div style="display:flex;gap:3px;align-items:center">
+        <span class="flag ${job.hasNFO ? 'on' : ''}">NFO</span>
+        <span class="flag ${job.hasSRS ? 'on' : ''}">SRS</span>
+      </div>
+      <div class="qr-status ${cls}">${job.status}</div>`;
+    body.appendChild(row);
+  });
+}
+
+async function autoSearchAll() {
+  log('Auto-searching all releases…', 'dim');
+  let matched = 0, ambiguous = 0, missing = 0;
+  for (let i = 0; i < batchJobs.length; i++) {
+    const job = batchJobs[i];
+    if (!job.release) continue;
+    // Try CRC-first (from SFV) then fall back to name
+    const res = await window.pywebview.api.search_from_folder(job.path);
+    if (res.ok && res.results.length === 1) {
+      // Only auto-select when there is exactly one match
+      const r = res.results[0];
+      job.release = r.release;
+      job.hasNFO  = r.hasNFO;
+      job.hasSRS  = r.hasSRS;
+      const via = res.by_crc ? 'CRC' : (res.method || 'name');
+      log(`  ✓ [${via}] ${job.name} → ${r.release}`, 'dim');
+      matched++;
+    } else if (res.ok && res.results.length > 1) {
+      // Store ALL candidates — backend will score them at process time
+      job.candidates = res.results;
+      job.release    = '';   // clear so process knows to auto-match
+      job.hasNFO     = false;
+      job.hasSRS     = false;
+      log(`  ? ${job.name} — ${res.results.length} candidates stored for auto-match`, 'warn');
+      ambiguous++;
+    } else {
+      log(`  ✗ ${job.name} — not found on srrdb.com`, 'err');
+      missing++;
+    }
+    renderQueue();
+  }
+  log(`Auto-search done — ${matched} matched, ${ambiguous} ambiguous, ${missing} not found`, 'info');
+  if (ambiguous > 0) log('Edit ambiguous release names in the queue and re-run Auto-Search, or type exact name.', 'warn');
+}
+
+function clearQueue() {
+  batchJobs = [];
+  renderQueue();
+}
+
+// ── Process ───────────────────────────────────────────────────────────────────
+async function doProcess() {
+  const dest           = document.getElementById('dest-dir').value.trim();
+  const doSample       = document.getElementById('do-sample').checked;
+  const extractIsoM2ts = document.getElementById('extract-iso-m2ts').checked;
+
+  if (!dest) { log('Set an output folder first.', 'warn'); return; }
+
+  if (mode === 'single') {
+    const release = selectedRelease || document.getElementById('search-input').value.trim();
+    if (!release) { log('Search srrdb.com and select a release first.', 'warn'); return; }
+    const content = document.getElementById('content-dir').value.trim();
+    clearLog();
+    await window.pywebview.api.start_process({
+      release_name:     release,
+      content_dir:      content || null,
+      dest_dir:         dest,
+      do_sample:        doSample,
+      extract_iso_m2ts: extractIsoM2ts,
+    });
+  } else {
+    // Batch
+    if (!batchJobs.length) { log('Scan a source folder first.', 'warn'); return; }
+    const src = document.getElementById('src-folder').value.trim();
+    const maxTest = parseInt(document.getElementById('max-test').value) || 5;
+    const jobs = batchJobs
+      .filter(j => (j.release || j.candidates.length) && j.status !== 'done')
+      .map(j => ({
+        release_name:     j.release,
+        candidates:       j.candidates,
+        content_dir:      j.path,
+        dest_dir:         dest,
+        do_sample:        doSample,
+        extract_iso_m2ts: extractIsoM2ts,
+        max_test:         maxTest,
+      }));
+    if (!jobs.length) { log('All jobs already done.', 'dim'); return; }
+    clearLog();
+    log(`Starting batch: ${jobs.length} release(s)`, 'info');
+    await window.pywebview.api.start_batch(jobs);
+  }
+}
+
+async function doStop() {
+  await window.pywebview.api.stop_process();
+}
+
+// ── RAR version setup ─────────────────────────────────────────────────────────
+async function doSetupRar() {
+  const btn = document.getElementById('btn-setup-rar');
+  btn.disabled = true; btn.textContent = '…';
+  log('Extracting rar_X.YY.exe from winrar_pack-4.20 installers…', 'dim');
+  const res = await window.pywebview.api.setup_rar_executables();
+  btn.disabled = false; btn.textContent = 'Setup RAR versions';
+  if (!res.ok) {
+    log(`Setup failed: ${res.error}`, 'err');
+    return;
+  }
+  (res.messages || []).forEach(m => log(m, m.includes('✓') ? 'ok' : m.includes('skipped') ? 'dim' : 'warn'));
+  log(`Done — ${res.done} extracted, ${res.skipped} skipped, ${res.failed} failed`, res.failed ? 'warn' : 'ok');
+  // Update info label
+  if (res.done > 0) {
+    const info = document.getElementById('rar-version-info');
+    const rc2 = await window.pywebview.api.check_rescene();
+    if (rc2.rar_versions && rc2.rar_versions.length > 0) {
+      info.textContent = `${rc2.rar_versions.length} version(s) ready`;
+      info.style.color = 'var(--acc)';
+    }
+  }
+}
+
+// ── Util ──────────────────────────────────────────────────────────────────────
+function esc(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

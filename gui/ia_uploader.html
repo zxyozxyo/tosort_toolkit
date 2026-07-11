@@ -167,7 +167,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
     <div class="panel-body" id="body-meta">
       <div class="row">
         <span class="lbl">Identifier</span>
-        <input class="txt" id="item-id" placeholder="my-rom-collection-2024" oninput="autoTitle()"/>
+        <input class="txt" id="item-id" placeholder="my-rom-collection-2024" oninput="this.value=this.value.replace(/ /g,'_'); autoTitle()"/>
         <button class="btn" onclick="fetchMeta()">Fetch</button>
       </div>
       <div class="two-col">
@@ -216,6 +216,23 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <span style="width:14px"></span>
       </div>
       <div class="file-list" id="file-list"><div class="file-empty">Add files or a folder</div></div>
+    </div>
+  </div>
+
+  <!-- Fixdat Filter -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('fixdat')">
+      <div class="dot" id="fixdat-dot"></div>Fixdat Filter
+      <span id="fixdat-sum" style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400"></span>
+      <span class="chevron" id="chev-fixdat">▾</span>
+    </div>
+    <div class="panel-body" id="body-fixdat">
+      <div class="row">
+        <button class="btn" onclick="browseFixdat()">Load Fixdat</button>
+        <span id="fixdat-path" style="flex:1;font-size:9px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 6px"></span>
+        <button class="btn btn-danger" id="btn-clear-fixdat" onclick="clearFixdat()" style="display:none">Clear</button>
+      </div>
+      <div id="fixdat-status" class="hint">Load fixdat — files listed as incomplete in RomVault will be skipped</div>
     </div>
   </div>
 
@@ -321,7 +338,52 @@ window.addEventListener('pywebviewready', async () => {
   const creds = await window.pywebview.api.load_credentials();
   if (creds.access_key) document.getElementById('cred-access').value = creds.access_key;
   if (creds.secret_key) document.getElementById('cred-secret').value = creds.secret_key;
+  // Restore fixdat filter
+  const fixdatStatus = await window.pywebview.api.get_fixdat_status();
+  if (fixdatStatus.active) updateFixdatUI(fixdatStatus);
 });
+
+// ── Fixdat filter ─────────────────────────────────────────────────────────────
+async function browseFixdat() {
+  const path = await window.pywebview.api.browse_fixdat();
+  if (!path) return;
+  const res = await window.pywebview.api.load_fixdat(path);
+  if (res.ok) {
+    updateFixdatUI(res);
+    addLog(`Fixdat loaded: ${res.count} incomplete game(s) will be excluded from upload`, 'warn');
+  } else {
+    addLog(`Fixdat load failed: ${res.error}`, 'err');
+  }
+}
+
+async function clearFixdat() {
+  await window.pywebview.api.clear_fixdat();
+  updateFixdatUI({ active: false, count: 0, path: '' });
+  addLog('Fixdat filter cleared — all files will upload', 'dim');
+}
+
+function updateFixdatUI(info) {
+  const dot    = document.getElementById('fixdat-dot');
+  const sum    = document.getElementById('fixdat-sum');
+  const status = document.getElementById('fixdat-status');
+  const pathEl = document.getElementById('fixdat-path');
+  const clearBtn = document.getElementById('btn-clear-fixdat');
+  if (info.active || info.count > 0) {
+    dot.style.background = 'var(--warn)';
+    sum.textContent = `${info.count} games`;
+    status.textContent = `${info.count} incomplete game(s) will be excluded from upload`;
+    status.style.color = 'var(--warn)';
+    pathEl.textContent = info.path || '';
+    clearBtn.style.display = '';
+  } else {
+    dot.style.background = '';
+    sum.textContent = '';
+    status.textContent = 'No fixdat loaded — all files will be uploaded';
+    status.style.color = '';
+    pathEl.textContent = '';
+    clearBtn.style.display = 'none';
+  }
+}
 
 // ── Panel collapse ────────────────────────────────────────────────────────────
 function togglePanel(id) {
@@ -380,6 +442,7 @@ async function addFolder() {
   if (!folder) return;
   srcFolder = folder;  // remember root for relative path uploads
   const files = await window.pywebview.api.get_folder_files(folder);
+  let excluded = 0;
   for (const f of files) {
     // Normalize to forward slashes — the backend always sends
     // fileStatus/fileProgress events using forward-slash relative
@@ -388,10 +451,13 @@ async function addFolder() {
     // silently never finds the right row to update on Windows, where
     // Path.relative_to() produces backslash-separated paths.
     const relNorm = f.rel ? f.rel.replace(/\\/g, '/') : f.rel;
+    if (f.excluded) { excluded++; continue; }
     if (!fileList.find(x => x.path === f.path))
       fileList.push({name: relNorm || f.name, path: f.path, size: f.size, rel: relNorm});
   }
   renderFiles();
+  if (excluded > 0)
+    addLog(`Fixdat filter: ${excluded} incomplete file(s) excluded from list`, 'warn');
 }
 function clearFiles() { fileList = []; renderFiles(); }
 

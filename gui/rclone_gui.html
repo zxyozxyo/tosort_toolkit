@@ -145,10 +145,27 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
       </div>
       <div class="row">
         <span class="lbl">Identifier</span>
-        <input class="txt" id="identifier" placeholder="archive.org/details/your-identifier" oninput="autoTitle(); validateId(this)"/>
+        <input class="txt" id="identifier" placeholder="archive.org/details/your-identifier" oninput="this.value=this.value.replace(/ /g,'_'); autoTitle(); validateId(this)"/>
         <button class="btn" onclick="fetchMeta()">Fetch</button>
       </div>
       <div class="hint">Identifier rules: 5-100 chars, letters/numbers/dots/hyphens/underscores, must be unique on IA.</div>
+    </div>
+  </div>
+
+  <!-- Fixdat Filter -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('fixdat')">
+      <div class="dot" id="fixdat-dot"></div>Fixdat Filter
+      <span id="fixdat-sum" style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400"></span>
+      <span class="chevron" id="chev-fixdat">▾</span>
+    </div>
+    <div class="panel-body" id="body-fixdat">
+      <div class="row">
+        <button class="btn" onclick="browseFixdat()">Load Fixdat</button>
+        <span id="fixdat-path" style="flex:1;font-size:9px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 6px"></span>
+        <button class="btn btn-danger" id="btn-clear-fixdat" onclick="clearFixdat()" style="display:none">Clear</button>
+      </div>
+      <div id="fixdat-status" class="hint">Load fixdat — files listed as incomplete in RomVault will be skipped</div>
     </div>
   </div>
 
@@ -330,11 +347,61 @@ window.addEventListener('pywebviewready', async () => {
   if (cfg.md_subject) document.getElementById('md-subject').value = cfg.md_subject;
   if (cfg.md_desc)    document.getElementById('md-desc').value = cfg.md_desc;
 
+  // Restore fixdat filter state
+  const fixdatStatus = await window.pywebview.api.get_fixdat_status();
+  if (fixdatStatus.active) updateFixdatUI(fixdatStatus);
+
   // Auto-populate the file queue if a source folder was restored from
   // a previous session, so the list isn't empty until Start/Scan is
   // pressed manually
   if (cfg.src) await scanSourceFiles();
 });
+
+// ── Fixdat filter ─────────────────────────────────────────────────────────────
+async function browseFixdat() {
+  const path = await window.pywebview.api.browse_fixdat();
+  if (!path) return;
+  const res = await window.pywebview.api.load_fixdat(path);
+  if (res.ok) {
+    updateFixdatUI(res);
+    addLog(`Fixdat loaded: ${res.count} incomplete game(s) will be excluded from upload`, 'warn');
+    const src = document.getElementById('src').value.trim();
+    if (src) await scanSourceFiles();
+  } else {
+    addLog(`Fixdat load failed: ${res.error}`, 'err');
+  }
+}
+
+async function clearFixdat() {
+  await window.pywebview.api.clear_fixdat();
+  updateFixdatUI({ active: false, count: 0, path: '' });
+  addLog('Fixdat filter cleared — all files will upload', 'dim');
+  const src = document.getElementById('src').value.trim();
+  if (src) await scanSourceFiles();
+}
+
+function updateFixdatUI(info) {
+  const dot    = document.getElementById('fixdat-dot');
+  const sum    = document.getElementById('fixdat-sum');
+  const status = document.getElementById('fixdat-status');
+  const pathEl = document.getElementById('fixdat-path');
+  const clearBtn = document.getElementById('btn-clear-fixdat');
+  if (info.active || info.count > 0) {
+    dot.style.background = 'var(--warn)';
+    sum.textContent = `${info.count} games`;
+    status.textContent = `${info.count} incomplete game(s) will be excluded from upload`;
+    status.style.color = 'var(--warn)';
+    pathEl.textContent = info.path || '';
+    clearBtn.style.display = '';
+  } else {
+    dot.style.background = '';
+    sum.textContent = '';
+    status.textContent = 'No fixdat loaded — all files will be uploaded';
+    status.style.color = '';
+    pathEl.textContent = '';
+    clearBtn.style.display = 'none';
+  }
+}
 
 // ── Python events ─────────────────────────────────────────────────────────────
 let isUploading = false;
@@ -408,10 +475,14 @@ async function scanSourceFiles() {
   if (!src) { addLog('Set a source folder first.', 'warn'); return; }
   addLog('Scanning source folder...', 'dim');
   const files = await window.pywebview.api.get_folder_files(src);
-  fileList = files.map(f => ({ name: f.rel, path: f.path, size: f.size, status: 'queued' }));
+  let excluded = 0;
+  fileList = files.map(f => {
+    if (f.excluded) { excluded++; return { name: f.rel, path: f.path, size: f.size, status: 'excluded' }; }
+    return { name: f.rel, path: f.path, size: f.size, status: 'queued' };
+  });
   lastScannedSrc = src;
   renderFiles();
-  addLog(`Found ${fileList.length} file(s) in ${src}`, fileList.length ? 'ok' : 'warn');
+  addLog(`Found ${files.length} file(s)${excluded ? ` — ${excluded} excluded by fixdat` : ''}`, files.length ? 'ok' : 'warn');
 }
 
 function updateFilesSummary() {
@@ -437,7 +508,7 @@ function updateFilesSummary() {
 // one end, finished (done/already) toward the other, so "sort by
 // error" and "sort by uploaded" are both just this same Status column,
 // clicked once for one direction and twice for the other
-const STATUS_ORDER = { error: 0, uploading: 1, queued: 2, done: 3, already: 4 };
+const STATUS_ORDER = { error: 0, uploading: 1, queued: 2, excluded: 3, done: 4, already: 5 };
 
 function sortFiles(key) {
   if (sortKey === key) {
@@ -488,8 +559,9 @@ function renderFiles() {
     d.dataset.fname = f.name;
     const stClass = f.status || 'queued';
     const stText = stClass === 'done' ? '✓' : stClass === 'already' ? '✓ existing' : stClass === 'error' ? '✗'
-                 : stClass === 'uploading' ? (f.pct != null ? f.pct + '%' : '…') : '—';
-    d.innerHTML = `<span class="file-name" title="${f.path}">${f.name}</span>`
+                 : stClass === 'excluded' ? '✗ fixdat' : stClass === 'uploading' ? (f.pct != null ? f.pct + '%' : '…') : '—';
+    const dimmed = stClass === 'excluded' ? ' style="opacity:0.4"' : '';
+    d.innerHTML = `<span class="file-name" title="${f.path}"${dimmed}>${f.name}</span>`
       + `<span class="file-sz">${fmtSz(f.size)}</span>`
       + `<span class="file-st ${stClass}" id="fst-${i}">${stText}</span>`;
     el.appendChild(d);

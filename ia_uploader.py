@@ -25,9 +25,105 @@ class IAUploaderAPI:
         self._running = False
         self._lock = threading.Lock()
         self._upload_stats = {}  # file_key -> {bytes_done, total, speed, status}
+        self._fixdat_names: set = set()
+        self._fixdat_path: str = ""
+        self._auto_load_fixdat()
 
     def set_window(self, window):
         self._window = window
+
+    # ── Fixdat filter ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_fixdat(path: str) -> set:
+        """Parse Logiqx XML fixdat, return set of game name strings."""
+        names = set()
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.parse(path).getroot()
+            for game in root.iter("game"):
+                n = game.get("name", "").strip()
+                if n:
+                    names.add(n)
+        except Exception:
+            pass
+        return names
+
+    def _auto_load_fixdat(self):
+        try:
+            p = self._load_uploader_settings().get("fixdat_path", "")
+            if p and Path(p).exists():
+                names = self._parse_fixdat(p)
+                if names:
+                    self._fixdat_names = names
+                    self._fixdat_path = p
+        except Exception:
+            pass
+
+    def _load_uploader_settings(self) -> dict:
+        try:
+            p = Path(__file__).parent / "ia_uploader.json"
+            if p.exists():
+                with open(p) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_uploader_setting(self, key: str, value):
+        try:
+            p = Path(__file__).parent / "ia_uploader.json"
+            cfg = self._load_uploader_settings()
+            cfg[key] = value
+            with open(p, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    def load_uploader_settings(self) -> dict:
+        return self._load_uploader_settings()
+
+    def browse_fixdat(self) -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                filetypes=[("DAT files", "*.dat *.xml"), ("All files", "*.*")]
+            )
+            root.destroy()
+            return path if path else ""
+        except Exception:
+            return ""
+
+    def load_fixdat(self, path: str) -> dict:
+        if not path or not Path(path).exists():
+            return {"ok": False, "error": "File not found"}
+        try:
+            names = self._parse_fixdat(path)
+            if not names:
+                return {"ok": False, "error": "No game entries found in fixdat"}
+            self._fixdat_names = names
+            self._fixdat_path = path
+            self._save_uploader_setting("fixdat_path", path)
+            return {"ok": True, "count": len(names), "path": path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def clear_fixdat(self) -> bool:
+        self._fixdat_names = set()
+        self._fixdat_path = ""
+        self._save_uploader_setting("fixdat_path", "")
+        return True
+
+    def get_fixdat_status(self) -> dict:
+        return {
+            "active": bool(self._fixdat_names),
+            "count": len(self._fixdat_names),
+            "path": self._fixdat_path,
+        }
 
     def _emit(self, event: str, data: dict):
         if not self._window:
@@ -178,6 +274,19 @@ class IAUploaderAPI:
             self._running = False
             self._emit("uploadStatus", {"state": "error"})
             return
+
+        # Apply fixdat filter — skip any file whose stem matches a game entry
+        if self._fixdat_names:
+            filtered = [fp for fp in file_paths if fp.stem not in self._fixdat_names]
+            skipped = len(file_paths) - len(filtered)
+            if skipped:
+                self._log(f"  Fixdat filter: {skipped} incomplete file(s) excluded from upload", "warn")
+            file_paths = filtered
+            if not file_paths:
+                self._log("ERROR: All files excluded by fixdat filter — nothing to upload.", "err")
+                self._running = False
+                self._emit("uploadStatus", {"state": "error"})
+                return
 
         total_bytes = sum(f.stat().st_size for f in file_paths)
         # Validate identifier — IA requires: start with letter/number,
@@ -618,17 +727,19 @@ class IAUploaderAPI:
             return []
 
     def get_folder_files(self, folder: str) -> list:
-        """Return list of {name, path, size} for all files in folder."""
+        """Return list of {name, path, size, rel, excluded} for all files in folder."""
         result = []
         try:
             for root, dirs, files in os.walk(folder):
                 for f in sorted(files):
                     fp = Path(root) / f
+                    excluded = fp.stem in self._fixdat_names if self._fixdat_names else False
                     result.append({
                         "name": fp.name,
                         "path": str(fp),
                         "size": fp.stat().st_size,
-                        "rel": str(fp.relative_to(folder))
+                        "rel": str(fp.relative_to(folder)),
+                        "excluded": excluded,
                     })
         except Exception:
             pass
