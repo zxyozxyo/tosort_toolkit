@@ -557,9 +557,10 @@ class SrrdbToolAPI:
                 return 0.0
             content = {
                 f.name.lower(): f.stat().st_size
-                for f in Path(content_dir).iterdir()
+                for f in Path(content_dir).rglob("*")
                 if f.is_file()
             }
+            content_sizes = set(content.values())
             score = 0.0
             for af in archived:
                 name = af.get("name", "").lower()
@@ -571,6 +572,10 @@ class SrrdbToolAPI:
                         score += 1.0
                     else:
                         score += 0.3
+                elif size > 0 and size in content_sizes:
+                    # Renamed content file — an exact byte-size match is a
+                    # near-unique fingerprint for large media files.
+                    score += 0.7
             return score / len(archived)
         except Exception:
             return 0.0
@@ -593,6 +598,8 @@ class SrrdbToolAPI:
             if score > best_score:
                 best_score   = score
                 best_release = release
+            if best_score >= 0.999:
+                break  # perfect match — skip remaining API calls
         return {"release": best_release, "score": best_score, "tested": tested}
 
     # ── SRR download ──────────────────────────────────────────────────────────
