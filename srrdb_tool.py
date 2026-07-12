@@ -868,7 +868,13 @@ class SrrdbToolAPI:
                     errors.append(_explain(str(e)))
 
             output_text = buf.getvalue()
-            out_files = [f.name for f in Path(out_dir).iterdir() if f.is_file()]
+            # Recursive: multi-CD releases reconstruct into CD1/, CD2/ …
+            # subfolders (stored paths). Exclude our own working dirs.
+            _SKIP_DIRS = {"_stored", "_subs_tmp", "_iso_m2ts_tmp", "Sample"}
+            out_files = [
+                str(f.relative_to(out_dir)) for f in Path(out_dir).rglob("*")
+                if f.is_file() and not (_SKIP_DIRS & set(f.relative_to(out_dir).parts[:-1]))
+            ]
             if ok_any:
                 return {"ok": True, "files": out_files, "output": output_text,
                         "error": "; ".join(errors) if errors else None}
@@ -880,6 +886,61 @@ class SrrdbToolAPI:
             return {"ok": False, "files": [], "output": buf.getvalue(), "error": _explain(str(e))}
         finally:
             done_flag.set()
+
+    def _reconstruct_nested(self, nsrr: Path, content_dir: str, out_root: Path,
+                            stored_dir: Path) -> dict:
+        """Rebuild one nested SRR (vobsubs etc.). Sources are assembled by exact
+        filename from the content folder and anything already produced in the
+        output (inner subs RARs feed outer ones) into a small temp pool —
+        subtitle files are tiny, so copying is cheap."""
+        try:
+            sets = self._srr_rar_sets(str(nsrr))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        needed = {Path(p).name.lower()
+                  for info in sets.values() for p in info["packed"]}
+        if not needed:
+            return {"ok": False, "error": "no packed files described"}
+        # If every RAR this SRR describes already exists (content or output),
+        # there is nothing to rebuild — common for inner vobsub RARs that were
+        # kept alongside the content.
+        vol_names = {Path(v).name.lower()
+                     for info in sets.values() for v in info["volumes"]}
+        existing = {
+            f.name.lower()
+            for root in (Path(content_dir), out_root)
+            for f in root.rglob("*") if f.is_file()
+        }
+        if vol_names and vol_names <= existing:
+            return {"ok": True, "produced": [], "already": True}
+        pool = out_root / "_subs_tmp"
+        pool.mkdir(parents=True, exist_ok=True)
+        try:
+            missing = set(needed)
+            for root in (Path(content_dir), out_root):
+                if not missing:
+                    break
+                for f in root.rglob("*"):
+                    if (f.is_file() and f.name.lower() in missing
+                            and pool not in f.parents):
+                        shutil.copy2(str(f), str(pool / f.name))
+                        missing.discard(f.name.lower())
+            if missing:
+                return {"ok": False, "error":
+                        "source not found: " + ", ".join(sorted(missing)[:4])}
+            rel_parent = nsrr.parent.relative_to(stored_dir)
+            n_out = out_root / rel_parent
+            rc = self._srr_reconstruct(str(nsrr), str(pool), str(n_out),
+                                       log_rar_pack=False)
+            if rc["ok"]:
+                produced = [f for f in rc["files"]
+                            if Path(f).suffix.lower() not in META_EXTS]
+                if produced:
+                    return {"ok": True, "produced": produced}
+                return {"ok": False, "error": "nothing produced"}
+            return {"ok": False, "error": rc.get("error") or "failed"}
+        finally:
+            shutil.rmtree(str(pool), ignore_errors=True)
 
     def _srr_list(self, srr_path: str) -> bool:
         """Log SRR contents. Returns True if RAR5 format (reconstruction not supported)."""
@@ -1214,6 +1275,12 @@ class SrrdbToolAPI:
         # for job events even after auto-match renames or nesting descent.
         queue_path = content_dir
 
+        # Per-job outcome for the queue status and the end-of-batch summary
+        summary = {
+            "release": release or (Path(queue_path).name if queue_path else "?"),
+            "ok": True, "rars": None, "sample": None, "note": "",
+        }
+
         self._emit("job_start", {"content_dir": queue_path, "release": release})
 
         # Resolve double-nesting: if the selected folder has no files (only one subdir),
@@ -1261,17 +1328,20 @@ class SrrdbToolAPI:
                         top = best.get("release", "?")
                         self._log(
                             f"  No confident match (best: {top} at {best['score']:.0%}) "
-                            "and content CRC not in srrdb. Set the release name manually.",
-                            "err",
+                            "and the content CRC is not in srrdb — the file is likely "
+                            "NON-SCENE (P2P/custom rip) or modified. Set the release "
+                            "name manually if you know it.", "err",
                         )
-                        raise RuntimeError("no confident match")
+                        raise RuntimeError("not in srrdb — possibly non-scene")
                     else:
                         self._log(
-                            "  ERROR: No release name, no candidates, and content "
-                            "CRC not found on srrdb.", "err",
+                            "  No name match and the content CRC is not in srrdb — "
+                            "the file is likely NON-SCENE (P2P/custom rip) or modified.",
+                            "err",
                         )
-                        raise RuntimeError("no match")
+                        raise RuntimeError("not in srrdb — possibly non-scene")
 
+            summary["release"] = release
             out_root = Path(dest_dir) / release
             stored_dir = out_root / "_stored"
 
@@ -1290,7 +1360,14 @@ class SrrdbToolAPI:
                 self._log("  Downloading SRR from srrdb.com…", "dim")
                 dl = self.download_srr(release, str(out_root))
                 if not dl["ok"]:
-                    self._log(f"  ERROR: {dl['error']}", "err"); raise RuntimeError()
+                    if dl.get("not_found"):
+                        self._log(
+                            f"  No SRR on srrdb.com for '{release}' — the database has "
+                            "no record of this release. It may be a NON-SCENE file "
+                            "(P2P/custom rip) or the release name is wrong.", "err",
+                        )
+                        raise RuntimeError("no SRR on srrdb — possibly non-scene")
+                    self._log(f"  ERROR: {dl['error']}", "err"); raise RuntimeError(dl["error"])
                 srr_file = Path(dl["srr_path"])  # use actual saved path (may be alt name)
                 self._log(f"  SRR downloaded ({dl['size']:,} B)", "ok")
 
@@ -1319,6 +1396,8 @@ class SrrdbToolAPI:
 
             if is_rar5:
                 self._log("  Skipping reconstruction — RAR5 not supported by pyReScene 0.7", "err")
+                summary["ok"] = False
+                summary["note"] = "RAR5 — not supported"
             elif content_dir and Path(content_dir).is_dir():
                 # Show what's in the content folder so mismatches are obvious
                 cdir = Path(content_dir)
@@ -1345,37 +1424,71 @@ class SrrdbToolAPI:
                         + ("…" if len(produced) > 8 else ""),
                         "ok" if produced else "warn",
                     )
+                    summary["rars"] = len(produced)
                     if not produced:
                         self._log("  No archive files produced", "warn")
+                        summary["ok"] = False
+                        summary["note"] = "no RARs produced"
                 else:
                     self._log(f"  Reconstruct ERROR: {rc.get('error', 'unknown')}", "err")
+                    summary["ok"] = False
+                    summary["note"] = (rc.get("error") or "reconstruct error")[:100]
 
                 # Nested SRRs (e.g. Subs/xxx.subs.srr) describe extra RAR sets
-                # such as vobsubs. Rebuild them when their sources are present
-                # in the content folder (idx/sub files or the inner subs RAR).
-                nested_srrs = (sorted(stored_dir.rglob("*.srr"))
-                               if stored_dir.exists() else [])
-                for nsrr in nested_srrs:
-                    rel_parent = nsrr.parent.relative_to(stored_dir)
-                    n_out = out_root / rel_parent
-                    self._log(f"  Nested SRR: {nsrr.name} — reconstructing…", "dim")
-                    nrc = self._srr_reconstruct(str(nsrr), content_dir, str(n_out),
-                                                log_rar_pack=False)
-                    if nrc["ok"] and nrc.get("files"):
-                        produced_n = [f for f in nrc["files"]
-                                      if Path(f).suffix.lower() not in META_EXTS]
-                        if produced_n:
-                            self._log(f"    Produced: {', '.join(produced_n[:6])}"
-                                      + ("…" if len(produced_n) > 6 else ""), "ok")
-                        else:
-                            self._log("    Nothing produced", "dim")
-                    else:
+                # such as vobsubs — sometimes two levels deep (per-CD inner RARs
+                # inside an outer subs RAR). Extract deeper SRRs first, then
+                # rebuild in passes so inner sets become sources for outer ones.
+                if stored_dir.exists():
+                    found: list[Path] = []
+                    scan = sorted(stored_dir.rglob("*.srr"))
+                    while scan:
+                        nsrr = scan.pop(0)
+                        if nsrr in found:
+                            continue
+                        found.append(nsrr)
+                        try:
+                            self._srr_extract(str(nsrr), str(nsrr.parent))
+                        except Exception:
+                            pass
+                        for extra in sorted(nsrr.parent.rglob("*.srr")):
+                            if extra not in found and extra not in scan:
+                                scan.append(extra)
+
+                    pending = found
+                    nested_errors: dict = {}
+                    for _pass in range(3):
+                        if not pending:
+                            break
+                        remaining = []
+                        progressed = False
+                        for nsrr in pending:
+                            self._log(f"  Nested SRR: {nsrr.name} — reconstructing…", "dim")
+                            nrc = self._reconstruct_nested(
+                                nsrr, content_dir, out_root, stored_dir)
+                            if nrc["ok"]:
+                                if nrc.get("already"):
+                                    self._log(
+                                        "    Target RAR(s) already present — "
+                                        "nothing to rebuild", "dim")
+                                else:
+                                    self._log(
+                                        f"    Produced: {', '.join(nrc['produced'][:6])}"
+                                        + ("…" if len(nrc["produced"]) > 6 else ""), "ok")
+                                progressed = True
+                            else:
+                                nested_errors[nsrr] = nrc.get("error") or "?"
+                                remaining.append(nsrr)
+                        pending = remaining
+                        if not progressed:
+                            break
+                    for nsrr in pending:
                         self._log(
-                            f"    Skipped — {nrc.get('error', 'source files not available')}",
+                            f"  Nested SRR {nsrr.name} skipped — {nested_errors[nsrr]}",
                             "warn",
                         )
             else:
                 self._log("  No content folder — NFO/SFV extracted only", "dim")
+                summary["note"] = "no content folder — NFO/SFV only"
 
             if self._stop.is_set(): raise InterruptedError()
 
@@ -1412,6 +1525,7 @@ class SrrdbToolAPI:
                                     f"({crc:08X}) ✓ copied as {dest.name}", "ok",
                                 )
                                 sample_done = True
+                                summary["sample"] = "verified ✓"
                                 break
 
                     # Prefer video/stream files over disc images — and never use a
@@ -1458,10 +1572,30 @@ class SrrdbToolAPI:
                             media_file = None
                     if media_file:
                         self._log("  Creating sample…", "dim")
-                        samp = self._srs_create_sample(
-                            str(srs_files[0]), str(media_file),
-                            str(out_root / "Sample"),
-                        )
+                        # Multi-CD releases: the SRS stores byte offsets into the
+                        # exact CD the sample was cut from. Wrong CD → rebuild
+                        # completes with the right size but wrong CRC (pyReScene
+                        # mislabels this "LOL xvid issue"). Try each stream file.
+                        attempts = [media_file] + [
+                            f for f in stream_media[:4] if f != media_file
+                        ]
+                        samp = None
+                        for i, mf in enumerate(attempts):
+                            if i:
+                                self._log(
+                                    f"  Sample source mismatch — retrying with "
+                                    f"{mf.name}…", "dim",
+                                )
+                            samp = self._srs_create_sample(
+                                str(srs_files[0]), str(mf),
+                                str(out_root / "Sample"),
+                            )
+                            if samp["ok"]:
+                                break
+                            err_l = samp.get("error", "").lower()
+                            if not ("rebuild failed" in err_l or "signature" in err_l
+                                    or "extract correct amount" in err_l):
+                                break  # non-retryable error
                         # Fallback: the sample may have been cut from a different
                         # stream on the disc — one raw scan of the ISO covers all
                         # of its M2TS files at once.
@@ -1478,6 +1612,7 @@ class SrrdbToolAPI:
                         if samp["ok"]:
                             files_str = ", ".join(samp.get("files", []))
                             self._log(f"  Sample created ✓ — {files_str}", "ok")
+                            summary["sample"] = "created ✓"
                         elif "signature" in samp.get("error", "").lower() and disc_media:
                             self._log(
                                 "  Sample FAILED: the sample's bytes are not on the disc. "
@@ -1486,6 +1621,7 @@ class SrrdbToolAPI:
                                 "sample cannot be rebuilt from the ISO by any byte-matching "
                                 "tool. The SRS can still verify an existing sample file.", "err",
                             )
+                            summary["sample"] = "unrebuildable (BD remux)"
                             if non_scene_sample:
                                 self._log(
                                     "  Creating NON-SCENE preview clip from the disc's "
@@ -1501,6 +1637,7 @@ class SrrdbToolAPI:
                                         f"({carve['size']:,} B). NOT a scene file; it will "
                                         "never CRC-match the SRS.", "ok",
                                     )
+                                    summary["sample"] += " + NONSCENE preview"
                                 else:
                                     self._log(
                                         f"  Non-scene preview failed: {carve['error']}", "warn",
@@ -1515,16 +1652,20 @@ class SrrdbToolAPI:
                                     "extra/re-encoded data, so it cannot be rebuilt "
                                     "byte-perfect from the movie file.", "err",
                                 )
+                                summary["sample"] = "unrebuildable (extra track)"
                             else:
                                 self._log(
                                     "  Sample FAILED: the sample's video data was not found "
                                     "in this file — the content may not match this exact "
                                     "release (wrong source or re-encode).", "err",
                                 )
+                                summary["sample"] = "failed (content mismatch)"
                         else:
                             self._log(f"  Sample FAILED: {samp['error']}", "err")
+                            summary["sample"] = "failed"
                     elif not sample_done and not stream_media and not disc_media:
                         self._log("  No media file for sample", "dim")
+                        summary["sample"] = "no media file"
                     # Clean up extracted M2TS
                     if _iso_tmp and _iso_tmp.exists():
                         shutil.rmtree(str(_iso_tmp), ignore_errors=True)
@@ -1537,8 +1678,10 @@ class SrrdbToolAPI:
                             "  No SRS — this usenet-sourced SRR stores only a sample "
                             "info .txt placeholder, so the sample cannot be rebuilt", "dim",
                         )
+                        summary["sample"] = "no SRS (usenet SRR)"
                     else:
                         self._log("  No SRS in stored files", "dim")
+                        summary["sample"] = "no SRS"
 
             # 5 — Move stored extras (Proof/, Subs/, jpgs …) into the release
             # folder, preserving their relative paths, then drop empty _stored.
@@ -1568,21 +1711,32 @@ class SrrdbToolAPI:
                 if moved:
                     self._log(f"  Moved {moved} stored extra(s) into release folder", "dim")
 
-            self._log(f"  ✓ Done → {out_root}", "ok")
-            self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": True})
+            if summary["ok"]:
+                self._log(f"  ✓ Done → {out_root}", "ok")
+            else:
+                self._log(f"  ⚠ Finished with errors → {out_root}", "warn")
+            self._emit("job_done", {"release": release, "content_dir": queue_path,
+                                    "ok": summary["ok"]})
 
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as e:
+            summary["ok"] = False
+            summary["note"] = summary["note"] or str(e) or "failed"
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         except InterruptedError:
             self._log("  Stopped.", "warn")
+            summary["ok"] = False
+            summary["note"] = "stopped"
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False, "stopped": True})
         except Exception as e:
             self._log(f"  FAILED: {e}", "err")
+            summary["ok"] = False
+            summary["note"] = str(e)[:100]
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
             if not batch_mode:
                 self._running = False
                 self._emit("status", {"state": "done"})
+        return summary
 
     # ── Batch processing ──────────────────────────────────────────────────────
 
@@ -1598,12 +1752,30 @@ class SrrdbToolAPI:
         self._running = True
         self._emit("status", {"state": "running"})
         total = len(jobs)
+        results = []
         for i, job in enumerate(jobs):
             if self._stop.is_set():
                 break
             self._emit("batch_progress", {"current": i + 1, "total": total})
             self._log(f"\n[{i + 1}/{total}]", "dim")
-            self._process_one(job, batch_mode=True)
-        self._log(f"\nBatch complete — {total} job(s) processed", "ok")
+            results.append(self._process_one(job, batch_mode=True))
+
+        ok_n = sum(1 for r in results if r["ok"])
+        self._log(f"\n══ Batch summary — {ok_n}/{len(results)} succeeded ══", "info")
+        for r in results:
+            if r["ok"]:
+                parts = []
+                if r["rars"] is not None:
+                    parts.append(f"{r['rars']} RARs")
+                if r["sample"]:
+                    parts.append(f"sample: {r['sample']}")
+                if r["note"]:
+                    parts.append(r["note"])
+                self._log(f"  ✓ {r['release']} — {', '.join(parts) or 'done'}", "ok")
+            else:
+                detail = r["note"] or "failed"
+                if r["sample"]:
+                    detail += f" (sample: {r['sample']})"
+                self._log(f"  ✗ {r['release']} — {detail}", "err")
         self._running = False
         self._emit("status", {"state": "done"})

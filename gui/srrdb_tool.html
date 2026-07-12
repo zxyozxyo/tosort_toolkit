@@ -235,6 +235,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="dot" style="background:var(--warn)"></div>
           Release Queue
           <button class="btn btn-sm" style="margin-left:auto" onclick="autoSearchAll()">Auto-Search All</button>
+          <button class="btn btn-sm" onclick="rescanSource()">Rescan</button>
           <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
         </div>
         <div style="padding:6px 10px">
@@ -389,6 +390,12 @@ async function browseSource() {
   if (!p) return;
   document.getElementById('src-folder').value = p;
   scanSource(p);
+}
+function rescanSource() {
+  const src = document.getElementById('src-folder').value.trim();
+  if (!src) { log('Set a source folder first.', 'warn'); return; }
+  log('Rescanning source folder…', 'dim');
+  scanSource(src);
 }
 async function browseContent() {
   const p = await window.pywebview.api.browse_folder();
