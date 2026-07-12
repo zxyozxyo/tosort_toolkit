@@ -42,34 +42,54 @@ bugs, all in or around `_srs_create_sample()`:
    all srs stdout/stderr lines are logged (`srs: ...` prefix); `-y` flag added so the overwrite
    prompt can't block on stdin.
 
-## Learned today — Blu-ray ISO samples
+4. **`locale.format()` crash (2026-07-12)** — removed in Python 3.12, used by rescene's `sep()`
+   number formatter which runs in the rebuild results display — *after* the sample was rebuilt
+   to a `.tmp` file but *before* the CRC check and rename. This stranded finished samples as
+   `.tmp` files. Shimmed with `locale.format = locale.format_string`. Additionally the wrapper
+   now recovers lingering `.tmp` files by renaming them to the intended sample name.
 
-`Unable to locate track signature for track 1` on Complete Blu-ray releases is **not a bug in
-the SRS**: the scene group built the sample SRS from an M2TS stream *inside* the disc
-(`BDMV/STREAM/*.m2ts`), so the SRS byte offsets reference that M2TS — not the ISO container.
-Passing the ISO gives srs the wrong byte layout.
+## The GUI silent-log bug (major, fixed 2026-07-12)
 
-Handling added:
+`_emit()` passed `json.dumps(...)` into a **single-quoted JS string** without escaping
+backslashes. Any log message containing a Windows path (`B:\...`) failed `JSON.parse` in the
+browser and was silently dropped. Every "Reconstruct ERROR: file does not exist" message was
+being lost — making real failures invisible. Fix: escape `\` then `'` before embedding.
 
-- Sample media selection now prefers stream files (searched recursively:
-  `.avi .mkv .mp4 .m4v .mov .wmv .m2ts .ts .vob`, largest first) over disc images
-  (`.iso .img .bin .nrg`).
-- New GUI option **"Extract M2TS from ISO for Blu-ray samples"** (off by default, greyed out
-  unless "Create sample" is ticked). When enabled: 7z lists `*.m2ts` inside the ISO, extracts
-  the largest stream (main feature) to `_iso_m2ts_tmp/` under the output folder, runs srs
-  against it, then deletes the temp extract. Config key: `extract_iso_m2ts`. Caveat: needs free
-  disk space roughly equal to the main video stream; extraction of a 40 GB stream takes minutes.
+## Sample rebuild landscape (verified through testing)
+
+| Sample source | SRS type | Rebuild? |
+|---|---|---|
+| MKV/AVI/MP4/WMV cut from the movie | format-aware (MKV etc.) | ✓ works, CRC-verified |
+| Complete Blu-ray (remuxed m2ts cut) | STREAM (raw bytes) | ✗ never — the 256-byte signature is remux-tool output, not on the disc |
+| Sample with extra tracks (e.g. `V_MS/VFW/FOURCC` group intro) | MKV | ✗ extra track has no source in the movie |
+| Usenet-sourced SRR | none (`sample.mkv.txt` placeholder) | ✗ no SRS data at all |
+| Sample file already in content folder | any | ✓ detected by size, CRC-verified, copied into place |
+
+## Reconstruction fixes (2026-07-12)
+
+- **Multi-set SRRs** (movie + Subs vobsub sets): rescene's `reconstruct()` was all-or-nothing —
+  a missing subs source killed the movie RARs too. Now each RAR set is checked for source
+  availability and reconstructed individually via `srr_part="prefix.*"`; unsourceable sets are
+  skipped with a clear log line.
+- **Renamed content files**: `auto_locate_renamed=True` — when the stored filename isn't on
+  disk, rescene matches by exact size + extension (fixes hash-named files and year-mismatch
+  names like GECKOS 2013/2014).
+- **Nested SRR reconstruction**: stored `Subs/*.subs.srr` files are now attempted after the
+  main set — rebuilds vobsub RARs when the idx/sub sources are present in the content folder.
+  Note: nested subs SRRs are headers-only (~441 B); subtitle data is NOT in the database, so
+  subs can only be rebuilt if the original Subs/ files are kept with the content.
 
 ## Known limitations / open items
 
 - **Compressed RAR4** — `Chromehounds.PAL.XBOX360-DNL` fails with "No good RAR version found"
   after trying all 62 pack versions. The exact WinRAR build used by DNL isn't in the pack.
-  Backtrack testing with more/older versions still pending.
+  Backtrack testing with more/older versions still pending. Game testing resumes after media
+  testing wraps.
 - **RAR5** — hard limit of pyReScene 0.7; detected and skipped.
-- **ISO M2TS extraction** — implemented today, not yet tested end-to-end (needs a Blu-ray ISO
-  run with the new checkbox ticked).
-- **Sample creation on plain video releases** (MKV/AVI content) — should now work after the
-  Python 3.13 fixes, needs confirmation on the next media batch.
+- **BD ISO samples** — confirmed unrebuildable (STREAM-type SRS of remuxed cuts); tool now
+  scans the ISO directly (skips the pointless M2TS extraction) and explains the failure.
+- **~75% of MKV batch reconstructed + sampled cleanly** as of 2026-07-12; remaining failures
+  all had identifiable causes (above), none tool bugs.
 
 ## Key internals (quick reference)
 

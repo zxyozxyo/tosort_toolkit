@@ -15,6 +15,7 @@ import sys
 import json
 import shutil
 import re
+import time
 import tempfile
 import threading
 import subprocess
@@ -92,6 +93,9 @@ MEDIA_EXTS = {
     ".iso", ".img", ".bin", ".cue", ".nrg", ".vob", ".ts", ".m2ts",
 }
 
+# Metadata files placed in the output folder before/besides reconstruction
+META_EXTS = {".srr", ".nfo", ".sfv", ".nzb", ".jpg", ".jpeg", ".png", ".diz", ".txt"}
+
 
 def _normalize_name(name: str) -> str:
     """Convert folder/file names to scene dot-notation for better srrdb search."""
@@ -132,7 +136,12 @@ class SrrdbToolAPI:
         if not self._window:
             return
         try:
-            payload = json.dumps(data, ensure_ascii=True).replace("'", "\\'")
+            # Escape for the enclosing single-quoted JS string literal:
+            # backslashes first (Windows paths!), then quotes. Without this,
+            # any message containing a backslash fails JSON.parse in the GUI
+            # and the log line is silently dropped.
+            payload = (json.dumps(data, ensure_ascii=True)
+                       .replace("\\", "\\\\").replace("'", "\\'"))
             self._window.evaluate_js(
                 f"window.srrEvent('{event}', JSON.parse('{payload}'))"
             )
@@ -666,20 +675,52 @@ class SrrdbToolAPI:
                 return str(candidate)
         return None
 
-    def _srr_reconstruct(self, srr_path: str, content_dir: str, out_dir: str) -> dict:
-        """Reconstruct RARs using the rescene Python API."""
+    @staticmethod
+    def _rar_set_prefix(vol_name: str) -> str:
+        """Group RAR volume names into sets: name.rar/name.r00 → 'name';
+        name.part01.rar → 'name'. Keeps any stored path (e.g. 'Subs/name')."""
+        base = re.sub(r"\.[^.]+$", "", vol_name)
+        base = re.sub(r"\.part\d+$", "", base, flags=re.IGNORECASE)
+        return base
+
+    def _srr_rar_sets(self, srr_path: str) -> dict:
+        """Map each RAR set in the SRR to the content files packed inside it.
+        Returns {set_prefix: {"volumes": [...], "packed": [...]}}."""
+        from rescene.rar import RarReader, BlockType  # type: ignore
+        sets: dict[str, dict] = {}
+        current = None
+        for block in RarReader(str(srr_path)).read_all():
+            if block.rawtype == BlockType.SrrRarFile:
+                current = self._rar_set_prefix(getattr(block, "file_name", ""))
+                entry = sets.setdefault(current, {"volumes": [], "packed": []})
+                entry["volumes"].append(getattr(block, "file_name", ""))
+            elif block.rawtype == BlockType.RarPackedFile and current is not None:
+                fname = getattr(block, "file_name", "")
+                if fname and fname not in sets[current]["packed"]:
+                    sets[current]["packed"].append(fname)
+        return sets
+
+    def _srr_reconstruct(self, srr_path: str, content_dir: str, out_dir: str,
+                         log_rar_pack: bool = True) -> dict:
+        """Reconstruct RARs using the rescene Python API.
+
+        SRRs can describe multiple RAR sets (movie + Subs + …). Sets whose
+        source files are missing from the content folder (typically subtitle
+        data, which is not inside the video file) are skipped individually so
+        they cannot take the rebuildable sets down with them."""
         import io
         from contextlib import redirect_stdout, redirect_stderr
 
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
         rar_dir = self._find_rar_dir()
-        if rar_dir:
-            rar_exes = [f.name for f in Path(rar_dir).iterdir()
-                        if f.is_file() and _RESCENE_RAR_RE.match(f.name)]
-            self._log(f"  RAR pack: {len(rar_exes)} version(s) — {', '.join(sorted(rar_exes))}", "dim")
-        else:
-            self._log("  No rar_X.YY.exe found — use Setup RAR versions button if release is compressed", "dim")
+        if log_rar_pack:
+            if rar_dir:
+                rar_exes = [f.name for f in Path(rar_dir).iterdir()
+                            if f.is_file() and _RESCENE_RAR_RE.match(f.name)]
+                self._log(f"  RAR pack: {len(rar_exes)} version(s) — {', '.join(sorted(rar_exes))}", "dim")
+            else:
+                self._log("  No rar_X.YY.exe found — use Setup RAR versions button if release is compressed", "dim")
 
         # Heartbeat so large files don't look frozen
         done_flag = threading.Event()
@@ -690,42 +731,91 @@ class SrrdbToolAPI:
                 self._log(f"  Still reconstructing… ({secs}s)", "dim")
         threading.Thread(target=_hb, daemon=True).start()
 
+        def _explain(err: str) -> str:
+            if "rar5" in err.lower() or "not yet supported" in err.lower():
+                return "RAR5 format — not supported by pyReScene 0.7 (WinRAR 5+ archives)"
+            if "rar executable" in err.lower() or "no rar" in err.lower():
+                return err + " — use Setup RAR versions button then retry"
+            if "no good rar" in err.lower():
+                return err + " — exact WinRAR version not in pack; try adding more versions"
+            return err
+
         buf = io.StringIO()
         try:
             import rescene.main as rm  # type: ignore
-            kwargs: dict = dict(
+
+            # Work out which RAR sets have their source content available
+            try:
+                rar_sets = self._srr_rar_sets(srr_path)
+            except Exception:
+                rar_sets = {}
+            content_names = {
+                f.name.lower() for f in Path(content_dir).rglob("*") if f.is_file()
+            }
+            skip_parts: list[str] = []
+            run_parts:  list[str] = []
+            if len(rar_sets) > 1:
+                self._log(f"  SRR describes {len(rar_sets)} RAR sets:", "dim")
+                for prefix, info in rar_sets.items():
+                    missing = [p for p in info["packed"]
+                               if Path(p).name.lower() not in content_names]
+                    if missing:
+                        skip_parts.append(prefix)
+                        self._log(
+                            f"    ✗ {prefix} — skipped, source not in content folder: "
+                            f"{', '.join(Path(m).name for m in missing[:4])}"
+                            + ("…" if len(missing) > 4 else ""), "warn",
+                        )
+                    else:
+                        run_parts.append(prefix)
+                        self._log(f"    ✓ {prefix} ({len(info['volumes'])} volume(s))", "dim")
+                if not run_parts:
+                    return {"ok": False, "files": [], "output": "",
+                            "error": "No RAR set has its source files in the content folder"}
+
+            base_kwargs: dict = dict(
                 srr_file=str(srr_path),
                 in_folder=str(content_dir),
                 out_folder=str(out_dir),
                 extract_files=False,
+                # Content files are often renamed (hash names, year fixes).
+                # Only consulted when the stored name is missing on disk:
+                # falls back to matching by file size + extension.
+                auto_locate_renamed=True,
             )
             if rar_dir:
-                kwargs["rar_executable_dir"] = rar_dir
-            with redirect_stdout(buf), redirect_stderr(buf):
-                result = rm.reconstruct(**kwargs)
+                base_kwargs["rar_executable_dir"] = rar_dir
+
+            errors: list[str] = []
+            ok_any = False
+            # One call per reconstructable set (srr_part prefix wildcard), or a
+            # single plain call when the SRR has just one set.
+            for part in (run_parts if skip_parts else [None]):
+                kwargs = dict(base_kwargs)
+                if part is not None:
+                    kwargs["srr_part"] = f"{part}.*"
+                try:
+                    with redirect_stdout(buf), redirect_stderr(buf):
+                        result = rm.reconstruct(**kwargs)
+                    if result is False:
+                        errors.append(_explain(
+                            buf.getvalue().strip() or "Reconstruction failed (no reason given)"))
+                    else:
+                        ok_any = True
+                except Exception as e:
+                    errors.append(_explain(str(e)))
+
             output_text = buf.getvalue()
             out_files = [f.name for f in Path(out_dir).iterdir() if f.is_file()]
-            if result is False:
-                err = output_text.strip() or "Reconstruction failed (no reason given)"
-                if "rar5" in err.lower() or "not yet supported" in err.lower():
-                    err = "RAR5 format — not supported by pyReScene 0.7 (WinRAR 5+ archives)"
-                elif "rar executable" in err.lower() or "no rar" in err.lower():
-                    err += " — use Setup RAR versions button then retry"
-                elif "no good rar" in err.lower():
-                    err += " — exact WinRAR version not in pack; try adding more versions"
-                return {"ok": False, "files": out_files, "output": output_text, "error": err}
-            return {"ok": True, "files": out_files, "output": output_text, "error": None}
+            if ok_any:
+                return {"ok": True, "files": out_files, "output": output_text,
+                        "error": "; ".join(errors) if errors else None}
+            return {"ok": False, "files": out_files, "output": output_text,
+                    "error": "; ".join(errors) or "Reconstruction failed"}
         except ImportError:
             return {"ok": False, "files": [], "output": "", "error": "rescene not available — pip install pyReScene"}
         except Exception as e:
-            err = str(e)
-            if "rar5" in err.lower() or "not yet supported" in err.lower():
-                err = "RAR5 format — not supported by pyReScene 0.7 (WinRAR 5+ archives)"
-            elif "rar executable" in err.lower() or "no rar" in err.lower():
-                err += " — use Setup RAR versions button then retry"
-            elif "no good rar" in err.lower():
-                err += " — exact WinRAR version not in pack"
-            return {"ok": False, "files": [], "output": buf.getvalue(), "error": err}
+            return {"ok": False, "files": [], "output": buf.getvalue(), "error": _explain(str(e))}
         finally:
             done_flag.set()
 
@@ -783,40 +873,123 @@ class SrrdbToolAPI:
             self._log(f"    (SRR read error: {e})", "dim")
             return False
 
+    # Shims for three Python 3.12+ incompatibilities in pyReScene 0.7, applied
+    # before importing resample.srs:
+    #   time.clock() removed in 3.8; distutils removed in 3.12 (used by
+    #   resample.fpcalc); locale.format() removed in 3.12 (used by rescene's
+    #   sep() in the rebuild results display — crashing there strands the
+    #   rebuilt sample as a .tmp file before the CRC check and rename).
+    _SRS_WRAPPER = (
+        "import time, types, shutil, sys, locale; "
+        "time.clock = time.perf_counter; "
+        "locale.format = locale.format_string; "
+        "_ds = types.ModuleType('distutils'); "
+        "_dss = types.ModuleType('distutils.spawn'); "
+        "_dss.find_executable = shutil.which; "
+        "sys.modules.setdefault('distutils', _ds); "
+        "sys.modules.setdefault('distutils.spawn', _dss); "
+        "from resample.srs import main; main(sys.argv[1:])"
+    )
+
+    def _srs_info(self, srs_path: str) -> dict:
+        """Run `srs -l` on an SRS file: log its metadata and return parsed fields
+        (notably 'type', e.g. STREAM / MKV / AVI)."""
+        info: dict = {}
+        try:
+            ri = subprocess.run(
+                [sys.executable, "-c", self._SRS_WRAPPER, str(srs_path), "-l"],
+                capture_output=True, text=True, timeout=60,
+            )
+            for line in (ri.stdout.strip() + "\n" + ri.stderr.strip()).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                self._log(f"    srs-info: {line}", "dim")
+                if m := re.match(r"^SRS Type\s*:\s*(\S+)", line):
+                    info["type"] = m.group(1).upper()
+                elif m := re.match(r"^Sample Name\s*:\s*(.+)$", line):
+                    info["name"] = m.group(1).strip()
+                elif m := re.match(r"^Sample Size\s*:\s*([\d,]+)", line):
+                    info["size"] = int(m.group(1).replace(",", ""))
+                elif m := re.match(r"^Sample CRC\s*:\s*([0-9A-Fa-f]{1,8})", line):
+                    info["crc"] = int(m.group(1), 16)
+        except Exception:
+            pass
+        return info
+
+    @staticmethod
+    def _crc32_file(path: str) -> int:
+        import zlib
+        crc = 0
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                crc = zlib.crc32(chunk, crc)
+        return crc & 0xFFFFFFFF
+
     def _srs_create_sample(self, srs_path: str, video_path: str, out_dir: str) -> dict:
-        """Create scene sample from SRS file + full video."""
+        """Create scene sample from SRS file + full video.
+        -y skips the overwrite prompt (which would block waiting for stdin)."""
         if not (_find_script("srs") or self._srs_script):
             return {"ok": False, "error": "srs script not found (installed with pyReScene)"}
         Path(out_dir).mkdir(parents=True, exist_ok=True)
-        # Patch two Python 3.12+ incompatibilities before importing resample.srs:
-        #   time.clock() removed in 3.8; distutils removed in 3.12 (used by resample.fpcalc).
-        # -y skips the overwrite prompt (which would block waiting for stdin).
-        wrapper = (
-            "import time, types, shutil, sys; "
-            "time.clock = time.perf_counter; "
-            "_ds = types.ModuleType('distutils'); "
-            "_dss = types.ModuleType('distutils.spawn'); "
-            "_dss.find_executable = shutil.which; "
-            "sys.modules.setdefault('distutils', _ds); "
-            "sys.modules.setdefault('distutils.spawn', _dss); "
-            "from resample.srs import main; main(sys.argv[1:])"
-        )
-        cmd = [sys.executable, "-c", wrapper,
+        cmd = [sys.executable, "-c", self._SRS_WRAPPER,
                str(srs_path), str(video_path), "-o", str(out_dir), "-y"]
         self._log(f"    srs: {Path(srs_path).name} + {Path(video_path).name} → {Path(out_dir).name}", "dim")
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            t0 = time.time()
+            # Generous timeout: locating the sample in a full Blu-ray stream is a
+            # linear scan of the whole file (can be 40+ GB).
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+            elapsed = time.time() - t0
             output = "\n".join(filter(None, [r.stdout.strip(), r.stderr.strip()]))
+            # Strip the terminal progress spinner (written as backspace+char pairs)
+            output = re.sub(r"\x08.", "", output).strip()
             for line in output.splitlines():
-                self._log(f"    srs: {line}", "dim")
-            created = [f for f in Path(out_dir).iterdir() if f.is_file()] if Path(out_dir).exists() else []
-            if created:
+                if line.strip():
+                    self._log(f"    srs: {line}", "dim")
+            self._log(f"    srs finished in {elapsed:.0f}s (exit {r.returncode})", "dim")
+
+            out_p = Path(out_dir)
+            all_files = [f for f in out_p.iterdir() if f.is_file()] if out_p.exists() else []
+            created = [f for f in all_files if f.suffix.lower() != ".tmp"]
+            tmp_files = [f for f in all_files if f.suffix.lower() == ".tmp"]
+
+            # pyReScene bug: replace_result() can fail its final os.rename silently,
+            # leaving '<sample name>-<random>.tmp' behind while srs still exits 0
+            # and reports success. Recover the intended name and rename it ourselves.
+            if not created and tmp_files and r.returncode == 0:
+                tmp = max(tmp_files, key=lambda f: f.stat().st_mtime)
+                m = re.match(r"^(.+)-[A-Za-z0-9_]+\.tmp$", tmp.name)
+                if m:
+                    target = out_p / m.group(1)
+                    if not target.exists():
+                        tmp.rename(target)
+                        self._log(f"    (renamed lingering temp file → {target.name})", "dim")
+                        created = [target]
+            if r.returncode == 0:
+                # Success — clear any stale temp files from older runs
+                for tf in tmp_files:
+                    if tf.exists() and tf not in created:
+                        tf.unlink(missing_ok=True)
+            elif tmp_files:
+                # Failure — keep temp files for inspection, just report them
+                names = ", ".join(f.name for f in tmp_files if f.exists())
+                if names:
+                    self._log(f"    (temp file(s) left in Sample dir: {names})", "dim")
+
+            if created and r.returncode == 0:
                 return {"ok": True, "output": output, "files": [f.name for f in created]}
+            # Full output is already logged above — the error field should be
+            # just the reason (last meaningful line), not the whole blob.
+            err_line = next(
+                (l.strip() for l in reversed(output.splitlines()) if l.strip()), "")
             if r.returncode != 0:
-                return {"ok": False, "error": output or f"srs exited {r.returncode}"}
-            return {"ok": False, "error": f"srs ran (exit 0) but no file created. Output: {output}"}
+                return {"ok": False, "output": output,
+                        "error": err_line or f"srs exited {r.returncode}"}
+            return {"ok": False, "output": output,
+                    "error": f"srs ran (exit 0) but no file created: {err_line}"}
         except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "Sample creation timed out"}
+            return {"ok": False, "error": "Sample creation timed out (2-hour limit)"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1029,8 +1202,6 @@ class SrrdbToolAPI:
                         self._log(f"    {line}", "dim")
                 if rc["ok"] and rc.get("files"):
                     # Exclude metadata files already placed there before reconstruction
-                    META_EXTS = {".srr", ".nfo", ".sfv", ".nzb", ".jpg", ".jpeg",
-                                 ".png", ".diz", ".txt"}
                     produced = [f for f in rc["files"]
                                 if Path(f).suffix.lower() not in META_EXTS]
                     self._log(
@@ -1042,6 +1213,31 @@ class SrrdbToolAPI:
                         self._log("  No archive files produced", "warn")
                 else:
                     self._log(f"  Reconstruct ERROR: {rc.get('error', 'unknown')}", "err")
+
+                # Nested SRRs (e.g. Subs/xxx.subs.srr) describe extra RAR sets
+                # such as vobsubs. Rebuild them when their sources are present
+                # in the content folder (idx/sub files or the inner subs RAR).
+                nested_srrs = (sorted(stored_dir.rglob("*.srr"))
+                               if stored_dir.exists() else [])
+                for nsrr in nested_srrs:
+                    rel_parent = nsrr.parent.relative_to(stored_dir)
+                    n_out = out_root / rel_parent
+                    self._log(f"  Nested SRR: {nsrr.name} — reconstructing…", "dim")
+                    nrc = self._srr_reconstruct(str(nsrr), content_dir, str(n_out),
+                                                log_rar_pack=False)
+                    if nrc["ok"] and nrc.get("files"):
+                        produced_n = [f for f in nrc["files"]
+                                      if Path(f).suffix.lower() not in META_EXTS]
+                        if produced_n:
+                            self._log(f"    Produced: {', '.join(produced_n[:6])}"
+                                      + ("…" if len(produced_n) > 6 else ""), "ok")
+                        else:
+                            self._log("    Nothing produced", "dim")
+                    else:
+                        self._log(
+                            f"    Skipped — {nrc.get('error', 'source files not available')}",
+                            "warn",
+                        )
             else:
                 self._log("  No content folder — NFO/SFV extracted only", "dim")
 
@@ -1055,20 +1251,58 @@ class SrrdbToolAPI:
                     _DISC_EXTS = {".iso", ".img", ".bin", ".nrg"}
                     _STREAM_EXTS = {".avi", ".mkv", ".mp4", ".m4v", ".mov",
                                     ".wmv", ".m2ts", ".ts", ".vob"}
-                    # Prefer video/stream files over disc images — M2TS extracted from
-                    # a Blu-ray disc is the correct input for BD sample SRS files.
+                    srs_meta = self._srs_info(str(srs_files[0]))
+                    srs_type    = srs_meta.get("type", "")
+                    sample_size = srs_meta.get("size")
+                    sample_crc  = srs_meta.get("crc")
+                    sample_name = srs_meta.get("name")
+
+                    # If a file matching the sample's exact size is already in the
+                    # content folder, it may BE the sample — verify CRC and copy.
+                    sample_done = False
+                    if sample_size:
+                        for cand in Path(content_dir).rglob("*"):
+                            if not (cand.is_file() and cand.stat().st_size == sample_size):
+                                continue
+                            crc = self._crc32_file(str(cand))
+                            if sample_crc is not None and crc == sample_crc:
+                                sample_dir = out_root / "Sample"
+                                sample_dir.mkdir(parents=True, exist_ok=True)
+                                dest = sample_dir / (sample_name or cand.name)
+                                if not dest.exists():
+                                    shutil.copy2(str(cand), str(dest))
+                                self._log(
+                                    f"  Sample already in content folder — CRC verified "
+                                    f"({crc:08X}) ✓ copied as {dest.name}", "ok",
+                                )
+                                sample_done = True
+                                break
+
+                    # Prefer video/stream files over disc images — and never use a
+                    # file that IS the sample as the rebuild source.
                     stream_media = [
                         f for f in Path(content_dir).rglob("*")
                         if f.is_file() and f.suffix.lower() in _STREAM_EXTS
+                        and f.stat().st_size != sample_size
                     ]
                     disc_media = [
                         f for f in Path(content_dir).iterdir()
                         if f.is_file() and f.suffix.lower() in _DISC_EXTS
                     ]
+                    if sample_done:
+                        stream_media, disc_media = [], []
                     media_file = (sorted(stream_media, key=lambda f: f.stat().st_size, reverse=True) or disc_media or [None])[0]
                     _iso_tmp: Path | None = None
                     if media_file and media_file.suffix.lower() in _DISC_EXTS:
-                        if extract_iso_m2ts:
+                        if srs_type == "STREAM":
+                            # STREAM SRS = raw byte matching. A scan of the ISO
+                            # covers every stream on the disc — extracting an
+                            # M2TS first adds nothing, so use the ISO directly.
+                            self._log(
+                                "  STREAM-type SRS — scanning the ISO directly "
+                                "(covers all streams on the disc)", "dim",
+                            )
+                        elif extract_iso_m2ts:
                             _iso_tmp = out_root / "_iso_m2ts_tmp"
                             ext_result = self._extract_m2ts_from_iso(
                                 str(media_file), str(_iso_tmp)
@@ -1092,19 +1326,64 @@ class SrrdbToolAPI:
                             str(srs_files[0]), str(media_file),
                             str(out_root / "Sample"),
                         )
+                        # Fallback: the sample may have been cut from a different
+                        # stream on the disc — one raw scan of the ISO covers all
+                        # of its M2TS files at once.
+                        if (not samp["ok"] and _iso_tmp and disc_media
+                                and "signature" in samp.get("error", "").lower()):
+                            self._log(
+                                "  Not found in main stream — retrying against the full ISO "
+                                "(covers all streams on the disc)…", "dim",
+                            )
+                            samp = self._srs_create_sample(
+                                str(srs_files[0]), str(disc_media[0]),
+                                str(out_root / "Sample"),
+                            )
                         if samp["ok"]:
                             files_str = ", ".join(samp.get("files", []))
                             self._log(f"  Sample created ✓ — {files_str}", "ok")
+                        elif "signature" in samp.get("error", "").lower() and disc_media:
+                            self._log(
+                                "  Sample FAILED: the sample's bytes are not on the disc. "
+                                "The group remuxed the sample when cutting it (the SRS "
+                                "signature is the remux tool's own header bytes), so this "
+                                "sample cannot be rebuilt from the ISO by any byte-matching "
+                                "tool. The SRS can still verify an existing sample file.", "err",
+                            )
+                        elif "signature" in samp.get("error", "").lower():
+                            m_trk = re.search(r"track (\d+)", samp["error"], re.IGNORECASE)
+                            trk = int(m_trk.group(1)) if m_trk else 1
+                            if trk > 1:
+                                self._log(
+                                    f"  Sample FAILED: track {trk} of the sample does not "
+                                    "exist in the main video — the group's sample contains "
+                                    "extra/re-encoded data, so it cannot be rebuilt "
+                                    "byte-perfect from the movie file.", "err",
+                                )
+                            else:
+                                self._log(
+                                    "  Sample FAILED: the sample's video data was not found "
+                                    "in this file — the content may not match this exact "
+                                    "release (wrong source or re-encode).", "err",
+                                )
                         else:
                             self._log(f"  Sample FAILED: {samp['error']}", "err")
-                    elif not stream_media and not disc_media:
+                    elif not sample_done and not stream_media and not disc_media:
                         self._log("  No media file for sample", "dim")
                     # Clean up extracted M2TS
                     if _iso_tmp and _iso_tmp.exists():
                         shutil.rmtree(str(_iso_tmp), ignore_errors=True)
                         self._log("  Cleaned up temp M2TS extract", "dim")
                 else:
-                    self._log("  No SRS in stored files", "dim")
+                    txt_placeholders = (list(stored_dir.rglob("*sample*.txt"))
+                                        if stored_dir.exists() else [])
+                    if txt_placeholders:
+                        self._log(
+                            "  No SRS — this usenet-sourced SRR stores only a sample "
+                            "info .txt placeholder, so the sample cannot be rebuilt", "dim",
+                        )
+                    else:
+                        self._log("  No SRS in stored files", "dim")
 
             self._log(f"  ✓ Done → {out_root}", "ok")
             self._emit("job_done", {"release": release, "ok": True})
