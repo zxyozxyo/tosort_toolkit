@@ -270,49 +270,93 @@ Repairs old scene `.zip` releases to byte-match a DAT-listed CRC32/MD5/SHA1 targ
 
 Downloads SRR files from [srrdb.com](https://www.srrdb.com) and reconstructs byte-perfect original scene RAR releases from unpacked content files.
 
-**Requires:** `pip install pyReScene`
+**Requires:** `pip install pyReScene` (the tool shims pyReScene 0.7's Python 3.12+ incompatibilities automatically — `time.clock`, `distutils`, `locale.format`)
 
 #### What is an SRR?
 
 An SRR (Scene Rebuilder Resource) file stores all original RAR block headers, file metadata and stored scene files (NFO, SFV, SRS) without the actual content. Combined with the original content file (the video, ISO etc.), pyReScene can reconstruct the exact original RAR set byte-for-byte.
 
+#### Finding the release — search strategies
+
+The tool identifies releases in this order, so badly named folders and files still work:
+
+1. **Name search** — NFO/SFV filename stem preferred over the folder name, with progressive
+   trimming (drops group suffix and trailing tokens) and dots↔underscores variants
+2. **Auto-match scoring** — each candidate's expected file list (srrdb details API) is scored
+   against your content by filename **and exact file size** (renamed files still match)
+3. **Content CRC lookup** — when names give nothing, the largest media file is hashed (CRC32)
+   and looked up via srrdb's `archive-crc` search: an exact, name-independent match.
+   A completely scrambled folder with an untouched original file still resolves.
+
+API calls are throttled (~1/s), cached for the session, and back off automatically on
+rate-limit responses.
+
 #### Usage — Single Folder
 
 1. Select the **Source** folder containing your unpacked content file(s) (e.g. `movie.avi`)
-2. The app auto-detects the release name from any NFO or SFV present, or falls back to the folder name
+2. The app auto-detects the release name (see search strategies above)
 3. Click **Search** to query srrdb.com — select the correct result from the list
 4. Set an **output folder**
 5. Click **Process**
 
-The tool will:
-- Download the SRR from srrdb.com
-- Extract stored files (NFO, SFV) directly to the output folder
-- Reconstruct the original RAR volumes
-- Create the scene sample if an SRS file is present and `Create sample` is ticked
-
 #### Usage — Batch (Subfolders)
 
-Switch to **Batch** mode and select a folder containing multiple release subfolders. The app scans each subfolder, auto-detects release names, and builds a queue. Click **Auto-Search All** to verify and fill release names from srrdb.com, then **Process** to run them in sequence.
+Switch to **Batch** mode and select a folder containing multiple release subfolders. The app scans each subfolder, auto-detects release names, and builds a queue. Click **Auto-Search All** to verify and fill release names from srrdb.com, then **Process** to run them in sequence. Ambiguous entries are resolved at run time by auto-match scoring and the CRC fallback.
+
+#### What gets rebuilt
+
+- **RAR volumes** — reconstructed byte-perfect from the content file. Renamed content is
+  located automatically by exact size + extension.
+- **Multi-set SRRs** (movie + Subs vobsub sets) — each RAR set is reconstructed independently;
+  sets whose sources are missing (subtitle data is *not* inside the video file) are skipped
+  without taking the movie set down.
+- **Nested subs SRRs** — `Subs/*.subs.srr` sets are rebuilt when the idx/sub sources are
+  present in the content folder.
+- **Stored files** — NFO, SFV, Proof/, etc. are extracted and placed in the release folder
+  with their original paths.
+- **Sample** — rebuilt from the SRS + full video and CRC-verified. If a file matching the
+  SRS sample size is already in the content folder, it is CRC-verified and copied into place.
 
 #### Output Structure
 
 ```
 output_folder/
 └── Release.Name-GRP/
-    ├── release.name-grp.nfo      ← from SRR stored files
-    ├── release.name-grp.sfv      ← from SRR stored files
-    ├── release.name-grp.rar      ← reconstructed
-    ├── release.name-grp.r00      ← reconstructed
-    ├── ...
+    ├── release.name-grp.nfo             ← from SRR stored files
+    ├── release.name-grp.sfv             ← from SRR stored files
+    ├── release.name-grp.rar             ← reconstructed
+    ├── release.name-grp.r00 …           ← reconstructed
+    ├── Proof/release.name-grp.proof.jpg ← from SRR stored files
+    ├── Subs/release.name-grp.subs.rar   ← reconstructed (if sources present)
     └── Sample/
-        └── release.name-grp.sample.avi  ← created from SRS + content
+        └── release.name-grp-sample.mkv  ← rebuilt from SRS + content, CRC-verified
 ```
+
+#### Sample rebuild — what works and what can't
+
+| Sample type | Rebuildable? |
+|---|---|
+| MKV / AVI / MP4 / WMV cut from the movie | ✓ yes, CRC-verified |
+| Complete Blu-ray (remuxed M2TS cut, STREAM-type SRS) | ✗ never — the sample's bytes don't exist on the disc |
+| Sample containing extra tracks (group intro etc.) | ✗ the extra data has no source |
+| Usenet-sourced SRR (`sample.mkv.txt` placeholder) | ✗ no SRS data stored |
+
+The log states the exact reason whenever a sample can't be rebuilt.
+
+**Options:**
+- **Extract M2TS from ISO** — for format-aware SRS types, extracts the main Blu-ray stream
+  before sample creation (needs disk space ≈ stream size). STREAM-type SRS skips this and
+  scans the ISO directly.
+- **NON-SCENE preview clip** — when the scene sample is provably unrebuildable (Blu-ray
+  remuxed samples), optionally carve a playable preview from the disc's main stream, sized
+  like the real sample. The file is named `NONSCENE-…-preview.m2ts` and is **not** a scene
+  file — it will never CRC-match the SRS. Off by default.
 
 #### Notes
 
 - **No Rar.exe required** for the vast majority of scene releases. Standard uncompressed video scene RARs are reconstructed natively by pyReScene in pure Python.
-- **Compressed RARs** (rare): require the exact original Rar.exe version. Legacy WinRAR installers are included in `apps/winrar_pack-4.20/` for reference.
-- The SRS stored file (scene sample script) is extracted automatically from the SRR. Sample creation additionally requires the full video file to be present as content.
+- **Compressed RARs** (mostly game releases): require the exact original Rar.exe version. Use the **Setup RAR versions** button to extract correctly named executables from installers in `apps/winrar_pack-4.20/`.
+- **RAR5 releases** (WinRAR 5+) cannot be reconstructed by pyReScene 0.7 — detected and skipped upfront.
 - SRR downloads are cached in the output folder — re-running the same release skips the download.
 
 ---

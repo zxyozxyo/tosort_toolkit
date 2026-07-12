@@ -196,6 +196,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <input type="checkbox" id="extract-iso-m2ts"> Extract M2TS from ISO for Blu-ray samples
             <span style="opacity:0.6"> — slow, needs ~same disk space as the video stream</span>
           </label>
+          <label class="chk-row" id="row-nonscene" style="margin-left:1.4em; font-size:0.85em; opacity:0.75">
+            <input type="checkbox" id="nonscene-sample"> Create NON-SCENE preview clip when the scene sample can't be rebuilt
+            <span style="opacity:0.6"> — clearly named NONSCENE, not a scene-verified file</span>
+          </label>
           <div class="row">
             <span class="lbl">Max candidates</span>
             <select class="sel" id="max-test" style="width:70px">
@@ -302,15 +306,19 @@ window.addEventListener('pywebviewready', async () => {
 // Grey out the ISO M2TS option when "Create sample" is unchecked
 (function() {
   const chkSample = document.getElementById('do-sample');
-  const rowIso    = document.getElementById('row-extract-iso');
-  const chkIso    = document.getElementById('extract-iso-m2ts');
-  function syncIsoRow() {
+  const subRows = [
+    [document.getElementById('row-extract-iso'), document.getElementById('extract-iso-m2ts')],
+    [document.getElementById('row-nonscene'),    document.getElementById('nonscene-sample')],
+  ];
+  function syncSubRows() {
     const on = chkSample.checked;
-    rowIso.style.opacity = on ? '0.75' : '0.35';
-    chkIso.disabled = !on;
+    for (const [row, chk] of subRows) {
+      row.style.opacity = on ? '0.75' : '0.35';
+      chk.disabled = !on;
+    }
   }
-  chkSample.addEventListener('change', syncIsoRow);
-  syncIsoRow();
+  chkSample.addEventListener('change', syncSubRows);
+  syncSubRows();
 })();
 
 // ── Events from Python ────────────────────────────────────────────────────────
@@ -326,11 +334,20 @@ window.srrEvent = function(event, data) {
     const running = data.state === 'running';
     go.style.display   = running ? 'none' : '';
     stop.style.display = running ? '' : 'none';
+  } else if (event === 'job_start') {
+    // Match by folder path — release names can change during auto-match
+    const job = batchJobs.find(j => j.path === data.content_dir);
+    if (job) {
+      job.status = 'running';
+      renderQueue();
+    }
   } else if (event === 'job_done') {
-    // Update batch queue row
-    const job = batchJobs.find(j => j.release === data.release);
+    // Update batch queue row (path first; release name as fallback)
+    const job = batchJobs.find(j => j.path === data.content_dir)
+             || batchJobs.find(j => j.release === data.release);
     if (job) {
       job.status = data.ok ? 'done' : (data.stopped ? 'skipped' : 'error');
+      if (data.ok && data.release) job.release = data.release;
       renderQueue();
     }
   } else if (event === 'batch_progress') {
@@ -549,6 +566,7 @@ async function doProcess() {
   const dest           = document.getElementById('dest-dir').value.trim();
   const doSample       = document.getElementById('do-sample').checked;
   const extractIsoM2ts = document.getElementById('extract-iso-m2ts').checked;
+  const nonSceneSample = document.getElementById('nonscene-sample').checked;
 
   if (!dest) { log('Set an output folder first.', 'warn'); return; }
 
@@ -563,6 +581,7 @@ async function doProcess() {
       dest_dir:         dest,
       do_sample:        doSample,
       extract_iso_m2ts: extractIsoM2ts,
+      non_scene_sample: nonSceneSample,
     });
   } else {
     // Batch
@@ -578,6 +597,7 @@ async function doProcess() {
         dest_dir:         dest,
         do_sample:        doSample,
         extract_iso_m2ts: extractIsoM2ts,
+        non_scene_sample: nonSceneSample,
         max_test:         maxTest,
       }));
     if (!jobs.length) { log('All jobs already done.', 'dim'); return; }

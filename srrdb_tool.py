@@ -151,10 +151,44 @@ class SrrdbToolAPI:
     def _log(self, msg: str, cls: str = "info"):
         self._emit("log", {"msg": msg, "cls": cls})
 
+    # Be a polite API client: srrdb publishes no rate limits but runs anti-bot
+    # protection, so throttle to ~1 req/s, retry once on 429/503 with backoff,
+    # and cache GET responses for the session (auto-match re-tests the same
+    # releases across runs).
+    _API_MIN_INTERVAL = 1.0
+    _api_lock = threading.Lock()
+    _api_last_call = 0.0
+    _api_cache: dict[str, dict] = {}
+
     def _api_get(self, url: str) -> dict:
+        cached = self._api_cache.get(url)
+        if cached is not None:
+            return cached
+        with SrrdbToolAPI._api_lock:
+            wait = SrrdbToolAPI._api_last_call + self._API_MIN_INTERVAL - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            SrrdbToolAPI._api_last_call = time.time()
         req = Request(url, headers=HEADERS)
-        with urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode("utf-8", errors="replace"))
+        try:
+            with urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+        except HTTPError as e:
+            if e.code in (429, 503):
+                retry_after = min(int(e.headers.get("Retry-After", 10) or 10), 60)
+                self._log(
+                    f"  srrdb rate limit (HTTP {e.code}) — waiting {retry_after}s…",
+                    "warn",
+                )
+                time.sleep(retry_after)
+                with urlopen(Request(url, headers=HEADERS), timeout=15) as r:
+                    data = json.loads(r.read().decode("utf-8", errors="replace"))
+            else:
+                raise
+        if len(self._api_cache) > 500:
+            self._api_cache.clear()
+        self._api_cache[url] = data
+        return data
 
     # ── rescene / script detection ────────────────────────────────────────────
 
@@ -447,7 +481,9 @@ class SrrdbToolAPI:
         return {"ok": True, "count": 0, "results": [], "query": q, "query_trimmed": False}
 
     def search_by_crc(self, crc32_hex: str) -> dict:
-        """Search srrdb.com by RAR archive CRC32 — most accurate method."""
+        """Search srrdb.com by archived-file CRC32 — the CRC of the content file
+        INSIDE the RARs (e.g. the movie file), not the RAR volume CRCs from an
+        SFV (those are not searchable). Exact-match, name-independent."""
         crc = crc32_hex.strip().upper().zfill(8)
         try:
             data = self._api_get(f"{SRRDB_API}/search/archive-crc:{crc}")
@@ -493,33 +529,42 @@ class SrrdbToolAPI:
             pass
         return entries
 
+    def search_by_content_hash(self, folder: str) -> dict:
+        """Hash the largest media file in the folder (CRC32) and look it up on
+        srrdb via archive-crc. Works no matter how files/folders are named —
+        the CRC of the original content file is stored in the database."""
+        base = Path(folder)
+        media = sorted(
+            (f for f in base.rglob("*")
+             if f.is_file() and f.suffix.lower() in MEDIA_EXTS),
+            key=lambda f: f.stat().st_size, reverse=True,
+        )
+        if not media:
+            return {"ok": True, "count": 0, "results": [], "query": "(no media file)"}
+        target = media[0]
+        self._log(
+            f"  Hashing {target.name} ({target.stat().st_size:,} B) "
+            "for exact srrdb CRC lookup…", "dim",
+        )
+        t0 = time.time()
+        crc = self._crc32_file(str(target))
+        self._log(f"  CRC32 = {crc:08X} ({time.time() - t0:.0f}s)", "dim")
+        return self.search_by_crc(f"{crc:08X}")
+
     def search_from_folder(self, folder: str) -> dict:
         """
-        Try CRC-based search (via SFV) first, then progressive name search.
-        Looks for SFV/NFO in the folder AND one level of subfolders (handles double-nesting).
+        Progressive name search (NFO/SFV stem preferred over folder name), then
+        content-hash CRC fallback when the name finds nothing.
+        Looks for SFV/NFO in the folder AND one level of subfolders.
         Returns the same structure as search_srrdb plus 'method' field.
         """
         base = Path(folder)
 
-        # Collect SFVs: direct + immediate subfolders
         sfv_paths: list[Path] = (
             sorted(base.glob("*.sfv")) + sorted(base.glob("*.SFV"))
             + sorted(p for sub in base.iterdir() if sub.is_dir()
                      for p in list(sub.glob("*.sfv")) + list(sub.glob("*.SFV")))
         )
-        for sfv_path in sfv_paths:
-            entries = self._parse_sfv(str(sfv_path))
-            rar_entries = [(fn, crc) for fn, crc in entries
-                           if Path(fn).suffix.lower() in {".rar", ".r00", ".r01", ".r02",
-                                                           ".001", ".002"}]
-            if rar_entries:
-                crc = rar_entries[0][1]
-                res = self.search_by_crc(crc)
-                if res["ok"] and res["count"] > 0:
-                    res["method"] = f"CRC32 ({crc})"
-                    return res
-
-        # Name fallback — prefer NFO/SFV stem over folder name, with progressive search
         nfo_paths: list[Path] = (
             sorted(base.glob("*.nfo")) + sorted(base.glob("*.NFO"))
             + sorted(p for sub in base.iterdir() if sub.is_dir()
@@ -534,6 +579,16 @@ class SrrdbToolAPI:
 
         res = self.search_srrdb_progressive(name_hint)
         trimmed = res.pop("query_trimmed", False)
+        if res.get("ok") and res.get("count", 0) > 0:
+            res["method"] = ("name (simplified)" if trimmed else "name")
+            return res
+
+        # Name found nothing — hash the content file for an exact CRC match
+        hres = self.search_by_content_hash(folder)
+        if hres.get("ok") and hres.get("count", 0) > 0:
+            hres["method"] = f"content CRC32 ({hres.get('query', '')})"
+            return hres
+
         res["method"] = ("name (simplified)" if trimmed else "name")
         return res
 
@@ -1000,24 +1055,19 @@ class SrrdbToolAPI:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def _extract_m2ts_from_iso(self, iso_path: str, tmp_dir: str) -> dict:
-        """
-        List all M2TS streams inside a Blu-ray ISO using 7z, pick the largest
-        (main feature), extract it to tmp_dir, and return its path.
-        Caller is responsible for deleting tmp_dir afterwards.
-        """
-        seven_zip = None
+    def _find_7z(self) -> str | None:
         for name in ("7z.exe", "7za.exe"):
             p = self._app_dir / name
             if p.exists():
-                seven_zip = str(p)
-                break
-        if not seven_zip:
-            seven_zip = shutil.which("7z") or shutil.which("7za")
+                return str(p)
+        return shutil.which("7z") or shutil.which("7za")
+
+    def _list_iso_m2ts(self, iso_path: str) -> dict:
+        """List all M2TS streams inside a Blu-ray ISO using 7z.
+        Returns {"ok", "seven_zip", "entries": [(path_in_iso, size), …]}."""
+        seven_zip = self._find_7z()
         if not seven_zip:
             return {"ok": False, "error": "7z.exe not found in apps/ — needed to read ISO"}
-
-        # 1 — list M2TS files and their sizes
         try:
             r = subprocess.run(
                 [seven_zip, "l", "-slt", "-r", iso_path, "*.m2ts"],
@@ -1049,6 +1099,60 @@ class SrrdbToolAPI:
 
         if not entries:
             return {"ok": False, "error": "No M2TS streams found in ISO"}
+        return {"ok": True, "seven_zip": seven_zip, "entries": entries}
+
+    def _carve_nonscene_sample(self, iso_path: str, out_dir: str,
+                               base_name: str, target_bytes: int | None) -> dict:
+        """Carve a NON-SCENE preview clip from the start of the ISO's main M2TS
+        stream. M2TS is valid from byte 0 (opens with PAT/PMT), so streaming the
+        first N bytes via `7z -so` yields a playable clip without extracting the
+        full stream. The result is clearly named NONSCENE and is NOT the scene
+        sample — it will never CRC-match the SRS."""
+        lst = self._list_iso_m2ts(iso_path)
+        if not lst["ok"]:
+            return {"ok": False, "error": lst["error"]}
+        best_path, best_size = max(lst["entries"], key=lambda x: x[1])
+
+        # Size the clip like the real scene sample when known; sane bounds.
+        target = target_bytes or (100 << 20)
+        target = max(16 << 20, min(target, 300 << 20, best_size))
+        target -= target % 192  # end on an M2TS packet boundary
+
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        out_file = Path(out_dir) / f"NONSCENE-{base_name}-preview.m2ts"
+        try:
+            proc = subprocess.Popen(
+                [lst["seven_zip"], "e", "-so", iso_path, best_path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            remaining = target
+            with open(out_file, "wb") as f:
+                while remaining > 0:
+                    chunk = proc.stdout.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            proc.kill()
+            proc.wait(timeout=30)
+        except Exception as e:
+            return {"ok": False, "error": f"carve failed: {e}"}
+        if not out_file.exists() or out_file.stat().st_size == 0:
+            return {"ok": False, "error": "no data carved from ISO"}
+        return {"ok": True, "path": str(out_file), "name": out_file.name,
+                "size": out_file.stat().st_size}
+
+    def _extract_m2ts_from_iso(self, iso_path: str, tmp_dir: str) -> dict:
+        """
+        List all M2TS streams inside a Blu-ray ISO using 7z, pick the largest
+        (main feature), extract it to tmp_dir, and return its path.
+        Caller is responsible for deleting tmp_dir afterwards.
+        """
+        lst = self._list_iso_m2ts(iso_path)
+        if not lst["ok"]:
+            return {"ok": False, "error": lst["error"]}
+        seven_zip = lst["seven_zip"]
+        entries = lst["entries"]
 
         # Pick largest (main feature, not trailers/extras)
         best_path, best_size = max(entries, key=lambda x: x[1])
@@ -1105,6 +1209,12 @@ class SrrdbToolAPI:
         dest_dir         = (config.get("dest_dir") or "").strip()
         do_sample        = config.get("do_sample", False)
         extract_iso_m2ts = config.get("extract_iso_m2ts", False)
+        non_scene_sample = config.get("non_scene_sample", False)
+        # Queue rows in the GUI are keyed by the original folder path — keep it
+        # for job events even after auto-match renames or nesting descent.
+        queue_path = content_dir
+
+        self._emit("job_start", {"content_dir": queue_path, "release": release})
 
         # Resolve double-nesting: if the selected folder has no files (only one subdir),
         # descend into it. Handles the case where batch source → release folder → content.
@@ -1121,27 +1231,46 @@ class SrrdbToolAPI:
 
             # If no confirmed release name, score candidates against content folder
             if not release:
-                if not candidates:
-                    self._log("ERROR: No release name and no candidates to test.", "err")
-                    raise ValueError()
                 if not content_dir or not Path(content_dir).is_dir():
                     self._log("ERROR: Need a content folder to auto-match candidates.", "err")
                     raise ValueError()
-                self._log(
-                    f"  Auto-matching — testing up to {min(len(candidates), max_test)}"
-                    f" of {len(candidates)} candidate(s)…", "dim"
-                )
-                best = self.find_best_match(candidates, content_dir, max_test)
+                best = {"release": None, "score": 0.0}
+                if candidates:
+                    self._log(
+                        f"  Auto-matching — testing up to {min(len(candidates), max_test)}"
+                        f" of {len(candidates)} candidate(s)…", "dim"
+                    )
+                    best = self.find_best_match(candidates, content_dir, max_test)
                 if best["release"] and best["score"] >= 0.5:
                     release = best["release"]
                     self._log(f"  ✓ Matched: {release}  ({best['score']:.0%} confidence)", "ok")
                 else:
-                    top = best.get("release", "?")
-                    self._log(
-                        f"  No confident match (best: {top} at {best['score']:.0%}). "
-                        "Set the release name manually.", "err"
-                    )
-                    raise RuntimeError("no confident match")
+                    # Candidates are junk (a bad folder name can still match
+                    # unrelated releases by name) or absent — an exact content
+                    # CRC lookup beats them all.
+                    if candidates:
+                        self._log(
+                            "  Candidates don't match content — trying exact "
+                            "content CRC lookup…", "dim",
+                        )
+                    hres = self.search_by_content_hash(content_dir)
+                    if hres.get("ok") and hres.get("results"):
+                        release = hres["results"][0]["release"]
+                        self._log(f"  ✓ Matched by content CRC: {release}", "ok")
+                    elif candidates:
+                        top = best.get("release", "?")
+                        self._log(
+                            f"  No confident match (best: {top} at {best['score']:.0%}) "
+                            "and content CRC not in srrdb. Set the release name manually.",
+                            "err",
+                        )
+                        raise RuntimeError("no confident match")
+                    else:
+                        self._log(
+                            "  ERROR: No release name, no candidates, and content "
+                            "CRC not found on srrdb.", "err",
+                        )
+                        raise RuntimeError("no match")
 
             out_root = Path(dest_dir) / release
             stored_dir = out_root / "_stored"
@@ -1357,6 +1486,25 @@ class SrrdbToolAPI:
                                 "sample cannot be rebuilt from the ISO by any byte-matching "
                                 "tool. The SRS can still verify an existing sample file.", "err",
                             )
+                            if non_scene_sample:
+                                self._log(
+                                    "  Creating NON-SCENE preview clip from the disc's "
+                                    "main stream instead…", "dim",
+                                )
+                                carve = self._carve_nonscene_sample(
+                                    str(disc_media[0]), str(out_root / "Sample"),
+                                    release.lower(), sample_size,
+                                )
+                                if carve["ok"]:
+                                    self._log(
+                                        f"  Non-scene preview created — {carve['name']} "
+                                        f"({carve['size']:,} B). NOT a scene file; it will "
+                                        "never CRC-match the SRS.", "ok",
+                                    )
+                                else:
+                                    self._log(
+                                        f"  Non-scene preview failed: {carve['error']}", "warn",
+                                    )
                         elif "signature" in samp.get("error", "").lower():
                             m_trk = re.search(r"track (\d+)", samp["error"], re.IGNORECASE)
                             trk = int(m_trk.group(1)) if m_trk else 1
@@ -1392,17 +1540,45 @@ class SrrdbToolAPI:
                     else:
                         self._log("  No SRS in stored files", "dim")
 
+            # 5 — Move stored extras (Proof/, Subs/, jpgs …) into the release
+            # folder, preserving their relative paths, then drop empty _stored.
+            # Runs after sample creation, which reads the SRS from _stored.
+            if stored_dir.exists():
+                moved = 0
+                for f in sorted(stored_dir.rglob("*")):
+                    if not f.is_file():
+                        continue
+                    dest_f = out_root / f.relative_to(stored_dir)
+                    if dest_f.exists():
+                        f.unlink()  # duplicate — NFO/SFV were already copied up
+                        continue
+                    dest_f.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(f), str(dest_f))
+                    moved += 1
+                for d in sorted((p for p in stored_dir.rglob("*") if p.is_dir()),
+                                reverse=True):
+                    try:
+                        d.rmdir()
+                    except OSError:
+                        pass
+                try:
+                    stored_dir.rmdir()
+                except OSError:
+                    pass
+                if moved:
+                    self._log(f"  Moved {moved} stored extra(s) into release folder", "dim")
+
             self._log(f"  ✓ Done → {out_root}", "ok")
-            self._emit("job_done", {"release": release, "ok": True})
+            self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": True})
 
         except (ValueError, RuntimeError):
-            self._emit("job_done", {"release": release, "ok": False})
+            self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         except InterruptedError:
             self._log("  Stopped.", "warn")
-            self._emit("job_done", {"release": release, "ok": False, "stopped": True})
+            self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False, "stopped": True})
         except Exception as e:
             self._log(f"  FAILED: {e}", "err")
-            self._emit("job_done", {"release": release, "ok": False})
+            self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
             if not batch_mode:
                 self._running = False
