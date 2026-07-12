@@ -1278,7 +1278,7 @@ class SrrdbToolAPI:
         # Per-job outcome for the queue status and the end-of-batch summary
         summary = {
             "release": release or (Path(queue_path).name if queue_path else "?"),
-            "ok": True, "rars": None, "sample": None, "note": "",
+            "ok": True, "rars": None, "sample": None, "subs": None, "note": "",
         }
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
@@ -1711,6 +1711,45 @@ class SrrdbToolAPI:
                 if moved:
                     self._log(f"  Moved {moved} stored extra(s) into release folder", "dim")
 
+            # 6 — Verify the Subs folder actually contains what its SFV expects.
+            # If the subs RAR(s) could not be rebuilt, the folder holds only
+            # metadata — rename it so the gap is impossible to miss.
+            subs_dir = out_root / "Subs"
+            if subs_dir.is_dir():
+                expected = []
+                for s in list(subs_dir.glob("*.sfv")) + list(subs_dir.glob("*.SFV")):
+                    expected += [fn for fn, _ in self._parse_sfv(str(s))]
+                if expected:
+                    missing_subs = [fn for fn in expected
+                                    if not (subs_dir / fn).exists()]
+                    subs_ok = not missing_subs
+                else:
+                    subs_ok = any(
+                        re.search(r"\.(rar|r\d\d|\d{3})$", f.name, re.IGNORECASE)
+                        for f in subs_dir.iterdir() if f.is_file()
+                    )
+                if subs_ok:
+                    summary["subs"] = "✓"
+                else:
+                    summary["subs"] = "NOT produced"
+                    target = out_root / "Subs_NOT_PRODUCED"
+                    try:
+                        if target.exists():
+                            # previous run already renamed — merge contents
+                            for f in subs_dir.iterdir():
+                                dst = target / f.name
+                                if not dst.exists():
+                                    shutil.move(str(f), str(dst))
+                            subs_dir.rmdir()
+                        else:
+                            subs_dir.rename(target)
+                        self._log(
+                            "  ⚠ Subs NOT produced — subtitle sources missing; "
+                            "folder renamed to Subs_NOT_PRODUCED", "warn",
+                        )
+                    except OSError as e:
+                        self._log(f"  ⚠ Subs NOT produced (rename failed: {e})", "warn")
+
             if summary["ok"]:
                 self._log(f"  ✓ Done → {out_root}", "ok")
             else:
@@ -1733,6 +1772,23 @@ class SrrdbToolAPI:
             summary["note"] = str(e)[:100]
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
+            # Prune empty directories: a failed job creates the release folder
+            # before writing anything; failed sample attempts leave an empty
+            # Sample/. rmdir only removes empty dirs, so content is never at risk.
+            try:
+                if "out_root" in locals() and out_root.is_dir():
+                    for d in sorted((p for p in out_root.rglob("*") if p.is_dir()),
+                                    reverse=True):
+                        try:
+                            d.rmdir()
+                        except OSError:
+                            pass
+                    try:
+                        out_root.rmdir()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
             if not batch_mode:
                 self._running = False
                 self._emit("status", {"state": "done"})
@@ -1769,13 +1825,18 @@ class SrrdbToolAPI:
                     parts.append(f"{r['rars']} RARs")
                 if r["sample"]:
                     parts.append(f"sample: {r['sample']}")
+                if r.get("subs"):
+                    parts.append(f"subs: {r['subs']}")
                 if r["note"]:
                     parts.append(r["note"])
-                self._log(f"  ✓ {r['release']} — {', '.join(parts) or 'done'}", "ok")
+                cls = "warn" if r.get("subs") == "NOT produced" else "ok"
+                self._log(f"  ✓ {r['release']} — {', '.join(parts) or 'done'}", cls)
             else:
                 detail = r["note"] or "failed"
                 if r["sample"]:
                     detail += f" (sample: {r['sample']})"
+                if r.get("subs") == "NOT produced":
+                    detail += " (subs: NOT produced)"
                 self._log(f"  ✗ {r['release']} — {detail}", "err")
         self._running = False
         self._emit("status", {"state": "done"})
