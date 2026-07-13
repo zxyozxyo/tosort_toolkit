@@ -268,11 +268,28 @@ class SrrdbToolAPI:
                 except Exception:
                     pass
 
+        # RAR 5.x+ executables must NEVER be in the rescene pack: rescene's
+        # compressed-rebuild sizing probe always uses the most recent version,
+        # and RAR 5+ produces RAR5-format output by default, which rescene
+        # cannot read back — poisoning EVERY compressed reconstruction.
+        # (rescene can only rebuild RAR4 archives anyway.)
+        rar5_re = re.compile(r"^\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$", re.IGNORECASE)
+        for f in list(winrar_pack.iterdir()):
+            if f.is_file() and rar5_re.match(f.name):
+                try:
+                    f.unlink()
+                    messages.append(f"  Removed RAR5-era {f.name} (breaks rescene)")
+                except Exception:
+                    pass
+
         for installer in installers:
             m = re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.IGNORECASE)
             if not m:
                 continue
             major, minor, beta = m.group(1), m.group(2), (m.group(3) or "")
+            if int(major) >= 5:
+                skipped += 1
+                continue  # see note above — RAR 5.x+ must not enter the pack
             ver_key = f"{major}{minor}"
             date = _WINRAR_DATES.get(ver_key, f"200{major}-01-01")  # fallback date
             target_name = f"{date}_rar{ver_key}{beta}.exe"
@@ -795,7 +812,10 @@ class SrrdbToolAPI:
 
         def _explain(err: str) -> str:
             if "rar5" in err.lower() or "not yet supported" in err.lower():
-                return "RAR5 format — not supported by pyReScene 0.7 (WinRAR 5+ archives)"
+                return ("RAR5 data encountered — if the release is RAR5 it cannot be "
+                        "rebuilt (pyReScene 0.7 limit). If the SRR info above says RAR4, "
+                        "a RAR 5.x+ rar.exe in the pack poisoned the test archive — "
+                        "click Setup RAR versions to purge 5.x+ binaries, then retry")
             if "rar executable" in err.lower() or "no rar" in err.lower():
                 return err + " — use Setup RAR versions button then retry"
             if "no good rar" in err.lower():
