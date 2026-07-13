@@ -286,10 +286,21 @@ class SrrdbToolAPI:
                 except Exception:
                     pass
 
-        # RAR 5.x+ executables ARE useful: post-2013 scene releases were made
-        # with modern WinRAR in RAR4 mode (-ma4). The rebuilder injects -ma4
-        # into every 5.x+ invocation so they always produce RAR4 output that
-        # rescene can read back.
+        # RAR 5.00–6.24 ARE useful: post-2013 scene releases were made with
+        # modern WinRAR in RAR4 mode (-ma4); the rebuilder injects -ma4 into
+        # every 5.x+ invocation. WinRAR 7.00 REMOVED RAR4 creation entirely
+        # ("Unknown option: ma4" — verified against the real binaries), so
+        # 7.x must stay out of the pack. 6.24 (2023) is the last RAR4-capable.
+        rar7_re = re.compile(r"^\d{4}-\d{2}-\d{2}_rar[7-9]\d\d(b\d)?\.exe$",
+                             re.IGNORECASE)
+        for f in list(winrar_pack.iterdir()):
+            if f.is_file() and rar7_re.match(f.name):
+                try:
+                    f.unlink()
+                    messages.append(f"  Removed {f.name} (7.x cannot create RAR4)")
+                except Exception:
+                    pass
+
         for installer in installers:
             # Old naming (wrar420.exe) and new naming (winrar-x64-723.exe)
             m = (re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.IGNORECASE)
@@ -299,6 +310,9 @@ class SrrdbToolAPI:
                 continue
             major, minor, beta = m.group(1), m.group(2), (m.group(3) or "")
             ver_key = f"{major}{minor}"
+            if int(ver_key) >= 700:
+                skipped += 1
+                continue  # WinRAR 7.00+ removed RAR4 creation (-ma4)
             date = _WINRAR_DATES.get(ver_key, f"200{major}-01-01")  # fallback date
             target_name = f"{date}_rar{ver_key}{beta}.exe"
             target = winrar_pack / target_name
@@ -843,11 +857,24 @@ class SrrdbToolAPI:
                 _orig_popen = rm.custom_popen
                 _r5plus = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$",
                                      re.IGNORECASE)
+                # RAR 5+ redefined the -md switch: RAR4-era letters (-mdA..G)
+                # and bare KB numbers are invalid — bare numbers now mean MB.
+                # Translate to explicit KB so 5.x+ builds the same dictionary.
+                _MD_LETTERS = {"a": "64", "b": "128", "c": "256", "d": "512",
+                               "e": "1024", "f": "2048", "g": "4096"}
+                def _fix_md(arg):
+                    m = re.match(r"^-md([a-gA-G]|\d+)$", arg)
+                    if not m:
+                        return arg
+                    v = m.group(1)
+                    kb = _MD_LETTERS.get(v.lower(), v)
+                    return f"-md{kb}k"
                 def _inject(cmd):
                     if (len(cmd) >= 3 and str(cmd[1]).lower() == "a"
                             and _r5plus.search(str(cmd[0]))
                             and "-ma4" not in cmd):
-                        return [cmd[0], cmd[1], "-ma4"] + list(cmd[2:])
+                        rest = [_fix_md(str(a)) for a in cmd[2:]]
+                        return [cmd[0], cmd[1], "-ma4"] + rest
                     return cmd
                 def _popen_ma4(cmd, *a, **kw):
                     try:
