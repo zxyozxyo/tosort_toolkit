@@ -33,7 +33,10 @@ class MiscToolsAPI:
             return
         try:
             import json as _j
-            payload = _j.dumps(data, ensure_ascii=True).replace("'", "\\'")
+            # Escape backslashes first (Windows paths), then quotes — otherwise
+            # JSON.parse fails in the GUI and the log line is silently dropped.
+            payload = (_j.dumps(data, ensure_ascii=True)
+                       .replace("\\", "\\\\").replace("'", "\\'"))
             self._window.evaluate_js(
                 f"window.miscEvent('{event}', JSON.parse('{payload}'))"
             )
@@ -250,6 +253,161 @@ class MiscToolsAPI:
             if p.exists():
                 return str(p)
         return ''
+
+    # ── RAR Inspector ─────────────────────────────────────────────────────────
+
+    _RAR4_SIG = b"Rar!\x1a\x07\x00"
+    _RAR5_SIG = b"Rar!\x1a\x07\x01\x00"
+    _METHODS  = {0x30: "Store (uncompressed, -m0)", 0x31: "Fastest (-m1)",
+                 0x32: "Fast (-m2)", 0x33: "Normal (-m3)",
+                 0x34: "Good (-m4)", 0x35: "Best (-m5)"}
+    _HOST_OS  = {0: "MS-DOS", 1: "OS/2", 2: "Windows", 3: "Unix", 4: "Mac", 5: "BeOS"}
+    _EXTRACT_VER = {
+        15: "RAR 1.5x (pre-1996)",
+        20: "RAR 2.0–2.5x era (1996–2000)",
+        26: "RAR 2.6 era (2000)",
+        29: "RAR 2.9–4.20 era (2001–2013)",
+        36: "RAR 3.6 alternative (rare)",
+        50: "RAR 5.x+ (2013 or later)",
+    }
+    _DICT_KB  = {0: 64, 1: 128, 2: 256, 3: 512, 4: 1024, 5: 2048, 6: 4096}
+
+    def analyze_rar(self, folder: str) -> dict:
+        """Inspect every RAR set under a folder: format, compression method,
+        minimum extract version (creation-era hint), dictionary size, archive
+        flags — and a reconstruction verdict for pyReScene."""
+        L = lambda m, c="info": self._log(m, c, "rai")
+        base = Path((folder or "").strip())
+        if not base.is_dir():
+            return {"ok": False, "error": "Folder not found"}
+        try:
+            import rarfile
+        except ImportError:
+            L("rarfile library not installed — pip install rarfile", "err")
+            return {"ok": False, "error": "rarfile not installed"}
+
+        # Set heads: every .rar that is not a .partN (N>1) continuation volume
+        heads = [
+            p for p in sorted(base.rglob("*.rar"))
+            if not re.search(r"\.part0*(?!1\b)\d+\.rar$", p.name, re.IGNORECASE)
+            or re.search(r"\.part0*1\.rar$", p.name, re.IGNORECASE)
+        ]
+        if not heads:
+            L("No .rar files found under this folder.", "warn")
+            return {"ok": True, "sets": 0}
+
+        L(f"Found {len(heads)} RAR set(s) under {base}", "info")
+        for head in heads:
+            L("", "")
+            L(f"══ {head.relative_to(base)} ══", "info")
+            try:
+                self._analyze_one_set(head, rarfile, L)
+            except Exception as e:
+                L(f"  ERROR: {e}", "err")
+        L("", "")
+        L(f"Analysis complete — {len(heads)} set(s).", "ok")
+        return {"ok": True, "sets": len(heads)}
+
+    def _analyze_one_set(self, head: Path, rarfile, L):
+        # Format from magic bytes
+        with open(head, "rb") as f:
+            magic = f.read(8)
+            # Main archive header flags (RAR4): marker(7) + CRC(2) type(1) flags(2)
+            main_flags = 0
+            if magic[:7] == self._RAR4_SIG:
+                f.seek(7)
+                hdr = f.read(7)
+                if len(hdr) == 7 and hdr[2] == 0x73:
+                    main_flags = int.from_bytes(hdr[3:5], "little")
+
+        if magic[:8] == self._RAR5_SIG:
+            fmt = "RAR5"
+        elif magic[:7] == self._RAR4_SIG:
+            fmt = "RAR4"
+        elif magic[:2] == b"MZ":
+            fmt = "SFX (self-extracting)"
+        else:
+            fmt = "unknown"
+        L(f"  Format: {fmt}", "dim")
+
+        if fmt == "RAR4" and main_flags:
+            fl = []
+            if main_flags & 0x0001: fl.append("multi-volume")
+            if main_flags & 0x0008: fl.append("SOLID")
+            if main_flags & 0x0010: fl.append("new-style naming (.partN)")
+            if main_flags & 0x0040: fl.append("recovery record")
+            if main_flags & 0x0080: fl.append("encrypted headers")
+            if main_flags & 0x0004: fl.append("locked")
+            if fl:
+                L(f"  Archive flags: {', '.join(fl)}", "dim")
+
+        rf = rarfile.RarFile(str(head))
+        try:
+            vols = rf.volumelist()
+            vol_bytes = sum(Path(v).stat().st_size for v in vols if Path(v).exists())
+            L(f"  Volumes: {len(vols)} ({vol_bytes:,} B total)", "dim")
+
+            infos = [i for i in rf.infolist() if i.is_file()]
+            methods, vers = set(), set()
+            solid_any = bool(main_flags & 0x0008)
+            dict_kbs = set()
+            for i in infos:
+                methods.add(i.compress_type)
+                if i.extract_version:
+                    vers.add(i.extract_version)
+                if fmt == "RAR4" and i.flags is not None:
+                    if i.flags & 0x10:
+                        solid_any = True
+                    d = (i.flags >> 5) & 7
+                    if d in self._DICT_KB:
+                        dict_kbs.add(self._DICT_KB[d])
+
+            L(f"  Packed files ({len(infos)}):", "dim")
+            for i in infos[:10]:
+                m = self._METHODS.get(i.compress_type, hex(i.compress_type or 0))
+                ratio = (100 * (i.compress_size or 0) / i.file_size) if i.file_size else 100
+                L(f"    {i.filename}  {i.file_size:,} B → {i.compress_size:,} B "
+                  f"({ratio:.1f}%)  [{m}]", "dim")
+            if len(infos) > 10:
+                L(f"    … and {len(infos) - 10} more", "dim")
+
+            for v in sorted(vers):
+                era = self._EXTRACT_VER.get(v, f"unknown (version byte {v})")
+                L(f"  Min. version to extract: {v / 10:.1f}  →  created with {era}", "info")
+            if dict_kbs:
+                L(f"  Dictionary size: {', '.join(f'{k} KB' for k in sorted(dict_kbs))}"
+                  + ("  (-md switch must match for rebuild)" if len(dict_kbs) == 1 else ""),
+                  "dim")
+            host = {i.host_os for i in infos if i.host_os is not None}
+            if host:
+                L(f"  Created on: {', '.join(self._HOST_OS.get(h, str(h)) for h in sorted(host))}", "dim")
+            if rf.needs_password():
+                L("  ⚠ Password protected", "warn")
+
+            # Reconstruction verdict
+            compressed = any(m != 0x30 for m in methods)
+            if fmt == "RAR5":
+                L("  ⛔ Verdict: RAR5 — pyReScene 0.7 cannot reconstruct this format.", "err")
+            elif not compressed:
+                L("  ✓ Verdict: uncompressed (stored) — pyReScene rebuilds natively, "
+                  "no rar.exe needed.", "ok")
+            else:
+                mnames = ", ".join(self._METHODS.get(m, hex(m)) for m in sorted(methods))
+                L(f"  ⚠ Verdict: COMPRESSED ({mnames}) — rebuild needs the exact "
+                  "original rar.exe version.", "warn")
+                if 29 in vers:
+                    L("    Era hint: version byte 29 spans WinRAR 2.90–4.20 "
+                      "(2001–2013). rescene will try each pack version in date "
+                      "order; make sure that whole range is in the pack.", "dim")
+                elif 20 in vers or 26 in vers:
+                    L("    Era hint: WinRAR 2.0x–2.6x (1996–2000) — needs very "
+                      "old rar.exe versions in the pack.", "dim")
+                if solid_any:
+                    L("    ⚠ SOLID archive — all files compressed as one stream; "
+                      "reconstruction needs every source file present and is "
+                      "more version-sensitive.", "warn")
+        finally:
+            rf.close()
 
 
 def main():

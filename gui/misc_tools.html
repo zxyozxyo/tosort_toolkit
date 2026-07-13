@@ -101,6 +101,27 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       </div>
     </div>
 
+    <!-- ── RAR Inspector ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('rai')">
+        <div class="dot" style="background:var(--acc)"></div>
+        RAR Inspector
+        <span class="chevron" id="chev-rai">▾</span>
+      </div>
+      <div class="panel-body" id="body-rai">
+        <div class="hint">Scans all RAR sets under a folder and reports: format (RAR4/RAR5/SFX), compression method, minimum extract version (creation-era hint), dictionary size, solid/recovery flags — plus a pyReScene reconstruction verdict for each set.</div>
+        <div class="row">
+          <span class="lbl">Folder</span>
+          <input class="txt" id="rai-folder" placeholder="Folder containing RAR archives (scanned recursively)" readonly/>
+          <button class="btn" onclick="browseRai()">Browse</button>
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn btn-go" id="btn-rai-go" onclick="runRarInspect()" disabled>Analyze</button>
+        </div>
+        <div class="log-w" id="rai-log" style="height:300px"></div>
+      </div>
+    </div>
+
     <!-- ── Extras Collector ── -->
     <div class="panel">
       <div class="panel-hdr" onclick="togglePanel('ext')">
@@ -160,7 +181,7 @@ function togglePanel(id) {
 // ── Python events ─────────────────────────────────────────────────────────────
 window.miscEvent = function(event, data) {
   if (event === 'log') {
-    const logId = data.target === 'mtf' ? 'mtf-log' : 'ext-log';
+    const logId = {mtf: 'mtf-log', rai: 'rai-log'}[data.target] || 'ext-log';
     addLog(logId, data.msg, data.cls);
   } else if (event === 'status') {
     const pill = document.getElementById('ext-pill');
@@ -183,6 +204,27 @@ function addLog(logId, msg, cls) {
   d.textContent = msg;
   el.appendChild(d);
   el.scrollTop = el.scrollHeight;
+}
+
+// ── RAR Inspector ─────────────────────────────────────────────────────────────
+async function browseRai() {
+  const path = await window.pywebview.api.browse_folder();
+  if (!path) return;
+  document.getElementById('rai-folder').value = path;
+  document.getElementById('btn-rai-go').disabled = false;
+}
+
+async function runRarInspect() {
+  const folder = document.getElementById('rai-folder').value.trim();
+  if (!folder) return;
+  document.getElementById('rai-log').innerHTML = '';
+  document.getElementById('btn-rai-go').disabled = true;
+  try {
+    const res = await window.pywebview.api.analyze_rar(folder);
+    if (res && !res.ok) addLog('rai-log', 'Error: ' + res.error, 'err');
+  } finally {
+    document.getElementById('btn-rai-go').disabled = false;
+  }
 }
 
 // ── Move to Folder ────────────────────────────────────────────────────────────

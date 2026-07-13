@@ -806,6 +806,22 @@ class SrrdbToolAPI:
         try:
             import rescene.main as rm  # type: ignore
 
+            # Stream rescene's internal events (version testing, rar.exe errors,
+            # CRC results) to the GUI — essential visibility for compressed
+            # rebuilds, which report almost nothing on stdout.
+            if not getattr(SrrdbToolAPI, "_rescene_subscribed", False):
+                _noisy = {rm.MsgCode.BLOCK, rm.MsgCode.RBLOCK, rm.MsgCode.FBLOCK,
+                          rm.MsgCode.STORING}
+                def _on_rescene_event(e, _self=self, _noisy=_noisy):
+                    try:
+                        msg = str(getattr(e, "message", "") or "").strip()
+                        if msg and getattr(e, "code", None) not in _noisy:
+                            _self._log(f"    rescene: {msg}", "dim")
+                    except Exception:
+                        pass
+                rm.subscribe(_on_rescene_event)
+                SrrdbToolAPI._rescene_subscribed = True
+
             # Work out which RAR sets have their source content available
             try:
                 rar_sets = self._srr_rar_sets(srr_path)
