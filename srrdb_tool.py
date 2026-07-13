@@ -73,6 +73,14 @@ _WINRAR_DATES: dict[str, str] = {
     "580": "2020-01-14", "590": "2020-05-07", "591": "2020-07-27",
     # RAR 6.x (released 2020–)
     "600": "2020-12-08", "601": "2021-01-25", "602": "2021-07-08",
+    "610": "2021-12-27", "611": "2022-03-03", "620": "2023-02-28",
+    "621": "2023-05-01", "622": "2023-08-01", "623": "2023-08-30",
+    "624": "2023-10-04",
+    # RAR 7.x — dates after mid-2025 are approximate; ordering is what matters
+    "700": "2024-02-28", "701": "2024-06-24",
+    "710": "2025-02-25", "711": "2025-04-08", "712": "2025-06-24",
+    "713": "2025-09-01", "720": "2025-11-15", "721": "2026-01-20",
+    "722": "2026-04-01", "723": "2026-06-15",
 }
 # regex for rescene-format rar executables
 _RESCENE_RAR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_rar\d+(?:b\d)?\.(exe)?$", re.IGNORECASE)
@@ -258,9 +266,10 @@ class SrrdbToolAPI:
         if not seven_zip:
             return {"ok": False, "error": "7z.exe not found in apps/ — needed to unpack installers"}
 
-        installers = sorted(winrar_pack.rglob("wrar*.exe"))
+        installers = sorted(winrar_pack.rglob("wrar*.exe")) + sorted(
+            winrar_pack.rglob("winrar-x*.exe"))
         if not installers:
-            return {"ok": False, "error": "No wrar*.exe installers found in apps/winrar_pack-4.20/ (searched recursively)"}
+            return {"ok": False, "error": "No wrar*.exe / winrar-x64-*.exe installers found in apps/winrar_pack-4.20/ (searched recursively)"}
 
         done = skipped = failed = 0
         messages = []
@@ -280,7 +289,10 @@ class SrrdbToolAPI:
         # into every 5.x+ invocation so they always produce RAR4 output that
         # rescene can read back.
         for installer in installers:
-            m = re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.IGNORECASE)
+            # Old naming (wrar420.exe) and new naming (winrar-x64-723.exe)
+            m = (re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.IGNORECASE)
+                 or re.match(r"winrar-x\d+-(\d)(\d{2})(b\d)?\.exe$",
+                             installer.name, re.IGNORECASE))
             if not m:
                 continue
             major, minor, beta = m.group(1), m.group(2), (m.group(3) or "")
