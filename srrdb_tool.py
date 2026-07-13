@@ -275,28 +275,15 @@ class SrrdbToolAPI:
                 except Exception:
                     pass
 
-        # RAR 5.x+ executables must NEVER be in the rescene pack: rescene's
-        # compressed-rebuild sizing probe always uses the most recent version,
-        # and RAR 5+ produces RAR5-format output by default, which rescene
-        # cannot read back — poisoning EVERY compressed reconstruction.
-        # (rescene can only rebuild RAR4 archives anyway.)
-        rar5_re = re.compile(r"^\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$", re.IGNORECASE)
-        for f in list(winrar_pack.iterdir()):
-            if f.is_file() and rar5_re.match(f.name):
-                try:
-                    f.unlink()
-                    messages.append(f"  Removed RAR5-era {f.name} (breaks rescene)")
-                except Exception:
-                    pass
-
+        # RAR 5.x+ executables ARE useful: post-2013 scene releases were made
+        # with modern WinRAR in RAR4 mode (-ma4). The rebuilder injects -ma4
+        # into every 5.x+ invocation so they always produce RAR4 output that
+        # rescene can read back.
         for installer in installers:
             m = re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.IGNORECASE)
             if not m:
                 continue
             major, minor, beta = m.group(1), m.group(2), (m.group(3) or "")
-            if int(major) >= 5:
-                skipped += 1
-                continue  # see note above — RAR 5.x+ must not enter the pack
             ver_key = f"{major}{minor}"
             date = _WINRAR_DATES.get(ver_key, f"200{major}-01-01")  # fallback date
             target_name = f"{date}_rar{ver_key}{beta}.exe"
@@ -832,6 +819,39 @@ class SrrdbToolAPI:
         buf = io.StringIO()
         try:
             import rescene.main as rm  # type: ignore
+
+            # RAR 5.x+ binaries create RAR5-format archives by default, which
+            # rescene cannot read back — but with -ma4 they produce RAR4 output
+            # and become valid candidates for post-2013 releases (scene groups
+            # kept using RAR4 format with modern WinRAR versions). rescene
+            # predates RAR5, so inject the switch into its rar.exe invocations.
+            if not getattr(SrrdbToolAPI, "_ma4_patched", False):
+                _orig_popen = rm.custom_popen
+                _r5plus = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$",
+                                     re.IGNORECASE)
+                def _inject(cmd):
+                    if (len(cmd) >= 3 and str(cmd[1]).lower() == "a"
+                            and _r5plus.search(str(cmd[0]))
+                            and "-ma4" not in cmd):
+                        return [cmd[0], cmd[1], "-ma4"] + list(cmd[2:])
+                    return cmd
+                def _popen_ma4(cmd, *a, **kw):
+                    try:
+                        cmd = _inject(cmd)
+                    except Exception:
+                        pass
+                    return _orig_popen(cmd, *a, **kw)
+                rm.custom_popen = _popen_ma4
+                # The final full-file compression calls subprocess.Popen with
+                # RarExecutable.full() directly — patch that path as well.
+                _orig_full = rm.RarExecutable.full
+                def _full_ma4(rar_self):
+                    try:
+                        return _inject(_orig_full(rar_self))
+                    except Exception:
+                        return _orig_full(rar_self)
+                rm.RarExecutable.full = _full_ma4
+                SrrdbToolAPI._ma4_patched = True
 
             # Stream rescene's internal events (version testing, rar.exe errors,
             # CRC results) to the GUI — essential visibility for compressed
