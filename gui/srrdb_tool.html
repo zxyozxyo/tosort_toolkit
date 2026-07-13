@@ -391,10 +391,16 @@ async function browseSource() {
   document.getElementById('src-folder').value = p;
   scanSource(p);
 }
-function rescanSource() {
+async function rescanSource() {
   const src = document.getElementById('src-folder').value.trim();
   if (!src) { log('Set a source folder first.', 'warn'); return; }
-  log('Rescanning source folder…', 'dim');
+  // Hard reset: drop the queue, cached search results, and stale state so
+  // the rescan reflects exactly what is on disk right now.
+  batchJobs = [];
+  renderQueue();
+  try { await window.pywebview.api.clear_session_cache(); } catch (e) {}
+  clearLog();
+  log('Rescanning source folder (fresh state)…', 'dim');
   scanSource(src);
 }
 async function browseContent() {

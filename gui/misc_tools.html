@@ -87,7 +87,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         Move to Folder
         <span class="chevron" id="chev-mtf">▾</span>
       </div>
-      <div class="panel-body" id="body-mtf">
+      <div class="panel-body collapsed" id="body-mtf">
         <div class="hint">Moves each file in the selected folder into a subfolder named after it (without extension). Useful for organising RomVault fixdats to avoid name collisions.</div>
         <div class="row">
           <span class="lbl">Folder</span>
@@ -108,7 +108,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         RAR Inspector
         <span class="chevron" id="chev-rai">▾</span>
       </div>
-      <div class="panel-body" id="body-rai">
+      <div class="panel-body collapsed" id="body-rai">
         <div class="hint">Scans all RAR sets under a folder and reports: format (RAR4/RAR5/SFX), compression method, minimum extract version (creation-era hint), dictionary size, solid/recovery flags — plus a pyReScene reconstruction verdict for each set.</div>
         <div class="row">
           <span class="lbl">Folder</span>
@@ -130,7 +130,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <span id="ext-pill" class="pill" style="font-size:9px">idle</span>
         <span class="chevron" id="chev-ext">▾</span>
       </div>
-      <div class="panel-body" id="body-ext">
+      <div class="panel-body collapsed" id="body-ext">
         <div class="hint">Recursively scans a source folder and copies extras (.nfo, .diz, .jpg, .png, .sfv, .nzb) and Proof/Sample subfolders into named folders at the destination. Original files are never modified.</div>
 
         <div class="row">
@@ -168,6 +168,14 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 window.addEventListener('pywebviewready', () => {
   const theme = localStorage.getItem('rv_theme');
   if (theme) document.documentElement.setAttribute('data-theme', theme);
+  // Panels start collapsed — point their chevrons accordingly
+  for (const id of ['mtf', 'rai', 'ext']) {
+    const body = document.getElementById('body-' + id);
+    const chev = document.getElementById('chev-' + id);
+    if (body && chev && body.classList.contains('collapsed')) {
+      chev.style.transform = 'rotate(-90deg)';
+    }
+  }
 });
 
 // ── Panel collapse ────────────────────────────────────────────────────────────

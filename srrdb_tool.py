@@ -160,6 +160,13 @@ class SrrdbToolAPI:
     _api_last_call = 0.0
     _api_cache: dict[str, dict] = {}
 
+    def clear_session_cache(self) -> dict:
+        """Drop cached API responses — used by the GUI Rescan button so a
+        re-test reflects current disk + srrdb state, not remembered results."""
+        n = len(SrrdbToolAPI._api_cache)
+        SrrdbToolAPI._api_cache.clear()
+        return {"ok": True, "cleared": n}
+
     def _api_get(self, url: str) -> dict:
         cached = self._api_cache.get(url)
         if cached is not None:
@@ -1808,6 +1815,24 @@ class SrrdbToolAPI:
             summary["note"] = str(e)[:100]
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
+            # Failed jobs leave no folder behind: remove the output release dir
+            # when the job failed AND it holds nothing substantial — extras,
+            # the cached SRR and stub RAR headers only (every non-metadata file
+            # ≤ 64 KB). A folder from an earlier successful run has full-size
+            # volumes and is never touched. User-stopped jobs are kept.
+            try:
+                if (not summary["ok"] and summary.get("note") != "stopped"
+                        and "out_root" in locals() and out_root.is_dir()):
+                    substantial = any(
+                        f.stat().st_size > 65536
+                        for f in out_root.rglob("*")
+                        if f.is_file() and f.suffix.lower() not in META_EXTS
+                    )
+                    if not substantial:
+                        shutil.rmtree(str(out_root), ignore_errors=True)
+                        self._log("  Removed failed output folder", "dim")
+            except Exception:
+                pass
             # Prune empty directories: a failed job creates the release folder
             # before writing anything; failed sample attempts leave an empty
             # Sample/. rmdir only removes empty dirs, so content is never at risk.
