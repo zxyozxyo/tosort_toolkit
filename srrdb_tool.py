@@ -483,7 +483,15 @@ class SrrdbToolAPI:
         if not q:
             return {"ok": False, "error": "Empty query"}
 
-        candidates: list[str] = [q]
+        candidates: list[str] = []
+
+        # Archive/pre folders are often prefixed with the pre date
+        # (2011-06-05-Release_Name). Scene names never start with a date like
+        # that, so strip it and search the clean name FIRST.
+        m = re.match(r"^\d{4}[-._]\d{2}[-._]\d{2}[-._](.+)$", q)
+        if m and len(m.group(1)) >= 4:
+            candidates.append(m.group(1))
+        candidates.append(q)
 
         # Try with underscores variant inline
         def _try(attempt: str) -> dict | None:
@@ -498,13 +506,16 @@ class SrrdbToolAPI:
                     return res2
             return None
 
+        # Later variants build on the date-stripped form when one exists
+        base = candidates[0]
+
         # Strip the group tag (everything after the last hyphen) as a high-priority variant
-        m = re.match(r"^(.+)-([A-Za-z0-9]{2,12})$", q)
+        m = re.match(r"^(.+)-([A-Za-z0-9]{2,12})$", base)
         if m:
             candidates.append(m.group(1))  # without -GROUP
 
         # Progressively remove trailing dot-tokens (handles region/platform suffixes)
-        parts = q.split(".")
+        parts = base.split(".")
         for trim in range(1, min(5, len(parts))):
             shorter = ".".join(parts[:-trim])
             if shorter and shorter not in candidates:
