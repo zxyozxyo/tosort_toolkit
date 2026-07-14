@@ -920,6 +920,10 @@ class SrrdbToolAPI:
                         # harmless, the file is still written
                         if "Cannot create a file when that file already exists" in msg:
                             return
+                        # rescene sometimes dumps full rar command lines with a
+                        # source file repeated dozens of times — cap the noise
+                        if len(msg) > 300:
+                            msg = msg[:300] + " …[truncated]"
                         _self._log(f"    rescene: {msg}", "dim")
                     except Exception:
                         pass
