@@ -914,8 +914,13 @@ class SrrdbToolAPI:
                 def _on_rescene_event(e, _self=self, _noisy=_noisy):
                     try:
                         msg = str(getattr(e, "message", "") or "").strip()
-                        if msg and getattr(e, "code", None) not in _noisy:
-                            _self._log(f"    rescene: {msg}", "dim")
+                        if not msg or getattr(e, "code", None) in _noisy:
+                            return
+                        # mkdir collision on re-runs inside rescene's extract —
+                        # harmless, the file is still written
+                        if "Cannot create a file when that file already exists" in msg:
+                            return
+                        _self._log(f"    rescene: {msg}", "dim")
                     except Exception:
                         pass
                 rm.subscribe(_on_rescene_event)
@@ -929,13 +934,35 @@ class SrrdbToolAPI:
             content_names = {
                 f.name.lower() for f in Path(content_dir).rglob("*") if f.is_file()
             }
+
+            # Some groups pack the NFO/JPG INSIDE the RARs. Those exact files
+            # are stored in the SRR and already extracted to _stored — hand
+            # them to rescene as sources via hints (absolute paths work:
+            # os.path.join drops in_folder for absolute hint values).
+            hints: dict = {}
+            stored_pool = Path(out_dir) / "_stored"
+            if rar_sets and stored_pool.is_dir():
+                stored_files = {f.name.lower(): f
+                                for f in stored_pool.rglob("*") if f.is_file()}
+                for info in rar_sets.values():
+                    for p in info["packed"]:
+                        nm = Path(p).name.lower()
+                        if nm not in content_names and nm in stored_files:
+                            hints[p] = str(stored_files[nm])
+                if hints:
+                    self._log(
+                        "  Using SRR-stored file(s) as sources: "
+                        + ", ".join(sorted(Path(k).name for k in hints)), "dim",
+                    )
+
             skip_parts: list[str] = []
             run_parts:  list[str] = []
             if len(rar_sets) > 1:
                 self._log(f"  SRR describes {len(rar_sets)} RAR sets:", "dim")
                 for prefix, info in rar_sets.items():
                     missing = [p for p in info["packed"]
-                               if Path(p).name.lower() not in content_names]
+                               if Path(p).name.lower() not in content_names
+                               and p not in hints]
                     if missing:
                         skip_parts.append(prefix)
                         self._log(
@@ -959,6 +986,7 @@ class SrrdbToolAPI:
                 # Only consulted when the stored name is missing on disk:
                 # falls back to matching by file size + extension.
                 auto_locate_renamed=True,
+                hints=hints,
             )
             if rar_dir:
                 base_kwargs["rar_executable_dir"] = rar_dir
