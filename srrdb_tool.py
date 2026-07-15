@@ -920,6 +920,9 @@ class SrrdbToolAPI:
                         # harmless, the file is still written
                         if "Cannot create a file when that file already exists" in msg:
                             return
+                        # Capture the detected version for the results database
+                        if msg.startswith("Good RAR version detected"):
+                            _self._last_good_rar = msg.split(":", 1)[-1].strip()
                         # rescene sometimes dumps full rar command lines with a
                         # source file repeated dozens of times — cap the noise
                         if len(msg) > 300:
@@ -1392,6 +1395,127 @@ class SrrdbToolAPI:
         self._log(f"  Extracted {best_name} ({extracted.stat().st_size:,} B)", "dim")
         return {"ok": True, "path": str(extracted), "name": best_name}
 
+    # ── Results database ──────────────────────────────────────────────────────
+    # Every processed release is recorded to srrdb_results.json automatically:
+    # year, platform, group, outcome, detected RAR version. View aggregated
+    # stats in the log or export CSV for spreadsheet work.
+
+    _PLATFORMS = ["NSW", "3DS", "NDS", "GBA", "GBC", "N64", "NGC", "GCN",
+                  "WIIU", "WII", "XBOX360", "XBOXONE", "XBOX", "PS2", "PS3",
+                  "PS4", "PS5", "PSP", "PSV", "VITA", "PSX", "DC", "DREAMCAST"]
+    _VIDEO_TOKENS = {"BLURAY", "DVDRIP", "DVDR", "WEB", "HDTV", "X264", "X265",
+                     "XVID", "H264", "H265", "BDRIP", "WEBRIP"}
+
+    @property
+    def _results_path(self) -> Path:
+        return Path(__file__).parent / "srrdb_results.json"
+
+    def _load_results(self) -> list:
+        try:
+            return json.loads(self._results_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+    def _record_result(self, summary: dict, queue_path: str):
+        try:
+            release = summary.get("release") or ""
+            tokens = set(re.split(r"[._\-]+", release.upper()))
+            group = ""
+            m = re.match(r"^.+-([A-Za-z0-9_]{2,15})$", release)
+            if m:
+                group = m.group(1)
+            platform = next((p for p in self._PLATFORMS if p in tokens), "")
+            if not platform and tokens & self._VIDEO_TOKENS:
+                platform = "video"
+            year = ""
+            if queue_path:
+                ym = re.match(r"^(\d{4})[-._]\d{2}[-._]\d{2}",
+                              Path(queue_path).name)
+                if ym:
+                    year = ym.group(1)
+            rec = {
+                "ts":          time.strftime("%Y-%m-%d %H:%M"),
+                "release":     release,
+                "group":       group,
+                "platform":    platform,
+                "year":        year,
+                "ok":          bool(summary.get("ok")),
+                "rars":        summary.get("rars"),
+                "sample":      summary.get("sample"),
+                "subs":        summary.get("subs"),
+                "rar_version": getattr(self, "_last_good_rar", None),
+                "note":        (summary.get("note") or "")[:120],
+            }
+            results = self._load_results()
+            # Re-runs replace the previous record for the same release
+            results = [r for r in results if r.get("release") != release]
+            results.append(rec)
+            self._results_path.write_text(
+                json.dumps(results, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+
+    def results_stats(self) -> dict:
+        """Log aggregated testing stats: per group and per year/platform."""
+        results = self._load_results()
+        if not results:
+            self._log("Results DB is empty — process some releases first.", "dim")
+            return {"ok": True, "count": 0}
+        ok_n = sum(1 for r in results if r["ok"])
+        self._log(f"══ Results DB — {len(results)} release(s), "
+                  f"{ok_n} ok ({ok_n / len(results):.0%}) ══", "info")
+
+        def _agg(key):
+            groups: dict = {}
+            for r in results:
+                k = r.get(key) or "?"
+                g = groups.setdefault(k, {"n": 0, "ok": 0, "vers": set()})
+                g["n"] += 1
+                g["ok"] += 1 if r["ok"] else 0
+                if r.get("rar_version"):
+                    g["vers"].add(r["rar_version"])
+            return groups
+
+        self._log("Per group:", "info")
+        for k, g in sorted(_agg("group").items(),
+                           key=lambda kv: -kv[1]["n"]):
+            vers = ", ".join(sorted(g["vers"])) or "—"
+            cls = "ok" if g["ok"] == g["n"] else ("warn" if g["ok"] else "err")
+            self._log(f"  {k:<18} {g['ok']}/{g['n']:<4} rar: {vers}", cls)
+
+        self._log("Per year/platform:", "info")
+        combo: dict = {}
+        for r in results:
+            k = f"{r.get('year') or '????'} {r.get('platform') or '?'}"
+            g = combo.setdefault(k, {"n": 0, "ok": 0})
+            g["n"] += 1
+            g["ok"] += 1 if r["ok"] else 0
+        for k, g in sorted(combo.items()):
+            self._log(f"  {k:<16} {g['ok']}/{g['n']}",
+                      "ok" if g["ok"] == g["n"] else "warn")
+
+        fails = [r for r in results if not r["ok"]]
+        if fails:
+            self._log(f"Failures ({len(fails)}):", "warn")
+            for r in fails:
+                self._log(f"  ✗ {r['release']} — {r.get('note') or '?'}", "err")
+        return {"ok": True, "count": len(results)}
+
+    def export_results_csv(self) -> dict:
+        results = self._load_results()
+        if not results:
+            return {"ok": False, "error": "Results DB is empty"}
+        import csv
+        out = Path(__file__).parent / "srrdb_results.csv"
+        cols = ["ts", "release", "group", "platform", "year", "ok", "rars",
+                "sample", "subs", "rar_version", "note"]
+        with open(out, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(results)
+        self._log(f"Exported {len(results)} record(s) → {out}", "ok")
+        return {"ok": True, "path": str(out), "count": len(results)}
+
     # ── Single-release processing thread ─────────────────────────────────────
 
     def start_process(self, config: dict) -> bool:
@@ -1427,6 +1551,7 @@ class SrrdbToolAPI:
             "release": release or (Path(queue_path).name if queue_path else "?"),
             "ok": True, "rars": None, "sample": None, "subs": None, "note": "",
         }
+        self._last_good_rar = None  # set by the rescene event stream
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
 
@@ -1957,6 +2082,7 @@ class SrrdbToolAPI:
             if not batch_mode:
                 self._running = False
                 self._emit("status", {"state": "done"})
+        self._record_result(summary, queue_path)
         return summary
 
     # ── Batch processing ──────────────────────────────────────────────────────

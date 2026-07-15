@@ -201,6 +201,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <span style="opacity:0.6"> — clearly named NONSCENE, not a scene-verified file</span>
           </label>
           <div class="row">
+            <span class="lbl">Results DB</span>
+            <button class="btn btn-sm" onclick="viewStats()">View Stats</button>
+            <button class="btn btn-sm" onclick="exportCsv()">Export CSV</button>
+            <span style="font-size:10px;opacity:0.6">every run is recorded automatically (group, year, outcome, RAR version)</span>
+          </div>
+          <div class="row">
             <span class="lbl">Max candidates</span>
             <select class="sel" id="max-test" style="width:70px">
               <option value="3">3</option>
@@ -447,6 +453,15 @@ async function scanSource(folder) {
     renderQueue();
     log(`Found ${batchJobs.length} subfolder(s)`, 'info');
   }
+}
+
+// ── Results DB ────────────────────────────────────────────────────────────────
+async function viewStats() {
+  await window.pywebview.api.results_stats();
+}
+async function exportCsv() {
+  const r = await window.pywebview.api.export_results_csv();
+  if (r && !r.ok) log('Export failed: ' + r.error, 'err');
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────

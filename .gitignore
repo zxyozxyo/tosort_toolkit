@@ -16,6 +16,8 @@ ia_folder_packer.json
 ia_uploader.json
 scene_recreator.json
 srrdb_tool.json
+srrdb_results.json
+srrdb_results.csv
 misc_tools.json
 reference_fingerprint_db.json
 
