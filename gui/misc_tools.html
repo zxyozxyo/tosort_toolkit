@@ -109,16 +109,37 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <span class="chevron" id="chev-rai">▾</span>
       </div>
       <div class="panel-body collapsed" id="body-rai">
-        <div class="hint">Scans all RAR sets under a folder and reports: format (RAR4/RAR5/SFX), compression method, minimum extract version (creation-era hint), dictionary size, solid/recovery flags — plus a pyReScene reconstruction verdict for each set.</div>
+        <div class="hint">Scans all RAR / ZIP / 7z archives under a folder. RAR: format, compression method, min extract version (creation-era hint), dictionary size, flags + pyReScene verdict. ZIP: methods, creator system/version, EOCD comment detection. 7z: methods, solid/blocks.</div>
         <div class="row">
           <span class="lbl">Folder</span>
-          <input class="txt" id="rai-folder" placeholder="Folder containing RAR archives (scanned recursively)" readonly/>
+          <input class="txt" id="rai-folder" placeholder="Folder containing archives (scanned recursively)" readonly/>
           <button class="btn" onclick="browseRai()">Browse</button>
         </div>
         <div class="row" style="justify-content:flex-end">
           <button class="btn btn-go" id="btn-rai-go" onclick="runRarInspect()" disabled>Analyze</button>
         </div>
         <div class="log-w" id="rai-log" style="height:300px"></div>
+      </div>
+    </div>
+
+    <!-- ── Local Backup ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('bak')">
+        <div class="dot" style="background:var(--danger)"></div>
+        Local Backup
+        <span class="chevron" id="chev-bak">▾</span>
+      </div>
+      <div class="panel-body collapsed" id="body-bak">
+        <div class="hint">Copies the ENTIRE toolkit folder — including gitignored files (apps, credentials, settings, results DB) — to a timestamped folder at the destination. For local disaster recovery; git does not cover these files.</div>
+        <div class="row">
+          <span class="lbl">Destination</span>
+          <input class="txt" id="bak-dest" placeholder="Backup destination folder" readonly/>
+          <button class="btn" onclick="browseBak()">Browse</button>
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn btn-go" id="btn-bak-go" onclick="runBackup()" disabled>Backup Now</button>
+        </div>
+        <div class="log-w" id="bak-log"></div>
       </div>
     </div>
 
@@ -165,11 +186,26 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
 <script>
 // ── Init ──────────────────────────────────────────────────────────────────────
+// ── Local Backup ──────────────────────────────────────────────────────────────
+async function browseBak() {
+  const path = await window.pywebview.api.browse_folder();
+  if (!path) return;
+  document.getElementById('bak-dest').value = path;
+  document.getElementById('btn-bak-go').disabled = false;
+}
+async function runBackup() {
+  const dest = document.getElementById('bak-dest').value.trim();
+  if (!dest) return;
+  document.getElementById('bak-log').innerHTML = '';
+  const r = await window.pywebview.api.start_backup(dest);
+  if (r && !r.ok) addLog('bak-log', 'Error: ' + r.error, 'err');
+}
+
 window.addEventListener('pywebviewready', () => {
   const theme = localStorage.getItem('rv_theme');
   if (theme) document.documentElement.setAttribute('data-theme', theme);
   // Panels start collapsed — point their chevrons accordingly
-  for (const id of ['mtf', 'rai', 'ext']) {
+  for (const id of ['mtf', 'rai', 'ext', 'bak']) {
     const body = document.getElementById('body-' + id);
     const chev = document.getElementById('chev-' + id);
     if (body && chev && body.classList.contains('collapsed')) {
@@ -189,7 +225,7 @@ function togglePanel(id) {
 // ── Python events ─────────────────────────────────────────────────────────────
 window.miscEvent = function(event, data) {
   if (event === 'log') {
-    const logId = {mtf: 'mtf-log', rai: 'rai-log'}[data.target] || 'ext-log';
+    const logId = {mtf: 'mtf-log', rai: 'rai-log', bak: 'bak-log'}[data.target] || 'ext-log';
     addLog(logId, data.msg, data.cls);
   } else if (event === 'status') {
     const pill = document.getElementById('ext-pill');

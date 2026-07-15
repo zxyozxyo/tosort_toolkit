@@ -254,6 +254,67 @@ class MiscToolsAPI:
                 return str(p)
         return ''
 
+    # ── Local Backup ──────────────────────────────────────────────────────────
+
+    def start_backup(self, dest: str) -> dict:
+        """Copy the ENTIRE toolkit folder (including gitignored files: apps,
+        credentials, settings, results DB) to a timestamped folder at dest."""
+        dest = (dest or "").strip()
+        if not dest:
+            return {"ok": False, "error": "No destination set"}
+        src = Path(__file__).parent
+        dst_root = Path(dest)
+        try:
+            dst_root.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": f"Cannot create destination: {e}"}
+        # Never back up into ourselves
+        try:
+            if src in [dst_root, *dst_root.parents]:
+                return {"ok": False, "error":
+                        "Destination is inside the toolkit folder — choose elsewhere"}
+        except Exception:
+            pass
+        if self._running:
+            return {"ok": False, "error": "Another operation is running"}
+        target = dst_root / f"tosort_toolkit_backup_{__import__('time').strftime('%Y%m%d-%H%M')}"
+        threading.Thread(target=self._backup_thread, args=(src, target),
+                         daemon=True).start()
+        return {"ok": True, "target": str(target)}
+
+    def _backup_thread(self, src: Path, target: Path):
+        self._running = True
+        L = lambda m, c="info": self._log(m, c, "bak")
+        L(f"Backing up {src} → {target}", "info")
+        files = 0
+        total = 0
+        errors = 0
+        try:
+            for f in src.rglob("*"):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(src)
+                if "__pycache__" in rel.parts:
+                    continue
+                out = target / rel
+                try:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(out))
+                    files += 1
+                    total += f.stat().st_size
+                    if files % 250 == 0:
+                        L(f"  {files} files, {total:,} B…", "dim")
+                except Exception as e:
+                    errors += 1
+                    L(f"  ERROR: {rel}: {e}", "err")
+            L(f"Backup complete — {files} file(s), {total:,} B"
+              + (f", {errors} error(s)" if errors else ""),
+              "ok" if not errors else "warn")
+        except Exception as e:
+            L(f"Backup FAILED: {e}", "err")
+        finally:
+            self._running = False
+
     # ── RAR Inspector ─────────────────────────────────────────────────────────
 
     _RAR4_SIG = b"Rar!\x1a\x07\x00"
@@ -292,11 +353,14 @@ class MiscToolsAPI:
             if not re.search(r"\.part0*(?!1\b)\d+\.rar$", p.name, re.IGNORECASE)
             or re.search(r"\.part0*1\.rar$", p.name, re.IGNORECASE)
         ]
-        if not heads:
-            L("No .rar files found under this folder.", "warn")
+        zips = sorted(base.rglob("*.zip"))
+        sevens = sorted(base.rglob("*.7z"))
+        if not heads and not zips and not sevens:
+            L("No .rar / .zip / .7z files found under this folder.", "warn")
             return {"ok": True, "sets": 0}
 
-        L(f"Found {len(heads)} RAR set(s) under {base}", "info")
+        L(f"Found {len(heads)} RAR set(s), {len(zips)} ZIP(s), "
+          f"{len(sevens)} 7z under {base}", "info")
         for head in heads:
             L("", "")
             L(f"══ {head.relative_to(base)} ══", "info")
@@ -304,9 +368,87 @@ class MiscToolsAPI:
                 self._analyze_one_set(head, rarfile, L)
             except Exception as e:
                 L(f"  ERROR: {e}", "err")
+        for z in zips:
+            L("", "")
+            L(f"══ {z.relative_to(base)} ══", "info")
+            try:
+                self._analyze_zip(z, L)
+            except Exception as e:
+                L(f"  ERROR: {e}", "err")
+        for s in sevens:
+            L("", "")
+            L(f"══ {s.relative_to(base)} ══", "info")
+            try:
+                self._analyze_7z(s, L)
+            except Exception as e:
+                L(f"  ERROR: {e}", "err")
         L("", "")
-        L(f"Analysis complete — {len(heads)} set(s).", "ok")
-        return {"ok": True, "sets": len(heads)}
+        L(f"Analysis complete — {len(heads) + len(zips) + len(sevens)} archive(s).", "ok")
+        return {"ok": True, "sets": len(heads) + len(zips) + len(sevens)}
+
+    _ZIP_METHODS = {0: "Store", 8: "Deflate", 9: "Deflate64", 12: "BZip2",
+                    14: "LZMA", 93: "Zstandard", 95: "XZ", 98: "PPMd", 99: "AES-encrypted"}
+    _ZIP_SYSTEMS = {0: "MS-DOS/Windows", 3: "Unix", 7: "Macintosh",
+                    10: "Windows NTFS", 19: "OS X"}
+
+    def _analyze_zip(self, path, L):
+        import zipfile
+        with zipfile.ZipFile(str(path)) as zf:
+            infos = zf.infolist()
+            comment = zf.comment or b""
+            methods, systems, versions = set(), set(), set()
+            encrypted = False
+            tot_u = tot_c = 0
+            for i in infos:
+                methods.add(i.compress_type)
+                systems.add(i.create_system)
+                versions.add(i.create_version)
+                if i.flag_bits & 0x1:
+                    encrypted = True
+                tot_u += i.file_size
+                tot_c += i.compress_size
+            L("  Format: ZIP", "dim")
+            L(f"  Entries: {len(infos)}  ({tot_u:,} B → {tot_c:,} B, "
+              f"{(100 * tot_c / tot_u) if tot_u else 100:.1f}%)", "dim")
+            for i in infos[:10]:
+                m = self._ZIP_METHODS.get(i.compress_type, str(i.compress_type))
+                ratio = (100 * i.compress_size / i.file_size) if i.file_size else 100
+                L(f"    {i.filename}  {i.file_size:,} B → {i.compress_size:,} B "
+                  f"({ratio:.1f}%)  [{m}]", "dim")
+            if len(infos) > 10:
+                L(f"    … and {len(infos) - 10} more", "dim")
+            L("  Created on: " + ", ".join(
+                self._ZIP_SYSTEMS.get(s, f"system {s}") for s in sorted(systems)), "dim")
+            L("  Creator version(s): " + ", ".join(
+                f"{v / 10:.1f}" for v in sorted(versions)), "dim")
+            if comment:
+                L(f"  ⚠ EOCD comment present ({len(comment)} B) — often a topsite "
+                  "tagline grow-append (Scene ZIP Recreator can strip it)", "warn")
+            if encrypted:
+                L("  ⚠ Password protected", "warn")
+            L("  Note: scene ZIP repair/byte-matching is handled by the "
+              "Scene ZIP Recreator module.", "dim")
+
+    def _analyze_7z(self, path, L):
+        try:
+            import py7zr
+        except ImportError:
+            L("  py7zr not installed — pip install py7zr", "err")
+            return
+        with py7zr.SevenZipFile(str(path), mode="r") as z:
+            info = z.archiveinfo()
+            entries = z.list()
+            L("  Format: 7z", "dim")
+            L(f"  Entries: {len(entries)}  (uncompressed {info.uncompressed:,} B, "
+              f"archive {Path(path).stat().st_size:,} B)", "dim")
+            L(f"  Method(s): {', '.join(info.method_names)}", "dim")
+            L(f"  Solid: {'YES' if info.solid else 'no'}   Blocks: {info.blocks}", "dim")
+            for e in entries[:10]:
+                L(f"    {e.filename}  {e.uncompressed:,} B", "dim")
+            if len(entries) > 10:
+                L(f"    … and {len(entries) - 10} more", "dim")
+            if z.needs_password():
+                L("  ⚠ Password protected", "warn")
 
     def _analyze_one_set(self, head: Path, rarfile, L):
         # Format from magic bytes

@@ -599,6 +599,20 @@ class RCloneAPI:
         except Exception:
             return ""
 
+    # ── Upload profiles (shared store with the Python IA uploader) ───────────
+
+    def profiles_list(self) -> list:
+        import upload_profiles
+        return upload_profiles.list_profiles("rclone")
+
+    def profiles_save(self, name: str, fields: dict) -> dict:
+        import upload_profiles
+        return upload_profiles.save_profile(name, "rclone", fields)
+
+    def profiles_delete(self, name: str) -> dict:
+        import upload_profiles
+        return upload_profiles.delete_profile(name, "rclone")
+
 
 def main():
     api = RCloneAPI()

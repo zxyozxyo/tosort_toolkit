@@ -133,6 +133,22 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
     </div>
   </div>
 
+  <!-- Upload Profiles -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('prof'); loadProfiles()">
+      <div class="dot" style="background:var(--acc)"></div>Upload Profiles
+      <span class="chevron" id="chev-prof">▾</span>
+    </div>
+    <div class="panel-body" id="body-prof">
+      <div class="hint">Saved upload setups (source folder, identifier, metadata, options). Click one to re-populate everything — ⚠ marks profiles whose source folder no longer exists (moved/renamed).</div>
+      <div class="row">
+        <input class="txt" id="prof-name" placeholder="Profile name (e.g. Redump PSX refresh)" style="max-width:280px"/>
+        <button class="btn" onclick="saveProfile()">Save Current as Profile</button>
+      </div>
+      <div id="prof-list" style="display:flex;flex-direction:column;gap:3px"></div>
+    </div>
+  </div>
+
   <!-- Credentials -->
   <div class="panel">
     <div class="panel-hdr" onclick="togglePanel('cred')">
@@ -427,6 +443,90 @@ window.iaEvent = function(event, data) {
   }
 };
 
+// ── Upload Profiles ───────────────────────────────────────────────────────────
+const PROF_TEXT = {
+  identifier: 'item-id', title: 'md-title', mediatype: 'md-type',
+  collection: 'md-coll', desc: 'md-desc', creator: 'md-creator',
+  date: 'md-date', subject: 'md-subj', lang: 'md-lang', license: 'md-lic',
+  threads: 'opt-threads',
+};
+const PROF_CHECK = { derive: 'opt-derive', checksum: 'opt-checksum' };
+
+function collectProfileFields() {
+  const f = { folder: srcFolder || '' };
+  for (const [k, id] of Object.entries(PROF_TEXT)) {
+    const el = document.getElementById(id);
+    if (el) f[k] = el.value;
+  }
+  for (const [k, id] of Object.entries(PROF_CHECK)) {
+    const el = document.getElementById(id);
+    if (el) f[k] = el.checked;
+  }
+  return f;
+}
+
+async function saveProfile() {
+  const name = document.getElementById('prof-name').value.trim()
+            || document.getElementById('item-id').value.trim();
+  if (!name) { addLog('Give the profile a name (or set an identifier).', 'warn'); return; }
+  const r = await window.pywebview.api.profiles_save(name, collectProfileFields());
+  if (r.ok) { addLog(`Profile saved: ${name}`, 'ok'); loadProfiles(); }
+  else addLog('Profile save failed: ' + r.error, 'err');
+}
+
+async function loadProfiles() {
+  const list = document.getElementById('prof-list');
+  const profiles = await window.pywebview.api.profiles_list();
+  list.innerHTML = '';
+  if (!profiles.length) {
+    list.innerHTML = '<div class="hint">No profiles saved yet.</div>';
+    return;
+  }
+  for (const p of profiles) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 8px;'
+      + 'background:var(--bg0);border:1px solid var(--border);border-radius:4px;cursor:pointer';
+    const warn = p.folder_missing
+      ? ' <span style="color:var(--danger)">⚠ folder missing</span>' : '';
+    const info = document.createElement('div');
+    info.style.cssText = 'flex:1;font-size:11px';
+    info.innerHTML = `<b>${p.name}</b> — ${(p.fields||{}).identifier||'?'}`
+      + `<span style="opacity:.55"> · ${(p.fields||{}).folder||''} · ${p.saved}</span>${warn}`;
+    info.onclick = () => applyProfile(p);
+    const del = document.createElement('button');
+    del.className = 'btn'; del.textContent = '✕';
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      await window.pywebview.api.profiles_delete(p.name);
+      loadProfiles();
+    };
+    row.appendChild(info); row.appendChild(del);
+    list.appendChild(row);
+  }
+}
+
+async function applyProfile(p) {
+  const f = p.fields || {};
+  for (const [k, id] of Object.entries(PROF_TEXT)) {
+    const el = document.getElementById(id);
+    if (el && f[k] !== undefined) el.value = f[k];
+  }
+  for (const [k, id] of Object.entries(PROF_CHECK)) {
+    const el = document.getElementById(id);
+    if (el && f[k] !== undefined) el.checked = f[k];
+  }
+  document.getElementById('prof-name').value = p.name;
+  if (p.folder_missing) {
+    addLog(`Profile applied: ${p.name} — ⚠ source folder is MISSING: ${f.folder}`, 'err');
+  } else {
+    addLog(`Profile applied: ${p.name}`, 'ok');
+    if (f.folder) {
+      fileList = [];
+      await addFolderPath(f.folder);
+    }
+  }
+}
+
 // ── Files ─────────────────────────────────────────────────────────────────────
 async function addFiles() {
   const paths = await window.pywebview.api.browse_files();
@@ -440,6 +540,9 @@ async function addFiles() {
 async function addFolder() {
   const folder = await window.pywebview.api.browse_folder();
   if (!folder) return;
+  await addFolderPath(folder);
+}
+async function addFolderPath(folder) {
   srcFolder = folder;  // remember root for relative path uploads
   const files = await window.pywebview.api.get_folder_files(folder);
   let excluded = 0;

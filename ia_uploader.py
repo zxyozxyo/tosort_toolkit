@@ -699,6 +699,20 @@ class IAUploaderAPI:
         except Exception:
             return ""
 
+    # ── Upload profiles (shared store with the RClone uploader) ──────────────
+
+    def profiles_list(self) -> list:
+        import upload_profiles
+        return upload_profiles.list_profiles("python")
+
+    def profiles_save(self, name: str, fields: dict) -> dict:
+        import upload_profiles
+        return upload_profiles.save_profile(name, "python", fields)
+
+    def profiles_delete(self, name: str) -> dict:
+        import upload_profiles
+        return upload_profiles.delete_profile(name, "python")
+
     def open_folder_packer(self):
         """
         Opens the IA Folder Packer window (where archive grouping/
