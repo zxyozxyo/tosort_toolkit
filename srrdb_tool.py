@@ -1620,6 +1620,7 @@ class SrrdbToolAPI:
         do_sample        = config.get("do_sample", False)
         extract_iso_m2ts = config.get("extract_iso_m2ts", False)
         non_scene_sample = config.get("non_scene_sample", False)
+        delete_source    = config.get("delete_source", False)
         # Queue rows in the GUI are keyed by the original folder path — keep it
         # for job events even after auto-match renames or nesting descent.
         queue_path = content_dir
@@ -2099,6 +2100,27 @@ class SrrdbToolAPI:
                         )
                     except OSError as e:
                         self._log(f"  ⚠ Subs NOT produced (rename failed: {e})", "warn")
+
+            # 7 — Optionally delete the SOURCE folder (old jpg/nfo included).
+            # Only after a fully successful rebuild that produced RAR volumes —
+            # the content then lives inside the CRC-verified archives.
+            if (delete_source and summary["ok"] and (summary.get("rars") or 0) > 0
+                    and queue_path and Path(queue_path).is_dir()):
+                try:
+                    qp = Path(queue_path).resolve()
+                    orp = out_root.resolve()
+                    if qp == qp.parent:
+                        self._log("  Source delete SKIPPED — refusing to remove "
+                                  "a drive root", "warn")
+                    elif orp == qp or qp in orp.parents or orp in qp.parents:
+                        self._log("  Source delete SKIPPED — source and output "
+                                  "folders overlap", "warn")
+                    else:
+                        shutil.rmtree(str(qp))
+                        self._log(f"  Source folder DELETED (option enabled): {qp}",
+                                  "warn")
+                except Exception as e:
+                    self._log(f"  Source delete failed: {e}", "err")
 
             if summary["ok"]:
                 self._log(f"  ✓ Done → {out_root}", "ok")

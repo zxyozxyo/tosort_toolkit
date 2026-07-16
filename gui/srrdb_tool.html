@@ -200,6 +200,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <input type="checkbox" id="nonscene-sample"> Create NON-SCENE preview clip when the scene sample can't be rebuilt
             <span style="opacity:0.6"> — clearly named NONSCENE, not a scene-verified file</span>
           </label>
+          <label class="chk-row" id="row-delsrc" style="color:var(--danger)">
+            <input type="checkbox" id="delete-source" onchange="confirmDeleteSource(this)">
+            Delete source folder after successful rebuild
+            <span style="opacity:0.7;font-size:0.85em"> — removes the input folder INCLUDING old nfo/jpg once the RARs are verified</span>
+          </label>
           <div class="row">
             <span class="lbl">Results DB</span>
             <button class="btn btn-sm" onclick="viewStats()">View Stats</button>
@@ -456,6 +461,24 @@ async function scanSource(folder) {
   }
 }
 
+// ── Delete-source confirmation ────────────────────────────────────────────────
+function confirmDeleteSource(el) {
+  if (!el.checked) return;
+  const sure = window.confirm(
+    'ARE YOU CERTAIN?\n\n' +
+    'After each successful rebuild, the SOURCE folder will be permanently ' +
+    'deleted — including any old nfo/jpg files inside it.\n\n' +
+    'Only enable this if the reconstructed RARs in the output folder are all ' +
+    'you need. Failed or stopped releases are never deleted.'
+  );
+  if (!sure) {
+    el.checked = false;
+    log('Delete-source option cancelled.', 'dim');
+  } else {
+    log('⚠ Delete-source ENABLED — input folders will be removed after successful rebuilds.', 'warn');
+  }
+}
+
 // ── Results DB ────────────────────────────────────────────────────────────────
 async function viewStats() {
   await window.pywebview.api.results_stats();
@@ -600,6 +623,7 @@ async function doProcess() {
   const doSample       = document.getElementById('do-sample').checked;
   const extractIsoM2ts = document.getElementById('extract-iso-m2ts').checked;
   const nonSceneSample = document.getElementById('nonscene-sample').checked;
+  const deleteSource   = document.getElementById('delete-source').checked;
 
   if (!dest) { log('Set an output folder first.', 'warn'); return; }
 
@@ -615,6 +639,7 @@ async function doProcess() {
       do_sample:        doSample,
       extract_iso_m2ts: extractIsoM2ts,
       non_scene_sample: nonSceneSample,
+      delete_source:    deleteSource,
     });
   } else {
     // Batch
@@ -631,6 +656,7 @@ async function doProcess() {
         do_sample:        doSample,
         extract_iso_m2ts: extractIsoM2ts,
         non_scene_sample: nonSceneSample,
+        delete_source:    deleteSource,
         max_test:         maxTest,
       }));
     if (!jobs.length) { log('All jobs already done.', 'dim'); return; }
