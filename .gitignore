@@ -18,6 +18,7 @@ scene_recreator.json
 srrdb_tool.json
 srrdb_results.json
 srrdb_results.csv
+srrdb_results.xlsx
 ia_upload_profiles.json
 misc_tools.json
 reference_fingerprint_db.json

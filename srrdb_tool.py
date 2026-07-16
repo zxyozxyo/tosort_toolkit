@@ -1501,19 +1501,75 @@ class SrrdbToolAPI:
                 self._log(f"  ✗ {r['release']} — {r.get('note') or '?'}", "err")
         return {"ok": True, "count": len(results)}
 
+    _RESULT_COLS = ["ts", "release", "group", "platform", "year", "ok", "rars",
+                    "sample", "subs", "rar_version", "note"]
+
     def export_results_csv(self) -> dict:
         results = self._load_results()
         if not results:
             return {"ok": False, "error": "Results DB is empty"}
         import csv
         out = Path(__file__).parent / "srrdb_results.csv"
-        cols = ["ts", "release", "group", "platform", "year", "ok", "rars",
-                "sample", "subs", "rar_version", "note"]
         with open(out, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=self._RESULT_COLS, extrasaction="ignore")
             w.writeheader()
             w.writerows(results)
         self._log(f"Exported {len(results)} record(s) → {out}", "ok")
+        return {"ok": True, "path": str(out), "count": len(results)}
+
+    def export_results_xlsx(self) -> dict:
+        """Styled spreadsheet: frozen header, autofilter, colour-coded rows."""
+        results = self._load_results()
+        if not results:
+            return {"ok": False, "error": "Results DB is empty"}
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            return {"ok": False, "error": "openpyxl not installed — pip install openpyxl"}
+
+        out = Path(__file__).parent / "srrdb_results.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "srrdb results"
+
+        hdr_fill = PatternFill("solid", fgColor="2A3045")
+        hdr_font = Font(bold=True, color="FFFFFF")
+        ok_fill = PatternFill("solid", fgColor="E2F0DA")   # soft green
+        bad_fill = PatternFill("solid", fgColor="F8D7DA")  # soft red
+
+        ws.append([c.upper() for c in self._RESULT_COLS])
+        for cell in ws[1]:
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = Alignment(horizontal="center")
+
+        for r in sorted(results, key=lambda x: (x.get("year") or "",
+                                                x.get("group") or "",
+                                                x.get("release") or "")):
+            row = [r.get(c, "") for c in self._RESULT_COLS]
+            row[self._RESULT_COLS.index("ok")] = "OK" if r.get("ok") else "FAILED"
+            ws.append(row)
+            fill = ok_fill if r.get("ok") else bad_fill
+            for cell in ws[ws.max_row]:
+                cell.fill = fill
+
+        widths = {"ts": 16, "release": 55, "group": 14, "platform": 10,
+                  "year": 7, "ok": 9, "rars": 7, "sample": 24, "subs": 14,
+                  "rar_version": 18, "note": 60}
+        for i, c in enumerate(self._RESULT_COLS, 1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 14)
+
+        ws.freeze_panes = "A2"                       # header stays put
+        ws.auto_filter.ref = ws.dimensions           # sortable/filterable columns
+        try:
+            wb.save(out)
+        except PermissionError:
+            return {"ok": False, "error":
+                    "srrdb_results.xlsx is open in Excel — close it and retry"}
+        self._log(f"Exported {len(results)} record(s) → {out} "
+                  "(frozen header, colour-coded, filterable)", "ok")
         return {"ok": True, "path": str(out), "count": len(results)}
 
     # ── Single-release processing thread ─────────────────────────────────────

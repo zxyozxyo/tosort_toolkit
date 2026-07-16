@@ -203,6 +203,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="row">
             <span class="lbl">Results DB</span>
             <button class="btn btn-sm" onclick="viewStats()">View Stats</button>
+            <button class="btn btn-sm" onclick="exportXlsx()">Export XLSX</button>
             <button class="btn btn-sm" onclick="exportCsv()">Export CSV</button>
             <span style="font-size:10px;opacity:0.6">every run is recorded automatically (group, year, outcome, RAR version)</span>
           </div>
@@ -461,6 +462,10 @@ async function viewStats() {
 }
 async function exportCsv() {
   const r = await window.pywebview.api.export_results_csv();
+  if (r && !r.ok) log('Export failed: ' + r.error, 'err');
+}
+async function exportXlsx() {
+  const r = await window.pywebview.api.export_results_xlsx();
   if (r && !r.ok) log('Export failed: ' + r.error, 'err');
 }
 
