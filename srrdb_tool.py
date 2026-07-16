@@ -204,7 +204,15 @@ class SrrdbToolAPI:
                 raise
         if len(self._api_cache) > 500:
             self._api_cache.clear()
-        self._api_cache[url] = data
+        # Never cache empty search results — a transient srrdb hiccup would
+        # otherwise make every retry return the same miss for the session.
+        empty_search = (
+            isinstance(data, dict)
+            and "/search/" in url
+            and int(data.get("resultsCount") or 0) == 0
+        )
+        if not empty_search:
+            self._api_cache[url] = data
         return data
 
     # ── rescene / script detection ────────────────────────────────────────────
