@@ -628,27 +628,41 @@ class SrrdbToolAPI:
             + sorted(p for sub in base.iterdir() if sub.is_dir()
                      for p in list(sub.glob("*.nfo")) + list(sub.glob("*.NFO")))
         )
+        # Try every available name hint and prefer an exact single hit.
+        # NFO stems are often short group tags (contrast-madden.nfo) whose
+        # trimmed variants match dozens of unrelated releases — the folder
+        # name usually carries the true release name.
+        hint_candidates: list[str] = []
         if nfo_paths:
-            name_hint = nfo_paths[0].stem
-        elif sfv_paths:
-            name_hint = sfv_paths[0].stem
-        else:
-            name_hint = base.name
+            hint_candidates.append(nfo_paths[0].stem)
+        if sfv_paths and sfv_paths[0].stem not in hint_candidates:
+            hint_candidates.append(sfv_paths[0].stem)
+        if base.name not in hint_candidates:
+            hint_candidates.append(base.name)
 
-        res = self.search_srrdb_progressive(name_hint)
-        trimmed = res.pop("query_trimmed", False)
-        if res.get("ok") and res.get("count", 0) > 0:
-            res["method"] = ("name (simplified)" if trimmed else "name")
-            return res
+        best: dict | None = None
+        best_trimmed = False
+        for hint in hint_candidates:
+            res = self.search_srrdb_progressive(hint)
+            trimmed = res.pop("query_trimmed", False)
+            if res.get("ok") and res.get("count") == 1:
+                res["method"] = ("name (simplified)" if trimmed else "name")
+                return res  # exact — done
+            if best is None and res.get("ok") and res.get("count", 0) > 0:
+                best, best_trimmed = res, trimmed
 
-        # Name found nothing — hash the content file for an exact CRC match
+        if best:
+            best["method"] = ("name (simplified)" if best_trimmed else "name")
+            return best
+
+        # Names found nothing — hash the content file for an exact CRC match
         hres = self.search_by_content_hash(folder)
         if hres.get("ok") and hres.get("count", 0) > 0:
             hres["method"] = f"content CRC32 ({hres.get('query', '')})"
             return hres
 
-        res["method"] = ("name (simplified)" if trimmed else "name")
-        return res
+        return {"ok": True, "count": 0, "results": [],
+                "query": hint_candidates[-1], "method": "name"}
 
     def get_release_details(self, release_name: str) -> dict:
         try:
