@@ -144,6 +144,14 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
       <div class="row">
         <input class="txt" id="prof-name" placeholder="Profile name (e.g. Redump PSX refresh)" style="max-width:280px"/>
         <button class="btn" onclick="saveProfile()">Save Current as Profile</button>
+        <span style="margin-left:auto;font-size:10px;opacity:.7">Sort</span>
+        <select class="sel" id="prof-sort" onchange="renderProfiles()">
+          <option value="date-desc">Newest first</option>
+          <option value="date-asc">Oldest first</option>
+          <option value="name-asc">Name A–Z</option>
+          <option value="name-desc">Name Z–A</option>
+          <option value="id-asc">Identifier A–Z</option>
+        </select>
       </div>
       <div id="prof-list" style="display:flex;flex-direction:column;gap:3px"></div>
     </div>
@@ -474,15 +482,34 @@ async function saveProfile() {
   else addLog('Profile save failed: ' + r.error, 'err');
 }
 
+let _profiles = [];
 async function loadProfiles() {
+  _profiles = await window.pywebview.api.profiles_list();
+  renderProfiles();
+}
+function sortedProfiles() {
+  const mode = (document.getElementById('prof-sort') || {}).value || 'date-desc';
+  const arr = [..._profiles];
+  const name = p => (p.name || '').toLowerCase();
+  const ident = p => ((p.fields || {}).identifier || '').toLowerCase();
+  const date = p => p.saved || '';
+  const cmp = {
+    'date-desc': (a, b) => date(b).localeCompare(date(a)),
+    'date-asc':  (a, b) => date(a).localeCompare(date(b)),
+    'name-asc':  (a, b) => name(a).localeCompare(name(b)),
+    'name-desc': (a, b) => name(b).localeCompare(name(a)),
+    'id-asc':    (a, b) => ident(a).localeCompare(ident(b)),
+  }[mode];
+  return arr.sort(cmp);
+}
+function renderProfiles() {
   const list = document.getElementById('prof-list');
-  const profiles = await window.pywebview.api.profiles_list();
   list.innerHTML = '';
-  if (!profiles.length) {
+  if (!_profiles.length) {
     list.innerHTML = '<div class="hint">No profiles saved yet.</div>';
     return;
   }
-  for (const p of profiles) {
+  for (const p of sortedProfiles()) {
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 8px;'
       + 'background:var(--bg0);border:1px solid var(--border);border-radius:4px;cursor:pointer';
