@@ -130,15 +130,26 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <span class="chevron" id="chev-bak">▾</span>
       </div>
       <div class="panel-body collapsed" id="body-bak">
-        <div class="hint">Copies the ENTIRE toolkit folder — including gitignored files (apps, credentials, settings, results DB) — to a timestamped folder at the destination. For local disaster recovery; git does not cover these files.</div>
+        <div class="hint">Quick mode backs up settings/credentials/results (.json, results CSV/XLSX, rclone.conf) into a rolling <b>tosort_quick_backup</b> folder. Full mode copies the ENTIRE toolkit (incl. apps/) into timestamped folders. All destinations are backed up in sequence. Settings persist; the auto timer runs while this window is open.</div>
         <div class="row">
-          <span class="lbl">Destination</span>
-          <input class="txt" id="bak-dest" placeholder="Backup destination folder" readonly/>
-          <button class="btn" onclick="browseBak()">Browse</button>
+          <span class="lbl">Mode</span>
+          <select class="sel" id="bak-mode" onchange="saveBakCfg()">
+            <option value="quick">Quick — settings &amp; data files only</option>
+            <option value="full">Full — entire toolkit folder</option>
+          </select>
+          <label style="margin-left:14px;font-size:11px;display:flex;align-items:center;gap:5px">
+            <input type="checkbox" id="bak-auto" onchange="saveBakCfg()"> Auto every
+          </label>
+          <input class="txt" id="bak-interval" type="number" min="0.25" step="0.25" value="6"
+                 style="max-width:60px" onchange="saveBakCfg()"/>
+          <span style="font-size:11px;opacity:.7">hours</span>
         </div>
-        <div class="row" style="justify-content:flex-end">
-          <button class="btn btn-go" id="btn-bak-go" onclick="runBackup()" disabled>Backup Now</button>
+        <div class="row">
+          <span class="lbl">Destinations</span>
+          <button class="btn" onclick="addBakDest()">+ Add Destination</button>
+          <button class="btn btn-go" id="btn-bak-go" onclick="runBackupNow()" style="margin-left:auto">Backup Now</button>
         </div>
+        <div id="bak-dests" style="display:flex;flex-direction:column;gap:3px"></div>
         <div class="log-w" id="bak-log"></div>
       </div>
     </div>
@@ -187,17 +198,59 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 <script>
 // ── Init ──────────────────────────────────────────────────────────────────────
 // ── Local Backup ──────────────────────────────────────────────────────────────
-async function browseBak() {
-  const path = await window.pywebview.api.browse_folder();
-  if (!path) return;
-  document.getElementById('bak-dest').value = path;
-  document.getElementById('btn-bak-go').disabled = false;
+let bakDests = [];
+
+function renderBakDests() {
+  const box = document.getElementById('bak-dests');
+  box.innerHTML = '';
+  if (!bakDests.length) {
+    box.innerHTML = '<div class="hint">No destinations yet — add at least one.</div>';
+    return;
+  }
+  bakDests.forEach((d, i) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 8px;'
+      + 'background:var(--bg0);border:1px solid var(--border);border-radius:4px;font-size:11px';
+    const span = document.createElement('span');
+    span.style.flex = '1';
+    span.textContent = d;
+    const del = document.createElement('button');
+    del.className = 'btn'; del.textContent = '✕';
+    del.onclick = () => { bakDests.splice(i, 1); renderBakDests(); saveBakCfg(); };
+    row.appendChild(span); row.appendChild(del);
+    box.appendChild(row);
+  });
 }
-async function runBackup() {
-  const dest = document.getElementById('bak-dest').value.trim();
-  if (!dest) return;
+
+async function addBakDest() {
+  const path = await window.pywebview.api.browse_folder();
+  if (!path || bakDests.includes(path)) return;
+  bakDests.push(path);
+  renderBakDests();
+  saveBakCfg();
+}
+
+async function saveBakCfg() {
+  await window.pywebview.api.backup_save_settings({
+    dests:      bakDests,
+    mode:       document.getElementById('bak-mode').value,
+    auto:       document.getElementById('bak-auto').checked,
+    interval_h: parseFloat(document.getElementById('bak-interval').value) || 6,
+  });
+}
+
+async function loadBakCfg() {
+  const s = await window.pywebview.api.backup_get_settings();
+  bakDests = s.dests || [];
+  document.getElementById('bak-mode').value        = s.mode || 'quick';
+  document.getElementById('bak-auto').checked      = !!s.auto;
+  document.getElementById('bak-interval').value    = s.interval_h || 6;
+  renderBakDests();
+}
+
+async function runBackupNow() {
   document.getElementById('bak-log').innerHTML = '';
-  const r = await window.pywebview.api.start_backup(dest);
+  const r = await window.pywebview.api.backup_now();
   if (r && !r.ok) addLog('bak-log', 'Error: ' + r.error, 'err');
 }
 
@@ -212,6 +265,7 @@ window.addEventListener('pywebviewready', () => {
       chev.style.transform = 'rotate(-90deg)';
     }
   }
+  loadBakCfg();
 });
 
 // ── Panel collapse ────────────────────────────────────────────────────────────

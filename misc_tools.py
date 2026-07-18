@@ -24,6 +24,8 @@ class MiscToolsAPI:
         self._window    = None
         self._stop_flag = threading.Event()
         self._running   = False
+        # Auto-backup timer resumes whenever the Misc Tools window is open
+        threading.Thread(target=self._auto_backup_loop, daemon=True).start()
 
     def set_window(self, w):
         self._window = w
@@ -255,65 +257,137 @@ class MiscToolsAPI:
         return ''
 
     # ── Local Backup ──────────────────────────────────────────────────────────
+    # Two modes: "full" (entire toolkit incl. apps/) into timestamped folders,
+    # "quick" (json settings/credentials/results + rclone.conf) into a rolling
+    # tosort_quick_backup folder. Multiple destinations, backed up in sequence.
+    # Settings persist in misc_tools.json; the auto timer resumes on start.
 
-    def start_backup(self, dest: str) -> dict:
-        """Copy the ENTIRE toolkit folder (including gitignored files: apps,
-        credentials, settings, results DB) to a timestamped folder at dest."""
-        dest = (dest or "").strip()
-        if not dest:
-            return {"ok": False, "error": "No destination set"}
-        src = Path(__file__).parent
-        dst_root = Path(dest)
+    _CFG_PATH = Path(__file__).parent / "misc_tools.json"
+
+    def _load_cfg(self) -> dict:
         try:
-            dst_root.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            return {"ok": False, "error": f"Cannot create destination: {e}"}
-        # Never back up into ourselves
+            return json.loads(self._CFG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_cfg(self, cfg: dict):
         try:
-            if src in [dst_root, *dst_root.parents]:
-                return {"ok": False, "error":
-                        "Destination is inside the toolkit folder — choose elsewhere"}
+            self._CFG_PATH.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         except Exception:
             pass
+
+    def backup_get_settings(self) -> dict:
+        b = self._load_cfg().get("backup", {})
+        return {
+            "dests":      b.get("dests", []),
+            "mode":       b.get("mode", "quick"),
+            "auto":       bool(b.get("auto", False)),
+            "interval_h": float(b.get("interval_h", 6)),
+        }
+
+    def backup_save_settings(self, settings: dict) -> dict:
+        cfg = self._load_cfg()
+        cfg["backup"] = {
+            "dests":      [d for d in (settings.get("dests") or []) if d.strip()],
+            "mode":       settings.get("mode", "quick"),
+            "auto":       bool(settings.get("auto", False)),
+            "interval_h": max(0.25, float(settings.get("interval_h", 6) or 6)),
+        }
+        self._save_cfg(cfg)
+        return {"ok": True}
+
+    def _quick_files(self, src: Path) -> list:
+        files = sorted(src.glob("*.json"))
+        for extra in ("srrdb_results.csv", "srrdb_results.xlsx"):
+            p = src / extra
+            if p.exists():
+                files.append(p)
+        rconf = src / "rclone" / "rclone.conf"
+        if rconf.exists():
+            files.append(rconf)
+        return files
+
+    def backup_now(self) -> dict:
+        """Run a backup with the SAVED settings (all destinations, in sequence)."""
+        s = self.backup_get_settings()
+        if not s["dests"]:
+            return {"ok": False, "error": "No destinations configured"}
         if self._running:
             return {"ok": False, "error": "Another operation is running"}
-        target = dst_root / f"tosort_toolkit_backup_{__import__('time').strftime('%Y%m%d-%H%M')}"
-        threading.Thread(target=self._backup_thread, args=(src, target),
-                         daemon=True).start()
-        return {"ok": True, "target": str(target)}
+        threading.Thread(target=self._backup_thread,
+                         args=(s["dests"], s["mode"], False), daemon=True).start()
+        return {"ok": True}
 
-    def _backup_thread(self, src: Path, target: Path):
+    def _backup_thread(self, dests: list, mode: str, auto: bool):
         self._running = True
         L = lambda m, c="info": self._log(m, c, "bak")
-        L(f"Backing up {src} → {target}", "info")
-        files = 0
-        total = 0
-        errors = 0
+        src = Path(__file__).parent
+        tag = "AUTO " if auto else ""
+        import time as _t
         try:
-            for f in src.rglob("*"):
-                if not f.is_file():
-                    continue
-                rel = f.relative_to(src)
-                if "__pycache__" in rel.parts:
-                    continue
-                out = target / rel
+            if mode == "quick":
+                files = self._quick_files(src)
+                L(f"{tag}Quick backup — {len(files)} settings/data file(s) "
+                  f"→ {len(dests)} destination(s)", "info")
+            else:
+                files = [f for f in src.rglob("*")
+                         if f.is_file() and "__pycache__" not in
+                         f.relative_to(src).parts]
+                L(f"{tag}Full backup — {len(files)} file(s) "
+                  f"→ {len(dests)} destination(s)", "info")
+
+            for dest in dests:
+                dst_root = Path(dest)
                 try:
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(f), str(out))
-                    files += 1
-                    total += f.stat().st_size
-                    if files % 250 == 0:
-                        L(f"  {files} files, {total:,} B…", "dim")
+                    if src in [dst_root, *dst_root.parents]:
+                        L(f"  SKIP {dest} — inside the toolkit folder", "err")
+                        continue
+                    dst_root.mkdir(parents=True, exist_ok=True)
                 except Exception as e:
-                    errors += 1
-                    L(f"  ERROR: {rel}: {e}", "err")
-            L(f"Backup complete — {files} file(s), {total:,} B"
-              + (f", {errors} error(s)" if errors else ""),
-              "ok" if not errors else "warn")
+                    L(f"  SKIP {dest} — {e}", "err")
+                    continue
+                if mode == "quick":
+                    target = dst_root / "tosort_quick_backup"   # rolling latest
+                else:
+                    target = dst_root / ("tosort_toolkit_backup_"
+                                         + _t.strftime("%Y%m%d-%H%M"))
+                copied = errors = 0
+                total = 0
+                for f in files:
+                    rel = f.relative_to(src)
+                    out = target / rel
+                    try:
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(f), str(out))
+                        copied += 1
+                        total += f.stat().st_size
+                        if copied % 250 == 0:
+                            L(f"  {dest}: {copied} files…", "dim")
+                    except Exception as e:
+                        errors += 1
+                        L(f"  ERROR: {rel}: {e}", "err")
+                L(f"  ✓ {target} — {copied} file(s), {total:,} B"
+                  + (f", {errors} error(s)" if errors else ""),
+                  "ok" if not errors else "warn")
+            L(f"{tag}Backup run complete.", "ok")
         except Exception as e:
             L(f"Backup FAILED: {e}", "err")
         finally:
             self._running = False
+
+    def _auto_backup_loop(self):
+        """Runs for the lifetime of the Misc Tools window. Sleeps the configured
+        interval, then performs a backup with the saved settings if enabled."""
+        import time as _t
+        while True:
+            s = self.backup_get_settings()
+            if not (s["auto"] and s["dests"]):
+                _t.sleep(30)
+                continue
+            _t.sleep(max(900, s["interval_h"] * 3600))
+            s = self.backup_get_settings()   # re-read: user may have toggled
+            if s["auto"] and s["dests"] and not self._running:
+                self._backup_thread(s["dests"], s["mode"], True)
 
     # ── RAR Inspector ─────────────────────────────────────────────────────────
 

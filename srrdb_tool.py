@@ -927,6 +927,24 @@ class SrrdbToolAPI:
                 rm.RarExecutable.full = _full_ma4
                 SrrdbToolAPI._ma4_patched = True
 
+            # Known-good version cache: put the group's previously detected
+            # RAR version(s) at the FRONT of rescene's candidate order.
+            # str(RarExecutable) == "YYYY-MM-DD MAJ.MIN", the same string we
+            # capture from "Good RAR version detected" events.
+            if not getattr(SrrdbToolAPI, "_verpref_patched", False):
+                _orig_get = rm.RarRepository.get_rar_executables
+                def _get_pref(repo_self, date, _orig=_orig_get):
+                    order = list(_orig(repo_self, date))
+                    prefs = getattr(SrrdbToolAPI, "_pref_versions", None) or []
+                    if prefs:
+                        front = [r for r in order if str(r) in prefs]
+                        front.sort(key=lambda r: prefs.index(str(r)))
+                        rest = [r for r in order if str(r) not in prefs]
+                        order = front + rest
+                    return order
+                rm.RarRepository.get_rar_executables = _get_pref
+                SrrdbToolAPI._verpref_patched = True
+
             # Stream rescene's internal events (version testing, rar.exe errors,
             # CRC results) to the GUI — essential visibility for compressed
             # rebuilds, which report almost nothing on stdout.
@@ -1438,23 +1456,49 @@ class SrrdbToolAPI:
         except Exception:
             return []
 
+    def _parse_meta(self, release: str, queue_path: str) -> tuple:
+        """(group, platform, year) derived from a release name + source folder."""
+        tokens = set(re.split(r"[._\-]+", (release or "").upper()))
+        group = ""
+        m = re.match(r"^.+-([A-Za-z0-9_]{2,15})$", release or "")
+        if m:
+            group = m.group(1)
+        platform = next((p for p in self._PLATFORMS if p in tokens), "")
+        if not platform and tokens & self._VIDEO_TOKENS:
+            platform = "video"
+        year = ""
+        if queue_path:
+            ym = re.match(r"^(\d{4})[-._]\d{2}[-._]\d{2}", Path(queue_path).name)
+            if ym:
+                year = ym.group(1)
+        return group, platform, year
+
+    def _preferred_rar_versions(self, release: str, queue_path: str) -> list:
+        """Known-good RAR versions from past successes of the SAME group —
+        same year first, then the group's other years. rescene will try these
+        before its date-ordered sweep, so a group's second release matches in
+        one attempt instead of scanning the whole pack."""
+        try:
+            group, _, year = self._parse_meta(release, queue_path)
+            if not group:
+                return []
+            prefs: list = []
+            results = self._load_results()
+            for want_year in (True, False):
+                for r in results:
+                    if (r.get("ok") and r.get("rar_version")
+                            and r.get("group") == group
+                            and (not want_year or r.get("year") == year)
+                            and r["rar_version"] not in prefs):
+                        prefs.append(r["rar_version"])
+            return prefs[:4]
+        except Exception:
+            return []
+
     def _record_result(self, summary: dict, queue_path: str):
         try:
             release = summary.get("release") or ""
-            tokens = set(re.split(r"[._\-]+", release.upper()))
-            group = ""
-            m = re.match(r"^.+-([A-Za-z0-9_]{2,15})$", release)
-            if m:
-                group = m.group(1)
-            platform = next((p for p in self._PLATFORMS if p in tokens), "")
-            if not platform and tokens & self._VIDEO_TOKENS:
-                platform = "video"
-            year = ""
-            if queue_path:
-                ym = re.match(r"^(\d{4})[-._]\d{2}[-._]\d{2}",
-                              Path(queue_path).name)
-                if ym:
-                    year = ym.group(1)
+            group, platform, year = self._parse_meta(release, queue_path)
             rec = {
                 "ts":          time.strftime("%Y-%m-%d %H:%M"),
                 "release":     release,
@@ -1761,7 +1805,17 @@ class SrrdbToolAPI:
                     self._log(f"    … and {len(citems) - 12} more", "dim")
 
                 self._log("  Reconstructing RARs…", "dim")
-                rc = self._srr_reconstruct(str(srr_file), content_dir, str(out_root))
+                prefs = self._preferred_rar_versions(release, queue_path)
+                SrrdbToolAPI._pref_versions = prefs
+                if prefs:
+                    self._log(
+                        f"  Known-good RAR cache: trying {', '.join(prefs)} "
+                        "first (this group's history)", "info",
+                    )
+                try:
+                    rc = self._srr_reconstruct(str(srr_file), content_dir, str(out_root))
+                finally:
+                    SrrdbToolAPI._pref_versions = []
                 for line in (rc.get("output") or "").splitlines():
                     line = line.strip()
                     if line:
