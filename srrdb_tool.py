@@ -881,6 +881,21 @@ class SrrdbToolAPI:
         try:
             import rescene.main as rm  # type: ignore
 
+            # rescene keeps module-level globals across reconstruct() calls.
+            # A solid multi-file compressed release leaves entries in
+            # archived_files pointing at its (now-deleted) temp dir, which
+            # poisons EVERY following release in a batch with a stale-path
+            # crash. Reset them before each reconstruction.
+            try:
+                if isinstance(getattr(rm, "archived_files", None), dict):
+                    rm.archived_files.clear()
+                else:
+                    rm.archived_files = {}
+                rm.temp_dir = None
+                rm.working_temp_dir = None
+            except Exception:
+                pass
+
             # RAR 5.x+ binaries create RAR5-format archives by default, which
             # rescene cannot read back — but with -ma4 they produce RAR4 output
             # and become valid candidates for post-2013 releases (scene groups
