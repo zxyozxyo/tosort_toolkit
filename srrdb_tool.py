@@ -834,6 +834,80 @@ class SrrdbToolAPI:
                     sets[current]["packed"].append(fname)
         return sets
 
+    def _fresh_rescene(self):
+        """Import a pristine rescene.main (purging any cached copy) and apply our
+        patches. Called once per reconstruction so no module-level global state
+        (archived_files, temp dirs, repository, event subscribers) can leak from
+        one release into the next during a long batch."""
+        for name in [n for n in list(sys.modules)
+                     if n == "rescene" or n.startswith("rescene.")]:
+            del sys.modules[name]
+        import rescene.main as rm  # type: ignore
+
+        # --- -ma4 + dictionary-switch injection for RAR 5.x/6.x binaries ---
+        _orig_popen = rm.custom_popen
+        _r5plus = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$",
+                             re.IGNORECASE)
+        _MD_LETTERS = {"a": "64", "b": "128", "c": "256", "d": "512",
+                       "e": "1024", "f": "2048", "g": "4096"}
+        def _fix_md(arg):
+            m = re.match(r"^-md([a-gA-G]|\d+)$", arg)
+            if not m:
+                return arg
+            v = m.group(1)
+            return f"-md{_MD_LETTERS.get(v.lower(), v)}k"
+        def _inject(cmd):
+            if (len(cmd) >= 3 and str(cmd[1]).lower() == "a"
+                    and _r5plus.search(str(cmd[0])) and "-ma4" not in cmd):
+                return [cmd[0], cmd[1], "-ma4"] + [_fix_md(str(a)) for a in cmd[2:]]
+            return cmd
+        def _popen_ma4(cmd, *a, **kw):
+            try:
+                cmd = _inject(cmd)
+            except Exception:
+                pass
+            return _orig_popen(cmd, *a, **kw)
+        rm.custom_popen = _popen_ma4
+        _orig_full = rm.RarExecutable.full
+        def _full_ma4(rar_self):
+            try:
+                return _inject(_orig_full(rar_self))
+            except Exception:
+                return _orig_full(rar_self)
+        rm.RarExecutable.full = _full_ma4
+
+        # --- known-good version cache fronts the candidate order ---
+        _orig_get = rm.RarRepository.get_rar_executables
+        def _get_pref(repo_self, date, _orig=_orig_get):
+            order = list(_orig(repo_self, date))
+            prefs = getattr(SrrdbToolAPI, "_pref_versions", None) or []
+            if prefs:
+                front = [r for r in order if str(r) in prefs]
+                front.sort(key=lambda r: prefs.index(str(r)))
+                order = front + [r for r in order if str(r) not in prefs]
+            return order
+        rm.RarRepository.get_rar_executables = _get_pref
+
+        # --- stream rescene's internal events to the GUI log ---
+        _noisy = {rm.MsgCode.BLOCK, rm.MsgCode.RBLOCK, rm.MsgCode.FBLOCK,
+                  rm.MsgCode.STORING}
+        def _on_rescene_event(e, _self=self, _noisy=_noisy):
+            try:
+                msg = str(getattr(e, "message", "") or "").strip()
+                if not msg or getattr(e, "code", None) in _noisy:
+                    return
+                if "Cannot create a file when that file already exists" in msg:
+                    return
+                if msg.startswith("Good RAR version detected"):
+                    _self._last_good_rar = msg.split(":", 1)[-1].strip()
+                if len(msg) > 300:
+                    msg = msg[:300] + " …[truncated]"
+                _self._log(f"    rescene: {msg}", "dim")
+            except Exception:
+                pass
+        rm.subscribe(_on_rescene_event)
+        return rm
+
     def _srr_reconstruct(self, srr_path: str, content_dir: str, out_dir: str,
                          log_rar_pack: bool = True) -> dict:
         """Reconstruct RARs using the rescene Python API.
@@ -879,114 +953,11 @@ class SrrdbToolAPI:
 
         buf = io.StringIO()
         try:
-            import rescene.main as rm  # type: ignore
-
-            # rescene keeps module-level globals across reconstruct() calls.
-            # A solid multi-file compressed release leaves entries in
-            # archived_files pointing at its (now-deleted) temp dir, which
-            # poisons EVERY following release in a batch with a stale-path
-            # crash. Reset them before each reconstruction.
-            try:
-                if isinstance(getattr(rm, "archived_files", None), dict):
-                    rm.archived_files.clear()
-                else:
-                    rm.archived_files = {}
-                rm.temp_dir = None
-                rm.working_temp_dir = None
-            except Exception:
-                pass
-
-            # RAR 5.x+ binaries create RAR5-format archives by default, which
-            # rescene cannot read back — but with -ma4 they produce RAR4 output
-            # and become valid candidates for post-2013 releases (scene groups
-            # kept using RAR4 format with modern WinRAR versions). rescene
-            # predates RAR5, so inject the switch into its rar.exe invocations.
-            if not getattr(SrrdbToolAPI, "_ma4_patched", False):
-                _orig_popen = rm.custom_popen
-                _r5plus = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$",
-                                     re.IGNORECASE)
-                # RAR 5+ redefined the -md switch: RAR4-era letters (-mdA..G)
-                # and bare KB numbers are invalid — bare numbers now mean MB.
-                # Translate to explicit KB so 5.x+ builds the same dictionary.
-                _MD_LETTERS = {"a": "64", "b": "128", "c": "256", "d": "512",
-                               "e": "1024", "f": "2048", "g": "4096"}
-                def _fix_md(arg):
-                    m = re.match(r"^-md([a-gA-G]|\d+)$", arg)
-                    if not m:
-                        return arg
-                    v = m.group(1)
-                    kb = _MD_LETTERS.get(v.lower(), v)
-                    return f"-md{kb}k"
-                def _inject(cmd):
-                    if (len(cmd) >= 3 and str(cmd[1]).lower() == "a"
-                            and _r5plus.search(str(cmd[0]))
-                            and "-ma4" not in cmd):
-                        rest = [_fix_md(str(a)) for a in cmd[2:]]
-                        return [cmd[0], cmd[1], "-ma4"] + rest
-                    return cmd
-                def _popen_ma4(cmd, *a, **kw):
-                    try:
-                        cmd = _inject(cmd)
-                    except Exception:
-                        pass
-                    return _orig_popen(cmd, *a, **kw)
-                rm.custom_popen = _popen_ma4
-                # The final full-file compression calls subprocess.Popen with
-                # RarExecutable.full() directly — patch that path as well.
-                _orig_full = rm.RarExecutable.full
-                def _full_ma4(rar_self):
-                    try:
-                        return _inject(_orig_full(rar_self))
-                    except Exception:
-                        return _orig_full(rar_self)
-                rm.RarExecutable.full = _full_ma4
-                SrrdbToolAPI._ma4_patched = True
-
-            # Known-good version cache: put the group's previously detected
-            # RAR version(s) at the FRONT of rescene's candidate order.
-            # str(RarExecutable) == "YYYY-MM-DD MAJ.MIN", the same string we
-            # capture from "Good RAR version detected" events.
-            if not getattr(SrrdbToolAPI, "_verpref_patched", False):
-                _orig_get = rm.RarRepository.get_rar_executables
-                def _get_pref(repo_self, date, _orig=_orig_get):
-                    order = list(_orig(repo_self, date))
-                    prefs = getattr(SrrdbToolAPI, "_pref_versions", None) or []
-                    if prefs:
-                        front = [r for r in order if str(r) in prefs]
-                        front.sort(key=lambda r: prefs.index(str(r)))
-                        rest = [r for r in order if str(r) not in prefs]
-                        order = front + rest
-                    return order
-                rm.RarRepository.get_rar_executables = _get_pref
-                SrrdbToolAPI._verpref_patched = True
-
-            # Stream rescene's internal events (version testing, rar.exe errors,
-            # CRC results) to the GUI — essential visibility for compressed
-            # rebuilds, which report almost nothing on stdout.
-            if not getattr(SrrdbToolAPI, "_rescene_subscribed", False):
-                _noisy = {rm.MsgCode.BLOCK, rm.MsgCode.RBLOCK, rm.MsgCode.FBLOCK,
-                          rm.MsgCode.STORING}
-                def _on_rescene_event(e, _self=self, _noisy=_noisy):
-                    try:
-                        msg = str(getattr(e, "message", "") or "").strip()
-                        if not msg or getattr(e, "code", None) in _noisy:
-                            return
-                        # mkdir collision on re-runs inside rescene's extract —
-                        # harmless, the file is still written
-                        if "Cannot create a file when that file already exists" in msg:
-                            return
-                        # Capture the detected version for the results database
-                        if msg.startswith("Good RAR version detected"):
-                            _self._last_good_rar = msg.split(":", 1)[-1].strip()
-                        # rescene sometimes dumps full rar command lines with a
-                        # source file repeated dozens of times — cap the noise
-                        if len(msg) > 300:
-                            msg = msg[:300] + " …[truncated]"
-                        _self._log(f"    rescene: {msg}", "dim")
-                    except Exception:
-                        pass
-                rm.subscribe(_on_rescene_event)
-                SrrdbToolAPI._rescene_subscribed = True
+            # Fresh rescene instance per release — rescene stores working state
+            # in module-level globals (archived_files, temp dirs, repository)
+            # that otherwise persist across reconstruct() calls and poison every
+            # following release in a batch. Reloading guarantees a clean slate.
+            rm = self._fresh_rescene()
 
             # Work out which RAR sets have their source content available
             try:
