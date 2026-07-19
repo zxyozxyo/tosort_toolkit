@@ -116,6 +116,14 @@ def _normalize_name(name: str) -> str:
     return name.strip(".")
 
 
+def _canon_release(s: str) -> str:
+    """Canonical form for exact release-name comparison: unify dots/underscores/
+    spaces, lowercase — but KEEP the group hyphen. Lets a folder named with
+    underscores match the same release stored with dots on srrdb, while still
+    telling siblings apart (Pac_World_2 ≠ Pac_World)."""
+    return re.sub(r"[._\s]+", ".", s or "").strip(".").lower()
+
+
 def _find_script(base_name: str) -> str | None:
     """Find srr.py / srs.py in the current Python's Scripts directory."""
     scripts_dir = Path(sys.executable).parent / "Scripts"
@@ -501,15 +509,28 @@ class SrrdbToolAPI:
             candidates.append(m.group(1))
         candidates.append(q)
 
+        # When multiple results come back, an EXACT name match to the query is
+        # the answer — collapse to it so a sibling release (Pac_World vs
+        # Pac_World_2, ...NFOFIX vs base) doesn't make an easy hit "ambiguous".
+        def _collapse_exact(res: dict, attempt: str) -> dict:
+            want = _canon_release(attempt)
+            exact = [r for r in res.get("results", [])
+                     if _canon_release(r.get("release", "")) == want]
+            if len(exact) == 1 and res.get("count", 0) > 1:
+                return {**res, "count": 1, "results": exact}
+            return res
+
         # Try with underscores variant inline
         def _try(attempt: str) -> dict | None:
             res = self._do_search(attempt)
             if res.get("ok") and res["count"] > 0:
+                res = _collapse_exact(res, attempt)
                 res["query"] = attempt
                 return res
             if "." in attempt:
                 res2 = self._do_search(attempt.replace(".", "_"))
                 if res2.get("ok") and res2["count"] > 0:
+                    res2 = _collapse_exact(res2, attempt)
                     res2["query"] = attempt.replace(".", "_")
                     return res2
             return None
