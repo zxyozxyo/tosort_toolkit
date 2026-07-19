@@ -1845,6 +1845,22 @@ class SrrdbToolAPI:
                     self._log(f"  Reconstruct ERROR: {rc.get('error', 'unknown')}", "err")
                     summary["ok"] = False
                     summary["note"] = (rc.get("error") or "reconstruct error")[:100]
+                    # A version WAS detected (it reproduced the first stored file)
+                    # but the full solid archive still failed — this is the
+                    # solid-stream + thread-count determinism wall, not a
+                    # missing version.
+                    if getattr(self, "_last_good_rar", None) and \
+                            "exhausted" in (rc.get("error") or "").lower():
+                        self._log(
+                            f"  Note: RAR {self._last_good_rar} reproduced the first "
+                            "small file, but the full SOLID archive's main file could "
+                            "not be matched — the original's thread count / advanced "
+                            "compression settings can't be reproduced. Not a "
+                            "missing-version issue.", "warn",
+                        )
+                        summary["note"] = (
+                            f"solid archive unrebuildable (matched {self._last_good_rar} "
+                            "on first file only)")
 
                 # Nested SRRs (e.g. Subs/xxx.subs.srr) describe extra RAR sets
                 # such as vobsubs — sometimes two levels deep (per-CD inner RARs
