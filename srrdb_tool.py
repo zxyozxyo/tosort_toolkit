@@ -2227,6 +2227,99 @@ class SrrdbToolAPI:
 
     # ── Batch processing ──────────────────────────────────────────────────────
 
+    def prefetch_srrs(self, jobs: list) -> bool:
+        """Resolve every queued release and download its SRR to the cache path
+        NOW — so the later Process run needs no srrdb access at all (rebuilding
+        is 100% local). Lets you run the whole network phase in one short VPN
+        window, then rebuild offline. Ambiguous releases are pinned by exact
+        content CRC (one API call), never by downloading all candidates."""
+        if self._running:
+            self._log("Already running.", "warn")
+            return False
+        self._stop.clear()
+        threading.Thread(target=self._prefetch_thread, args=(jobs,), daemon=True).start()
+        return True
+
+    def _prefetch_thread(self, jobs: list):
+        self._running = True
+        self._emit("status", {"state": "running"})
+        self._log(f"Prefetching SRRs for {len(jobs)} release(s) — keep VPN on "
+                  "until this finishes…", "info")
+        ready = failed = 0
+        for i, job in enumerate(jobs):
+            if self._stop.is_set():
+                break
+            path = (job.get("content_dir") or "").strip()
+            dest_dir = (job.get("dest_dir") or "").strip()
+            release = (job.get("release_name") or "").strip()
+            candidates = job.get("candidates", [])
+            max_test = int(job.get("max_test", 5))
+            name = Path(path).name if path else "?"
+            self._emit("batch_progress", {"current": i + 1, "total": len(jobs)})
+
+            # Resolve to a single release name (network-dependent) --------------
+            content_dir = path
+            try:
+                if content_dir and Path(content_dir).is_dir():
+                    children = list(Path(content_dir).iterdir())
+                    if (children and len(children) == 1 and children[0].is_dir()):
+                        content_dir = str(children[0])
+            except Exception:
+                pass
+
+            resolved = release
+            if not resolved and content_dir and Path(content_dir).is_dir():
+                # exact content CRC first — one call, name-independent
+                hres = self.search_by_content_hash(content_dir)
+                if hres.get("ok") and hres.get("results"):
+                    resolved = hres["results"][0]["release"]
+                    self._log(f"  [{i+1}] {name}: CRC → {resolved}", "dim")
+                elif candidates:
+                    best = self.find_best_match(candidates, content_dir, max_test)
+                    if best.get("release") and best.get("score", 0) >= 0.5:
+                        resolved = best["release"]
+                        self._log(f"  [{i+1}] {name}: matched → {resolved} "
+                                  f"({best['score']:.0%})", "dim")
+
+            if not resolved:
+                self._log(f"  [{i+1}] {name}: could not resolve — skipped", "warn")
+                self._emit("prefetch_done", {"content_dir": path, "ok": False})
+                failed += 1
+                continue
+
+            # Download the SRR to the exact path Process expects ---------------
+            if not dest_dir:
+                self._log(f"  [{i+1}] {resolved}: no output folder set", "err")
+                self._emit("prefetch_done", {"content_dir": path, "ok": False})
+                failed += 1
+                continue
+            out_root = Path(dest_dir) / resolved
+            existing = list(out_root.glob("*.srr"))
+            if existing:
+                self._log(f"  [{i+1}] {resolved}: SRR already cached", "dim")
+                self._emit("prefetch_done", {"content_dir": path, "release": resolved,
+                                             "ok": True})
+                ready += 1
+                continue
+            dl = self.download_srr(resolved, str(out_root))
+            if dl.get("ok"):
+                self._log(f"  [{i+1}] {resolved}: SRR downloaded "
+                          f"({dl.get('size', 0):,} B) ✓", "ok")
+                self._emit("prefetch_done", {"content_dir": path, "release": resolved,
+                                             "ok": True})
+                ready += 1
+            else:
+                self._log(f"  [{i+1}] {resolved}: SRR download failed — "
+                          f"{dl.get('error', '?')}", "err")
+                self._emit("prefetch_done", {"content_dir": path, "ok": False})
+                failed += 1
+
+        self._log(f"Prefetch complete — {ready} ready, {failed} unresolved. "
+                  "You can DISABLE the VPN now; Process rebuilds entirely offline.",
+                  "ok" if not failed else "warn")
+        self._running = False
+        self._emit("status", {"state": "done"})
+
     def start_batch(self, jobs: list) -> bool:
         if self._running:
             self._log("Already running.", "warn")

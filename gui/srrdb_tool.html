@@ -247,6 +247,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="dot" style="background:var(--warn)"></div>
           Release Queue
           <button class="btn btn-sm" style="margin-left:auto" onclick="autoSearchAll()">Auto-Search All</button>
+          <button class="btn btn-sm" onclick="prefetchAll()" title="Download all SRRs now (VPN on), then rebuild offline">Prefetch SRRs</button>
           <button class="btn btn-sm" onclick="rescanSource()">Rescan</button>
           <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
         </div>
@@ -361,6 +362,20 @@ window.srrEvent = function(event, data) {
     if (job) {
       job.status = data.ok ? 'done' : (data.stopped ? 'skipped' : 'error');
       if (data.ok && data.release) job.release = data.release;
+      renderQueue();
+    }
+  } else if (event === 'prefetch_done') {
+    // Pin the resolved release + clear candidates so Process uses the cached
+    // SRR and needs no network at all.
+    const job = batchJobs.find(j => j.path === data.content_dir);
+    if (job) {
+      if (data.ok && data.release) {
+        job.release    = data.release;
+        job.candidates = [];
+        job.status     = 'ready';
+      } else {
+        job.status = 'error';
+      }
       renderQueue();
     }
   } else if (event === 'batch_progress') {
@@ -562,7 +577,7 @@ function renderQueue() {
   const body = document.getElementById('queue-body');
   body.innerHTML = '';
   batchJobs.forEach((job, i) => {
-    const cls = {pending:'qs-pending',running:'qs-running',done:'qs-done',error:'qs-error',skipped:'qs-skipped'}[job.status] || 'qs-pending';
+    const cls = {pending:'qs-pending',running:'qs-running',done:'qs-done',error:'qs-error',skipped:'qs-skipped',ready:'qs-done'}[job.status] || 'qs-pending';
     const row = document.createElement('div');
     row.className = 'queue-row';
     row.innerHTML = `
@@ -615,6 +630,26 @@ async function autoSearchAll() {
 function clearQueue() {
   batchJobs = [];
   renderQueue();
+}
+
+async function prefetchAll() {
+  const dest = document.getElementById('dest-dir').value.trim();
+  if (!dest) { log('Set an output folder first.', 'warn'); return; }
+  if (!batchJobs.length) { log('Scan a source folder first.', 'warn'); return; }
+  const maxTest = parseInt(document.getElementById('max-test').value) || 5;
+  const jobs = batchJobs
+    .filter(j => j.status !== 'done')
+    .map(j => ({
+      release_name: j.release,
+      candidates:   j.candidates,
+      content_dir:  j.path,
+      dest_dir:     dest,
+      max_test:     maxTest,
+    }));
+  if (!jobs.length) { log('Nothing to prefetch.', 'dim'); return; }
+  clearLog();
+  log(`Prefetching ${jobs.length} SRR(s) — keep the VPN ON until this finishes.`, 'info');
+  await window.pywebview.api.prefetch_srrs(jobs);
 }
 
 // ── Process ───────────────────────────────────────────────────────────────────
