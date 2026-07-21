@@ -1030,6 +1030,11 @@ class SrrdbToolAPI:
                 return err + " — use Setup RAR versions button then retry"
             if "no good rar" in err.lower():
                 return err + " — exact WinRAR version not in pack; try adding more versions"
+            if "still not fine" in err.lower():
+                return ("near-miss: the right WinRAR version was found but the "
+                        "recompressed size is a few bytes off — the original was "
+                        "packed with a different thread count (-mt) than pyReScene "
+                        "can reproduce for a single-file archive. Not rebuildable.")
             return err
 
         buf = io.StringIO()
