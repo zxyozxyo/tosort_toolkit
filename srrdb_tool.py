@@ -106,6 +106,10 @@ MEDIA_EXTS = {
 # Metadata files placed in the output folder before/besides reconstruction
 META_EXTS = {".srr", ".nfo", ".sfv", ".nzb", ".jpg", ".jpeg", ".png", ".diz", ".txt"}
 
+# Max wall-clock time for a single release's reconstruction before it is
+# aborted so the batch can continue. Generous — only fires on a genuine stall.
+_RECON_TIMEOUT_S = 1800  # 30 minutes
+
 
 def _normalize_name(name: str) -> str:
     """Convert folder/file names to scene dot-notation for better srrdb search."""
@@ -144,6 +148,8 @@ class SrrdbToolAPI:
         self._app_dir = Path(__file__).parent / "apps"
         self._srr_script = None
         self._srs_script = None
+        self._live_procs = []      # rar.exe subprocesses of the current rebuild
+        self._recon_deadline = 0   # wall-clock abort time for current rebuild
 
     def set_window(self, w):
         self._window = w
@@ -883,11 +889,23 @@ class SrrdbToolAPI:
                 return [cmd[0], cmd[1], "-ma4"] + [_fix_md(str(a)) for a in cmd[2:]]
             return cmd
         def _popen_ma4(cmd, *a, **kw):
+            # Hard deadline: a stuck release (e.g. rescene spiralling on an
+            # incompressible embedded jpg) must never hang the whole batch.
+            # Once past the deadline, refuse new rar.exe spawns so reconstruct
+            # exhausts and returns; the heartbeat also kills the running one.
+            deadline = getattr(self, "_recon_deadline", 0)
+            if deadline and time.time() > deadline:
+                raise RuntimeError("reconstruction deadline exceeded")
             try:
                 cmd = _inject(cmd)
             except Exception:
                 pass
-            return _orig_popen(cmd, *a, **kw)
+            proc = _orig_popen(cmd, *a, **kw)
+            try:
+                self._live_procs.append(proc)
+            except Exception:
+                pass
+            return proc
         rm.custom_popen = _popen_ma4
         _orig_full = rm.RarExecutable.full
         def _full_ma4(rar_self):
@@ -898,11 +916,15 @@ class SrrdbToolAPI:
         rm.RarExecutable.full = _full_ma4
 
         # --- known-good version cache fronts the candidate order ---
+        # Only for the FIRST file's version hunt (archived_files empty). Once
+        # rescene has found a good version it puts that first itself for the
+        # remaining files — overriding that with our prefs can promote slow
+        # RAR5 binaries into per-file hunts (e.g. on an embedded jpg).
         _orig_get = rm.RarRepository.get_rar_executables
-        def _get_pref(repo_self, date, _orig=_orig_get):
+        def _get_pref(repo_self, date, _orig=_orig_get, _rm=rm):
             order = list(_orig(repo_self, date))
             prefs = getattr(SrrdbToolAPI, "_pref_versions", None) or []
-            if prefs:
+            if prefs and not getattr(_rm, "archived_files", None):
                 front = [r for r in order if str(r) in prefs]
                 front.sort(key=lambda r: prefs.index(str(r)))
                 order = front + [r for r in order if str(r) not in prefs]
@@ -951,13 +973,33 @@ class SrrdbToolAPI:
             else:
                 self._log("  No rar_X.YY.exe found — use Setup RAR versions button if release is compressed", "dim")
 
-        # Heartbeat so large files don't look frozen
+        # Per-release wall-clock deadline: legit game compression can take many
+        # minutes, but a truly stuck release (rescene spiralling on an
+        # incompressible embedded jpg) must not hang the batch forever. Generous
+        # so it only ever fires on a genuine stall.
+        self._live_procs = []
+        self._recon_deadline = time.time() + _RECON_TIMEOUT_S
+
+        # Heartbeat so large files don't look frozen; also enforces the deadline
         done_flag = threading.Event()
         def _hb():
             secs = 0
+            killed = False
             while not done_flag.wait(30):
                 secs += 30
                 self._log(f"  Still reconstructing… ({secs}s)", "dim")
+                if not killed and time.time() > self._recon_deadline:
+                    killed = True
+                    self._log(
+                        f"  ⏱ Exceeded {_RECON_TIMEOUT_S // 60} min — aborting this "
+                        "release (likely a stuck/incompressible file). Batch continues.",
+                        "err",
+                    )
+                    for p in list(self._live_procs):
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
         threading.Thread(target=_hb, daemon=True).start()
 
         def _explain(err: str) -> str:
@@ -1083,6 +1125,8 @@ class SrrdbToolAPI:
             return {"ok": False, "files": [], "output": buf.getvalue(), "error": _explain(str(e))}
         finally:
             done_flag.set()
+            self._recon_deadline = 0
+            self._live_procs = []
 
     def _reconstruct_nested(self, nsrr: Path, content_dir: str, out_root: Path,
                             stored_dir: Path) -> dict:
