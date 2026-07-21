@@ -103,6 +103,13 @@ MEDIA_EXTS = {
     ".iso", ".img", ".bin", ".cue", ".nrg", ".vob", ".ts", ".m2ts",
 }
 
+# Largest-file candidates for content-CRC lookup — media plus ROM/disc images
+# (3DS/NDS/Switch/GC/Wii etc.), so name-independent CRC search resolves games.
+CONTENT_HASH_EXTS = MEDIA_EXTS | {
+    ".3ds", ".cia", ".cci", ".nds", ".cxi", ".nsp", ".xci", ".rvz",
+    ".wbfs", ".gcm", ".gcz", ".cso", ".wud", ".wux", ".nsz", ".xcz",
+}
+
 # Metadata files placed in the output folder before/besides reconstruction
 META_EXTS = {".srr", ".nfo", ".sfv", ".nzb", ".jpg", ".jpeg", ".png", ".diz", ".txt"}
 
@@ -621,7 +628,7 @@ class SrrdbToolAPI:
         base = Path(folder)
         media = sorted(
             (f for f in base.rglob("*")
-             if f.is_file() and f.suffix.lower() in MEDIA_EXTS),
+             if f.is_file() and f.suffix.lower() in CONTENT_HASH_EXTS),
             key=lambda f: f.stat().st_size, reverse=True,
         )
         if not media:
@@ -655,41 +662,52 @@ class SrrdbToolAPI:
             + sorted(p for sub in base.iterdir() if sub.is_dir()
                      for p in list(sub.glob("*.nfo")) + list(sub.glob("*.NFO")))
         )
-        # Try every available name hint and prefer an exact single hit.
-        # NFO stems are often short group tags (contrast-madden.nfo) whose
-        # trimmed variants match dozens of unrelated releases — the folder
-        # name usually carries the true release name.
-        hint_candidates: list[str] = []
-        if nfo_paths:
+        # The FOLDER name is the true release name; NFO/SFV stems are often
+        # group codenames (hr-prrl, contrast-madden) that srrdb FUZZY-matches to
+        # unrelated releases (e.g. hr-prrl → a vinyl album with cat# PRRLP001).
+        # So: try the folder name first, and only ACCEPT a result that is an
+        # EXACT name match to the hint or folder — a fuzzy single hit is never
+        # trusted over CRC.
+        folder_canon = _canon_release(_normalize_name(base.name))
+        hint_candidates: list[str] = [base.name]
+        if nfo_paths and nfo_paths[0].stem not in hint_candidates:
             hint_candidates.append(nfo_paths[0].stem)
         if sfv_paths and sfv_paths[0].stem not in hint_candidates:
             hint_candidates.append(sfv_paths[0].stem)
-        if base.name not in hint_candidates:
-            hint_candidates.append(base.name)
 
         best: dict | None = None
         best_trimmed = False
         for hint in hint_candidates:
             res = self.search_srrdb_progressive(hint)
             trimmed = res.pop("query_trimmed", False)
-            if res.get("ok") and res.get("count") == 1:
-                res["method"] = ("name (simplified)" if trimmed else "name")
-                return res  # exact — done
-            if best is None and res.get("ok") and res.get("count", 0) > 0:
+            if not (res.get("ok") and res.get("count", 0) > 0):
+                continue
+            hint_canon = _canon_release(_normalize_name(hint))
+            exact = next(
+                (r for r in res["results"]
+                 if _canon_release(r.get("release", "")) in (hint_canon, folder_canon)),
+                None,
+            )
+            if exact:
+                return {"ok": True, "count": 1, "results": [exact],
+                        "query": res.get("query", hint),
+                        "method": ("name (simplified)" if trimmed else "name")}
+            if best is None:
                 best, best_trimmed = res, trimmed
 
-        if best:
-            best["method"] = ("name (simplified)" if best_trimmed else "name")
-            return best
-
-        # Names found nothing — hash the content file for an exact CRC match
+        # No EXACT name match — an exact content CRC beats any fuzzy name guess
         hres = self.search_by_content_hash(folder)
         if hres.get("ok") and hres.get("count", 0) > 0:
             hres["method"] = f"content CRC32 ({hres.get('query', '')})"
             return hres
 
+        # Last resort: a fuzzy name hit — flag it so it isn't blindly trusted
+        if best:
+            best["method"] = "name (fuzzy — verify)"
+            return best
+
         return {"ok": True, "count": 0, "results": [],
-                "query": hint_candidates[-1], "method": "name"}
+                "query": hint_candidates[0], "method": "name"}
 
     def get_release_details(self, release_name: str) -> dict:
         try:

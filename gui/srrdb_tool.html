@@ -600,8 +600,9 @@ async function autoSearchAll() {
     if (!job.release) continue;
     // Try CRC-first (from SFV) then fall back to name
     const res = await window.pywebview.api.search_from_folder(job.path);
-    if (res.ok && res.results.length === 1) {
-      // Only auto-select when there is exactly one match
+    const fuzzy = (res.method || '').includes('fuzzy');
+    if (res.ok && res.results.length === 1 && !fuzzy) {
+      // Only auto-select an EXACT single match (never a fuzzy guess)
       const r = res.results[0];
       job.release = r.release;
       job.hasNFO  = r.hasNFO;
@@ -609,13 +610,15 @@ async function autoSearchAll() {
       const via = res.by_crc ? 'CRC' : (res.method || 'name');
       log(`  ✓ [${via}] ${job.name} → ${r.release}`, 'dim');
       matched++;
-    } else if (res.ok && res.results.length > 1) {
-      // Store ALL candidates — backend will score them at process time
+    } else if (res.ok && (res.results.length > 1 || fuzzy)) {
+      // Store candidates — backend scores them against content at process time
       job.candidates = res.results;
-      job.release    = '';   // clear so process knows to auto-match
+      job.release    = '';   // clear so process knows to auto-match / CRC
       job.hasNFO     = false;
       job.hasSRS     = false;
-      log(`  ? ${job.name} — ${res.results.length} candidates stored for auto-match`, 'warn');
+      const note = fuzzy ? 'only a fuzzy name guess — will verify by content CRC'
+                         : `${res.results.length} candidates stored for auto-match`;
+      log(`  ? ${job.name} — ${note}`, 'warn');
       ambiguous++;
     } else {
       log(`  ✗ ${job.name} — not found on srrdb.com`, 'err');
