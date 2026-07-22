@@ -103,6 +103,11 @@ _UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 HEADERS = {"User-Agent": _UA, "Accept": "application/json, */*"}
+# srrdb's download host sits behind Anubis, which serves a proof-of-work HTML
+# challenge to *browser-like* (Mozilla) User-Agents — so our normal UA gets a
+# wall instead of the file. A non-browser UA is passed straight through (Anubis
+# assumes only scrapers fake a browser). Used for direct file/add downloads.
+DL_HEADERS = {"User-Agent": "srrdb_tool/1.0 (+https://www.srrdb.com)"}
 
 MEDIA_EXTS = {
     ".avi", ".mkv", ".mp4", ".m4v", ".mov", ".wmv",
@@ -863,7 +868,9 @@ class SrrdbToolAPI:
         url = SRRDB_DL_ADD.format(release=quote(release), id=add_id,
                                   name=quote(filename))
         try:
-            req = Request(url, headers={**HEADERS, "Referer": "https://www.srrdb.com/"})
+            # Non-browser UA to bypass the Anubis challenge (see DL_HEADERS).
+            req = Request(url, headers={**DL_HEADERS,
+                                        "Referer": "https://www.srrdb.com/"})
             with urlopen(req, timeout=120) as r:
                 data = r.read()
         except HTTPError as e:
