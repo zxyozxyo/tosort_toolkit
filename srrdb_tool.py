@@ -19,6 +19,7 @@ import time
 import tempfile
 import threading
 import subprocess
+import zlib
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
@@ -91,6 +92,11 @@ import webview
 
 SRRDB_API    = "https://api.srrdb.com/v1"
 SRRDB_DL_SRR = "https://www.srrdb.com/download/srr/{}"
+# srrdb "adds" (extra files uploaded for a release — proof jpgs etc., sometimes
+# still unconfirmed). Some are packed INSIDE the rars but not stored in the SRR,
+# so they're needed as rebuild sources. Served by add-id, not the /download/file
+# path used for SRR-stored files.
+SRRDB_DL_ADD = "https://www.srrdb.com/download/temp/{release}/{id}/{name}"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -827,6 +833,59 @@ class SrrdbToolAPI:
         tried = " / ".join(names_to_try)
         return {"ok": False, "error": f"Release not found on srrdb.com (tried: {tried})"}
 
+    def _srrdb_details(self, release_name: str):
+        """Fetch a release's metadata from the srrdb JSON API (api.srrdb.com —
+        NOT behind the download host's bot-wall). Returns the parsed dict with a
+        '_resolved_name' key, or None. Retries dots/underscores like download."""
+        names = [release_name]
+        alt = (release_name.replace(".", "_") if "." in release_name
+               else release_name.replace("_", "."))
+        if alt != release_name:
+            names.append(alt)
+        for name in names:
+            try:
+                req = Request(f"{SRRDB_API}/details/{quote(name)}",
+                              headers={**HEADERS, "Referer": "https://www.srrdb.com/"})
+                with urlopen(req, timeout=30) as r:
+                    data = json.loads(r.read().decode("utf-8", "replace"))
+                if isinstance(data, dict) and (data.get("archived-files") or data.get("adds")):
+                    data["_resolved_name"] = name
+                    return data
+            except Exception:
+                continue
+        return None
+
+    def _download_add(self, release: str, add_id, filename: str,
+                      dest_path: Path, expect_crc=None) -> dict:
+        """Download one srrdb 'add' by id, verify its CRC32 against the API
+        value, and write it to dest_path. Rejects HTML bot-wall responses so a
+        blocked download never masquerades as a source file."""
+        url = SRRDB_DL_ADD.format(release=quote(release), id=add_id,
+                                  name=quote(filename))
+        try:
+            req = Request(url, headers={**HEADERS, "Referer": "https://www.srrdb.com/"})
+            with urlopen(req, timeout=120) as r:
+                data = r.read()
+        except HTTPError as e:
+            return {"ok": False, "error": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        head = data[:256].lstrip().lower()
+        if not data or head.startswith(b"<!doctype") or head.startswith(b"<html"):
+            return {"ok": False, "error": "srrdb returned an HTML page "
+                    "(bot-wall / VPN off / not downloadable)"}
+        if expect_crc:
+            got = "%08X" % (zlib.crc32(data) & 0xffffffff)
+            if got.upper() != str(expect_crc).upper():
+                return {"ok": False,
+                        "error": f"CRC mismatch (got {got}, expected {expect_crc})"}
+        try:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(data)
+        except Exception as e:
+            return {"ok": False, "error": f"write failed: {e}"}
+        return {"ok": True, "size": len(data)}
+
     # ── rescene operations ────────────────────────────────────────────────────
 
     def _srr_extract(self, srr_path: str, out_dir: str) -> dict:
@@ -1123,6 +1182,49 @@ class SrrdbToolAPI:
                         + ", ".join(sorted(Path(k).name for k in hints)), "dim",
                     )
 
+            # Extras packed INSIDE the rars but NOT stored in the SRR (srrdb
+            # "adds" — e.g. an unconfirmed proof jpg) are still needed as rebuild
+            # SOURCES. Fetch them from srrdb by add-id, CRC-verify, and drop into
+            # _stored so they behave exactly like SRR-stored sources. Cached on
+            # disk → a re-run needs no network. First run needs network; if the
+            # VPN is off / bot-wall blocks it, it's skipped cleanly with a warning
+            # and reconstruction proceeds (and fails as before) — never worse.
+            if rar_sets:
+                still_missing = []
+                for info in rar_sets.values():
+                    for p in info["packed"]:
+                        nm = Path(p).name.lower()
+                        if nm not in content_names and p not in hints:
+                            still_missing.append((p, nm))
+                if still_missing:
+                    release_nm = Path(srr_path).stem
+                    details = self._srrdb_details(release_nm)
+                    adds = {a["name"].lower(): a
+                            for a in (details or {}).get("adds", [])
+                            if a.get("name") and a.get("id")}
+                    fetched = []
+                    for p, nm in still_missing:
+                        a = adds.get(nm)
+                        if not a:
+                            continue
+                        dest = stored_pool / Path(p).name
+                        if dest.is_file():
+                            hints[p] = str(dest); fetched.append(Path(p).name); continue
+                        self._log("  Missing source not in SRR — trying srrdb "
+                                  f"adds: {Path(p).name}…", "dim")
+                        res = self._download_add(
+                            details.get("_resolved_name", release_nm),
+                            a["id"], a["name"], dest, a.get("crc"))
+                        if res["ok"]:
+                            hints[p] = str(dest); fetched.append(Path(p).name)
+                            self._log(f"    ✓ fetched {Path(p).name} "
+                                      f"({res['size']:,} B, CRC verified)", "ok")
+                        else:
+                            self._log(f"    ✗ {Path(p).name}: {res['error']}", "warn")
+                    if fetched:
+                        self._log("  Using srrdb add(s) as sources: "
+                                  + ", ".join(sorted(fetched)), "dim")
+
             skip_parts: list[str] = []
             run_parts:  list[str] = []
             if len(rar_sets) > 1:
@@ -1365,6 +1467,55 @@ class SrrdbToolAPI:
             while chunk := f.read(1 << 20):
                 crc = zlib.crc32(chunk, crc)
         return crc & 0xFFFFFFFF
+
+    _VERIFY_SKIP_DIRS = {"_stored", "_subs_tmp", "_iso_m2ts_tmp", "Sample"}
+
+    def _verify_rebuilt_sfv(self, out_root: Path) -> dict:
+        """CRC32-check the produced RAR volumes against every SFV under out_root.
+
+        rescene returning "ok" does NOT guarantee each volume is byte-exact — a
+        near-miss on a trailing compressed stream can still leave a bad last
+        volume. This is the only honest success test, and the guard that must
+        pass before delete-source is allowed to run.
+
+        Returns {sfv_count, checked, bad:[(name,exp,got)], missing:[name]}."""
+        sfvs, seen = [], set()
+        for pat in ("*.sfv", "*.SFV"):
+            for p in out_root.rglob(pat):
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp); sfvs.append(p)
+
+        # name -> produced file (skip our own working dirs and metadata)
+        index: dict = {}
+        for f in out_root.rglob("*"):
+            if not f.is_file():
+                continue
+            if self._VERIFY_SKIP_DIRS & set(f.relative_to(out_root).parts[:-1]):
+                continue
+            index.setdefault(f.name.lower(), f)
+
+        checked, bad, missing, entry_seen = 0, [], [], set()
+        for s in sfvs:
+            # An SFV lists volumes relative to its own folder; match by basename.
+            for name, exp in self._parse_sfv(str(s)):
+                key = name.lower()
+                if key in entry_seen:
+                    continue
+                entry_seen.add(key)
+                exp = exp.upper().zfill(8)
+                # don't try to CRC-verify the SFV/NFO themselves
+                if key.endswith((".sfv", ".nfo")):
+                    continue
+                f = index.get(key)
+                if f is None:
+                    missing.append(name); continue
+                got = "%08X" % self._crc32_file(str(f))
+                checked += 1
+                if got != exp:
+                    bad.append((name, exp, got))
+        return {"sfv_count": len(sfvs), "checked": checked,
+                "bad": bad, "missing": missing}
 
     def _srs_create_sample(self, srs_path: str, video_path: str, out_dir: str) -> dict:
         """Create scene sample from SRS file + full video.
@@ -2053,6 +2204,39 @@ class SrrdbToolAPI:
                             f"  Nested SRR {nsrr.name} skipped — {nested_errors[nsrr]}",
                             "warn",
                         )
+
+                # Verify produced volumes against the SFV before trusting the
+                # rebuild — and, crucially, before delete-source can run.
+                # rescene's "ok" does NOT guarantee byte-exact volumes: a
+                # near-miss on a trailing compressed stream leaves a bad last
+                # volume that must be caught here, reported FAILED, and the
+                # source kept.
+                if summary.get("ok") and (summary.get("rars") or 0) > 0:
+                    vres = self._verify_rebuilt_sfv(out_root)
+                    summary["verified"] = vres
+                    if vres["bad"]:
+                        summary["ok"] = False
+                        bad_ex = vres["bad"][0]
+                        summary["note"] = ("SFV mismatch: "
+                            + ", ".join(n for n, _, _ in vres["bad"][:4]))
+                        self._log(
+                            f"  ✗ SFV verify FAILED — {len(vres['bad'])} volume(s) "
+                            f"wrong (e.g. {bad_ex[0]}: got {bad_ex[2]}, expected "
+                            f"{bad_ex[1]}). Near-miss, NOT a rebuild — marked FAILED, "
+                            "source kept.", "err",
+                        )
+                    elif vres["missing"]:
+                        self._log(
+                            f"  ⚠ SFV verify: {vres['checked']} volume(s) CRC-OK, but "
+                            f"{len(vres['missing'])} SFV-listed file(s) not produced "
+                            f"(e.g. {vres['missing'][0]}) — rebuild incomplete.", "warn",
+                        )
+                    elif vres["checked"]:
+                        self._log(f"  ✓ SFV verify: all {vres['checked']} volume(s) "
+                                  "CRC-match the SFV.", "ok")
+                    else:
+                        self._log("  ⚠ SFV verify: no SFV found to check against — "
+                                  "cannot confirm the rebuild.", "warn")
             else:
                 self._log("  No content folder — NFO/SFV extracted only", "dim")
                 summary["note"] = "no content folder — NFO/SFV only"
@@ -2318,9 +2502,15 @@ class SrrdbToolAPI:
                         self._log(f"  ⚠ Subs NOT produced (rename failed: {e})", "warn")
 
             # 7 — Optionally delete the SOURCE folder (old jpg/nfo included).
-            # Only after a fully successful rebuild that produced RAR volumes —
-            # the content then lives inside the CRC-verified archives.
+            # ONLY after the produced volumes have been CRC-verified against the
+            # SFV with zero bad and zero missing — the content then genuinely
+            # lives inside byte-exact archives. A near-miss (bad last volume) or
+            # an incomplete rebuild keeps the source, so a false "success" can
+            # never delete the only copy of the source.
+            _v = summary.get("verified") or {}
+            fully_verified = bool(_v.get("checked")) and not _v.get("bad") and not _v.get("missing")
             if (delete_source and summary["ok"] and (summary.get("rars") or 0) > 0
+                    and fully_verified
                     and queue_path and Path(queue_path).is_dir()):
                 try:
                     qp = Path(queue_path).resolve()
@@ -2337,6 +2527,10 @@ class SrrdbToolAPI:
                                   "warn")
                 except Exception as e:
                     self._log(f"  Source delete failed: {e}", "err")
+            elif (delete_source and (summary.get("rars") or 0) > 0
+                    and not fully_verified):
+                self._log("  Source delete SKIPPED — rebuild not fully "
+                          "CRC-verified against the SFV; keeping the source.", "warn")
 
             if summary["ok"]:
                 self._log(f"  ✓ Done → {out_root}", "ok")
