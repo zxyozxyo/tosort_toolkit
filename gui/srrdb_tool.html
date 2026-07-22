@@ -230,7 +230,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <button class="btn btn-sm" id="btn-setup-rar" onclick="doSetupRar()" title="Extract rar_X.YY.exe from each WinRAR installer in apps/winrar_pack-4.20/">Setup RAR versions</button>
           </div>
           <div class="row" style="justify-content:flex-end;gap:6px;margin-top:2px">
-            <button class="btn btn-stop" id="btn-stop" onclick="doStop()" style="display:none">Stop</button>
+            <button class="btn btn-stop" id="btn-skip" onclick="doStop('current')" style="display:none" title="Abort the release being rebuilt right now and move on to the next queued file — the batch keeps going">Skip file</button>
+            <button class="btn btn-stop" id="btn-stop" onclick="doStop('all')" style="display:none" title="Abort the current release AND halt the whole batch/queue">Stop all</button>
             <button class="btn btn-go" id="btn-go" onclick="doProcess()">Process</button>
           </div>
         </div>
@@ -343,11 +344,13 @@ window.srrEvent = function(event, data) {
     const pill = document.getElementById('status-pill');
     const go   = document.getElementById('btn-go');
     const stop = document.getElementById('btn-stop');
+    const skip = document.getElementById('btn-skip');
     pill.className = 'pill ' + (data.state === 'running' ? 'running' : data.state === 'done' ? 'done' : '');
     pill.textContent = data.state;
     const running = data.state === 'running';
     go.style.display   = running ? 'none' : '';
     stop.style.display = running ? '' : 'none';
+    skip.style.display = running ? '' : 'none';
   } else if (event === 'job_start') {
     // Match by folder path — release names can change during auto-match
     const job = batchJobs.find(j => j.path === data.content_dir);
@@ -704,8 +707,8 @@ async function doProcess() {
   }
 }
 
-async function doStop() {
-  await window.pywebview.api.stop_process();
+async function doStop(scope) {
+  await window.pywebview.api.stop_process(scope || 'all');
 }
 
 // ── RAR version setup ─────────────────────────────────────────────────────────

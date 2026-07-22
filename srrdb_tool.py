@@ -150,7 +150,8 @@ def _find_script(base_name: str) -> str | None:
 class SrrdbToolAPI:
     def __init__(self):
         self._window  = None
-        self._stop    = threading.Event()
+        self._stop    = threading.Event()   # hard stop: abort release + halt batch
+        self._skip    = threading.Event()   # soft skip: abort release, keep batch going
         self._running = False
         self._app_dir = Path(__file__).parent / "apps"
         self._srr_script = None
@@ -907,6 +908,13 @@ class SrrdbToolAPI:
                 return [cmd[0], cmd[1], "-ma4"] + [_fix_md(str(a)) for a in cmd[2:]]
             return cmd
         def _popen_ma4(cmd, *a, **kw):
+            # User stop/skip: refuse new rar.exe spawns immediately so an
+            # in-flight reconstruction unwinds and returns at once instead of
+            # churning to the next version. stop_process() also kills the
+            # running rar.exe, so the current compress dies and this blocks the
+            # follow-up spawn — the reconstruction aborts within a second.
+            if self._stop.is_set() or self._skip.is_set():
+                raise RuntimeError("stopped by user")
             # Hard deadline: a stuck release (e.g. rescene spiralling on an
             # incompressible embedded jpg) must never hang the whole batch.
             # Once past the deadline, refuse new rar.exe spawns so reconstruct
@@ -941,6 +949,22 @@ class SrrdbToolAPI:
         _orig_get = rm.RarRepository.get_rar_executables
         def _get_pref(repo_self, date, _orig=_orig_get, _rm=rm):
             order = list(_orig(repo_self, date))
+            # Fast-fail the embedded-jpg wall: once a version reproduced the
+            # first stream of THIS set, every other stream in the same set was
+            # produced by the same single WinRAR invocation — and the whole set
+            # is reassembled with one version — so only that version can ever
+            # reproduce a later stream. If it can't, no pack version will (it's
+            # the thread-count/settings wall, not a missing version). Restrict
+            # the hunt to it so rescene rejects in seconds instead of churning
+            # all 84 versions. Set-scoped: _set_good_rar is cleared per
+            # reconstruct() call, so it never leaks across RAR sets that may
+            # legitimately use different versions, and it's only ever set AFTER
+            # a genuine match — so it can't hurt a rebuild that would succeed.
+            good = getattr(self, "_set_good_rar", None)
+            if good:
+                only = [r for r in order if str(r) == good]
+                if only:
+                    return only
             prefs = getattr(SrrdbToolAPI, "_pref_versions", None) or []
             if prefs and not getattr(_rm, "archived_files", None):
                 front = [r for r in order if str(r) in prefs]
@@ -948,6 +972,25 @@ class SrrdbToolAPI:
                 order = front + [r for r in order if str(r) not in prefs]
             return order
         rm.RarRepository.get_rar_executables = _get_pref
+
+        # --- skip the 1 GB "test with previous file" fallback on non-solid sets ---
+        # When a stream's direct match fails, rescene retries by PREPENDING the
+        # previous stream and recompressing (main.py:2411-2429) — here the 1 GB
+        # .3ds, per thread-count try. In a NON-SOLID archive there is no
+        # cross-file dictionary, so the prepend produces byte-identical output
+        # for the target file: it can never turn a fail into a success, it just
+        # burns minutes. Neutralise it, but ONLY once a version is locked for the
+        # set AND every detected stream is provably non-solid (positive .solid
+        # check; if any object lacks the flag we leave it untouched). Solid sets,
+        # which genuinely need the prepend, are never affected.
+        _orig_sefb = rm.RarArguments.set_extra_files_before
+        def _sefb(args_self, file_list, _orig=_orig_sefb, _rm=rm):
+            if getattr(self, "_set_good_rar", None):
+                vals = list((getattr(_rm, "archived_files", None) or {}).values())
+                if vals and all(hasattr(v, "solid") and not v.solid for v in vals):
+                    return _orig(args_self, [])  # drop the prepend
+            return _orig(args_self, file_list)
+        rm.RarArguments.set_extra_files_before = _sefb
 
         # --- stream rescene's internal events to the GUI log ---
         _noisy = {rm.MsgCode.BLOCK, rm.MsgCode.RBLOCK, rm.MsgCode.FBLOCK,
@@ -960,7 +1003,11 @@ class SrrdbToolAPI:
                 if "Cannot create a file when that file already exists" in msg:
                     return
                 if msg.startswith("Good RAR version detected"):
-                    _self._last_good_rar = msg.split(":", 1)[-1].strip()
+                    ver = msg.split(":", 1)[-1].strip()
+                    _self._last_good_rar = ver
+                    # Lock this version for the rest of the CURRENT set so the
+                    # next compressed stream's hunt can fast-fail (see _get_pref).
+                    _self._set_good_rar = ver
                 if len(msg) > 300:
                     msg = msg[:300] + " …[truncated]"
                 _self._log(f"    rescene: {msg}", "dim")
@@ -981,6 +1028,8 @@ class SrrdbToolAPI:
         from contextlib import redirect_stdout, redirect_stderr
 
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+        # Cleared per RAR set below; drives the per-set fast-fail in _get_pref.
+        self._set_good_rar = None
 
         rar_dir = self._find_rar_dir()
         if log_rar_pack:
@@ -1118,6 +1167,10 @@ class SrrdbToolAPI:
                 kwargs = dict(base_kwargs)
                 if part is not None:
                     kwargs["srr_part"] = f"{part}.*"
+                # New set = new WinRAR invocation, possibly a different version.
+                # Reset so the fast-fail never carries one set's version into
+                # another (rescene's archived_files persists across these calls).
+                self._set_good_rar = None
                 try:
                     with redirect_stdout(buf), redirect_stderr(buf):
                         result = rm.reconstruct(**kwargs)
@@ -1719,11 +1772,30 @@ class SrrdbToolAPI:
             self._log("Already running.", "warn")
             return False
         self._stop.clear()
+        self._skip.clear()
         threading.Thread(target=self._process_one, args=(config,), daemon=True).start()
         return True
 
-    def stop_process(self):
-        self._stop.set()
+    def stop_process(self, scope: str = "all"):
+        """Interrupt the running work.
+
+        scope="current": abort the release being rebuilt right now and move on
+            to the next queued file — the batch keeps going.
+        scope="all": abort the current release AND halt the whole batch/queue.
+
+        Either way, kill any in-flight rar.exe immediately so a long compress
+        stops within a second instead of at the next inter-file checkpoint."""
+        for p in list(self._live_procs):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        if scope == "current":
+            self._skip.set()
+            self._log("  ⏭ Skipping current release — moving to the next file…", "warn")
+        else:
+            self._stop.set()
+            self._log("  ⏹ Stopping — aborting current release and halting the batch…", "warn")
 
     def _process_one(self, config: dict, batch_mode: bool = False):
         if not batch_mode:
@@ -1840,7 +1912,7 @@ class SrrdbToolAPI:
                 srr_file = Path(dl["srr_path"])  # use actual saved path (may be alt name)
                 self._log(f"  SRR downloaded ({dl['size']:,} B)", "ok")
 
-            if self._stop.is_set(): raise InterruptedError()
+            if self._stop.is_set() or self._skip.is_set(): raise InterruptedError()
 
             # 2 — Extract stored files (NFO, SFV, SRS)
             self._log("  Extracting stored files (NFO, SFV, SRS)…", "dim")
@@ -1857,7 +1929,7 @@ class SrrdbToolAPI:
             else:
                 self._log(f"  Extract WARN: {ex['error']}", "warn")
 
-            if self._stop.is_set(): raise InterruptedError()
+            if self._stop.is_set() or self._skip.is_set(): raise InterruptedError()
 
             # 3 — Reconstruct RARs
             self._log("  SRR info:", "dim")
@@ -1985,7 +2057,7 @@ class SrrdbToolAPI:
                 self._log("  No content folder — NFO/SFV extracted only", "dim")
                 summary["note"] = "no content folder — NFO/SFV only"
 
-            if self._stop.is_set(): raise InterruptedError()
+            if self._stop.is_set() or self._skip.is_set(): raise InterruptedError()
 
             # 4 — Sample creation
             if do_sample and content_dir and Path(content_dir).is_dir():
@@ -2275,8 +2347,15 @@ class SrrdbToolAPI:
 
         except (ValueError, RuntimeError) as e:
             summary["ok"] = False
-            summary["note"] = summary["note"] or str(e) or "failed"
-            self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
+            if self._stop.is_set() or self._skip.is_set():
+                # rar.exe was killed / spawns refused by a user stop or skip.
+                self._log("  ⏹ Release aborted by user.", "warn")
+                summary["note"] = "stopped"
+                self._emit("job_done", {"release": release, "content_dir": queue_path,
+                                        "ok": False, "stopped": True})
+            else:
+                summary["note"] = summary["note"] or str(e) or "failed"
+                self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         except InterruptedError:
             self._log("  Stopped.", "warn")
             summary["ok"] = False
@@ -2288,6 +2367,10 @@ class SrrdbToolAPI:
             summary["note"] = str(e)[:100]
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
+            # A skip only aborts THIS release — clear it so the next queued job
+            # runs normally. (_stop stays set on a hard stop: the batch loop
+            # checks it and halts.)
+            self._skip.clear()
             # Failed jobs leave no folder behind: remove the output release dir
             # when the job failed AND it holds nothing substantial — extras,
             # the cached SRR and stub RAR headers only (every non-metadata file
@@ -2341,6 +2424,7 @@ class SrrdbToolAPI:
             self._log("Already running.", "warn")
             return False
         self._stop.clear()
+        self._skip.clear()
         threading.Thread(target=self._prefetch_thread, args=(jobs,), daemon=True).start()
         return True
 
@@ -2429,6 +2513,7 @@ class SrrdbToolAPI:
             self._log("Already running.", "warn")
             return False
         self._stop.clear()
+        self._skip.clear()
         threading.Thread(target=self._batch_thread, args=(jobs,), daemon=True).start()
         return True
 
