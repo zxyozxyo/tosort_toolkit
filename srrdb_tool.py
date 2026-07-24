@@ -1259,6 +1259,24 @@ class SrrdbToolAPI:
             cur = crf_self.good_rar.args.thread_count()
         except Exception:
             cur = 1
+        # A version that predates -mt (added in RAR 3.60, 2006) IGNORES the
+        # thread switch, so every "retry at another -mt" recompresses the file
+        # identically — pure churn that can never succeed. Fail fast: this
+        # near-miss is from some other setting we can't vary, not a thread count.
+        supports_mt = True
+        try:
+            supports_mt = bool(crf_self.good_rar.supports_setting_threads())
+        except Exception:
+            pass
+        if not supports_mt:
+            self._log(
+                "    rescene: locked version predates -mt (RAR <3.60) — a "
+                "thread-count sweep can't vary anything, so this near-miss is "
+                "from another setting. Not rebuildable.", "warn")
+            if base is not None:
+                del streams[base:]
+                streams.extend(orig_records)
+            raise ValueError("Still not fine :(.")
         self._log(
             f"    rescene: near-miss at -mt{cur} — retrying other thread "
             f"counts (up to -mt{_MT_RETRY_CAP}) before giving up…", "dim")
