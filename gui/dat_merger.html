@@ -102,6 +102,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     <div class="tab" onclick="switchTab('create')">DAT Creator</div>
     <div class="tab" onclick="switchTab('rebuild')">Rebuilder</div>
     <div class="tab" onclick="switchTab('size')">Size Calc</div>
+    <div class="tab" onclick="switchTab('stripmia')">Strip MIA</div>
   </div>
 
   <div class="content">
@@ -204,6 +205,28 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="file-list" id="size-list"><div class="file-empty">Add DATs to calculate total ROM sizes</div></div>
           <div class="row"><label>Save report to</label><input class="path-input" id="size-txt" placeholder="Optional: path for .txt report (leave blank for log only)"/><button class="browse-btn" onclick="browseSave('size-txt','size_report.txt')">Browse&hellip;</button></div>
           <div class="hint">Reads ROM sizes from DAT entries and totals them. Useful for estimating storage needs per set.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: STRIP MIA ═══ -->
+    <div class="tab-body" id="tab-stripmia">
+      <div class="panel">
+        <div class="panel-hdr"><div class="dot" style="background:var(--danger)"></div>Strip MIA &mdash; remove missing entries from fixDATs</div>
+        <div class="panel-body">
+          <div class="hint" style="margin-bottom:8px">Removes every &lt;game&gt; that contains a &lt;rom mia=&quot;yes&quot;&gt; from RomVault fixDAT files, leaving a still-usable DAT. Point at a single .dat file or a folder (parsed recursively for every .dat inside).</div>
+          <div class="row"><label>Input</label><input class="path-input" id="stripmia-input" placeholder="A single .dat file, or a folder of .dat files"/><button class="browse-btn" onclick="browseSingle('stripmia-input')">File&hellip;</button><button class="browse-btn" onclick="browseFolder('stripmia-input')">Folder&hellip;</button></div>
+          <div class="divider" style="margin:10px 0"></div>
+          <div style="font-size:11px;color:var(--text);font-weight:600;margin-bottom:6px">Output</div>
+          <label class="opt"><input type="radio" name="stripmia-out" value="inplace" checked> Overwrite the DAT(s) in place</label>
+          <label class="opt"><input type="radio" name="stripmia-out" value="suffix"> Save a cleaned copy alongside, with a suffix</label>
+          <div class="row" style="margin-top:4px"><label>Suffix</label><input class="path-input" id="stripmia-suffix" value="_noMIA" placeholder="e.g. _noMIA"/></div>
+          <label class="opt"><input type="radio" name="stripmia-out" value="dir"> Write cleaned DAT(s) to a separate folder</label>
+          <div class="row" style="margin-top:4px"><label>Output folder</label><input class="path-input" id="stripmia-dir" placeholder="Destination folder for cleaned DATs"/><button class="browse-btn" onclick="browseFolder('stripmia-dir')">Browse&hellip;</button></div>
+          <div class="divider" style="margin:10px 0"></div>
+          <label class="opt"><input type="checkbox" id="stripmia-dry"> Dry run &mdash; report what would be removed, write nothing</label>
+          <label class="opt"><input type="checkbox" id="stripmia-verbose"> Verbose &mdash; list every file, even ones with no MIA entries</label>
+          <div class="hint">In-place overwrites the originals &mdash; use a suffix or a separate folder to keep them.</div>
         </div>
       </div>
     </div>
@@ -347,7 +370,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 let activeTab = 'merge';
 function switchTab(name) {
   activeTab = name;
-  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', ['merge','diff','smart','ext','intdedupe','integrity','create','rebuild','size'][i] === name));
+  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', ['merge','diff','smart','ext','intdedupe','integrity','create','rebuild','size','stripmia'][i] === name));
   document.querySelectorAll('.tab-body').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
 }
@@ -555,6 +578,15 @@ function runActive() {
     api.run_size_calc({
       files: getList('size-list'),
       output_txt: document.getElementById('size-txt').value.trim(),
+    });
+  } else if (activeTab === 'stripmia') {
+    api.run_strip_mia({
+      input: document.getElementById('stripmia-input').value.trim(),
+      output_mode: document.querySelector('input[name="stripmia-out"]:checked').value,
+      suffix: document.getElementById('stripmia-suffix').value.trim(),
+      output_dir: document.getElementById('stripmia-dir').value.trim(),
+      dry_run: document.getElementById('stripmia-dry').checked,
+      verbose: document.getElementById('stripmia-verbose').checked,
     });
   }
 }

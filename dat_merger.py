@@ -402,6 +402,53 @@ def write_clrmamepro_dat(filepath: Path, header: DatHeader, entries: list):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# MIA STRIPPER — remove <game> entries containing <rom mia="yes"> from
+# RomVault fixDAT (Logiqx XML) files, leaving a usable DAT. Ported from the
+# standalone fixdat_strip_mia.py.
+# ═══════════════════════════════════════════════════════════════════════
+
+def _game_has_mia_rom(game_elem) -> bool:
+    """True if any <rom> child of a <game> has mia="yes" (case-insensitive)."""
+    for rom in game_elem.findall("rom"):
+        if rom.get("mia", "").strip().lower() == "yes":
+            return True
+    return False
+
+
+def strip_mia_from_tree(tree) -> tuple:
+    """Remove MIA <game> entries from an ElementTree in place.
+    Returns (total_games, removed_games)."""
+    root = tree.getroot()
+    games = root.findall("game")
+    total = len(games)
+    removed = 0
+    for game in games:
+        if _game_has_mia_rom(game):
+            root.remove(game)
+            removed += 1
+    return total, removed
+
+
+def write_fixdat(tree, dest: Path, original_path: Path) -> None:
+    """Write the tree to dest, preserving the original XML declaration and
+    RomVault's tab indentation."""
+    ET.indent(tree, space="\t")
+    decl = '<?xml version="1.0"?>'
+    try:
+        with original_path.open("r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline().rstrip()
+            if first.startswith("<?xml"):
+                decl = first
+    except Exception:
+        pass
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(decl + "\n")
+        tree.write(fh, encoding="unicode", xml_declaration=False)
+        fh.write("\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # API CLASS - exposed to JS via PyWebView
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1269,6 +1316,127 @@ class DatMergerAPI:
         self._running = False
         self._emit("done", {"success": True, "stats": {
             "total_input": len(entries), "duplicates_removed": dupes, "total_output": len(unique)
+        }})
+
+    # ══════════════════════════════════════════════════════════════════
+    # FEATURE: STRIP MIA (remove missing entries from RomVault fixDATs)
+    # ══════════════════════════════════════════════════════════════════
+    def run_strip_mia(self, config: dict):
+        """
+        config = {
+            input: str,                # a single .dat file OR a folder
+            output_mode: "inplace" | "suffix" | "dir",
+            suffix: str,               # used when output_mode == "suffix"
+            output_dir: str,           # used when output_mode == "dir"
+            dry_run: bool,
+            verbose: bool,
+        }
+        """
+        if self._running: return
+        t = threading.Thread(target=self._strip_mia_thread, args=(config,), daemon=True)
+        t.start()
+
+    def _strip_mia_thread(self, config: dict):
+        self._running = True
+        self._stop.clear()
+
+        raw_input   = (config.get("input") or "").strip()
+        output_mode = (config.get("output_mode") or "inplace").strip()
+        suffix      = (config.get("suffix") or "").strip()
+        output_dir  = (config.get("output_dir") or "").strip()
+        dry_run     = config.get("dry_run", False)
+        verbose     = config.get("verbose", False)
+
+        self._log("=" * 50, "info")
+        self._log("Strip MIA — remove missing entries from fixDATs", "ok")
+        self._log("=" * 50, "info")
+
+        if not raw_input:
+            self._log("No input file or folder selected.", "err")
+            self._running = False; self._emit("done", {"success": False}); return
+
+        in_path = Path(raw_input)
+        if in_path.is_file():
+            dat_files = [in_path]
+        elif in_path.is_dir():
+            dat_files = sorted(in_path.rglob("*.dat"))
+            if not dat_files:
+                self._log(f"No .dat files found in {in_path}", "warn")
+                self._running = False; self._emit("done", {"success": False}); return
+        else:
+            self._log(f"Not a file or folder: {in_path}", "err")
+            self._running = False; self._emit("done", {"success": False}); return
+
+        out_dir = None
+        if output_mode == "dir":
+            if not output_dir:
+                self._log("Separate-folder mode selected but no output folder given.", "err")
+                self._running = False; self._emit("done", {"success": False}); return
+            out_dir = Path(output_dir)
+        use_suffix = suffix if output_mode == "suffix" else ""
+
+        self._log(f"Processing {len(dat_files)} file(s)"
+                  + ("   [DRY RUN — nothing will be written]" if dry_run else ""), "info")
+
+        total_games = total_removed = files_changed = errors = 0
+        for i, dat in enumerate(dat_files):
+            if self._stop.is_set():
+                self._log("Stopped by user.", "warn"); break
+            self._progress(int((i / len(dat_files)) * 100), f"Scanning: {dat.name}")
+            try:
+                parser = ET.XMLParser(encoding="utf-8")
+                tree = ET.parse(dat, parser=parser)
+            except Exception as e:
+                errors += 1
+                self._log(f"  [skip] {dat.name}: not a parseable XML fixDAT ({e})", "err")
+                continue
+
+            total, removed = strip_mia_from_tree(tree)
+            total_games += total
+            total_removed += removed
+
+            if dry_run:
+                if removed or verbose:
+                    self._log(f"  [dry] {dat.name}: {removed}/{total} MIA game(s) "
+                              "would be removed", "warn" if removed else "dim")
+                continue
+            if removed == 0:
+                if verbose:
+                    self._log(f"  {dat.name}: no MIA entries", "dim")
+                continue
+
+            if out_dir:
+                dest = out_dir / dat.name
+            elif use_suffix:
+                dest = dat.with_stem(dat.stem + use_suffix)
+            else:
+                dest = dat
+            try:
+                write_fixdat(tree, dest, dat)
+                files_changed += 1
+                where = f"→ {dest}" if dest != dat else "(in place)"
+                self._log(f"  {dat.name}: removed {removed}/{total} MIA game(s) {where}", "ok")
+            except Exception as e:
+                errors += 1
+                self._log(f"  [error] {dat.name}: write failed — {e}", "err")
+
+        self._progress(100, "Complete")
+        self._log("", "")
+        self._log("=" * 50, "info")
+        verb = "would be removed" if dry_run else "removed"
+        summary = (f"Strip MIA complete — {total_removed} MIA game(s) {verb} "
+                   f"across {len(dat_files)} file(s)")
+        if not dry_run:
+            summary += f", {files_changed} file(s) written"
+        if errors:
+            summary += f", {errors} error(s)"
+        self._log(summary, "warn" if errors else "ok")
+        self._log("=" * 50, "info")
+        self._running = False
+        self._emit("done", {"success": True, "stats": {
+            "total_input": total_games,
+            "duplicates_removed": total_removed,
+            "total_output": max(total_games - total_removed, 0),
         }})
 
     # ══════════════════════════════════════════════════════════════════
