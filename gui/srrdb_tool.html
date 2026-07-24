@@ -93,6 +93,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .qs-done{color:var(--acc)}
 .qs-error{color:var(--danger)}
 .qs-skipped{color:var(--text3)}
+.qs-na{color:var(--text3);font-style:italic}
 
 /* Status pill */
 .pill{display:inline-block;padding:1px 8px;border-radius:8px;font-size:9px;font-family:var(--mono);border:1px solid var(--border);color:var(--text2);margin-left:auto}
@@ -363,7 +364,10 @@ window.srrEvent = function(event, data) {
     const job = batchJobs.find(j => j.path === data.content_dir)
              || batchJobs.find(j => j.release === data.release);
     if (job) {
-      job.status = data.ok ? 'done' : (data.stopped ? 'skipped' : 'error');
+      job.status = data.ok ? 'done'
+                 : data.metadata_only ? 'na'
+                 : (data.stopped ? 'skipped' : 'error');
+      if (data.note) job.note = data.note;
       if (data.ok && data.release) job.release = data.release;
       renderQueue();
     }
@@ -580,7 +584,8 @@ function renderQueue() {
   const body = document.getElementById('queue-body');
   body.innerHTML = '';
   batchJobs.forEach((job, i) => {
-    const cls = {pending:'qs-pending',running:'qs-running',done:'qs-done',error:'qs-error',skipped:'qs-skipped',ready:'qs-done'}[job.status] || 'qs-pending';
+    const cls = {pending:'qs-pending',running:'qs-running',done:'qs-done',error:'qs-error',skipped:'qs-skipped',ready:'qs-done',na:'qs-na'}[job.status] || 'qs-pending';
+    const statusLabel = job.status === 'na' ? 'n/a' : job.status;
     const row = document.createElement('div');
     row.className = 'queue-row';
     row.innerHTML = `
@@ -590,7 +595,7 @@ function renderQueue() {
         <span class="flag ${job.hasNFO ? 'on' : ''}">NFO</span>
         <span class="flag ${job.hasSRS ? 'on' : ''}">SRS</span>
       </div>
-      <div class="qr-status ${cls}">${job.status}</div>`;
+      <div class="qr-status ${cls}" title="${esc(job.note || '')}">${statusLabel}</div>`;
     body.appendChild(row);
   });
 }

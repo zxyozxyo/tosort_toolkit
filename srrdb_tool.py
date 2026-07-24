@@ -152,6 +152,23 @@ _RECON_TIMEOUT_S = 1800  # 30 minutes
 # higher just burns time. The per-release deadline still bounds the total.
 _MT_RETRY_CAP = 8
 
+# Scene "fix" releases (DIRFIX/NFOFIX) are metadata-only follow-ups — a
+# corrected NFO or directory-name note, with NO packed content. There is
+# nothing for rescene to rebuild, so a content-CRC / name match legitimately
+# finds nothing; we detect these to report a clean "nothing to do" instead of
+# a scary "not in srrdb" error.
+_METADATA_ONLY_RE = re.compile(r'(?:^|[._\-\s])(dir|nfo)fix(?:[._\-\s]|$)',
+                               re.IGNORECASE)
+
+def _metadata_only_tag(*names: str):
+    """Return 'DIRFIX'/'NFOFIX' if any name is a metadata-only scene follow-up
+    (nothing to rebuild), else None."""
+    for name in names:
+        m = _METADATA_ONLY_RE.search(name or "")
+        if m:
+            return m.group(1).upper() + "FIX"
+    return None
+
 
 def _normalize_name(name: str) -> str:
     """Convert folder/file names to scene dot-notation for better srrdb search."""
@@ -2417,6 +2434,23 @@ class SrrdbToolAPI:
             if not dest_dir:
                 self._log("ERROR: No output folder.", "err"); raise ValueError()
 
+            # Metadata-only scene follow-ups (DIRFIX/NFOFIX) carry only a
+            # corrected NFO — no packed content — so there is nothing to
+            # rebuild and no content CRC to match. Report cleanly instead of
+            # letting the match fail with a generic "not in srrdb" error.
+            fixtag = _metadata_only_tag(
+                release,
+                Path(queue_path).name if queue_path else "",
+                Path(content_dir).name if content_dir else "")
+            if fixtag:
+                self._log(
+                    f"  ⊘ {fixtag} — metadata-only scene release (corrected "
+                    "NFO/dir name); no packed content, nothing to rebuild.",
+                    "warn")
+                summary["metadata_only"] = fixtag
+                summary["note"] = f"{fixtag} — metadata only, nothing to rebuild"
+                raise RuntimeError(summary["note"])
+
             # If no confirmed release name, score candidates against content folder
             if not release:
                 if not content_dir or not Path(content_dir).is_dir():
@@ -3013,7 +3047,11 @@ class SrrdbToolAPI:
                                         "ok": False, "stopped": True})
             else:
                 summary["note"] = summary["note"] or str(e) or "failed"
-                self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
+                jd = {"release": release, "content_dir": queue_path, "ok": False,
+                      "note": summary["note"]}
+                if summary.get("metadata_only"):
+                    jd["metadata_only"] = summary["metadata_only"]
+                self._emit("job_done", jd)
         except InterruptedError:
             self._log("  Stopped.", "warn")
             summary["ok"] = False
@@ -3189,10 +3227,20 @@ class SrrdbToolAPI:
             self._log(f"\n[{i + 1}/{total}]", "dim")
             results.append(self._process_one(job, batch_mode=True))
 
-        ok_n = sum(1 for r in results if r["ok"])
-        self._log(f"\n══ Batch summary — {ok_n}/{len(results)} succeeded ══", "info")
+        # Metadata-only releases (DIRFIX/NFOFIX) have nothing to rebuild — don't
+        # count them as failures against the success ratio; list them apart.
+        na = [r for r in results if r.get("metadata_only")]
+        rebuildable = [r for r in results if not r.get("metadata_only")]
+        ok_n = sum(1 for r in rebuildable if r["ok"])
+        tail = f"  ({len(na)} n/a — metadata only)" if na else ""
+        self._log(f"\n══ Batch summary — {ok_n}/{len(rebuildable)} succeeded{tail} ══",
+                  "info")
         for r in results:
-            if r["ok"]:
+            if r.get("metadata_only"):
+                self._log(f"  ⊘ {r['release']} — "
+                          f"{r.get('note') or 'metadata only, nothing to rebuild'}",
+                          "dim")
+            elif r["ok"]:
                 parts = []
                 if r["rars"] is not None:
                     parts.append(f"{r['rars']} RARs")
