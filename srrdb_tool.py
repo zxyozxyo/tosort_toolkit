@@ -88,6 +88,13 @@ _WINRAR_DATES: dict[str, str] = {
 # regex for rescene-format rar executables
 _RESCENE_RAR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_rar\d+(?:b\d)?\.(exe)?$", re.IGNORECASE)
 
+# Observational only (never affects reconstruction): pull the -mt thread count
+# rescene locked out of the rar command line it fires, and the stream name out
+# of its "Compressing X..." message, so we can record the winning
+# (version, -mt) per stream for diagnostics and the .srr2 idea.
+_MT_RE       = re.compile(r"-mt(\d+)")
+_COMPRESS_RE = re.compile(r"^Compressing\s+(.+?)\.\.\.\s*$")
+
 import webview
 
 SRRDB_API    = "https://api.srrdb.com/v1"
@@ -127,6 +134,16 @@ META_EXTS = {".srr", ".nfo", ".sfv", ".nzb", ".jpg", ".jpeg", ".png", ".diz", ".
 # Max wall-clock time for a single release's reconstruction before it is
 # aborted so the batch can continue. Generous — only fires on a genuine stall.
 _RECON_TIMEOUT_S = 1800  # 30 minutes
+
+# Single-file thread-count near-miss rescue: rescene greedily locks the first
+# -mt whose test piece passes, then does one full compress; if the size is a
+# few bytes off ("Still not fine") it gives up, even though the ORIGINAL may
+# have been packed with a higher thread count that only diverges on the full
+# file. When that happens we re-run the full compress at other thread counts
+# (1..CAP) restricted to the already-locked version, and let the outer SFV
+# verify confirm the CRC. Scene machines of the 3DS era were ≤8 cores; going
+# higher just burns time. The per-release deadline still bounds the total.
+_MT_RETRY_CAP = 8
 
 
 def _normalize_name(name: str) -> str:
@@ -1058,6 +1075,37 @@ class SrrdbToolAPI:
             return _orig(args_self, file_list)
         rm.RarArguments.set_extra_files_before = _sefb
 
+        # --- drop rescene's inner "more files" append during a -mt rescue ---
+        # Inside CompressedRarFile.__init__, a failed solo hunt is retried once
+        # with the NEXT file appended (main.py:2156-2159 → set_extra_files_after).
+        # For a NON-SOLID member that append can't change the target's bytes
+        # (same reasoning as _sefb), so during a forced-mt rescue it can't turn a
+        # miss into a hit — drop it. Scoped to rescue mode (_mt_override set) so
+        # the normal path is completely unchanged; solid sets keep the append.
+        _orig_sefa = rm.RarArguments.set_extra_files_after
+        def _sefa(args_self, file_list, _orig=_orig_sefa, _rm=rm):
+            if getattr(self, "_mt_override", None):
+                vals = list((getattr(_rm, "archived_files", None) or {}).values())
+                if vals and all(hasattr(v, "solid") and not v.solid for v in vals):
+                    return _orig(args_self, [])  # drop the append
+            return _orig(args_self, file_list)
+        rm.RarArguments.set_extra_files_after = _sefa
+
+        # --- disable the "method2" ALL-files fallback during a -mt rescue ---
+        # THE expensive path: when a stream's CompressedRarFile fails, rescene
+        # falls back to CompressedRarFileAll (main.py:2032), which recompresses
+        # EVERY file together ("Compressing ALL files", prepending the 1 GB .3ds)
+        # and sweeps thread counts via try_again. For a NON-SOLID member this can
+        # never reproduce the target's bytes, so during a forced-mt rescue it's
+        # pure waste — fail fast instead so the outer sweep moves to the next mt.
+        # Gated on _mt_override, so the normal path keeps method2 untouched.
+        _orig_all_init = rm.CompressedRarFileAll.__init__
+        def _all_init(all_self, *a, _orig=_orig_all_init, _rm=rm, **kw):
+            if getattr(self, "_mt_override", None):
+                raise _rm.RarNotFound("method2 disabled during -mt rescue")
+            return _orig(all_self, *a, **kw)
+        rm.CompressedRarFileAll.__init__ = _all_init
+
         # --- stream rescene's internal events to the GUI log ---
         _noisy = {rm.MsgCode.BLOCK, rm.MsgCode.RBLOCK, rm.MsgCode.FBLOCK,
                   rm.MsgCode.STORING}
@@ -1074,13 +1122,284 @@ class SrrdbToolAPI:
                     # Lock this version for the rest of the CURRENT set so the
                     # next compressed stream's hunt can fast-fail (see _get_pref).
                     _self._set_good_rar = ver
+                # --- observational: record the winning (version, -mt) per
+                # stream. Read-side only — parses rescene's own log messages
+                # and touches no reconstruction state. rescene fires the rar
+                # command line (carrying the -mt it locked) immediately before
+                # its "Compressing X..." line, so latch the mt, then flush a
+                # record when the compress line names the stream.
+                mt_m = _MT_RE.search(msg)
+                if mt_m and ".exe" in msg.lower():
+                    _self._pending_mt = int(mt_m.group(1))
+                cm = _COMPRESS_RE.match(msg)
+                if cm and hasattr(_self, "_recon_streams"):
+                    _self._recon_streams.append((
+                        cm.group(1).strip(),
+                        getattr(_self, "_last_good_rar", None),
+                        getattr(_self, "_pending_mt", None),
+                    ))
+                    _self._pending_mt = None
                 if len(msg) > 300:
                     msg = msg[:300] + " …[truncated]"
                 _self._log(f"    rescene: {msg}", "dim")
             except Exception:
                 pass
         rm.subscribe(_on_rescene_event)
+
+        # --- single-file thread-count near-miss rescue ---
+        # Wrap CompressedRarFile.__init__ so that, ONLY when rescene has already
+        # declared a non-solid stream unrebuildable with "Still not fine :(."
+        # (its locked -mt reproduced the version but not the exact packed size),
+        # we retry the full compress at other thread counts before giving up.
+        #
+        # Strictly additive & safe:
+        #   • Runs ONLY after the original __init__ raised "Still not fine" — so
+        #     any release that rebuilds today is completely untouched (we return
+        #     immediately on the first successful __init__).
+        #   • Solid streams are left exactly as-is (raise re-propagates), so the
+        #     prepend/solid path near the accidental fix is never entered here.
+        #   • Only drives RarArguments.mt_settings (thread count) — it never
+        #     touches _sefb, _get_pref, or the version lock. The per-set version
+        #     restriction still applies, so retries only re-test the ONE locked
+        #     version at a different -mt.
+        #   • Bounded by the existing per-release deadline + Stop/Skip.
+        _orig_crf_init = rm.CompressedRarFile.__init__
+
+        def _crf_init(crf_self, first_block, blocks, src,
+                      next_block=None, next_src=None, solid=False,
+                      _orig=_orig_crf_init, _rm=rm, _self=self):
+            # Multi-file CRC rescue: if the outer sweep has pinned a specific
+            # -mt for THIS stream (keyed by source basename), force it and skip
+            # the single-file rescue — a forced-mt failure just means "wrong
+            # thread count for this stream", which the outer loop handles by
+            # trying the next value. Empty override (the normal case) is a no-op.
+            override = getattr(_self, "_mt_override", None) or {}
+            forced = override.get(os.path.basename(src).lower())
+            if forced is not None:
+                _rm.RarArguments.mt_settings = _rm.RarMtSettings()
+                _rm.RarArguments.mt_settings.mt_set = [forced]
+                try:
+                    _orig(crf_self, first_block, blocks, src,
+                          next_block, next_src, solid)
+                finally:
+                    _rm.RarArguments.mt_settings = _rm.RarMtSettings()
+                return
+
+            streams = getattr(_self, "_recon_streams", None)
+            base = len(streams) if streams is not None else None
+            try:
+                _orig(crf_self, first_block, blocks, src,
+                      next_block, next_src, solid)
+                return
+            except ValueError as e:
+                # Only the NON-SOLID size near-miss qualifies. Solid stays
+                # untouched; the Dragon_Ball-style CRC near-miss does NOT raise
+                # here (__init__ succeeds, the outer SFV verify catches it), so
+                # it never reaches this rescue.
+                if solid or "still not fine" not in str(e).lower():
+                    raise
+            _self._rescue_mt_near_miss(
+                _orig, crf_self,
+                (first_block, blocks, src, next_block, next_src, solid),
+                _rm, base)
+
+        rm.CompressedRarFile.__init__ = _crf_init
         return rm
+
+    def _rescue_mt_near_miss(self, orig_init, crf_self, ctor_args, rm, base):
+        """Retry a non-solid 'Still not fine' full compress at other thread
+        counts (1..CAP), restricted to the already-locked version. Called ONLY
+        after orig_init has raised 'Still not fine' — so it never affects a
+        release that rebuilds normally. Raises ValueError('Still not fine :(.')
+        if no thread count reproduces the exact packed size; on success it
+        leaves crf_self fully constructed for the caller.
+
+        base: len(self._recon_streams) captured BEFORE the first (failed)
+        __init__, so the per-attempt combo records can be collapsed to just the
+        winning one (or the original near-miss restored on total failure)."""
+        first_block, blocks, src, next_block, next_src, solid = ctor_args
+        streams = getattr(self, "_recon_streams", None)
+        orig_records = list(streams[base:]) if base is not None else []
+        try:
+            cur = crf_self.good_rar.args.thread_count()
+        except Exception:
+            cur = 1
+        self._log(
+            f"    rescene: near-miss at -mt{cur} — retrying other thread "
+            f"counts (up to -mt{_MT_RETRY_CAP}) before giving up…", "dim")
+        for n in range(1, _MT_RETRY_CAP + 1):
+            if n == cur:
+                continue
+            if self._stop.is_set() or self._skip.is_set():
+                break
+            if time.time() > getattr(self, "_recon_deadline", float("inf")):
+                self._log("    rescene: deadline reached — stopping mt "
+                          "retries.", "dim")
+                break
+            # Fresh temp dir each attempt: the failed __init__ called close()
+            # which rmtree'd the previous working_temp_dir.
+            rm.working_temp_dir = rm.get_temp_directory()
+            rm.RarArguments.mt_settings = rm.RarMtSettings()
+            rm.RarArguments.mt_settings.mt_set = [n]
+            try:
+                orig_init(crf_self, first_block, blocks, src,
+                          next_block, next_src, solid)
+                self._log(f"    rescene: exact size matched at -mt{n} ✓ "
+                          "(CRC still verified against the SFV)", "ok")
+                # Collapse the per-attempt combo records to just the winning one.
+                if base is not None:
+                    winning = streams[-1] if len(streams) > base else None
+                    del streams[base:]
+                    if winning is not None:
+                        streams.append(winning)
+                return
+            except rm.RarNotFound:
+                continue  # this thread count didn't even match the piece
+            except ValueError as e2:
+                if "still not fine" not in str(e2).lower():
+                    raise
+                continue  # size still off; try the next thread count
+            finally:
+                rm.RarArguments.mt_settings = rm.RarMtSettings()
+        # Nothing matched — restore the original near-miss record and fail
+        # exactly as rescene would have.
+        if base is not None:
+            del streams[base:]
+            streams.extend(orig_records)
+        raise ValueError("Still not fine :(.")
+
+    def _clear_produced_volumes(self, out_root: Path) -> int:
+        """Delete the produced RAR volumes (the SFV-listed files, excluding the
+        SFV/NFO themselves) so a retry reconstruction won't hit rescene's
+        'Operation aborted. Archive already exists.' NEVER touches _stored (which
+        holds the packed sources) or any other working dir / metadata."""
+        names: set = set()
+        for pat in ("*.sfv", "*.SFV"):
+            for s in out_root.rglob(pat):
+                for name, _crc in self._parse_sfv(str(s)):
+                    k = name.lower()
+                    if not k.endswith((".sfv", ".nfo")):
+                        names.add(k)
+        removed = 0
+        for f in list(out_root.rglob("*")):
+            if not f.is_file():
+                continue
+            if self._VERIFY_SKIP_DIRS & set(f.relative_to(out_root).parts[:-1]):
+                continue
+            if f.name.lower() in names:
+                try:
+                    f.unlink(); removed += 1
+                except OSError:
+                    pass
+        return removed
+
+    def _rescue_multifile_crc(self, srr_file: str, content_dir: str,
+                              out_root: Path):
+        """Rescue a multi-file NON-SOLID CRC near-miss (e.g. a big content file
+        that verified fine + a small embedded jpg whose thread count produced
+        the right SIZE but wrong BYTES, so __init__ succeeded and only the SFV
+        catches it).
+
+        rescene's per-stream hunt can't tell thread counts apart when they yield
+        the same compressed size, so the only truth-check is the volume CRC. We
+        pin every already-locked stream to its own -mt (streams re-hunt to the
+        same value; only the suspect is forced) and sweep the SUSPECT's -mt,
+        re-running the full reconstruction and re-checking the SFV each time.
+
+        Deliberately conservative — engages ONLY when exactly one compressed
+        stream was locked at -mt>1 (the classic embedded-jpg culprit; a stream
+        locked at -mt1 is single-threaded and deterministic, so no other -mt
+        helps it). 0 or ≥2 such streams → we don't touch it and it stays FAILED.
+
+        Returns the winning verify-result dict on success, else None. Only ever
+        called after the SFV verify already failed, so a release that rebuilds
+        (or fails) normally today is unaffected."""
+        streams = list(getattr(self, "_recon_streams", None) or [])
+        suspects = [s for s in streams if s[2] and s[2] > 1]
+        if len(suspects) != 1:
+            if suspects:
+                self._log(
+                    f"  Multi-file rescue skipped — {len(suspects)} streams at "
+                    "-mt>1; can't isolate the culprit safely.", "dim")
+            return None
+        suspect_file, _ver, cur_mt = suspects[0]
+        skey = suspect_file.lower()
+        # Pin the version the original run locked (e.g. 2014-05-21 5.11). Without
+        # this the sweep re-hunts from scratch and can lock a DIFFERENT version
+        # (e.g. 5.50) that also reproduces the big stream — at which point the
+        # suspect can never match (it was packed with the original version) and
+        # every attempt collapses into rescene's method2 prepend. Fronting the
+        # pinned version means the big stream locks it first and the fast-fail
+        # then restricts the suspect's hunt to that same version.
+        pinned = getattr(self, "_last_good_rar", None)
+        self._log(
+            f"  Multi-file near-miss: sweeping -mt for {suspect_file} "
+            f"(locked -mt{cur_mt})"
+            + (f", pinned to {pinned}" if pinned else "")
+            + " while the rest re-lock as before…", "dim")
+        # The sweep needs its OWN wall-clock budget: each attempt calls
+        # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
+        # we can't lean on that here. Budget the whole sweep (each attempt still
+        # has its own per-reconstruction deadline inside _srr_reconstruct).
+        sweep_deadline = time.time() + _RECON_TIMEOUT_S
+        # Order the sweep smartly. The original hunt locks the FIRST thread count
+        # that reproduced the suspect's size (ascending), so every value BELOW
+        # cur_mt already failed the size test and would only fast-fail again —
+        # after paying a full recompress of the pinned neighbour. The true count
+        # therefore lies at cur_mt+1..CAP, so try those first; only fall back to
+        # the below-cur_mt values (in case the piece-size test wasn't perfectly
+        # representative of the full file) if the likely range is exhausted.
+        order = (list(range(cur_mt + 1, _MT_RETRY_CAP + 1))
+                 + list(range(1, cur_mt)))
+        try:
+            for n in order:
+                if self._stop.is_set() or self._skip.is_set():
+                    break
+                if time.time() > sweep_deadline:
+                    self._log("  Multi-file rescue: deadline reached — "
+                              "stopping.", "dim")
+                    break
+                self._clear_produced_volumes(out_root)
+                self._mt_override = {skey: n}
+                self._recon_streams = []          # fresh combos for this attempt
+                if pinned:
+                    SrrdbToolAPI._pref_versions = [pinned]
+                self._log(f"    trying {suspect_file} at -mt{n}…", "dim")
+                try:
+                    rc = self._srr_reconstruct(
+                        srr_file, content_dir, str(out_root), log_rar_pack=False)
+                finally:
+                    self._mt_override = {}
+                    SrrdbToolAPI._pref_versions = []
+                if not rc.get("ok"):
+                    continue
+                v2 = self._verify_rebuilt_sfv(out_root)
+                if v2["checked"] and not v2["bad"]:
+                    self._log(
+                        f"  ✓ Multi-file rescue: {suspect_file} rebuilt at "
+                        f"-mt{n} — all {v2['checked']} volume(s) now CRC-match "
+                        "the SFV.", "ok")
+                    return v2
+        finally:
+            self._mt_override = {}
+        self._log("  Multi-file rescue exhausted — no thread count reproduced "
+                  f"{suspect_file} exactly. Kept as FAILED.", "warn")
+        return None
+
+    def _log_recon_combos(self, style: str = "dim") -> None:
+        """Emit the (stream → version -mt) combos rescene locked this release.
+
+        Observational: it only reads self._recon_streams, captured from
+        rescene's own log messages. Useful for spotting which stream/thread
+        count caused a near-miss, and as raw material for the .srr2 idea."""
+        streams = getattr(self, "_recon_streams", None)
+        if not streams:
+            return
+        parts = []
+        for fname, ver, mt in streams:
+            mt_txt = f"-mt{mt}" if mt is not None else "-mt?"
+            parts.append(f"{fname} → {ver or '?'} {mt_txt}")
+        self._log("  Packed with: " + "; ".join(parts), style)
 
     def _srr_reconstruct(self, srr_path: str, content_dir: str, out_dir: str,
                          log_rar_pack: bool = True) -> dict:
@@ -1096,6 +1415,14 @@ class SrrdbToolAPI:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         # Cleared per RAR set below; drives the per-set fast-fail in _get_pref.
         self._set_good_rar = None
+        # Observational log of (stream, version, -mt) combos the hunt locked —
+        # see _on_rescene_event. Diagnostics only. Reset once per release in
+        # _process_one, NOT here: a release's nested SRRs re-enter this method,
+        # and their combos should accumulate into the same release rather than
+        # wipe the main set's before the summary logs it.
+        if not hasattr(self, "_recon_streams"):
+            self._recon_streams = []
+        self._pending_mt = None
 
         rar_dir = self._find_rar_dir()
         if log_rar_pack:
@@ -1795,6 +2122,12 @@ class SrrdbToolAPI:
                 "sample":      summary.get("sample"),
                 "subs":        summary.get("subs"),
                 "rar_version": getattr(self, "_last_good_rar", None),
+                # Per-stream (file, version, -mt) combos the hunt locked. On an
+                # ok=True record these are the byte-exact packing settings — the
+                # accumulating dataset behind the .srr2 idea. Stored as
+                # [[file, version, mt], …]; mt may be null for pre-mt versions.
+                "combos":      [list(c) for c in
+                                (getattr(self, "_recon_streams", None) or [])],
                 "note":        (summary.get("note") or "")[:120],
             }
             results = self._load_results()
@@ -1845,6 +2178,28 @@ class SrrdbToolAPI:
             self._log(f"  {k:<16} {g['ok']}/{g['n']}",
                       "ok" if g["ok"] == g["n"] else "warn")
 
+        # Known-good packing combos harvested from clean rebuilds — the raw
+        # (version, -mt) dataset behind the .srr2 idea. Only ok=True records
+        # carry byte-exact settings, so restrict to those and de-dup.
+        seen: set = set()
+        combo_rows: list = []
+        for r in results:
+            if not r.get("ok"):
+                continue
+            for c in (r.get("combos") or []):
+                fname, ver, mt = (list(c) + [None, None, None])[:3]
+                mt_txt = f"-mt{mt}" if mt is not None else "-mt?"
+                key = (r.get("group") or "?", ver or "?", mt_txt,
+                       (str(fname).rsplit(".", 1)[-1] or "").lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                combo_rows.append(key)
+        if combo_rows:
+            self._log(f"Known-good packing combos ({len(combo_rows)}):", "info")
+            for grp, ver, mt_txt, ext in sorted(combo_rows):
+                self._log(f"  {grp:<18} {ver:<16} {mt_txt:<6} .{ext}", "ok")
+
         fails = [r for r in results if not r["ok"]]
         if fails:
             self._log(f"Failures ({len(fails)}):", "warn")
@@ -1853,7 +2208,17 @@ class SrrdbToolAPI:
         return {"ok": True, "count": len(results)}
 
     _RESULT_COLS = ["ts", "release", "group", "platform", "year", "ok", "rars",
-                    "sample", "subs", "rar_version", "note"]
+                    "sample", "subs", "rar_version", "combos", "note"]
+
+    @staticmethod
+    def _fmt_combos(combos) -> str:
+        """Flatten [[file, version, mt], …] to 'file=version -mtN; …' for CSV."""
+        out = []
+        for c in (combos or []):
+            fname, ver, mt = (list(c) + [None, None, None])[:3]
+            mt_txt = f"-mt{mt}" if mt is not None else "-mt?"
+            out.append(f"{fname}={ver or '?'} {mt_txt}")
+        return "; ".join(out)
 
     def export_results_csv(self) -> dict:
         results = self._load_results()
@@ -1864,7 +2229,10 @@ class SrrdbToolAPI:
         with open(out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=self._RESULT_COLS, extrasaction="ignore")
             w.writeheader()
-            w.writerows(results)
+            for r in results:
+                row = dict(r)
+                row["combos"] = self._fmt_combos(r.get("combos"))
+                w.writerow(row)
         self._log(f"Exported {len(results)} record(s) → {out}", "ok")
         return {"ok": True, "path": str(out), "count": len(results)}
 
@@ -1901,6 +2269,7 @@ class SrrdbToolAPI:
                                                 x.get("release") or "")):
             row = [r.get(c, "") for c in self._RESULT_COLS]
             row[self._RESULT_COLS.index("ok")] = "OK" if r.get("ok") else "FAILED"
+            row[self._RESULT_COLS.index("combos")] = self._fmt_combos(r.get("combos"))
             ws.append(row)
             fill = ok_fill if r.get("ok") else bad_fill
             for cell in ws[ws.max_row]:
@@ -1908,7 +2277,7 @@ class SrrdbToolAPI:
 
         widths = {"ts": 16, "release": 55, "group": 14, "platform": 10,
                   "year": 7, "ok": 9, "rars": 7, "sample": 24, "subs": 14,
-                  "rar_version": 18, "note": 60}
+                  "rar_version": 18, "combos": 48, "note": 60}
         for i, c in enumerate(self._RESULT_COLS, 1):
             ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 14)
 
@@ -2109,6 +2478,12 @@ class SrrdbToolAPI:
                     self._log(f"    … and {len(citems) - 12} more", "dim")
 
                 self._log("  Reconstructing RARs…", "dim")
+                # Fresh per-release combo log (main set + any nested SRRs both
+                # accumulate into this; see _srr_reconstruct).
+                self._recon_streams = []
+                # No per-stream -mt pin for the normal run (only the multi-file
+                # rescue sets this; see _rescue_multifile_crc / _crf_init).
+                self._mt_override = {}
                 prefs = self._preferred_rar_versions(release, queue_path)
                 SrrdbToolAPI._pref_versions = prefs
                 if prefs:
@@ -2142,6 +2517,10 @@ class SrrdbToolAPI:
                     self._log(f"  Reconstruct ERROR: {rc.get('error', 'unknown')}", "err")
                     summary["ok"] = False
                     summary["note"] = (rc.get("error") or "reconstruct error")[:100]
+                    # If a version+mt was locked before the failure (near-miss /
+                    # "Still not fine"), surface the combo so the suspect thread
+                    # count is visible.
+                    self._log_recon_combos("warn")
                     # A version WAS detected (it reproduced the first stored file)
                     # but the full solid archive still failed — this is the
                     # solid-stream + thread-count determinism wall, not a
@@ -2222,16 +2601,35 @@ class SrrdbToolAPI:
                     vres = self._verify_rebuilt_sfv(out_root)
                     summary["verified"] = vres
                     if vres["bad"]:
-                        summary["ok"] = False
                         bad_ex = vres["bad"][0]
-                        summary["note"] = ("SFV mismatch: "
-                            + ", ".join(n for n, _, _ in vres["bad"][:4]))
                         self._log(
                             f"  ✗ SFV verify FAILED — {len(vres['bad'])} volume(s) "
                             f"wrong (e.g. {bad_ex[0]}: got {bad_ex[2]}, expected "
-                            f"{bad_ex[1]}). Near-miss, NOT a rebuild — marked FAILED, "
-                            "source kept.", "err",
+                            f"{bad_ex[1]}). Near-miss — trying a per-stream -mt "
+                            "sweep before giving up…", "warn",
                         )
+                        # Show which stream/thread-count combo the hunt locked —
+                        # a wrong trailing volume usually points at one stream's
+                        # -mt reproducing the right size but the wrong bytes.
+                        self._log_recon_combos("warn")
+                        # Multi-file CRC rescue: sweep the suspect stream's -mt
+                        # (see _rescue_multifile_crc). Only ever runs here, after
+                        # the SFV already failed, so nothing that passes today is
+                        # affected.
+                        rescued = self._rescue_multifile_crc(
+                            str(srr_file), content_dir, out_root)
+                        if rescued:
+                            summary["ok"] = True
+                            summary["verified"] = rescued
+                            summary["rars"] = rescued["checked"]
+                            self._log_recon_combos("dim")
+                        else:
+                            summary["ok"] = False
+                            summary["note"] = ("SFV mismatch: "
+                                + ", ".join(n for n, _, _ in vres["bad"][:4]))
+                            self._log(
+                                "  Near-miss, NOT a rebuild — marked FAILED, "
+                                "source kept.", "err")
                     elif vres["missing"]:
                         self._log(
                             f"  ⚠ SFV verify: {vres['checked']} volume(s) CRC-OK, but "
@@ -2241,6 +2639,9 @@ class SrrdbToolAPI:
                     elif vres["checked"]:
                         self._log(f"  ✓ SFV verify: all {vres['checked']} volume(s) "
                                   "CRC-match the SFV.", "ok")
+                        # Record the winning combos on a clean rebuild — this is
+                        # exactly the (version, -mt) data the .srr2 idea wants.
+                        self._log_recon_combos("dim")
                     else:
                         self._log("  ⚠ SFV verify: no SFV found to check against — "
                                   "cannot confirm the rebuild.", "warn")
