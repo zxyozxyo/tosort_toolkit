@@ -116,6 +116,13 @@ HEADERS = {"User-Agent": _UA, "Accept": "application/json, */*"}
 # assumes only scrapers fake a browser). Used for direct file/add downloads.
 DL_HEADERS = {"User-Agent": "srrdb_tool/1.0 (+https://www.srrdb.com)"}
 
+# Persistent SRR cache — every SRR we ever fetch is kept here, keyed by release
+# name, so re-tests never re-hit srrdb (its download host is rate-limited per
+# 24h and won't be dodged by VPN). Survives output-folder deletion/cleanup,
+# unlike the copy dropped in each release's output dir. Small files (KB–MB), so
+# no eviction needed.
+SRR_CACHE_DIR = Path(__file__).parent / "srr_cache"
+
 MEDIA_EXTS = {
     ".avi", ".mkv", ".mp4", ".m4v", ".mov", ".wmv",
     ".iso", ".img", ".bin", ".cue", ".nrg", ".vob", ".ts", ".m2ts",
@@ -844,11 +851,39 @@ class SrrdbToolAPI:
         if alt != release_name:
             names_to_try.append(alt)
 
+        # 0 — serve from the persistent SRR cache if we've ever fetched this
+        # release. This is the guard against re-hitting srrdb's rate-limited
+        # download host on re-tests, cleared output folders, or a fresh batch.
+        try:
+            SRR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        for name in names_to_try:
+            cached = SRR_CACHE_DIR / f"{name}.srr"
+            if cached.is_file() and cached.stat().st_size > 0:
+                out_path = dest / f"{name}.srr"
+                try:
+                    if out_path.resolve() != cached.resolve():
+                        shutil.copy2(str(cached), str(out_path))
+                except Exception:
+                    out_path = cached  # fall back to using the cached copy in place
+                return {"ok": True, "srr_path": str(out_path),
+                        "size": Path(out_path).stat().st_size, "cached": True}
+
         for name in names_to_try:
             result = self._do_download_srr(name, dest)
             if result["ok"]:
                 if name != release_name:
                     self._log(f"  (srrdb uses '{name}' — saved under that name)", "dim")
+                # Populate the persistent cache so this release is never fetched
+                # again, even if its output folder is later deleted.
+                try:
+                    src = Path(result["srr_path"])
+                    dst = SRR_CACHE_DIR / src.name
+                    if dst.resolve() != src.resolve():
+                        shutil.copy2(str(src), str(dst))
+                except Exception:
+                    pass
                 return result
             if not result.get("not_found"):
                 return result  # non-404 error, don't retry
@@ -2425,7 +2460,6 @@ class SrrdbToolAPI:
                 srr_file = srr_file_alt
                 self._log(f"  SRR cached ({srr_file.stat().st_size:,} B) [{alt_release}.srr]", "dim")
             else:
-                self._log("  Downloading SRR from srrdb.com…", "dim")
                 dl = self.download_srr(release, str(out_root))
                 if not dl["ok"]:
                     if dl.get("not_found"):
@@ -2437,7 +2471,11 @@ class SrrdbToolAPI:
                         raise RuntimeError("no SRR on srrdb — possibly non-scene")
                     self._log(f"  ERROR: {dl['error']}", "err"); raise RuntimeError(dl["error"])
                 srr_file = Path(dl["srr_path"])  # use actual saved path (may be alt name)
-                self._log(f"  SRR downloaded ({dl['size']:,} B)", "ok")
+                if dl.get("cached"):
+                    self._log(f"  SRR from local cache ({dl['size']:,} B) — "
+                              "no srrdb request", "dim")
+                else:
+                    self._log(f"  SRR downloaded ({dl['size']:,} B)", "ok")
 
             if self._stop.is_set() or self._skip.is_set(): raise InterruptedError()
 
@@ -3093,7 +3131,9 @@ class SrrdbToolAPI:
                 continue
             dl = self.download_srr(resolved, str(out_root))
             if dl.get("ok"):
-                self._log(f"  [{i+1}] {resolved}: SRR downloaded "
+                src = ("local cache — no srrdb request" if dl.get("cached")
+                       else "downloaded")
+                self._log(f"  [{i+1}] {resolved}: SRR {src} "
                           f"({dl.get('size', 0):,} B) ✓", "ok")
                 self._emit("prefetch_done", {"content_dir": path, "release": resolved,
                                              "ok": True})
