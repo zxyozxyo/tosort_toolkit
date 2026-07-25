@@ -2568,6 +2568,17 @@ class SrrdbToolAPI:
                     self._log(f"    … and {len(citems) - 12} more", "dim")
 
                 self._log("  Reconstructing RARs…", "dim")
+                # Clear any RAR volumes left in the output by a PREVIOUS run.
+                # rescene refuses to overwrite existing archives ("Operation
+                # aborted. Archive already exists.") and would just re-verify the
+                # stale (near-miss) volumes — which also starves the -mt rescue of
+                # freshly-compressed streams to work with, so it can't engage.
+                # _clear_produced_volumes only removes SFV-listed volumes; it
+                # never touches _stored (the packed sources) or the SRR/NFO/SFV.
+                _stale = self._clear_produced_volumes(out_root)
+                if _stale:
+                    self._log(f"  Cleared {_stale} stale volume(s) from a previous "
+                              "run so this rebuild starts fresh.", "dim")
                 # Fresh per-release combo log (main set + any nested SRRs both
                 # accumulate into this; see _srr_reconstruct).
                 self._recon_streams = []
