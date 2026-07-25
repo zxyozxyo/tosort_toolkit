@@ -1169,6 +1169,18 @@ class SrrdbToolAPI:
         _orig_get = rm.RarRepository.get_rar_executables
         def _get_pref(repo_self, date, _orig=_orig_get, _rm=rm):
             order = list(_orig(repo_self, date))
+            # Version-sweep rescue: restrict the hunt to ONE forced version so a
+            # near-miss re-run tries exactly that build (rescene otherwise stops
+            # at the first piece-CRC match and never full-verifies the rest).
+            force = getattr(SrrdbToolAPI, "_version_force", None)
+            if force:
+                return [r for r in order if str(r) == force]
+            # Capture the full ordered version list once (first-file hunt, no
+            # restriction active) so the version-sweep rescue knows every build
+            # available in the pack, in rescene's own naming.
+            if not getattr(_rm, "archived_files", None) \
+                    and not getattr(self, "_set_good_rar", None):
+                self._all_versions = [str(r) for r in order]
             # Fast-fail the embedded-jpg wall: once a version reproduced the
             # first stream of THIS set, every other stream in the same set was
             # produced by the same single WinRAR invocation — and the whole set
@@ -1334,6 +1346,11 @@ class SrrdbToolAPI:
                 # here (__init__ succeeds, the outer SFV verify catches it), so
                 # it never reaches this rescue.
                 if solid or "still not fine" not in str(e).lower():
+                    raise
+                # During a version sweep the whole reconstruction is re-run per
+                # forced version; the -mt rescue would multiply that by CAP for
+                # every candidate, so skip it and let this version fail fast.
+                if getattr(_self, "_in_version_sweep", False):
                     raise
             _self._rescue_mt_near_miss(
                 _orig, crf_self,
@@ -1592,6 +1609,104 @@ class SrrdbToolAPI:
             self._mt_override = {}
         self._log("  Multi-file rescue exhausted — no thread count reproduced "
                   "the near-miss stream(s) exactly. Kept as FAILED.", "warn")
+        return None
+
+    @staticmethod
+    def _version_date(ver: str):
+        """Parse the leading YYYY-MM-DD out of a rescene version string
+        ('2004-07-20 3.30') → date, or None."""
+        import datetime
+        m = re.match(r"\s*(\d{4})-(\d{2})-(\d{2})", ver or "")
+        if not m:
+            return None
+        try:
+            return datetime.date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            return None
+
+    def _rescue_version_near_miss(self, srr_file: str, content_dir: str,
+                                  out_root: Path):
+        """Rescue a near-miss where rescene locked a WinRAR version whose
+        full-file compressed size was off by a little.
+
+        rescene's version hunt accepts the FIRST build whose test *piece*
+        reproduces the block CRC (main.py:2377), then commits to it and never
+        tries another. On low-effort methods (-m1) the compressed piece is tiny
+        and several early builds share its CRC, so rescene can lock an ancient
+        version (e.g. 3.30, 2004) for a release that was really packed years
+        later — the full multi-volume archive then differs by a few header
+        bytes. rescene has no way out of this; we do: re-run the reconstruction
+        forcing each OTHER pack build in turn (nearest release date first, since
+        the true build shares the locked one's compression era) and CRC-verify
+        against the SFV.
+
+        Bounded by the per-release deadline. The -mt single-file rescue is
+        disabled during the sweep (_in_version_sweep) so each candidate fails
+        fast instead of multiplying the work by the thread-count cap. Only ever
+        called after a near-miss reconstruction ERROR, so a release that
+        rebuilds (or fails for another reason) today is untouched.
+
+        Returns the winning verify-result dict on success, else None."""
+        detected = getattr(self, "_last_good_rar", None)
+        allv = list(getattr(self, "_all_versions", None) or [])
+        if not allv:
+            return None
+        candidates = [v for v in allv if v != detected]
+        if not candidates:
+            return None
+        # Ordering. The winning build must itself pass the piece-CRC test (it
+        # produced the real archive), so we can't know it a priori — but two
+        # priors help: (1) this group's known-good history (what OTHER releases
+        # by the same group packed with — the release-era build, directly
+        # answering "the locked version is implausibly old"); then (2) release
+        # dates nearest the locked build, which tend to share its compression
+        # engine. Group history first, then nearest-date, then the rest.
+        prefs = [v for v in (getattr(self, "_recon_prefs", None) or [])
+                 if v in candidates]
+        rest = [v for v in candidates if v not in prefs]
+        d0 = self._version_date(detected) if detected else None
+        if d0 is not None:
+            rest.sort(key=lambda v: (self._version_date(v) is None,
+                                     abs((self._version_date(v) - d0).days)
+                                     if self._version_date(v) else 1 << 30))
+        candidates = prefs + rest
+        self._log(
+            f"  Version near-miss: '{detected}' matched the test piece but the "
+            f"full archive was off — sweeping {len(candidates)} other pack "
+            "build(s), nearest release date first…", "dim")
+        sweep_deadline = time.time() + _RECON_TIMEOUT_S
+        self._in_version_sweep = True
+        try:
+            for cand in candidates:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() > sweep_deadline:
+                    self._log("  Version rescue: deadline reached — stopping.",
+                              "dim")
+                    return None
+                self._clear_produced_volumes(out_root)
+                self._recon_streams = []
+                SrrdbToolAPI._version_force = cand
+                self._log(f"    trying {cand}…", "dim")
+                try:
+                    rc = self._srr_reconstruct(
+                        srr_file, content_dir, str(out_root),
+                        log_rar_pack=False)
+                finally:
+                    SrrdbToolAPI._version_force = None
+                if not rc.get("ok"):
+                    continue
+                v2 = self._verify_rebuilt_sfv(out_root)
+                if v2["checked"] and not v2["bad"]:
+                    self._log(
+                        f"  ✓ Version rescue: rebuilt with {cand} — all "
+                        f"{v2['checked']} volume(s) CRC-match the SFV.", "ok")
+                    return v2
+        finally:
+            self._in_version_sweep = False
+            SrrdbToolAPI._version_force = None
+        self._log("  Version rescue exhausted — no pack build reproduced the "
+                  "archive exactly. Kept as FAILED.", "warn")
         return None
 
     def _log_recon_combos(self, style: str = "dim") -> None:
@@ -2798,6 +2913,7 @@ class SrrdbToolAPI:
                 # rescue sets this; see _rescue_multifile_crc / _crf_init).
                 self._mt_override = {}
                 prefs = self._preferred_rar_versions(release, queue_path)
+                self._recon_prefs = prefs   # fed to the version-sweep rescue
                 SrrdbToolAPI._pref_versions = prefs
                 if prefs:
                     self._log(
@@ -2838,8 +2954,9 @@ class SrrdbToolAPI:
                     # but the full solid archive still failed — this is the
                     # solid-stream + thread-count determinism wall, not a
                     # missing version.
+                    _err = (rc.get("error") or "").lower()
                     if getattr(self, "_last_good_rar", None) and \
-                            "exhausted" in (rc.get("error") or "").lower():
+                            "exhausted" in _err:
                         self._log(
                             f"  Note: RAR {self._last_good_rar} reproduced the first "
                             "small file, but the full SOLID archive's main file could "
@@ -2850,6 +2967,21 @@ class SrrdbToolAPI:
                         summary["note"] = (
                             f"solid archive unrebuildable (matched {self._last_good_rar} "
                             "on first file only)")
+                    elif getattr(self, "_last_good_rar", None) and \
+                            ("near-miss" in _err or "still not fine" in _err):
+                        # rescene locked a version off the test piece but the
+                        # full archive was a few bytes off, then gave up. On
+                        # -m1 especially, an ancient build can share the piece
+                        # CRC while a later build reproduces the whole archive.
+                        # Sweep the other pack builds before writing it off.
+                        rescued = self._rescue_version_near_miss(
+                            str(srr_file), content_dir, out_root)
+                        if rescued:
+                            summary["ok"] = True
+                            summary["verified"] = rescued
+                            summary["rars"] = rescued["checked"]
+                            summary["note"] = ""
+                            self._log_recon_combos("dim")
 
                 # Nested SRRs (e.g. Subs/xxx.subs.srr) describe extra RAR sets
                 # such as vobsubs — sometimes two levels deep (per-CD inner RARs
