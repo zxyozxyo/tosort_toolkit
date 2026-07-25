@@ -1070,6 +1070,7 @@ class SrrdbToolAPI:
                 continue  # already the right size — leave it alone
             lf = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
             crlf = lf.replace(b"\n", b"\r\n")
+            matched = False
             for variant, kind in ((lf, "LF"), (crlf, "CRLF")):
                 if len(variant) == exp:
                     try:
@@ -1082,7 +1083,13 @@ class SrrdbToolAPI:
                     self._log(f"  Line-ending fix: {Path(p).name} "
                               f"{len(data):,}→{exp:,} B ({kind}) to match the "
                               "packed copy.", "dim")
+                    matched = True
                     break
+            if not matched:
+                self._log(f"  ⚠ {Path(p).name}: stored copy is {len(data):,} B "
+                          f"but the packed copy is {exp:,} B, and it's NOT a clean "
+                          "CRLF/LF difference — can't reconstruct it from the "
+                          "stored copy (needs the exact packed file).", "warn")
 
     def _fresh_rescene(self):
         """Import a pristine rescene.main (purging any cached copy) and apply our
