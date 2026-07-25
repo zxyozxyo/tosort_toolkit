@@ -1670,12 +1670,32 @@ class SrrdbToolAPI:
             # VPN is off / bot-wall blocks it, it's skipped cleanly with a warning
             # and reconstruction proceeds (and fails as before) — never worse.
             if rar_sets:
-                still_missing = []
+                # Expected packed (unpacked) sizes — to spot text sources whose
+                # SRR-stored copy differs from the copy actually packed.
+                try:
+                    expected_sizes = self._srr_packed_sizes(srr_path)
+                except Exception:
+                    expected_sizes = {}
+                still_missing = []   # packed source absent from content AND hints
+                wrong_size   = []    # text source present but the WRONG size — the
+                                     # packed copy differs (e.g. ABSTRAKT nfo: the
+                                     # SRR stores the release nfo, but a DIFFERENT
+                                     # nfo was packed and uploaded to srrdb adds).
                 for info in rar_sets.values():
                     for p in info["packed"]:
                         nm = Path(p).name.lower()
-                        if nm not in content_names and p not in hints:
+                        if nm in content_names:
+                            continue
+                        if p not in hints:
                             still_missing.append((p, nm))
+                        elif nm.endswith((".nfo", ".diz", ".txt")):
+                            exp = expected_sizes.get(nm)
+                            try:
+                                cur = Path(hints[p]).stat().st_size
+                            except Exception:
+                                cur = None
+                            if exp is not None and cur is not None and cur != exp:
+                                wrong_size.append((p, nm))
                 if len(still_missing) > _MAX_FETCH_ADDS:
                     # Too many missing sources to be "extras" — a wrong match or a
                     # loose-asset release. One summary line, no per-file logging
@@ -1687,7 +1707,9 @@ class SrrdbToolAPI:
                         "the wrong release match for this content, or a release "
                         "whose loose files aren't present. Not rebuildable; "
                         "skipping add-fetch.", "warn")
-                elif still_missing:
+                elif still_missing or wrong_size:
+                    wrong_set = {p for p, _ in wrong_size}
+                    to_fetch = still_missing + wrong_size
                     release_nm = Path(srr_path).stem
                     details = self._srrdb_details(release_nm)
                     raw_adds = (details or {}).get("adds", []) if details else []
@@ -1703,9 +1725,9 @@ class SrrdbToolAPI:
                             adds.setdefault(Path(nm_a).name.lower(), a)
                     if not details:
                         self._log("  ⚠ Couldn't fetch srrdb release details to "
-                                  "locate the missing packed source(s) — VPN off / "
-                                  "rate-limited? Rebuild will fail until available.",
-                                  "warn")
+                                  "locate the missing/mismatched packed source(s) — "
+                                  "VPN off / rate-limited? Rebuild may fail until "
+                                  "available.", "warn")
                     elif not adds:
                         self._log("  ⚠ srrdb lists no fetchable 'adds' for this "
                                   "release.", "warn")
@@ -1716,16 +1738,25 @@ class SrrdbToolAPI:
                                   + ("…" if len(_names) > 6 else "") + ")", "dim")
                     fetched = []
                     no_match = []
-                    for p, nm in still_missing:
+                    for p, nm in to_fetch:
+                        is_wrong = p in wrong_set
                         a = adds.get(nm)
                         if not a:
-                            no_match.append(Path(p).name)
+                            # Genuinely-missing source with no add can't rebuild; a
+                            # wrong-size one falls back to the line-ending fix below.
+                            if not is_wrong:
+                                no_match.append(Path(p).name)
                             continue
-                        dest = stored_pool / Path(p).name
+                        # Wrong-size sources go to _stored/_adds so re-extraction
+                        # (which restores the mismatched SRR copy each run) can't
+                        # clobber the correct fetched copy; both are cache-checked.
+                        dest = (stored_pool / "_adds" / Path(p).name if is_wrong
+                                else stored_pool / Path(p).name)
                         if dest.is_file():
                             hints[p] = str(dest); fetched.append(Path(p).name); continue
-                        self._log("  Missing source not in SRR — trying srrdb "
-                                  f"adds: {Path(p).name}…", "dim")
+                        label = ("mismatched source, fetching exact packed copy"
+                                 if is_wrong else "missing source not in SRR")
+                        self._log(f"  {label}: {Path(p).name}…", "dim")
                         res = self._download_add(
                             details.get("_resolved_name", release_nm),
                             a["id"], a["name"], dest, a.get("crc"))
