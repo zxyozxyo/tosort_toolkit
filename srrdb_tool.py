@@ -1017,6 +1017,66 @@ class SrrdbToolAPI:
                     sets[current]["packed"].append(fname)
         return sets
 
+    def _srr_packed_sizes(self, srr_path: str) -> dict:
+        """Map packed-file basename (lower) -> expected UNPACKED size, read from
+        the SRR's RarPackedFile blocks. Used to detect line-ending-mismatched
+        text sources."""
+        from rescene.rar import RarReader, BlockType  # type: ignore
+        sizes: dict = {}
+        for block in RarReader(str(srr_path)).read_all():
+            if block.rawtype == BlockType.RarPackedFile:
+                fname = getattr(block, "file_name", "")
+                sz = getattr(block, "unpacked_size", None)
+                if fname and sz is not None:
+                    sizes.setdefault(Path(fname).name.lower(), sz)
+        return sizes
+
+    def _fix_text_source_endings(self, hints: dict, srr_path: str, out_dir: str):
+        """Some groups pack an nfo/diz with different line endings than the copy
+        stored in the SRR, so the extracted source is the WRONG SIZE (e.g. CRLF
+        5027 B vs the packed LF 5008 B) and rescene bails with 'Data file is not
+        the correct size'. When a text source's size doesn't match the packed
+        size, write a CRLF<->LF variant that DOES match and point the hint at it.
+
+        Only ever touches text sources whose size is already off, so releases
+        that rebuild fine are untouched. The SFV/CRC verify stays the final
+        guard — a size that matches but isn't byte-exact still fails cleanly."""
+        try:
+            expected = self._srr_packed_sizes(srr_path)
+        except Exception:
+            return
+        if not expected:
+            return
+        conv_dir = Path(out_dir) / "_stored" / "_leconv"
+        for p, src in list(hints.items()):
+            nm = Path(p).name.lower()
+            if not nm.endswith((".nfo", ".diz", ".txt")):
+                continue
+            exp = expected.get(nm)
+            if exp is None:
+                continue
+            try:
+                data = Path(src).read_bytes()
+            except Exception:
+                continue
+            if len(data) == exp:
+                continue  # already the right size — leave it alone
+            lf = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            crlf = lf.replace(b"\n", b"\r\n")
+            for variant, kind in ((lf, "LF"), (crlf, "CRLF")):
+                if len(variant) == exp:
+                    try:
+                        conv_dir.mkdir(parents=True, exist_ok=True)
+                        dest = conv_dir / Path(p).name
+                        dest.write_bytes(variant)
+                    except Exception:
+                        break
+                    hints[p] = str(dest)
+                    self._log(f"  Line-ending fix: {Path(p).name} "
+                              f"{len(data):,}→{exp:,} B ({kind}) to match the "
+                              "packed copy.", "dim")
+                    break
+
     def _fresh_rescene(self):
         """Import a pristine rescene.main (purging any cached copy) and apply our
         patches. Called once per reconstruction so no module-level global state
@@ -1654,6 +1714,11 @@ class SrrdbToolAPI:
                     if fetched:
                         self._log("  Using srrdb add(s) as sources: "
                                   + ", ".join(sorted(fetched)), "dim")
+
+            # Correct line-ending-mismatched text sources (nfo/diz) so their
+            # size matches the packed copy — see _fix_text_source_endings.
+            if hints:
+                self._fix_text_source_endings(hints, srr_path, out_dir)
 
             skip_parts: list[str] = []
             run_parts:  list[str] = []
