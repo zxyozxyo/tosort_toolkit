@@ -934,8 +934,10 @@ class SrrdbToolAPI:
         """Download one srrdb 'add' by id, verify its CRC32 against the API
         value, and write it to dest_path. Rejects HTML bot-wall responses so a
         blocked download never masquerades as a source file."""
+        # filename may carry a subfolder (e.g. "[for reconstruction]/x.jpg") —
+        # keep the "/" so the path resolves; only the segments get encoded.
         url = SRRDB_DL_ADD.format(release=quote(release), id=add_id,
-                                  name=quote(filename))
+                                  name=quote(filename, safe="/"))
         try:
             # Non-browser UA to bypass the Anubis challenge (see DL_HEADERS).
             req = Request(url, headers={**DL_HEADERS,
@@ -1603,13 +1605,37 @@ class SrrdbToolAPI:
                 if still_missing:
                     release_nm = Path(srr_path).stem
                     details = self._srrdb_details(release_nm)
-                    adds = {a["name"].lower(): a
-                            for a in (details or {}).get("adds", [])
-                            if a.get("name") and a.get("id")}
+                    raw_adds = (details or {}).get("adds", []) if details else []
+                    # Key by BASENAME. srrdb serves reconstruction adds from
+                    # subfolders, e.g. "[for reconstruction]/ctr-h-anfj.jpg", so
+                    # the API name carries a path that must not defeat the match
+                    # against the packed file's bare name — but the FULL name is
+                    # kept (a["name"]) for the download URL, which needs the path.
+                    adds = {}
+                    for a in raw_adds:
+                        nm_a = a.get("name")
+                        if nm_a and a.get("id"):
+                            adds.setdefault(Path(nm_a).name.lower(), a)
+                    if not details:
+                        self._log("  ⚠ Couldn't fetch srrdb release details to "
+                                  "locate the missing packed source(s) — VPN off / "
+                                  "rate-limited? Rebuild will fail until available.",
+                                  "warn")
+                    elif not adds:
+                        self._log("  ⚠ srrdb lists no fetchable 'adds' for this "
+                                  "release.", "warn")
+                    else:
+                        _names = sorted(str(a.get("name", "?")) for a in raw_adds)
+                        self._log(f"  srrdb adds available: {len(_names)} "
+                                  f"({', '.join(_names[:6])}"
+                                  + ("…" if len(_names) > 6 else "") + ")", "dim")
                     fetched = []
                     for p, nm in still_missing:
                         a = adds.get(nm)
                         if not a:
+                            self._log(f"  ⚠ No srrdb add matches missing packed "
+                                      f"source {Path(p).name} — can't rebuild "
+                                      "without it.", "warn")
                             continue
                         dest = stored_pool / Path(p).name
                         if dest.is_file():
