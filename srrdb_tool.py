@@ -1056,13 +1056,19 @@ class SrrdbToolAPI:
 
         Only ever touches text sources whose size is already off, so releases
         that rebuild fine are untouched. The SFV/CRC verify stays the final
-        guard — a size that matches but isn't byte-exact still fails cleanly."""
+        guard — a size that matches but isn't byte-exact still fails cleanly.
+
+        Returns the list of packed-file names that remain UNRECONSTRUCTABLE — a
+        wrong-size text source that is neither a clean CRLF/LF variant nor
+        fetchable as a srrdb add. The caller fast-fails on those (rescene would
+        just recompress the big content file, then bail on the text block)."""
+        declined: list[str] = []
         try:
             expected = self._srr_packed_sizes(srr_path)
         except Exception:
-            return
+            return declined
         if not expected:
-            return
+            return declined
         conv_dir = Path(out_dir) / "_stored" / "_leconv"
         for p, src in list(hints.items()):
             nm = Path(p).name.lower()
@@ -1099,6 +1105,8 @@ class SrrdbToolAPI:
                           f"but the packed copy is {exp:,} B, and it's NOT a clean "
                           "CRLF/LF difference — can't reconstruct it from the "
                           "stored copy (needs the exact packed file).", "warn")
+                declined.append(Path(p).name)
+        return declined
 
     def _fresh_rescene(self):
         """Import a pristine rescene.main (purging any cached copy) and apply our
@@ -1953,8 +1961,30 @@ class SrrdbToolAPI:
 
             # Correct line-ending-mismatched text sources (nfo/diz) so their
             # size matches the packed copy — see _fix_text_source_endings.
-            if hints:
-                self._fix_text_source_endings(hints, srr_path, out_dir)
+            declined_text = self._fix_text_source_endings(
+                hints, srr_path, out_dir) if hints else []
+            # Fast-fail: a wrong-size text source (nfo/diz) that couldn't be
+            # fetched as a srrdb add AND isn't a clean CRLF/LF variant is
+            # genuinely unreconstructable — the group packed a different copy
+            # than the SRR stored, and it exists nowhere fetchable. rescene
+            # would happily recompress the big content file for minutes, then
+            # bail on the tiny text block with "Data file is not the correct
+            # size". Skip that wasted work and fail now with a clear reason.
+            #
+            # STRICTLY SAFE: `declined` only lists sources that are already the
+            # wrong size on disk (the exact check rescene's _repack does) and
+            # that our add-fetch could not resolve — so this can never abort a
+            # release that would otherwise rebuild. Gated to single-set releases
+            # so it never short-circuits a multi-set SRR where another set could
+            # still reconstruct.
+            if declined_text and len(rar_sets) <= 1:
+                names = ", ".join(declined_text)
+                return {
+                    "ok": False, "files": [], "output": "",
+                    "error": (
+                        f"packed {names} differs from the SRR-stored copy and no "
+                        "exact copy is available on srrdb — not rebuildable "
+                        "(skipped the content recompress).")}
 
             skip_parts: list[str] = []
             run_parts:  list[str] = []
