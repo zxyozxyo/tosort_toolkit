@@ -19,6 +19,11 @@ srrdb_tool.json
 srrdb_results.json
 srrdb_results.csv
 srrdb_results.xlsx
+srrdb_extras.db
+srrdb_extras.db-journal
+srrdb_extras.db-wal
+srrdb_extras.db-shm
+srr_cache/
 ia_upload_profiles.json
 misc_tools.json
 reference_fingerprint_db.json
