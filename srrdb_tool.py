@@ -152,6 +152,13 @@ _RECON_TIMEOUT_S = 1800  # 30 minutes
 # higher just burns time. The per-release deadline still bounds the total.
 _MT_RETRY_CAP = 8
 
+# A release normally packs 1–2 "extras" (proof jpg / file_id.diz) that aren't in
+# the content folder and get fetched from srrdb adds. Far more than this means a
+# wrong release match or a release whose loose files simply aren't present (e.g.
+# a PS5 asset dump with hundreds of .anim/.skel) — not an adds case. Bail with a
+# single summary instead of iterating/logging each (which floods the UI).
+_MAX_FETCH_ADDS = 8
+
 # Scene "fix" releases (DIRFIX/NFOFIX) are metadata-only follow-ups — a
 # corrected NFO or directory-name note, with NO packed content. There is
 # nothing for rescene to rebuild, so a content-CRC / name match legitimately
@@ -1662,7 +1669,18 @@ class SrrdbToolAPI:
                         nm = Path(p).name.lower()
                         if nm not in content_names and p not in hints:
                             still_missing.append((p, nm))
-                if still_missing:
+                if len(still_missing) > _MAX_FETCH_ADDS:
+                    # Too many missing sources to be "extras" — a wrong match or a
+                    # loose-asset release. One summary line, no per-file logging
+                    # (which floods the UI) and no add-fetch hammering.
+                    _nm = [Path(p).name for p, _ in still_missing]
+                    self._log(
+                        f"  ⚠ {len(_nm)} packed source(s) are missing from the "
+                        f"content folder (e.g. {', '.join(_nm[:4])}…) — looks like "
+                        "the wrong release match for this content, or a release "
+                        "whose loose files aren't present. Not rebuildable; "
+                        "skipping add-fetch.", "warn")
+                elif still_missing:
                     release_nm = Path(srr_path).stem
                     details = self._srrdb_details(release_nm)
                     raw_adds = (details or {}).get("adds", []) if details else []
@@ -1690,12 +1708,11 @@ class SrrdbToolAPI:
                                   f"({', '.join(_names[:6])}"
                                   + ("…" if len(_names) > 6 else "") + ")", "dim")
                     fetched = []
+                    no_match = []
                     for p, nm in still_missing:
                         a = adds.get(nm)
                         if not a:
-                            self._log(f"  ⚠ No srrdb add matches missing packed "
-                                      f"source {Path(p).name} — can't rebuild "
-                                      "without it.", "warn")
+                            no_match.append(Path(p).name)
                             continue
                         dest = stored_pool / Path(p).name
                         if dest.is_file():
@@ -1711,6 +1728,10 @@ class SrrdbToolAPI:
                                       f"({res['size']:,} B, CRC verified)", "ok")
                         else:
                             self._log(f"    ✗ {Path(p).name}: {res['error']}", "warn")
+                    if no_match:
+                        self._log(f"  ⚠ No srrdb add for {len(no_match)} missing "
+                                  f"source(s): {', '.join(no_match)} — can't rebuild "
+                                  "without them.", "warn")
                     if fetched:
                         self._log("  Using srrdb add(s) as sources: "
                                   + ", ".join(sorted(fetched)), "dim")
