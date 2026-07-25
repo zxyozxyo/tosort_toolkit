@@ -27,6 +27,7 @@ srr_cache/
 ia_upload_profiles.json
 misc_tools.json
 reference_fingerprint_db.json
+excluded_references.txt
 
 # Credentials — never commit these
 ia_credentials.json

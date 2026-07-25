@@ -121,7 +121,10 @@ ia_folder_packer.json         # Folder packer saved settings
 rclone_ia.json                # RClone uploader saved settings (fixdat path etc.)
 scene_recreator.json          # Scene recreator saved settings
 srrdb_tool.json               # srrdb rebuilder saved settings
+srrdb_extras.db               # srrdb local extras store — CRC index of your extras folders (auto-generated)
+srr_cache/                    # srrdb persistent SRR download cache
 reference_fingerprint_db.json # Scene recreator fingerprint DB (auto-generated, can be large)
+excluded_references.txt       # Scene recreator exclusion list (local)
 tosort_settings_export.json
 ```
 
@@ -168,7 +171,7 @@ Monitors source folder and runs pipeline automatically on new files.
 
 ### DAT Tools (dat_merger.html)
 
-Nine-tab DAT management suite: Merger, Splitter, Cleaner, Rebuilder, DAT Creator (file-based), DAT Creator (folder-based), Header Editor, Diff Tool, Batch Rename.
+Ten-tab DAT management suite: Merger, Splitter, Cleaner, Rebuilder, DAT Creator (file-based), DAT Creator (folder-based), Header Editor, Diff Tool, Batch Rename, and **Strip MIA** (remove all MIA-flagged entries from a single DAT or a folder of DATs, leaving the DAT usable).
 
 ---
 
@@ -352,12 +355,24 @@ The log states the exact reason whenever a sample can't be rebuilt.
   like the real sample. The file is named `NONSCENE-…-preview.m2ts` and is **not** a scene
   file — it will never CRC-match the SRS. Off by default.
 
+#### Compressed RAR reconstruction (game releases)
+
+Game scene RARs (3DS, NDS, etc.) are usually **compressed**, which makes the rebuild sensitive to the exact WinRAR build and settings the original packer used. Rather than write a near-miss off, the tool applies a layered rescue stack — each layer only ever runs *after* the normal rebuild has failed, so releases that rebuild today are untouched:
+
+- **Version sweep** — pyReScene locks the first WinRAR build whose test *piece* matches and never tries another; on low-effort methods (`-m1`) that can be an implausibly old build. When the full archive comes out a few bytes off, every other build in the pack is tried (this group's known-good history and nearest release date first) and CRC-verified against the SFV.
+- **Thread-count (`-mt`) rescue** — when the right version reproduces the wrong bytes because the original used a different thread count, the tool sweeps thread counts for the affected stream and re-verifies. Handles the single-file case, embedded proof-JPG near-misses, and small NFO/DIZ files that inherited a large file's thread count.
+- **Missing / mismatched extras** — some groups pack a proof JPG or an NFO/DIZ that isn't stored in the SRR, or a copy that differs from the loose one. These are resolved, in order, from: srrdb's "adds", a CRLF↔LF line-ending fix, and the **local extras store** (below). A genuinely unreconstructable extra fast-fails *before* wasting a full content recompress.
+
+**Local extras store.** Point the srrdb tool at one or more folders of scene extras — e.g. a set built with the misc-tools **Extras Collector**, or a pack from a DAT site. A single SQLite index (`srrdb_extras.db`, in the tosort folder for easy backup) is built from them, keyed by **content CRC32** — so it's name-independent and can hold same-named files from different packs with different bytes. When a rebuild needs an exact packed NFO/DIZ/proof the SRR doesn't carry and srrdb has no add for, it's matched by the SRR's exact CRC, **copied** (never moved) into the release, and re-verified. Manage folders and trigger a rescan from the **Extras store** panel; the scan is incremental (only new/changed files are read) and the folder list persists across restarts. Entirely inert until you add a folder.
+
+**Genuine walls** (reported clearly, never silently failed): RAR5 releases (pyReScene 0.7 limit), solid-compressed archives whose exact settings can't be reproduced, and a packed extra that differs from the SRR copy when no matching file exists on srrdb or in your extras store.
+
 #### Notes
 
 - **No Rar.exe required** for the vast majority of scene releases. Standard uncompressed video scene RARs are reconstructed natively by pyReScene in pure Python.
-- **Compressed RARs** (mostly game releases): require the exact original Rar.exe version. Use the **Setup RAR versions** button to extract correctly named executables from installers in `apps/winrar_pack-4.20/`.
+- **Compressed RARs** (mostly game releases): require the exact original Rar.exe version. Use the **Setup RAR versions** button to extract correctly named executables from installers in `apps/winrar_pack-4.20/`. See the rescue stack above.
 - **RAR5 releases** (WinRAR 5+) cannot be reconstructed by pyReScene 0.7 — detected and skipped upfront.
-- SRR downloads are cached in the output folder — re-running the same release skips the download.
+- SRR downloads are cached persistently in `srr_cache/` — re-running any release (even after a restart) skips the download and never re-hits the rate-limited host.
 
 ---
 
