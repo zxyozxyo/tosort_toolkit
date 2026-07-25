@@ -152,6 +152,15 @@ _RECON_TIMEOUT_S = 1800  # 30 minutes
 # higher just burns time. The per-release deadline still bounds the total.
 _MT_RETRY_CAP = 8
 
+# Multi-file rescue sweeps a small embedded "extra" (proof jpg / nfo / diz)
+# whose thread count produced the right size but wrong bytes. Those are cheap to
+# recompress, so allow a wider sweep than the single big-file cap — some later
+# scene machines had >8 cores, and the small file is quick to retry. A stream is
+# treated as a big CONTENT file (pinned, never swept — its compressed size is
+# reproduced by essentially the one thread count already locked) above this size.
+_MT_RETRY_CAP_SMALL = 16
+_LARGE_STREAM_BYTES = 16 * 1024 * 1024
+
 # A release normally packs 1–2 "extras" (proof jpg / file_id.diz) that aren't in
 # the content folder and get fetched from srrdb adds. Far more than this means a
 # wrong release match or a release whose loose files simply aren't present (e.g.
@@ -1455,16 +1464,22 @@ class SrrdbToolAPI:
             so the tiny file INHERITS the big file's high -mt and locks a
             spurious one — while the scene original packed it single-threaded.
 
-        We sweep each -mt>1 suspect in turn, pinning every OTHER suspect to its
-        own locked -mt so a passing SFV is unambiguously due to the swept
-        stream. Text metadata is swept first (its true count is almost always
-        -mt1) and climbs from 1; a binary suspect climbs from cur_mt+1 (values
-        below already failed the size test). Version is pinned to the one the
-        first run locked so the re-runs don't drift to a different version that
-        also reproduces the big stream but never the suspect.
+        We sweep the SMALL -mt>1 suspects (the embedded extras), smallest first,
+        and NEVER sweep a big content file when a smaller suspect exists — a big
+        file's compressed size is reproduced by essentially the one thread count
+        already locked, so every other value just fast-fails the size test after
+        a minutes-long recompress. The big file is left to re-lock naturally
+        (the proven single-suspect path). Text metadata climbs from -mt1 (its
+        true count is almost always single-threaded); a binary extra climbs from
+        cur_mt+1 (values below already failed the size test) up to a wider cap
+        (small files are cheap to retry). Version is pinned to the one the first
+        run locked so the re-runs don't drift to a different version that also
+        reproduces the big stream but never the suspect. Any OTHER small suspect
+        is held at its locked -mt so a passing SFV is unambiguously the swept
+        stream.
 
-        With a SINGLE suspect there are no other suspects to pin, so behaviour
-        is identical to the original single-suspect rescue. 0 suspects → no-op.
+        With a SINGLE suspect there are no others to hold, so behaviour matches
+        the original single-suspect rescue. 0 suspects → no-op.
 
         Returns the winning verify-result dict on success, else None. Only ever
         called after the SFV verify already failed, so a release that rebuilds
@@ -1481,18 +1496,32 @@ class SrrdbToolAPI:
         # pinned version means the big stream locks it first and the fast-fail
         # then restricts the suspect's hunt to that same version.
         pinned = getattr(self, "_last_good_rar", None)
+        sizes = self._srr_packed_sizes(srr_file)
+
+        def _sz(name: str) -> int:
+            return sizes.get(os.path.basename(name).lower(), 1 << 62)
 
         def _is_text_meta(name: str) -> bool:
             return os.path.splitext(name)[1].lower() in (
                 ".nfo", ".diz", ".txt", ".sfv", ".ini")
 
-        # Text metadata first (fast likely win at -mt1), then binary suspects.
-        ordered = ([s for s in suspects if _is_text_meta(s[0])]
-                   + [s for s in suspects if not _is_text_meta(s[0])])
+        def _is_big(name: str) -> bool:
+            return _sz(name) >= _LARGE_STREAM_BYTES
+
+        # Sweep the cheapest, likeliest culprit first — the small embedded extra
+        # (proof jpg / nfo / diz), ascending by packed size. A big CONTENT file
+        # (.3ds etc.) is NEVER swept when a smaller suspect exists: its compressed
+        # size is reproduced by essentially the one thread count already locked,
+        # so every other value fast-fails the size test after a minutes-long full
+        # recompress — pure churn. It simply re-locks to its own -mt while the
+        # small suspect is swept.
+        have_small = any(not _is_big(s[0]) for s in suspects)
+        ordered = sorted(suspects, key=lambda s: _sz(s[0]))
         if len(suspects) > 1:
             self._log(
                 f"  Multi-file near-miss: {len(suspects)} streams at -mt>1 — "
-                "sweeping each in turn (text metadata first; the rest pinned)"
+                "sweeping the small extra(s) first; the big content file re-locks "
+                "naturally, never swept"
                 + (f", pinned to {pinned}" if pinned else "") + "…", "dim")
         # The sweep needs its OWN wall-clock budget: each attempt calls
         # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
@@ -1502,25 +1531,30 @@ class SrrdbToolAPI:
         try:
             for suspect_file, _ver, cur_mt in ordered:
                 skey = suspect_file.lower()
-                # Hold every OTHER suspect fixed at its own locked -mt while we
-                # vary this one. Empty for a single suspect → identical to the
-                # original single-suspect rescue (only the suspect is forced).
+                big = _is_big(suspect_file)
+                if big and have_small:
+                    continue
+                # Hold any OTHER SMALL suspect at its locked -mt so a pass is
+                # unambiguously the swept stream; big neighbours are left to
+                # re-lock naturally (the proven single-suspect path — forcing a
+                # 100 MB+ file through the -mt override is both fragile and slow).
                 base_pins = {s[0].lower(): s[2] for s in suspects
-                             if s[0].lower() != skey}
+                             if s[0].lower() != skey and not _is_big(s[0])}
+                cap = _MT_RETRY_CAP if big else _MT_RETRY_CAP_SMALL
                 if _is_text_meta(suspect_file):
                     # Inherited a spurious high count; the truth is almost always
                     # single-threaded, so climb from 1.
-                    order = [n for n in range(1, _MT_RETRY_CAP + 1)
-                             if n != cur_mt]
+                    order = [n for n in range(1, cap + 1) if n != cur_mt]
                 else:
                     # The original hunt locks the FIRST -mt whose piece matched
                     # the size (ascending), so every value BELOW cur_mt already
                     # failed and would only fast-fail again after a full
-                    # recompress. The true count usually lies at cur_mt+1..CAP.
-                    order = (list(range(cur_mt + 1, _MT_RETRY_CAP + 1))
+                    # recompress. The true count usually lies at cur_mt+1..cap.
+                    order = (list(range(cur_mt + 1, cap + 1))
                              + list(range(1, cur_mt)))
                 self._log(
-                    f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt})"
+                    f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt}, up "
+                    f"to -mt{cap})"
                     + (f"; holding {', '.join(sorted(base_pins))}"
                        if base_pins else "") + "…", "dim")
                 for n in order:
