@@ -1391,7 +1391,7 @@ class SrrdbToolAPI:
                 orig_init(crf_self, first_block, blocks, src,
                           next_block, next_src, solid)
                 self._log(f"    rescene: exact size matched at -mt{n} ✓ "
-                          "(CRC still verified against the SFV)", "ok")
+                          "(final CRC still checked by the SFV verify)", "ok")
                 # Collapse the per-attempt combo records to just the winning one.
                 if base is not None:
                     winning = streams[-1] if len(streams) > base else None
@@ -1441,35 +1441,38 @@ class SrrdbToolAPI:
 
     def _rescue_multifile_crc(self, srr_file: str, content_dir: str,
                               out_root: Path):
-        """Rescue a multi-file NON-SOLID CRC near-miss (e.g. a big content file
-        that verified fine + a small embedded jpg whose thread count produced
-        the right SIZE but wrong BYTES, so __init__ succeeded and only the SFV
-        catches it).
+        """Rescue a multi-file NON-SOLID CRC near-miss: one or more compressed
+        streams reproduced the right SIZE but wrong BYTES, so rescene's
+        __init__ (which only size-checks, main.py:2216) accepted them and only
+        the final volume SFV caught the wrong CRC.
 
-        rescene's per-stream hunt can't tell thread counts apart when they yield
-        the same compressed size, so the only truth-check is the volume CRC. We
-        pin every already-locked stream to its own -mt (streams re-hunt to the
-        same value; only the suspect is forced) and sweep the SUSPECT's -mt,
-        re-running the full reconstruction and re-checking the SFV each time.
+        Two classic culprits, both handled here:
+          • an embedded jpg whose true thread count is ABOVE the one rescene
+            greedily locked (the first -mt whose test piece matched the size);
+          • a small trailing TEXT file (nfo/diz/txt) packed AFTER the big
+            content file. rescene seeds each file's thread hunt from the MAX
+            thread count of files already done in the set (main.py:2143-2148),
+            so the tiny file INHERITS the big file's high -mt and locks a
+            spurious one — while the scene original packed it single-threaded.
 
-        Deliberately conservative — engages ONLY when exactly one compressed
-        stream was locked at -mt>1 (the classic embedded-jpg culprit; a stream
-        locked at -mt1 is single-threaded and deterministic, so no other -mt
-        helps it). 0 or ≥2 such streams → we don't touch it and it stays FAILED.
+        We sweep each -mt>1 suspect in turn, pinning every OTHER suspect to its
+        own locked -mt so a passing SFV is unambiguously due to the swept
+        stream. Text metadata is swept first (its true count is almost always
+        -mt1) and climbs from 1; a binary suspect climbs from cur_mt+1 (values
+        below already failed the size test). Version is pinned to the one the
+        first run locked so the re-runs don't drift to a different version that
+        also reproduces the big stream but never the suspect.
+
+        With a SINGLE suspect there are no other suspects to pin, so behaviour
+        is identical to the original single-suspect rescue. 0 suspects → no-op.
 
         Returns the winning verify-result dict on success, else None. Only ever
         called after the SFV verify already failed, so a release that rebuilds
         (or fails) normally today is unaffected."""
         streams = list(getattr(self, "_recon_streams", None) or [])
         suspects = [s for s in streams if s[2] and s[2] > 1]
-        if len(suspects) != 1:
-            if suspects:
-                self._log(
-                    f"  Multi-file rescue skipped — {len(suspects)} streams at "
-                    "-mt>1; can't isolate the culprit safely.", "dim")
+        if not suspects:
             return None
-        suspect_file, _ver, cur_mt = suspects[0]
-        skey = suspect_file.lower()
         # Pin the version the original run locked (e.g. 2014-05-21 5.11). Without
         # this the sweep re-hunts from scratch and can lock a DIFFERENT version
         # (e.g. 5.50) that also reproduces the big stream — at which point the
@@ -1478,58 +1481,83 @@ class SrrdbToolAPI:
         # pinned version means the big stream locks it first and the fast-fail
         # then restricts the suspect's hunt to that same version.
         pinned = getattr(self, "_last_good_rar", None)
-        self._log(
-            f"  Multi-file near-miss: sweeping -mt for {suspect_file} "
-            f"(locked -mt{cur_mt})"
-            + (f", pinned to {pinned}" if pinned else "")
-            + " while the rest re-lock as before…", "dim")
+
+        def _is_text_meta(name: str) -> bool:
+            return os.path.splitext(name)[1].lower() in (
+                ".nfo", ".diz", ".txt", ".sfv", ".ini")
+
+        # Text metadata first (fast likely win at -mt1), then binary suspects.
+        ordered = ([s for s in suspects if _is_text_meta(s[0])]
+                   + [s for s in suspects if not _is_text_meta(s[0])])
+        if len(suspects) > 1:
+            self._log(
+                f"  Multi-file near-miss: {len(suspects)} streams at -mt>1 — "
+                "sweeping each in turn (text metadata first; the rest pinned)"
+                + (f", pinned to {pinned}" if pinned else "") + "…", "dim")
         # The sweep needs its OWN wall-clock budget: each attempt calls
         # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
         # we can't lean on that here. Budget the whole sweep (each attempt still
         # has its own per-reconstruction deadline inside _srr_reconstruct).
         sweep_deadline = time.time() + _RECON_TIMEOUT_S
-        # Order the sweep smartly. The original hunt locks the FIRST thread count
-        # that reproduced the suspect's size (ascending), so every value BELOW
-        # cur_mt already failed the size test and would only fast-fail again —
-        # after paying a full recompress of the pinned neighbour. The true count
-        # therefore lies at cur_mt+1..CAP, so try those first; only fall back to
-        # the below-cur_mt values (in case the piece-size test wasn't perfectly
-        # representative of the full file) if the likely range is exhausted.
-        order = (list(range(cur_mt + 1, _MT_RETRY_CAP + 1))
-                 + list(range(1, cur_mt)))
         try:
-            for n in order:
-                if self._stop.is_set() or self._skip.is_set():
-                    break
-                if time.time() > sweep_deadline:
-                    self._log("  Multi-file rescue: deadline reached — "
-                              "stopping.", "dim")
-                    break
-                self._clear_produced_volumes(out_root)
-                self._mt_override = {skey: n}
-                self._recon_streams = []          # fresh combos for this attempt
-                if pinned:
-                    SrrdbToolAPI._pref_versions = [pinned]
-                self._log(f"    trying {suspect_file} at -mt{n}…", "dim")
-                try:
-                    rc = self._srr_reconstruct(
-                        srr_file, content_dir, str(out_root), log_rar_pack=False)
-                finally:
-                    self._mt_override = {}
-                    SrrdbToolAPI._pref_versions = []
-                if not rc.get("ok"):
-                    continue
-                v2 = self._verify_rebuilt_sfv(out_root)
-                if v2["checked"] and not v2["bad"]:
-                    self._log(
-                        f"  ✓ Multi-file rescue: {suspect_file} rebuilt at "
-                        f"-mt{n} — all {v2['checked']} volume(s) now CRC-match "
-                        "the SFV.", "ok")
-                    return v2
+            for suspect_file, _ver, cur_mt in ordered:
+                skey = suspect_file.lower()
+                # Hold every OTHER suspect fixed at its own locked -mt while we
+                # vary this one. Empty for a single suspect → identical to the
+                # original single-suspect rescue (only the suspect is forced).
+                base_pins = {s[0].lower(): s[2] for s in suspects
+                             if s[0].lower() != skey}
+                if _is_text_meta(suspect_file):
+                    # Inherited a spurious high count; the truth is almost always
+                    # single-threaded, so climb from 1.
+                    order = [n for n in range(1, _MT_RETRY_CAP + 1)
+                             if n != cur_mt]
+                else:
+                    # The original hunt locks the FIRST -mt whose piece matched
+                    # the size (ascending), so every value BELOW cur_mt already
+                    # failed and would only fast-fail again after a full
+                    # recompress. The true count usually lies at cur_mt+1..CAP.
+                    order = (list(range(cur_mt + 1, _MT_RETRY_CAP + 1))
+                             + list(range(1, cur_mt)))
+                self._log(
+                    f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt})"
+                    + (f"; holding {', '.join(sorted(base_pins))}"
+                       if base_pins else "") + "…", "dim")
+                for n in order:
+                    if self._stop.is_set() or self._skip.is_set():
+                        return None
+                    if time.time() > sweep_deadline:
+                        self._log("  Multi-file rescue: deadline reached — "
+                                  "stopping.", "dim")
+                        return None
+                    self._clear_produced_volumes(out_root)
+                    ov = dict(base_pins)
+                    ov[skey] = n
+                    self._mt_override = ov
+                    self._recon_streams = []      # fresh combos for this attempt
+                    if pinned:
+                        SrrdbToolAPI._pref_versions = [pinned]
+                    self._log(f"    trying {suspect_file} at -mt{n}…", "dim")
+                    try:
+                        rc = self._srr_reconstruct(
+                            srr_file, content_dir, str(out_root),
+                            log_rar_pack=False)
+                    finally:
+                        self._mt_override = {}
+                        SrrdbToolAPI._pref_versions = []
+                    if not rc.get("ok"):
+                        continue
+                    v2 = self._verify_rebuilt_sfv(out_root)
+                    if v2["checked"] and not v2["bad"]:
+                        self._log(
+                            f"  ✓ Multi-file rescue: {suspect_file} rebuilt at "
+                            f"-mt{n} — all {v2['checked']} volume(s) now "
+                            "CRC-match the SFV.", "ok")
+                        return v2
         finally:
             self._mt_override = {}
         self._log("  Multi-file rescue exhausted — no thread count reproduced "
-                  f"{suspect_file} exactly. Kept as FAILED.", "warn")
+                  "the near-miss stream(s) exactly. Kept as FAILED.", "warn")
         return None
 
     def _log_recon_combos(self, style: str = "dim") -> None:
