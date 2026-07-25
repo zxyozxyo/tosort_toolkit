@@ -213,6 +213,17 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <button class="btn btn-sm" onclick="exportCsv()">Export CSV</button>
             <span style="font-size:10px;opacity:0.6">every run is recorded automatically (group, year, outcome, RAR version)</span>
           </div>
+          <div class="row" style="align-items:flex-start">
+            <span class="lbl" title="Local folder(s) of scene extras (nfo/diz/proof jpg). When a rebuild needs an exact packed file that srrdb has no add for, it's matched here by CRC32 and copied in — never moved.">Extras store</span>
+            <div style="flex:1;display:flex;flex-direction:column;gap:4px">
+              <div id="extras-folders" style="display:flex;flex-direction:column;gap:2px"></div>
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <button class="btn btn-sm" onclick="extrasAddFolder()">Add folder</button>
+                <button class="btn btn-sm" id="btn-extras-rescan" onclick="extrasRescan()" title="Scan the folder(s) and (re)build the CRC index. Incremental — only new/changed files are read.">Rescan</button>
+                <span id="extras-stats" style="font-size:10px;color:var(--text3)"></span>
+              </div>
+            </div>
+          </div>
           <div class="row">
             <span class="lbl">Max candidates</span>
             <select class="sel" id="max-test" style="width:70px">
@@ -317,6 +328,9 @@ window.addEventListener('pywebviewready', async () => {
       info.textContent = 'pack found — click to extract';
     }
   }
+
+  // Extras store — load configured folders + stats
+  refreshExtras();
 });
 
 // Grey out the ISO M2TS option when "Create sample" is unchecked
@@ -387,6 +401,13 @@ window.srrEvent = function(event, data) {
     }
   } else if (event === 'batch_progress') {
     document.getElementById('status-pill').textContent = `${data.current}/${data.total}`;
+  } else if (event === 'progress') {
+    const s = document.getElementById('extras-stats');
+    if (s && data.label) s.textContent = data.label;
+  } else if (event === 'extras') {
+    const b = document.getElementById('btn-extras-rescan');
+    if (b) { b.disabled = false; b.textContent = 'Rescan'; }
+    refreshExtras();
   }
 };
 
@@ -512,6 +533,53 @@ async function exportCsv() {
 async function exportXlsx() {
   const r = await window.pywebview.api.export_results_xlsx();
   if (r && !r.ok) log('Export failed: ' + r.error, 'err');
+}
+
+// ── Extras store ──────────────────────────────────────────────────────────────
+async function refreshExtras() {
+  let info;
+  try { info = await window.pywebview.api.extras_get_folders(); } catch (e) { return; }
+  const box = document.getElementById('extras-folders');
+  box.innerHTML = '';
+  (info.folders || []).forEach(f => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:11px';
+    const rm = document.createElement('button');
+    rm.className = 'btn btn-sm'; rm.textContent = '×';
+    rm.title = 'Remove this folder from the list (files on disk are not touched)';
+    rm.style.cssText = 'padding:0 6px;line-height:1.4';
+    rm.onclick = () => extrasRemoveFolder(f.path);
+    const path = document.createElement('span');
+    path.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    path.textContent = f.path; path.title = f.path;
+    const cnt = document.createElement('span');
+    cnt.style.cssText = 'color:var(--text3);font-size:10px';
+    cnt.textContent = `${(f.files || 0).toLocaleString()} file(s)`;
+    row.appendChild(rm); row.appendChild(path); row.appendChild(cnt);
+    box.appendChild(row);
+  });
+  const s = document.getElementById('extras-stats');
+  if (!info.folders || !info.folders.length) {
+    s.textContent = 'No folders yet — add a scene extras pack (nfo/diz/proofs) to reclaim releases whose packed nfo differs from the SRR copy.';
+  } else {
+    s.textContent = `${(info.total_files || 0).toLocaleString()} file(s) indexed`
+      + (info.last_scan ? ` · last scan ${info.last_scan}` : ' · not scanned yet — click Rescan');
+  }
+}
+async function extrasAddFolder() {
+  const r = await window.pywebview.api.extras_add_folder();
+  if (r && r.ok) { log('Extras folder added: ' + r.folder + ' — click Rescan to index it.', 'ok'); refreshExtras(); }
+}
+async function extrasRemoveFolder(path) {
+  if (!confirm('Remove this folder from the extras store?\n\n' + path + '\n\n(The folder on disk is NOT deleted — only its index entries.)')) return;
+  await window.pywebview.api.extras_remove_folder(path);
+  refreshExtras();
+}
+async function extrasRescan() {
+  const b = document.getElementById('btn-extras-rescan');
+  const r = await window.pywebview.api.extras_rescan();
+  if (r && r.ok) { b.disabled = true; b.textContent = 'Scanning…'; }
+  else if (r && r.error) log('Extras: ' + r.error, 'warn');
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────

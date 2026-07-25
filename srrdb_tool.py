@@ -20,6 +20,7 @@ import tempfile
 import threading
 import subprocess
 import zlib
+import sqlite3
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
@@ -167,6 +168,13 @@ _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 # a PS5 asset dump with hundreds of .anim/.skel) — not an adds case. Bail with a
 # single summary instead of iterating/logging each (which floods the UI).
 _MAX_FETCH_ADDS = 8
+
+# Local extras store: files larger than this are skipped by the scan (extras —
+# nfo/diz/proof jpg/sfv/sample — are small; this avoids CRCing a stray game dump
+# that happens to sit in a source folder). Content is indexed by CRC32 so the
+# store is name-independent: two packs can hold same-named files with different
+# bytes and both are kept, matched to a rebuild by the SRR's exact packed CRC.
+_EXTRAS_MAX_FILE_BYTES = 200 * 1024 * 1024
 
 # Scene "fix" releases (DIRFIX/NFOFIX) are metadata-only follow-ups — a
 # corrected NFO or directory-name note, with NO packed content. There is
@@ -1047,6 +1055,269 @@ class SrrdbToolAPI:
                     sizes.setdefault(Path(fname).name.lower(), sz)
         return sizes
 
+    def _srr_packed_info(self, srr_path: str) -> dict:
+        """Map packed-file basename (lower) -> (unpacked_size, crc_hex) from the
+        SRR's RarPackedFile blocks. crc_hex is the 8-digit lowercase CRC32 of
+        the packed file's *content* (None if the SRR doesn't carry it, e.g. very
+        old RAR that stores the CRC only in a trailing block). Used to resolve a
+        needed source from the local extras DB by exact content."""
+        from rescene.rar import RarReader, BlockType  # type: ignore
+        info: dict = {}
+        for block in RarReader(str(srr_path)).read_all():
+            if block.rawtype == BlockType.RarPackedFile:
+                fname = getattr(block, "file_name", "")
+                sz = getattr(block, "unpacked_size", None)
+                crc = getattr(block, "file_crc", None)
+                if fname and sz is not None:
+                    key = Path(fname).name.lower()
+                    if key not in info:
+                        crc_hex = (f"{crc:08x}"
+                                   if isinstance(crc, int) and crc != 0xFFFFFFFF
+                                   else None)
+                        info[key] = (sz, crc_hex)
+        return info
+
+    # ── Local extras store (content-addressed by CRC32) ───────────────────────
+    # A user-supplied folder (or several) of scene "extras" — the exact packed
+    # nfo/diz/proof-jpg copies that some groups pack DIFFERENTLY from the loose
+    # copy the SRR stored, and that srrdb has no add for. Indexed once into a
+    # single SQLite file in the tosort folder (easy backup), keyed by content
+    # CRC32 so it's name-independent and can hold same-named files from two packs
+    # with different bytes. During a rebuild, a source we can't otherwise produce
+    # is looked up by the SRR's EXACT packed CRC+size; on a match the file is
+    # COPIED (never moved) into the release and re-verified. Entirely inert when
+    # no folders are configured, so the normal rebuild path is untouched.
+
+    @property
+    def _extras_db_path(self) -> Path:
+        return Path(__file__).parent / "srrdb_extras.db"
+
+    def _extras_connect(self, create: bool = True):
+        """Open the extras SQLite DB (schema-created on demand). Returns a
+        connection, or None when create=False and the DB doesn't exist yet.
+        Default rollback journal (no WAL) so the store stays a single .db file
+        for backup. Bound to the calling thread (SQLite default)."""
+        p = self._extras_db_path
+        if not create and not p.exists():
+            return None
+        con = sqlite3.connect(str(p))
+        con.execute("""CREATE TABLE IF NOT EXISTS files(
+            path TEXT PRIMARY KEY, crc TEXT, size INTEGER, name TEXT,
+            folder TEXT, mtime REAL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_files_crc ON files(crc, size)")
+        con.execute("CREATE TABLE IF NOT EXISTS folders(path TEXT PRIMARY KEY, added REAL)")
+        con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        con.commit()
+        return con
+
+    @staticmethod
+    def _file_crc32(path: str):
+        """Streaming CRC32 of a file → 8-digit lowercase hex, or None on error."""
+        try:
+            crc = 0
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    crc = zlib.crc32(chunk, crc)
+            return f"{crc & 0xffffffff:08x}"
+        except OSError:
+            return None
+
+    # --- GUI-facing config + scan API ---
+    def extras_get_folders(self) -> dict:
+        """Configured extras folders (with per-folder file counts) + store stats,
+        for the GUI. Persisted in the DB, so it survives a restart."""
+        con = self._extras_connect(create=False)
+        if not con:
+            return {"folders": [], "total_files": 0, "last_scan": None}
+        try:
+            folders = [r[0] for r in con.execute("SELECT path FROM folders ORDER BY path")]
+            counts = {r[0]: r[1] for r in con.execute(
+                "SELECT folder, COUNT(*) FROM files GROUP BY folder")}
+            total = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            last = con.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
+            return {
+                "folders": [{"path": f, "files": counts.get(f, 0)} for f in folders],
+                "total_files": total,
+                "last_scan": last[0] if last else None,
+                "scanning": bool(getattr(self, "_extras_scanning", False)),
+            }
+        finally:
+            con.close()
+
+    def extras_add_folder(self) -> dict:
+        """Browse for a folder and add it to the extras source list."""
+        folder = self.browse_folder()
+        if not folder:
+            return {"ok": False}
+        con = self._extras_connect()
+        try:
+            con.execute("INSERT OR IGNORE INTO folders(path, added) VALUES(?,?)",
+                        (folder, time.time()))
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "folder": folder}
+
+    def extras_remove_folder(self, folder: str) -> dict:
+        """Remove a folder from the list and drop its indexed files (the folder
+        on disk is never touched)."""
+        con = self._extras_connect(create=False)
+        if not con:
+            return {"ok": True}
+        try:
+            con.execute("DELETE FROM folders WHERE path=?", (folder,))
+            con.execute("DELETE FROM files WHERE folder=?", (folder,))
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True}
+
+    def extras_rescan(self) -> dict:
+        """Kick off an incremental (re)scan of all configured folders in a
+        background thread — emits log + progress events, then an 'extras' event
+        when done."""
+        if getattr(self, "_extras_scanning", False):
+            return {"ok": False, "error": "a scan is already running"}
+        self._extras_scanning = True
+        threading.Thread(target=self._extras_scan_thread, daemon=True).start()
+        return {"ok": True}
+
+    def _extras_scan_thread(self):
+        try:
+            self._extras_scan()
+        except Exception as e:
+            self._log(f"Extras scan error: {e}", "err")
+        finally:
+            self._extras_scanning = False
+            self._emit("extras", {"scanning": False})
+
+    def _extras_scan(self):
+        con = self._extras_connect()
+        try:
+            folders = [r[0] for r in con.execute("SELECT path FROM folders")]
+            if not folders:
+                self._log("Extras: no source folders configured — nothing to scan.",
+                          "warn")
+                return
+            # Incremental: keep CRCs of files whose size+mtime are unchanged.
+            have = {r[0]: (r[1], r[2]) for r in
+                    con.execute("SELECT path, size, mtime FROM files")}
+            allfiles = []
+            for folder in folders:
+                if not os.path.isdir(folder):
+                    self._log(f"Extras: folder not found, skipping — {folder}", "warn")
+                    continue
+                for root, _dirs, names in os.walk(folder):
+                    for n in names:
+                        allfiles.append((folder, os.path.join(root, n)))
+            total = len(allfiles)
+            self._log(f"Extras: scanning {total:,} file(s) across "
+                      f"{len(folders)} folder(s)…", "info")
+            seen = set()
+            added = updated = skipped = big = 0
+            for i, (folder, fp) in enumerate(allfiles, 1):
+                if i % 200 == 0:
+                    self._emit("progress", {
+                        "pct": int(i * 100 / max(total, 1)),
+                        "label": f"Scanning extras {i:,}/{total:,}"})
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                seen.add(fp)
+                if st.st_size > _EXTRAS_MAX_FILE_BYTES:
+                    big += 1
+                    continue
+                prev = have.get(fp)
+                if prev and prev[0] == st.st_size and abs(prev[1] - st.st_mtime) < 1e-6:
+                    skipped += 1
+                    continue
+                crc = self._file_crc32(fp)
+                if crc is None:
+                    continue
+                con.execute(
+                    "INSERT OR REPLACE INTO files(path,crc,size,name,folder,mtime) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (fp, crc, st.st_size, os.path.basename(fp).lower(), folder,
+                     st.st_mtime))
+                if prev:
+                    updated += 1
+                else:
+                    added += 1
+                if (added + updated) % 500 == 0:
+                    con.commit()
+            # Prune rows whose file vanished (deleted / folder removed).
+            removed = 0
+            for (path,) in list(con.execute("SELECT path FROM files")):
+                if path not in seen:
+                    con.execute("DELETE FROM files WHERE path=?", (path,))
+                    removed += 1
+            con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_scan',?)",
+                        (time.strftime("%Y-%m-%d %H:%M:%S"),))
+            con.commit()
+            total_now = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            self._log(
+                f"Extras scan done: {added:,} new, {updated:,} updated, "
+                f"{skipped:,} unchanged, {removed:,} removed"
+                + (f", {big:,} too big (skipped)" if big else "")
+                + f" — {total_now:,} file(s) indexed.", "ok")
+            self._emit("progress", {"pct": 100, "label": ""})
+            self._emit("extras", {"scanning": False, "total_files": total_now})
+        finally:
+            con.close()
+
+    def _extras_lookup(self, crc_hex, size):
+        """Return an on-disk extras path whose content CRC+size match, else None.
+        Read-only and safe with no DB configured (returns None)."""
+        if not crc_hex:
+            return None
+        con = self._extras_connect(create=False)
+        if not con:
+            return None
+        try:
+            for (path,) in con.execute(
+                    "SELECT path FROM files WHERE crc=? AND size=?", (crc_hex, size)):
+                if os.path.isfile(path):
+                    return path
+        except sqlite3.Error:
+            return None
+        finally:
+            con.close()
+        return None
+
+    def _resolve_from_extras(self, items, is_wrong, hints, stored_pool, packed_info):
+        """For each (packed_path, name) in items, look the SRR's exact packed
+        CRC+size up in the local extras store; on a content match COPY it in
+        (never move), re-verify the CRC, and point the hint at it. Returns the
+        sublist it resolved. Inert when the store is empty/absent."""
+        resolved = []
+        for p, nm in items:
+            exp = packed_info.get(nm)
+            if not exp:
+                continue
+            size, crc_hex = exp
+            hit = self._extras_lookup(crc_hex, size)
+            if not hit:
+                continue
+            dest = (stored_pool / "_adds" / Path(p).name if is_wrong
+                    else stored_pool / Path(p).name)
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(hit, dest)
+            except OSError:
+                continue
+            if self._file_crc32(str(dest)) != crc_hex:
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                continue
+            hints[p] = str(dest)
+            resolved.append((p, nm))
+            self._log(f"  Extras store: matched {Path(p).name} by CRC {crc_hex} "
+                      "— copied from your local pack.", "ok")
+        return resolved
+
     def _fix_text_source_endings(self, hints: dict, srr_path: str, out_dir: str):
         """Some groups pack an nfo/diz with different line endings than the copy
         stored in the SRR, so the extracted source is the WRONG SIZE (e.g. CRLF
@@ -1881,6 +2152,20 @@ class SrrdbToolAPI:
                                 cur = None
                             if exp is not None and cur is not None and cur != exp:
                                 wrong_size.append((p, nm))
+                # Local extras store first — content-addressed by the SRR's exact
+                # packed CRC, offline, and it spares srrdb. Whatever it resolves is
+                # removed from the missing/wrong lists so only the rest goes to the
+                # network (and the LE-fix / fast-fail below). Inert with no store.
+                if (still_missing or wrong_size) and self._extras_db_path.exists():
+                    packed_info = self._srr_packed_info(srr_path)
+                    r_miss = self._resolve_from_extras(
+                        still_missing, False, hints, stored_pool, packed_info)
+                    r_wrong = self._resolve_from_extras(
+                        wrong_size, True, hints, stored_pool, packed_info)
+                    if r_miss:
+                        still_missing = [x for x in still_missing if x not in r_miss]
+                    if r_wrong:
+                        wrong_size = [x for x in wrong_size if x not in r_wrong]
                 if len(still_missing) > _MAX_FETCH_ADDS:
                     # Too many missing sources to be "extras" — a wrong match or a
                     # loose-asset release. One summary line, no per-file logging
