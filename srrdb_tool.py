@@ -1890,7 +1890,18 @@ class SrrdbToolAPI:
         # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
         # we can't lean on that here. Budget the whole sweep (each attempt still
         # has its own per-reconstruction deadline inside _srr_reconstruct).
-        sweep_deadline = time.time() + _RECON_TIMEOUT_S
+        # Every attempt recompresses the big content stream in full, so a
+        # multi-GB .3ds needs proportionally more wall-clock or the -mt sweep
+        # can't reach a trailing extra's true count (a 2 GB .3ds is ~3-4 min per
+        # attempt). Scale from the base timeout by size, capped so a pathological
+        # release can't hang the batch indefinitely.
+        big_bytes = max((_sz(s[0]) for s in streams if _is_big(s[0])),
+                        default=0)
+        budget = _RECON_TIMEOUT_S
+        if big_bytes > (1 << 30):     # > 1 GB
+            budget = min(int(_RECON_TIMEOUT_S * (big_bytes / (1 << 30))),
+                         4 * _RECON_TIMEOUT_S)
+        sweep_deadline = time.time() + budget
 
         def _attempt(ov, label, force_method2=False, build_force=None):
             """One reconstruct+verify pass. `ov` is the -mt override map
@@ -1936,7 +1947,14 @@ class SrrdbToolAPI:
             # attempt (the big stream already revealed the count), CRC-verified
             # before we accept it, so a miss simply falls through to the -mt
             # sweeps below and NOTHING that rebuilds today changes.
-            if has_big:
+            #
+            # SKIP when the whole set is single-threaded (dominant_mt <= 1):
+            # with one thread, in-context == isolated compression, so method2
+            # reproduces the EXACT bytes the plain rebuild already failed on —
+            # it can never help, and on a multi-GB .3ds it wastes many minutes
+            # that the -mt sweep below needs (the trailing extra was a separate
+            # `rar a -mtX` add, e.g. Rayman -mt3 / Metroid -mt6).
+            if has_big and dominant_mt > 1:
                 if self._stop.is_set() or self._skip.is_set():
                     return None
                 if time.time() <= sweep_deadline:
@@ -2056,57 +2074,18 @@ class SrrdbToolAPI:
                             "CRC-match the SFV.", "ok")
                         return r
 
-            # ── Alternate-build sweep ──────────────────────────────────────
-            # A CRC near-miss can also mean rescene locked the right version
-            # NUMBER but the wrong BUILD of it — a beta vs the final (both are
-            # e.g. "2014-05-21 5.11", so nothing above could tell them apart).
-            # This is the remaining cause once thread count is ruled out: on a
-            # single-threaded (-mt1) set method2 can't help — in-context and
-            # isolated compression are identical — yet the big stream can still
-            # reproduce under both builds while a trailing extra differs. Retry
-            # each SIBLING build (same date+major.minor, different exe, minus the
-            # one already used); if a plain rebuild misses, try method2 under it
-            # too (a multithreaded set may need both the sibling build AND the
-            # in-context path). CRC-verified, so a miss simply falls through.
-            siblings = self._sibling_builds(
-                self._find_rar_dir(), getattr(self, "_last_good_rar", None),
-                getattr(self, "_last_good_exe", None))
-            if siblings:
-                self._log(
-                    f"  Multi-file near-miss: locked version has "
-                    f"{len(siblings)} sibling build(s) ({', '.join(siblings)}) "
-                    "— retrying under each…", "dim")
-            for build in siblings:
-                if self._stop.is_set() or self._skip.is_set():
-                    return None
-                if time.time() > sweep_deadline:
-                    self._log("  Multi-file rescue: deadline reached — "
-                              "stopping.", "dim")
-                    return None
-                r = _attempt({}, f"rebuild under {build}", build_force=build)
-                if not r and any(_is_big(s[0]) for s in streams):
-                    if time.time() > sweep_deadline:
-                        return None
-                    r = _attempt({}, f"all files together under {build}",
-                                 force_method2=True, build_force=build)
-                if r:
-                    self._log(
-                        f"  ✓ Multi-file rescue: rebuilt under sibling build "
-                        f"{build} — all {r['checked']} volume(s) now CRC-match "
-                        "the SFV.", "ok")
-                    return r
-
-            # ── Last resort: sweep -mt1-locked small extras ────────────────
+            # ── Sweep -mt1-locked small extras ─────────────────────────────
             # A small extra that locked -mt1 was excluded from `suspects`, but
             # its piece-SIZE lock is UNRELIABLE — many thread counts share a
             # small file's compressed size, so a proof jpg genuinely packed at a
             # higher count (e.g. added after an -mt1 .3ds via a separate
-            # `rar a -mtX`) still locks a spurious -mt1 and is never swept. As a
-            # final lever, sweep each such extra across -mt2..cap (mt1 already
-            # failed in the first pass), holding the OTHER small extras at their
-            # locked count; the big content file re-locks naturally. Costliest
-            # tier (a full recompress per value), so it runs last, only once
-            # every cheaper path has missed. CRC-verified like all the rest.
+            # `rar a -mtX`) still locks a spurious -mt1 and is never swept. This
+            # is the PROVEN fix for the -mt1 .3ds family (Rayman -mt3, Metroid
+            # -mt6), so it runs BEFORE the rarer build sweep — and, for an -mt1
+            # set, method2 above was skipped, so this is the primary lever and
+            # gets the full budget. Sweep each such extra across -mt2..cap (mt1
+            # already failed), holding the OTHER small extras at their locked
+            # count; the big content file re-locks naturally. CRC-verified.
             mt1_extras = sorted(
                 (s for s in streams if not _is_big(s[0])
                  and s[2] == 1 and not _is_text_meta(s[0])),
@@ -2117,8 +2096,8 @@ class SrrdbToolAPI:
                              if not _is_big(s[0]) and s[0].lower() != skey}
                 cap = _MT_RETRY_CAP_SMALL
                 self._log(
-                    f"  Last resort: sweeping -mt for {extra_file} (locked "
-                    f"-mt1, unreliable for a small file — trying -mt2–{cap})"
+                    f"  Sweeping -mt for {extra_file} (locked -mt1, unreliable "
+                    f"for a small file — trying -mt2–{cap})"
                     + (f"; holding {', '.join(sorted(base_pins))}"
                        if base_pins else "") + "…", "dim")
                 for n in range(2, cap + 1):
@@ -2137,6 +2116,45 @@ class SrrdbToolAPI:
                             f"-mt{n} — all {r['checked']} volume(s) now "
                             "CRC-match the SFV.", "ok")
                         return r
+
+            # ── Alternate-build sweep ──────────────────────────────────────
+            # A CRC near-miss can also mean rescene locked the right version
+            # NUMBER but the wrong BUILD of it — a beta vs the final (both are
+            # e.g. "2014-05-21 5.11", so nothing above could tell them apart).
+            # The big stream can reproduce under both builds while a trailing
+            # extra differs. Retry each SIBLING build (same date+major.minor,
+            # different exe, minus the one already used); if a plain rebuild
+            # misses AND the set is multithreaded, try method2 under it too (a
+            # single-threaded set gains nothing from method2). CRC-verified, so
+            # a miss simply falls through.
+            siblings = self._sibling_builds(
+                self._find_rar_dir(), getattr(self, "_last_good_rar", None),
+                getattr(self, "_last_good_exe", None))
+            if siblings:
+                self._log(
+                    f"  Multi-file near-miss: locked version has "
+                    f"{len(siblings)} sibling build(s) ({', '.join(siblings)}) "
+                    "— retrying under each…", "dim")
+            for build in siblings:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() > sweep_deadline:
+                    self._log("  Multi-file rescue: deadline reached — "
+                              "stopping.", "dim")
+                    return None
+                r = _attempt({}, f"rebuild under {build}", build_force=build)
+                if not r and dominant_mt > 1 and any(_is_big(s[0])
+                                                     for s in streams):
+                    if time.time() > sweep_deadline:
+                        return None
+                    r = _attempt({}, f"all files together under {build}",
+                                 force_method2=True, build_force=build)
+                if r:
+                    self._log(
+                        f"  ✓ Multi-file rescue: rebuilt under sibling build "
+                        f"{build} — all {r['checked']} volume(s) now CRC-match "
+                        "the SFV.", "ok")
+                    return r
         finally:
             self._mt_override = {}
             self._force_method2 = False
