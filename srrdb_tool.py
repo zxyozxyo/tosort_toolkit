@@ -2095,6 +2095,48 @@ class SrrdbToolAPI:
                         f"{build} — all {r['checked']} volume(s) now CRC-match "
                         "the SFV.", "ok")
                     return r
+
+            # ── Last resort: sweep -mt1-locked small extras ────────────────
+            # A small extra that locked -mt1 was excluded from `suspects`, but
+            # its piece-SIZE lock is UNRELIABLE — many thread counts share a
+            # small file's compressed size, so a proof jpg genuinely packed at a
+            # higher count (e.g. added after an -mt1 .3ds via a separate
+            # `rar a -mtX`) still locks a spurious -mt1 and is never swept. As a
+            # final lever, sweep each such extra across -mt2..cap (mt1 already
+            # failed in the first pass), holding the OTHER small extras at their
+            # locked count; the big content file re-locks naturally. Costliest
+            # tier (a full recompress per value), so it runs last, only once
+            # every cheaper path has missed. CRC-verified like all the rest.
+            mt1_extras = sorted(
+                (s for s in streams if not _is_big(s[0])
+                 and s[2] == 1 and not _is_text_meta(s[0])),
+                key=lambda s: _sz(s[0]), reverse=True)
+            for extra_file, _v, _m in mt1_extras:
+                skey = extra_file.lower()
+                base_pins = {s[0].lower(): s[2] for s in streams
+                             if not _is_big(s[0]) and s[0].lower() != skey}
+                cap = _MT_RETRY_CAP_SMALL
+                self._log(
+                    f"  Last resort: sweeping -mt for {extra_file} (locked "
+                    f"-mt1, unreliable for a small file — trying -mt2–{cap})"
+                    + (f"; holding {', '.join(sorted(base_pins))}"
+                       if base_pins else "") + "…", "dim")
+                for n in range(2, cap + 1):
+                    if self._stop.is_set() or self._skip.is_set():
+                        return None
+                    if time.time() > sweep_deadline:
+                        self._log("  Multi-file rescue: deadline reached — "
+                                  "stopping.", "dim")
+                        return None
+                    ov = dict(base_pins)
+                    ov[skey] = n
+                    r = _attempt(ov, f"trying {extra_file} at -mt{n}")
+                    if r:
+                        self._log(
+                            f"  ✓ Multi-file rescue: {extra_file} rebuilt at "
+                            f"-mt{n} — all {r['checked']} volume(s) now "
+                            "CRC-match the SFV.", "ok")
+                        return r
         finally:
             self._mt_override = {}
             self._force_method2 = False
