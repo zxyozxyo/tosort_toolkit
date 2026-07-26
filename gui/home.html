@@ -53,6 +53,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
   padding:3px 9px;cursor:pointer;transition:.15s;
 }
 .theme-btn:hover{border-color:var(--acc);color:var(--acc)}
+.autobak{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text2);cursor:pointer;user-select:none;white-space:nowrap}
+.autobak input{cursor:pointer;accent-color:var(--acc)}
+#autobak-status{font-size:10px;color:var(--text3);font-family:var(--mono);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ── Main content ── */
 .content{flex:1;overflow-y:auto;padding:28px 24px}
@@ -161,6 +164,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <div class="sub">ROM Collection Management Suite</div>
     </div>
     <div class="titlebar-right">
+      <label class="autobak" id="autobak-label" title="Run a backup at startup (only if the last one was over the configured interval ago). Destinations, mode and interval are set in Miscellaneous → Local Backup.">
+        <input type="checkbox" id="autobak-chk" onchange="toggleAutoBackup(this.checked)">
+        Auto-backup on start
+      </label>
+      <span id="autobak-status"></span>
       <button class="theme-btn" onclick="cycleTheme()">Theme</button>
     </div>
   </div>
@@ -278,7 +286,33 @@ window.addEventListener('pywebviewready', () => {
     themeIdx = THEMES.indexOf(saved === 'dark' ? 'dark' : saved);
     if (themeIdx < 0) themeIdx = 0;
   }
+  refreshAutoBackup();
 });
+
+// ── Startup auto-backup toggle (config shared with Misc Tools → Local Backup) ──
+async function refreshAutoBackup() {
+  try {
+    const info = await window.pywebview.api.backup_startup_info();
+    document.getElementById('autobak-chk').checked = !!info.startup;
+    const st = document.getElementById('autobak-status');
+    if (!info.startup) { st.textContent = ''; }
+    else if (!info.dests) { st.textContent = '⚠ no destinations set'; }
+    else { st.textContent = info.last_backup_str ? ('last: ' + info.last_backup_str) : 'no backup yet'; }
+    document.getElementById('autobak-label').title =
+      `Run a ${info.mode || 'quick'} backup at startup, but only if the last one was over `
+      + `${info.interval_h || 6}h ago. Destinations, mode and interval are set in `
+      + `Miscellaneous → Local Backup.`;
+  } catch (e) {}
+}
+async function toggleAutoBackup(on) {
+  try { await window.pywebview.api.backup_set_startup(on); } catch (e) {}
+  refreshAutoBackup();
+}
+// Pushed from Python while a startup backup runs.
+window.homeBackupStatus = function(msg) {
+  const st = document.getElementById('autobak-status');
+  if (st) st.textContent = msg;
+};
 
 function cycleTheme() {
   themeIdx = (themeIdx + 1) % THEMES.length;

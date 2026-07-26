@@ -206,12 +206,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             Delete source folder after successful rebuild
             <span style="opacity:0.7;font-size:0.85em"> — removes the input folder INCLUDING old nfo/jpg once the RARs are verified</span>
           </label>
-          <div class="row">
+          <div class="row" style="flex-wrap:wrap">
             <span class="lbl">Results DB</span>
             <button class="btn btn-sm" onclick="viewStats()">View Stats</button>
             <button class="btn btn-sm" onclick="exportXlsx()">Export XLSX</button>
             <button class="btn btn-sm" onclick="exportCsv()">Export CSV</button>
-            <span style="font-size:10px;opacity:0.6">every run is recorded automatically (group, year, outcome, RAR version)</span>
+            <span style="font-size:10px;opacity:0.6;flex-basis:100%">every run is recorded automatically (group, year, outcome, RAR version)</span>
           </div>
           <div class="row" style="align-items:flex-start">
             <span class="lbl" title="Local folder(s) of scene extras (nfo/diz/proof jpg). When a rebuild needs an exact packed file that srrdb has no add for, it's matched here by CRC32 and copied in — never moved.">Extras store</span>

@@ -6,6 +6,8 @@ Requires: pip install pywebview py7zr rarfile zstandard
 
 import webview
 import os
+import threading
+import time
 
 from api import ToSortAPI
 from dat_merger import DatMergerAPI
@@ -154,6 +156,10 @@ class LauncherAPI:
     """Minimal API exposed to the home/launcher page."""
     def __init__(self):
         self._window = None
+        # Config-only Misc Tools instance (auto_loop=False → no periodic timer;
+        # the launcher runs the one-shot startup backup instead). Backup config
+        # lives in misc_tools.json, shared with the Misc Tools window.
+        self._misc = MiscToolsAPI(auto_loop=False)
 
     def set_window(self, w):
         self._window = w
@@ -166,6 +172,40 @@ class LauncherAPI:
     def open_scene_recreator(self): open_scene_recreator()
     def open_misc_tools(self):    open_misc_tools()
     def open_srrdb_tool(self):    open_srrdb_tool()
+
+    # --- startup auto-backup (settings shared with Misc Tools → Local Backup) ---
+    def backup_startup_info(self):
+        return self._misc.backup_startup_info()
+
+    def backup_set_startup(self, enabled):
+        return self._misc.backup_set_startup(enabled)
+
+    def _home_status(self, msg, cls="info"):
+        """Push a one-line backup status to the launcher page."""
+        if not self._window:
+            return
+        try:
+            import json as _j
+            self._window.evaluate_js(
+                "window.homeBackupStatus && window.homeBackupStatus("
+                + _j.dumps(str(msg)) + ")")
+        except Exception:
+            pass
+
+    def _run_startup_backup(self):
+        """Runs once after the GUI is up (see webview.start). Backs up only if
+        due — see MiscToolsAPI.maybe_run_startup_backup."""
+        time.sleep(1.5)   # let the page finish loading before pushing status
+        try:
+            self._misc.maybe_run_startup_backup(log_cb=self._home_status)
+        except Exception:
+            pass
+        try:
+            if self._window:
+                self._window.evaluate_js(
+                    "window.refreshAutoBackup && window.refreshAutoBackup()")
+        except Exception:
+            pass
 
 
 def main():
@@ -180,7 +220,8 @@ def main():
         background_color="#0d0f12",
     )
     api.set_window(window)
-    webview.start(debug=False)
+    # Run the startup auto-backup check in the background once the GUI loop is up.
+    webview.start(api._run_startup_backup, debug=False)
 
 
 if __name__ == "__main__":

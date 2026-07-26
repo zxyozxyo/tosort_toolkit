@@ -20,12 +20,15 @@ EXTRA_DIRS   = {'proof', 'sample'}
 
 
 class MiscToolsAPI:
-    def __init__(self):
+    def __init__(self, auto_loop: bool = True):
         self._window    = None
         self._stop_flag = threading.Event()
         self._running   = False
-        # Auto-backup timer resumes whenever the Misc Tools window is open
-        threading.Thread(target=self._auto_backup_loop, daemon=True).start()
+        # Auto-backup timer resumes whenever the Misc Tools window is open.
+        # auto_loop=False is used for the launcher's config-only instance (it
+        # runs the one-shot startup backup instead, not the periodic loop).
+        if auto_loop:
+            threading.Thread(target=self._auto_backup_loop, daemon=True).start()
 
     def set_window(self, w):
         self._window = w
@@ -279,22 +282,87 @@ class MiscToolsAPI:
     def backup_get_settings(self) -> dict:
         b = self._load_cfg().get("backup", {})
         return {
-            "dests":      b.get("dests", []),
-            "mode":       b.get("mode", "quick"),
-            "auto":       bool(b.get("auto", False)),
-            "interval_h": float(b.get("interval_h", 6)),
+            "dests":       b.get("dests", []),
+            "mode":        b.get("mode", "quick"),
+            "auto":        bool(b.get("auto", False)),
+            "startup":     bool(b.get("startup", False)),
+            "interval_h":  float(b.get("interval_h", 6)),
+            "last_backup": float(b.get("last_backup", 0)),
         }
 
     def backup_save_settings(self, settings: dict) -> dict:
         cfg = self._load_cfg()
+        prev = cfg.get("backup", {})
         cfg["backup"] = {
-            "dests":      [d for d in (settings.get("dests") or []) if d.strip()],
-            "mode":       settings.get("mode", "quick"),
-            "auto":       bool(settings.get("auto", False)),
-            "interval_h": max(0.25, float(settings.get("interval_h", 6) or 6)),
+            "dests":       [d for d in (settings.get("dests") or []) if d.strip()],
+            "mode":        settings.get("mode", "quick"),
+            "auto":        bool(settings.get("auto", False)),
+            # Preserve the startup toggle + last-backup stamp: this save comes
+            # from the Misc Tools form, which doesn't own those fields (the home
+            # checkbox sets `startup`; a completed backup writes `last_backup`).
+            "startup":     bool(settings.get("startup", prev.get("startup", False))),
+            "interval_h":  max(0.25, float(settings.get("interval_h", 6) or 6)),
+            "last_backup": float(prev.get("last_backup", 0)),
         }
         self._save_cfg(cfg)
         return {"ok": True}
+
+    def backup_set_startup(self, enabled) -> dict:
+        """Toggle the run-at-startup flag (used by the launcher-hub checkbox)
+        without touching the other backup settings."""
+        cfg = self._load_cfg()
+        cfg.setdefault("backup", {})["startup"] = bool(enabled)
+        self._save_cfg(cfg)
+        return {"ok": True}
+
+    def backup_startup_info(self) -> dict:
+        """State for the launcher-hub checkbox: whether startup backup is on,
+        the interval + mode + destination count (set in Misc Tools), and when
+        the last backup ran."""
+        import time as _t
+        s = self.backup_get_settings()
+        last = s["last_backup"]
+        return {
+            "startup":         s["startup"],
+            "interval_h":      s["interval_h"],
+            "mode":            s["mode"],
+            "dests":           len(s["dests"]),
+            "last_backup":     last,
+            "last_backup_str": (_t.strftime("%Y-%m-%d %H:%M", _t.localtime(last))
+                                if last else ""),
+        }
+
+    def maybe_run_startup_backup(self, log_cb=None) -> dict:
+        """Run ONE backup at app launch, but only if the startup option is on,
+        destinations are configured, AND at least interval_h has elapsed since
+        the last backup — so frequent restarts (e.g. while testing) don't
+        trigger a backup every time. Meant to be called from a background
+        thread; runs the copy synchronously."""
+        import time as _t
+        def _say(m, c="info"):
+            if log_cb:
+                try:
+                    log_cb(m, c)
+                except Exception:
+                    pass
+        s = self.backup_get_settings()
+        if not s["startup"]:
+            return {"ran": False, "reason": "disabled"}
+        if not s["dests"]:
+            _say("Startup backup is on but no destinations are set "
+                 "(configure them in Misc Tools → Local Backup).", "warn")
+            return {"ran": False, "reason": "no_dests"}
+        elapsed = _t.time() - s["last_backup"]
+        interval = s["interval_h"] * 3600
+        if s["last_backup"] and elapsed < interval:
+            _say(f"Startup backup skipped — last backup was {elapsed/3600:.1f}h "
+                 f"ago (interval {s['interval_h']:g}h).", "dim")
+            return {"ran": False, "reason": "not_due"}
+        _say(f"Startup backup running ({s['mode']}, "
+             f"{len(s['dests'])} destination(s))…", "info")
+        self._backup_thread(s["dests"], s["mode"], True)
+        _say("Startup backup complete.", "ok")
+        return {"ran": True}
 
     def _quick_files(self, src: Path) -> list:
         files = sorted(src.glob("*.json"))
@@ -370,6 +438,14 @@ class MiscToolsAPI:
                   + (f", {errors} error(s)" if errors else ""),
                   "ok" if not errors else "warn")
             L(f"{tag}Backup run complete.", "ok")
+            # Stamp completion so the startup auto-backup knows whether a fresh
+            # one is due (prevents a backup on every quick restart).
+            try:
+                c = self._load_cfg()
+                c.setdefault("backup", {})["last_backup"] = _t.time()
+                self._save_cfg(c)
+            except Exception:
+                pass
         except Exception as e:
             L(f"Backup FAILED: {e}", "err")
         finally:
