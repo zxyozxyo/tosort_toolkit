@@ -260,7 +260,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="dot" style="background:var(--warn)"></div>
           Release Queue
           <button class="btn btn-sm" style="margin-left:auto" onclick="autoSearchAll()">Auto-Search All</button>
-          <button class="btn btn-sm" onclick="prefetchAll()" title="Download all SRRs now (VPN on), then rebuild offline">Prefetch SRRs</button>
+          <button class="btn btn-sm" onclick="prefetchAll()" title="Download all SRRs now in one network pass, then rebuild offline">Prefetch SRRs</button>
           <button class="btn btn-sm" onclick="rescanSource()">Rescan</button>
           <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
         </div>
@@ -753,7 +753,7 @@ async function prefetchAll() {
     }));
   if (!jobs.length) { log('Nothing to prefetch.', 'dim'); return; }
   clearLog();
-  log(`Prefetching ${jobs.length} SRR(s) — keep the VPN ON until this finishes.`, 'info');
+  log(`Prefetching ${jobs.length} SRR(s) — stay online until this finishes.`, 'info');
   await window.pywebview.api.prefetch_srrs(jobs);
 }
 

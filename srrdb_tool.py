@@ -119,7 +119,7 @@ DL_HEADERS = {"User-Agent": "srrdb_tool/1.0 (+https://www.srrdb.com)"}
 
 # Persistent SRR cache — every SRR we ever fetch is kept here, keyed by release
 # name, so re-tests never re-hit srrdb (its download host is rate-limited per
-# 24h and won't be dodged by VPN). Survives output-folder deletion/cleanup,
+# 24h). Survives output-folder deletion/cleanup,
 # unlike the copy dropped in each release's output dir. Small files (KB–MB), so
 # no eviction needed.
 SRR_CACHE_DIR = Path(__file__).parent / "srr_cache"
@@ -975,7 +975,7 @@ class SrrdbToolAPI:
         head = data[:256].lstrip().lower()
         if not data or head.startswith(b"<!doctype") or head.startswith(b"<html"):
             return {"ok": False, "error": "srrdb returned an HTML page "
-                    "(bot-wall / VPN off / not downloadable)"}
+                    "(bot-wall / no network / not downloadable)"}
         if expect_crc:
             got = "%08X" % (zlib.crc32(data) & 0xffffffff)
             if got.upper() != str(expect_crc).upper():
@@ -2159,7 +2159,7 @@ class SrrdbToolAPI:
             # SOURCES. Fetch them from srrdb by add-id, CRC-verify, and drop into
             # _stored so they behave exactly like SRR-stored sources. Cached on
             # disk → a re-run needs no network. First run needs network; if the
-            # VPN is off / bot-wall blocks it, it's skipped cleanly with a warning
+            # network is unavailable / bot-wall blocks it, it's skipped cleanly with a warning
             # and reconstruction proceeds (and fails as before) — never worse.
             if rar_sets:
                 # Expected packed (unpacked) sizes — to spot text sources whose
@@ -2232,7 +2232,7 @@ class SrrdbToolAPI:
                     if not details:
                         self._log("  ⚠ Couldn't fetch srrdb release details to "
                                   "locate the missing/mismatched packed source(s) — "
-                                  "VPN off / rate-limited? Rebuild may fail until "
+                                  "no network / rate-limited? Rebuild may fail until "
                                   "available.", "warn")
                     elif not adds:
                         self._log("  ⚠ srrdb lists no fetchable 'adds' for this "
@@ -3819,7 +3819,7 @@ class SrrdbToolAPI:
     def prefetch_srrs(self, jobs: list) -> bool:
         """Resolve every queued release and download its SRR to the cache path
         NOW — so the later Process run needs no srrdb access at all (rebuilding
-        is 100% local). Lets you run the whole network phase in one short VPN
+        is 100% local). Lets you run the whole network phase in one short online
         window, then rebuild offline. Ambiguous releases are pinned by exact
         content CRC (one API call), never by downloading all candidates."""
         if self._running:
@@ -3833,7 +3833,7 @@ class SrrdbToolAPI:
     def _prefetch_thread(self, jobs: list):
         self._running = True
         self._emit("status", {"state": "running"})
-        self._log(f"Prefetching SRRs for {len(jobs)} release(s) — keep VPN on "
+        self._log(f"Prefetching SRRs for {len(jobs)} release(s) — stay online "
                   "until this finishes…", "info")
         ready = failed = 0
         for i, job in enumerate(jobs):
@@ -3907,7 +3907,7 @@ class SrrdbToolAPI:
                 failed += 1
 
         self._log(f"Prefetch complete — {ready} ready, {failed} unresolved. "
-                  "You can DISABLE the VPN now; Process rebuilds entirely offline.",
+                  "The network phase is done; Process rebuilds entirely offline.",
                   "ok" if not failed else "warn")
         self._running = False
         self._emit("status", {"state": "done"})
