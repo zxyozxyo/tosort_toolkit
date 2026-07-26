@@ -1825,20 +1825,30 @@ class SrrdbToolAPI:
         def _is_big(name: str) -> bool:
             return _sz(name) >= _LARGE_STREAM_BYTES
 
-        # Sweep the cheapest, likeliest culprit first — the small embedded extra
-        # (proof jpg / nfo / diz), ascending by packed size. A big CONTENT file
-        # (.3ds etc.) is NEVER swept when a smaller suspect exists: its compressed
-        # size is reproduced by essentially the one thread count already locked,
-        # so every other value fast-fails the size test after a minutes-long full
-        # recompress — pure churn. It simply re-locks to its own -mt while the
-        # small suspect is swept.
+        # Sweep the likeliest culprit first — the BIGGEST small embedded extra
+        # (proof jpg before a tiny nfo/diz). Each attempt costs the same (it
+        # recompresses the big content file regardless of which extra is being
+        # swept), and a bigger extra is far more likely to be the -mt culprit: a
+        # tiny nfo's locked count is usually already correct (WinRAR caps threads
+        # by data size), whereas a mid-size jpg often locked a spurious LOWER
+        # value than the archive's real -mt. A big CONTENT file (.3ds etc.) is
+        # NEVER swept when a smaller suspect exists: its compressed size is
+        # reproduced by essentially the one thread count already locked, so every
+        # other value fast-fails the size test after a minutes-long recompress.
         have_small = any(not _is_big(s[0]) for s in suspects)
-        ordered = sorted(suspects, key=lambda s: _sz(s[0]))
+        ordered = sorted(suspects, key=lambda s: _sz(s[0]), reverse=True)
+        # The whole set was packed with ONE `rar a -mt<N>` command, so the real
+        # thread count is the highest any stream locked (the big content file
+        # reveals it — smaller files may cap lower). Try that value FIRST for
+        # every suspect: a jpg that piece-locked a low count almost always needs
+        # exactly this. Turns a Captain-Toad-style 20-attempt sweep into ~1.
+        dominant_mt = max((s[2] for s in streams if s[2]), default=0)
         if len(suspects) > 1:
             self._log(
                 f"  Multi-file near-miss: {len(suspects)} streams at -mt>1 — "
-                "sweeping the small extra(s) first; the big content file re-locks "
-                "naturally, never swept"
+                "sweeping the biggest extra first (archive -mt"
+                + (f"{dominant_mt} " if dominant_mt else " ")
+                + "tried first); the big content file re-locks naturally"
                 + (f", pinned to {pinned}" if pinned else "") + "…", "dim")
         # The sweep needs its OWN wall-clock budget: each attempt calls
         # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
@@ -1869,6 +1879,11 @@ class SrrdbToolAPI:
                     # recompress. The true count usually lies at cur_mt+1..cap.
                     order = (list(range(cur_mt + 1, cap + 1))
                              + list(range(1, cur_mt)))
+                # Try the archive's real thread count first (see above): it's the
+                # single likeliest value for a mid-size extra that piece-locked
+                # too low. De-dup so it isn't retried later in the sweep.
+                if dominant_mt and dominant_mt != cur_mt and dominant_mt <= cap:
+                    order = [dominant_mt] + [n for n in order if n != dominant_mt]
                 self._log(
                     f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt}, up "
                     f"to -mt{cap})"
