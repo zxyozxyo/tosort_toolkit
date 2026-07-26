@@ -215,8 +215,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           </div>
           <div class="row" style="align-items:flex-start">
             <span class="lbl" title="Local folder(s) of scene extras (nfo/diz/proof jpg). When a rebuild needs an exact packed file that srrdb has no add for, it's matched here by CRC32 and copied in — never moved.">Extras store</span>
-            <div style="flex:1;display:flex;flex-direction:column;gap:4px">
-              <div id="extras-folders" style="display:flex;flex-direction:column;gap:2px"></div>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:4px">
+              <div id="extras-folders" style="display:flex;flex-direction:column;gap:2px;max-height:92px;overflow-y:auto;overflow-x:hidden"></div>
               <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
                 <button class="btn btn-sm" onclick="extrasAddFolder()">Add folder</button>
                 <button class="btn btn-sm" id="btn-extras-rescan" onclick="extrasRescan()" title="Scan the folder(s) and (re)build the CRC index. Incremental — only new/changed files are read.">Rescan</button>
@@ -263,6 +263,16 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <button class="btn btn-sm" onclick="prefetchAll()" title="Download all SRRs now (VPN on), then rebuild offline">Prefetch SRRs</button>
           <button class="btn btn-sm" onclick="rescanSource()">Rescan</button>
           <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
+        </div>
+        <div id="queue-warn" style="display:none;margin:6px 10px 0;padding:8px 10px;border-radius:6px;background:rgba(230,170,40,0.12);border:1px solid var(--warn);font-size:11px;line-height:1.45">
+          <div style="display:flex;gap:8px;align-items:flex-start">
+            <span style="font-size:14px;line-height:1.1">⚠</span>
+            <div style="flex:1;min-width:0">
+              <b>Large queue — <span id="queue-warn-count">0</span> releases.</b>
+              srrdb may rate-limit big bursts of searches/downloads. To stay comfortably under its limit, consider running smaller batches, or click <b>Prefetch SRRs</b> to fetch them all in one pass and then rebuild offline. Already-downloaded SRRs are reused automatically from the cache — re-runs don't hit the site again.
+            </div>
+            <button class="btn btn-sm" style="flex:0 0 auto" onclick="dismissQueueWarn()">Dismiss</button>
+          </div>
         </div>
         <div style="padding:6px 10px">
           <div class="queue" id="queue" style="max-height:260px">
@@ -452,6 +462,7 @@ async function rescanSource() {
   // Hard reset: drop the queue, cached search results, and stale state so
   // the rescan reflects exactly what is on disk right now.
   batchJobs = [];
+  queueWarnDismissed = false;   // a fresh scan should warn again if large
   renderQueue();
   try { await window.pywebview.api.clear_session_cache(); } catch (e) {}
   clearLog();
@@ -543,17 +554,17 @@ async function refreshExtras() {
   box.innerHTML = '';
   (info.folders || []).forEach(f => {
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:11px';
+    row.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:11px;min-width:0';
     const rm = document.createElement('button');
     rm.className = 'btn btn-sm'; rm.textContent = '×';
     rm.title = 'Remove this folder from the list (files on disk are not touched)';
-    rm.style.cssText = 'padding:0 6px;line-height:1.4';
+    rm.style.cssText = 'padding:0 6px;line-height:1.4;flex:0 0 auto';
     rm.onclick = () => extrasRemoveFolder(f.path);
     const path = document.createElement('span');
-    path.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    path.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
     path.textContent = f.path; path.title = f.path;
     const cnt = document.createElement('span');
-    cnt.style.cssText = 'color:var(--text3);font-size:10px';
+    cnt.style.cssText = 'color:var(--text3);font-size:10px;flex:0 0 auto;white-space:nowrap';
     cnt.textContent = `${(f.files || 0).toLocaleString()} file(s)`;
     row.appendChild(rm); row.appendChild(path); row.appendChild(cnt);
     box.appendChild(row);
@@ -648,7 +659,21 @@ function selectResult(r, el) {
 }
 
 // ── Batch queue ───────────────────────────────────────────────────────────────
+const QUEUE_WARN_THRESHOLD = 50;   // srrdb throttles big bursts; warn past this
+let queueWarnDismissed = false;    // per-session: once dismissed, stay hidden
+function updateQueueWarn() {
+  const el = document.getElementById('queue-warn');
+  if (!el) return;
+  const show = batchJobs.length > QUEUE_WARN_THRESHOLD && !queueWarnDismissed;
+  el.style.display = show ? '' : 'none';
+  if (show) document.getElementById('queue-warn-count').textContent = batchJobs.length;
+}
+function dismissQueueWarn() {
+  queueWarnDismissed = true;
+  document.getElementById('queue-warn').style.display = 'none';
+}
 function renderQueue() {
+  updateQueueWarn();
   const body = document.getElementById('queue-body');
   body.innerHTML = '';
   batchJobs.forEach((job, i) => {
@@ -708,6 +733,7 @@ async function autoSearchAll() {
 
 function clearQueue() {
   batchJobs = [];
+  queueWarnDismissed = false;   // a fresh batch should warn again
   renderQueue();
 }
 
