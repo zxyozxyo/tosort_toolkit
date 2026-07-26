@@ -95,6 +95,10 @@ _RESCENE_RAR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_rar\d+(?:b\d)?\.(exe)?$", re.I
 # (version, -mt) per stream for diagnostics and the .srr2 idea.
 _MT_RE       = re.compile(r"-mt(\d+)")
 _COMPRESS_RE = re.compile(r"^Compressing\s+(.+?)\.\.\.\s*$")
+# The exact WinRAR build (exe) rescene invoked, incl. any beta suffix — its
+# __str__ drops the beta ("5.11" for both rar511.exe and rar511b1.exe), so we
+# capture the filename off the command line to distinguish beta vs final builds.
+_EXE_RE      = re.compile(r"(\d{4}-\d{2}-\d{2}_rar\d+(?:b\d)?\.exe)", re.I)
 
 import webview
 
@@ -1470,6 +1474,14 @@ class SrrdbToolAPI:
         _orig_get = rm.RarRepository.get_rar_executables
         def _get_pref(repo_self, date, _orig=_orig_get, _rm=rm):
             order = list(_orig(repo_self, date))
+            # Build-sweep rescue: restrict the hunt to ONE exact exe (by file
+            # name, so a beta can be told apart from its final — rescene's
+            # __str__ collapses both to e.g. "2014-05-21 5.11"). Used to retry a
+            # CRC near-miss under the sibling build.
+            bforce = getattr(SrrdbToolAPI, "_build_force", None)
+            if bforce:
+                return [r for r in order
+                        if getattr(r, "file_name", None) == bforce]
             # Version-sweep rescue: restrict the hunt to ONE forced version so a
             # near-miss re-run tries exactly that build (rescene otherwise stops
             # at the first piece-CRC match and never full-verifies the rest).
@@ -1581,6 +1593,12 @@ class SrrdbToolAPI:
                 mt_m = _MT_RE.search(msg)
                 if mt_m and ".exe" in msg.lower():
                     _self._pending_mt = int(mt_m.group(1))
+                # Latch the exact build (exe) rescene is invoking so the
+                # build-sweep rescue can skip it and try the beta/final sibling.
+                if ".exe" in msg.lower():
+                    em = _EXE_RE.search(msg)
+                    if em:
+                        _self._last_good_exe = em.group(1)
                 cm = _COMPRESS_RE.match(msg)
                 if cm and hasattr(_self, "_recon_streams"):
                     _self._recon_streams.append((
@@ -1874,14 +1892,16 @@ class SrrdbToolAPI:
         # has its own per-reconstruction deadline inside _srr_reconstruct).
         sweep_deadline = time.time() + _RECON_TIMEOUT_S
 
-        def _attempt(ov, label, force_method2=False):
+        def _attempt(ov, label, force_method2=False, build_force=None):
             """One reconstruct+verify pass. `ov` is the -mt override map
             (basename→thread count); `force_method2` instead drives an
-            all-files-together rebuild (see the tier below). Returns the passing
+            all-files-together rebuild; `build_force` pins one exact exe (by
+            file name) so a beta/final sibling can be tried. Returns the passing
             verify dict, or None. The caller owns the Stop/Skip/deadline guards."""
             self._clear_produced_volumes(out_root)
             self._mt_override = dict(ov)
             self._force_method2 = force_method2
+            SrrdbToolAPI._build_force = build_force
             self._recon_streams = []          # fresh combos for this attempt
             if pinned:
                 SrrdbToolAPI._pref_versions = [pinned]
@@ -1892,6 +1912,7 @@ class SrrdbToolAPI:
             finally:
                 self._mt_override = {}
                 self._force_method2 = False
+                SrrdbToolAPI._build_force = None
                 SrrdbToolAPI._pref_versions = []
             if not rc.get("ok"):
                 return None
@@ -2034,12 +2055,72 @@ class SrrdbToolAPI:
                             f"-mt{n} — all {r['checked']} volume(s) now "
                             "CRC-match the SFV.", "ok")
                         return r
+
+            # ── Alternate-build sweep ──────────────────────────────────────
+            # A CRC near-miss can also mean rescene locked the right version
+            # NUMBER but the wrong BUILD of it — a beta vs the final (both are
+            # e.g. "2014-05-21 5.11", so nothing above could tell them apart).
+            # This is the remaining cause once thread count is ruled out: on a
+            # single-threaded (-mt1) set method2 can't help — in-context and
+            # isolated compression are identical — yet the big stream can still
+            # reproduce under both builds while a trailing extra differs. Retry
+            # each SIBLING build (same date+major.minor, different exe, minus the
+            # one already used); if a plain rebuild misses, try method2 under it
+            # too (a multithreaded set may need both the sibling build AND the
+            # in-context path). CRC-verified, so a miss simply falls through.
+            siblings = self._sibling_builds(
+                self._find_rar_dir(), getattr(self, "_last_good_rar", None),
+                getattr(self, "_last_good_exe", None))
+            if siblings:
+                self._log(
+                    f"  Multi-file near-miss: locked version has "
+                    f"{len(siblings)} sibling build(s) ({', '.join(siblings)}) "
+                    "— retrying under each…", "dim")
+            for build in siblings:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() > sweep_deadline:
+                    self._log("  Multi-file rescue: deadline reached — "
+                              "stopping.", "dim")
+                    return None
+                r = _attempt({}, f"rebuild under {build}", build_force=build)
+                if not r and any(_is_big(s[0]) for s in streams):
+                    if time.time() > sweep_deadline:
+                        return None
+                    r = _attempt({}, f"all files together under {build}",
+                                 force_method2=True, build_force=build)
+                if r:
+                    self._log(
+                        f"  ✓ Multi-file rescue: rebuilt under sibling build "
+                        f"{build} — all {r['checked']} volume(s) now CRC-match "
+                        "the SFV.", "ok")
+                    return r
         finally:
             self._mt_override = {}
             self._force_method2 = False
+            SrrdbToolAPI._build_force = None
         self._log("  Multi-file rescue exhausted — no thread count reproduced "
                   "the near-miss stream(s) exactly. Kept as FAILED.", "warn")
         return None
+
+    @staticmethod
+    def _sibling_builds(rar_dir, locked_ver, used_exe):
+        """Exe file names in the pack that share the locked version's
+        date+major.minor but are a DIFFERENT build (beta vs final, or another
+        beta), excluding the one already used. Empty when the version has no
+        sibling — which is the normal case, so this rescue is a rare no-op."""
+        if not rar_dir or not locked_ver:
+            return []
+        m = re.match(r"\s*(\d{4}-\d{2}-\d{2})\s+(\d+)\.(\d+)", locked_ver)
+        if not m:
+            return []
+        prefix = f"{m.group(1)}_rar{m.group(2)}{m.group(3)}"
+        pat = re.compile(re.escape(prefix) + r"(b\d)?\.exe$", re.I)
+        try:
+            return [f for f in sorted(os.listdir(rar_dir))
+                    if pat.match(f) and f != used_exe]
+        except OSError:
+            return []
 
     @staticmethod
     def _version_date(ver: str):
@@ -3211,6 +3292,7 @@ class SrrdbToolAPI:
             "ok": True, "rars": None, "sample": None, "subs": None, "note": "",
         }
         self._last_good_rar = None  # set by the rescene event stream
+        self._last_good_exe = None  # exact build (exe) rescene invoked
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
 
