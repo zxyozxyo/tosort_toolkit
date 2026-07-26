@@ -1618,6 +1618,17 @@ class SrrdbToolAPI:
         def _crf_init(crf_self, first_block, blocks, src,
                       next_block=None, next_src=None, solid=False,
                       _orig=_orig_crf_init, _rm=rm, _self=self):
+            # Method2 all-files rescue: once the big content stream has rebuilt
+            # (archived_files non-empty), force the NEXT file's per-file rebuild
+            # to raise so rescene's factory (compressed_rar_file_factory) falls
+            # through to CompressedRarFileAll — a single `rar a` of ALL files
+            # together at the big stream's locked -mt, reproducing trailing
+            # embedded extras exactly as the scene pack did (an isolated
+            # per-file recompress can't). Gated on the rescue flag so the normal
+            # path is untouched; solid sets keep their own prepend path.
+            if (getattr(_self, "_force_method2", False) and not solid
+                    and len(getattr(_rm, "archived_files", None) or {}) > 0):
+                raise ValueError("srrdb: forcing method2 all-files rebuild")
             # Multi-file CRC rescue: if the outer sweep has pinned a specific
             # -mt for THIS stream (keyed by source basename), force it and skip
             # the single-file rescue — a forced-mt failure just means "wrong
@@ -1773,7 +1784,7 @@ class SrrdbToolAPI:
         __init__ (which only size-checks, main.py:2216) accepted them and only
         the final volume SFV caught the wrong CRC.
 
-        Two classic culprits, both handled here:
+        Three culprits, all handled here:
           • an embedded jpg whose true thread count is ABOVE the one rescene
             greedily locked (the first -mt whose test piece matched the size);
           • a small trailing TEXT file (nfo/diz/txt) packed AFTER the big
@@ -1781,6 +1792,10 @@ class SrrdbToolAPI:
             thread count of files already done in the set (main.py:2143-2148),
             so the tiny file INHERITS the big file's high -mt and locks a
             spurious one — while the scene original packed it single-threaded.
+          • a trailing extra whose bytes NO isolated thread count reproduces,
+            because WinRAR's -mt pipeline compressed it in-context of the whole
+            multi-file `rar a` command. For this we drive rescene's method2
+            (all files compressed together) as the first tier — see below.
 
         We sweep the SMALL -mt>1 suspects (the embedded extras), smallest first,
         and NEVER sweep a big content file when a smaller suspect exists — a big
@@ -1803,9 +1818,9 @@ class SrrdbToolAPI:
         called after the SFV verify already failed, so a release that rebuilds
         (or fails) normally today is unaffected."""
         streams = list(getattr(self, "_recon_streams", None) or [])
+        if len(streams) < 2:
+            return None                 # nothing to compress together / sweep
         suspects = [s for s in streams if s[2] and s[2] > 1]
-        if not suspects:
-            return None
         # Pin the version the original run locked (e.g. 2014-05-21 5.11). Without
         # this the sweep re-hunts from scratch and can lock a DIFFERENT version
         # (e.g. 5.50) that also reproduces the big stream — at which point the
@@ -1825,6 +1840,15 @@ class SrrdbToolAPI:
 
         def _is_big(name: str) -> bool:
             return _sz(name) >= _LARGE_STREAM_BYTES
+
+        # A big content stream followed by ≥1 extra means the set was packed
+        # with ONE `rar a` command whose trailing extras rescene rebuilds in
+        # isolation — the case the method2 tier below repairs. The -mt sweeps
+        # additionally need at least one -mt>1 suspect. If neither applies there
+        # is nothing this rescue can do, so bail (keeps the no-op guarantee).
+        has_big = any(_is_big(s[0]) for s in streams)
+        if not suspects and not has_big:
+            return None
 
         # Sweep the likeliest culprit first — the BIGGEST small embedded extra
         # (proof jpg before a tiny nfo/diz). Each attempt costs the same (it
@@ -1850,12 +1874,14 @@ class SrrdbToolAPI:
         # has its own per-reconstruction deadline inside _srr_reconstruct).
         sweep_deadline = time.time() + _RECON_TIMEOUT_S
 
-        def _attempt(ov, label):
-            """One reconstruct+verify pass with the given -mt override map
-            (basename→thread count). Returns the passing verify dict, or None.
-            The caller owns the Stop/Skip/deadline guards."""
+        def _attempt(ov, label, force_method2=False):
+            """One reconstruct+verify pass. `ov` is the -mt override map
+            (basename→thread count); `force_method2` instead drives an
+            all-files-together rebuild (see the tier below). Returns the passing
+            verify dict, or None. The caller owns the Stop/Skip/deadline guards."""
             self._clear_produced_volumes(out_root)
             self._mt_override = dict(ov)
+            self._force_method2 = force_method2
             self._recon_streams = []          # fresh combos for this attempt
             if pinned:
                 SrrdbToolAPI._pref_versions = [pinned]
@@ -1865,6 +1891,7 @@ class SrrdbToolAPI:
                     srr_file, content_dir, str(out_root), log_rar_pack=False)
             finally:
                 self._mt_override = {}
+                self._force_method2 = False
                 SrrdbToolAPI._pref_versions = []
             if not rc.get("ok"):
                 return None
@@ -1874,6 +1901,38 @@ class SrrdbToolAPI:
             return None
 
         try:
+            # ── Method2: all-files-together rebuild ────────────────────────
+            # The scene pack ran ONE `rar a -mt<N> f1 f2 …` command. rescene
+            # rebuilds each file in ISOLATION, which reproduces the first big
+            # stream but often NOT a trailing embedded extra: WinRAR's -mt
+            # pipeline compresses a small file differently in-context than
+            # alone, so NO isolated thread count ever matches (the whole
+            # Thomas/Harvest/Moco/Rayman trailing-jpg family). Drive rescene's
+            # own method2 (CompressedRarFileAll): once the big stream locks its
+            # version+mt, the NEXT file's per-file rebuild is forced to raise
+            # (see _crf_init / self._force_method2) and the factory recompresses
+            # ALL files together at that mt — the faithful reproduction. One
+            # attempt (the big stream already revealed the count), CRC-verified
+            # before we accept it, so a miss simply falls through to the -mt
+            # sweeps below and NOTHING that rebuilds today changes.
+            if has_big:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() <= sweep_deadline:
+                    self._log(
+                        "  Multi-file near-miss: trying an all-files-together "
+                        "rebuild — rescene method2, the exact single pack "
+                        "command" + (f", pinned to {pinned}" if pinned else "")
+                        + "…", "dim")
+                    r = _attempt({}, "all files together at the archive -mt",
+                                 force_method2=True)
+                    if r:
+                        self._log(
+                            "  ✓ Multi-file rescue: all-files-together rebuild "
+                            f"CRC-matches the SFV — all {r['checked']} "
+                            "volume(s) verified.", "ok")
+                        return r
+
             # ── Unified shared-mt phase ────────────────────────────────────
             # When TWO OR MORE binary extras (e.g. two proof jpgs) share the
             # failing volume, the whole set was packed with ONE `rar a -mt<N>`
@@ -1977,6 +2036,7 @@ class SrrdbToolAPI:
                         return r
         finally:
             self._mt_override = {}
+            self._force_method2 = False
         self._log("  Multi-file rescue exhausted — no thread count reproduced "
                   "the near-miss stream(s) exactly. Kept as FAILED.", "warn")
         return None
