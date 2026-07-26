@@ -1440,6 +1440,27 @@ class SrrdbToolAPI:
                 return _orig_full(rar_self)
         rm.RarExecutable.full = _full_ma4
 
+        # --- case-insensitive volume-set grouping for mixed-case release names ---
+        # Some groups (e.g. LiGHTFORCE) pack a release whose volumes carry
+        # INCONSISTENT case — LFC-BFYP.RAR, lfc-bfyp.r00, LFC-BFYP.R02… On a
+        # case-insensitive filesystem these are one archive. rescene groups the
+        # volume blocks into "sets" via get_set(), and get_archived_file_blocks
+        # stops collecting a file's blocks the moment the set name changes.
+        # get_set derives the set from the volume name WITHOUT folding case
+        # ('LFC-BFYP' vs 'lfc-bfyp'), so the case flip after volume 1 splits one
+        # archive in two: rescene then thinks the compressed file fits in a
+        # single ~50 MB volume while the source is the full multi-GB file → a
+        # permanent, unfixable "size a few bytes off" near-miss (and a futile
+        # version/-mt sweep chasing a phantom). Fold case so every volume of one
+        # archive shares a set. No-op for a normal consistent-case release.
+        _orig_get_set = rm.get_set
+        def _get_set_ci(srr_rar_block, _orig=_orig_get_set):
+            try:
+                return _orig(srr_rar_block).lower()
+            except Exception:
+                return _orig(srr_rar_block)
+        rm.get_set = _get_set_ci
+
         # --- known-good version cache fronts the candidate order ---
         # Only for the FIRST file's version hunt (archived_files empty). Once
         # rescene has found a good version it puts that first itself for the
