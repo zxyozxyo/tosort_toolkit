@@ -154,12 +154,13 @@ _RECON_TIMEOUT_S = 1800  # 30 minutes
 _MT_RETRY_CAP = 8
 
 # Multi-file rescue sweeps a small embedded "extra" (proof jpg / nfo / diz)
-# whose thread count produced the right size but wrong bytes. Those are cheap to
-# recompress, so allow a wider sweep than the single big-file cap — some later
-# scene machines had >8 cores, and the small file is quick to retry. A stream is
-# treated as a big CONTENT file (pinned, never swept — its compressed size is
-# reproduced by essentially the one thread count already locked) above this size.
-_MT_RETRY_CAP_SMALL = 16
+# whose thread count produced the right size but wrong bytes. rescene's piece
+# test locks the FIRST -mt whose piece size matches, which is a LOWER bound — the
+# real count is usually at or above it — so the sweep must reach well beyond the
+# locked value. Scene machines of this era ran up to ~32 cores (observed a jpg
+# locked at -mt19), and WinRAR 5.x tops out at 32 threads. Cap at 32 so a
+# high-core release isn't missed; the per-release deadline still bounds the total.
+_MT_RETRY_CAP_SMALL = 32
 _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 
 # A release normally packs 1–2 "extras" (proof jpg / file_id.diz) that aren't in
@@ -1885,8 +1886,8 @@ class SrrdbToolAPI:
                 if dominant_mt and dominant_mt != cur_mt and dominant_mt <= cap:
                     order = [dominant_mt] + [n for n in order if n != dominant_mt]
                 self._log(
-                    f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt}, up "
-                    f"to -mt{cap})"
+                    f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt}, "
+                    f"trying -mt{min(order)}–{max(order)})"
                     + (f"; holding {', '.join(sorted(base_pins))}"
                        if base_pins else "") + "…", "dim")
                 for n in order:
