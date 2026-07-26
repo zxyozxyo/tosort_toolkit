@@ -1844,19 +1844,88 @@ class SrrdbToolAPI:
         # every suspect: a jpg that piece-locked a low count almost always needs
         # exactly this. Turns a Captain-Toad-style 20-attempt sweep into ~1.
         dominant_mt = max((s[2] for s in streams if s[2]), default=0)
-        if len(suspects) > 1:
-            self._log(
-                f"  Multi-file near-miss: {len(suspects)} streams at -mt>1 — "
-                "sweeping the biggest extra first (archive -mt"
-                + (f"{dominant_mt} " if dominant_mt else " ")
-                + "tried first); the big content file re-locks naturally"
-                + (f", pinned to {pinned}" if pinned else "") + "…", "dim")
         # The sweep needs its OWN wall-clock budget: each attempt calls
         # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
         # we can't lean on that here. Budget the whole sweep (each attempt still
         # has its own per-reconstruction deadline inside _srr_reconstruct).
         sweep_deadline = time.time() + _RECON_TIMEOUT_S
+
+        def _attempt(ov, label):
+            """One reconstruct+verify pass with the given -mt override map
+            (basename→thread count). Returns the passing verify dict, or None.
+            The caller owns the Stop/Skip/deadline guards."""
+            self._clear_produced_volumes(out_root)
+            self._mt_override = dict(ov)
+            self._recon_streams = []          # fresh combos for this attempt
+            if pinned:
+                SrrdbToolAPI._pref_versions = [pinned]
+            self._log(f"    {label}…", "dim")
+            try:
+                rc = self._srr_reconstruct(
+                    srr_file, content_dir, str(out_root), log_rar_pack=False)
+            finally:
+                self._mt_override = {}
+                SrrdbToolAPI._pref_versions = []
+            if not rc.get("ok"):
+                return None
+            v2 = self._verify_rebuilt_sfv(out_root)
+            if v2["checked"] and not v2["bad"]:
+                return v2
+            return None
+
         try:
+            # ── Unified shared-mt phase ────────────────────────────────────
+            # When TWO OR MORE binary extras (e.g. two proof jpgs) share the
+            # failing volume, the whole set was packed with ONE `rar a -mt<N>`
+            # command, so their true thread count is the SAME value — almost
+            # always the archive-wide dominant. rescene locks each small file
+            # independently on a piece-SIZE match, which is near-arbitrary for
+            # sub-MB files (two ~550 KB jpgs have locked -mt7 and -mt1 in the
+            # same set!), so the per-suspect sweep below — which holds the OTHER
+            # extra at its mis-locked value, and never even sees an extra that
+            # locked -mt1 (excluded from `suspects`) — can never converge. Pin
+            # every small binary extra to one shared count and sweep that single
+            # value, dominant first; text metadata is pinned to -mt1 (threading
+            # never engages on it, so its bytes are thread-count-independent).
+            bin_small = [s for s in streams
+                         if not _is_big(s[0]) and not _is_text_meta(s[0])]
+            if len(bin_small) >= 2:
+                cap = _MT_RETRY_CAP_SMALL
+                shared_order = list(range(1, cap + 1))
+                if dominant_mt and dominant_mt <= cap:
+                    shared_order = ([dominant_mt]
+                                    + [n for n in shared_order
+                                       if n != dominant_mt])
+                self._log(
+                    f"  Multi-file near-miss: {len(bin_small)} binary extras "
+                    "share the volume — trying one shared -mt for all of them "
+                    f"(archive -mt{dominant_mt} first"
+                    + (f", pinned to {pinned}" if pinned else "") + ")…", "dim")
+                for n in shared_order:
+                    if self._stop.is_set() or self._skip.is_set():
+                        return None
+                    if time.time() > sweep_deadline:
+                        self._log("  Multi-file rescue: deadline reached — "
+                                  "stopping.", "dim")
+                        return None
+                    ov = {s[0].lower(): (1 if _is_text_meta(s[0]) else n)
+                          for s in streams if not _is_big(s[0])}
+                    r = _attempt(ov, f"all extras at -mt{n}")
+                    if r:
+                        self._log(
+                            f"  ✓ Multi-file rescue: all binary extras rebuilt "
+                            f"at a shared -mt{n} — all {r['checked']} volume(s) "
+                            "now CRC-match the SFV.", "ok")
+                        return r
+
+            # ── Per-suspect sweep ──────────────────────────────────────────
+            if len(suspects) > 1:
+                self._log(
+                    f"  Multi-file near-miss: {len(suspects)} streams at -mt>1 "
+                    "— sweeping the biggest extra first (archive -mt"
+                    + (f"{dominant_mt} " if dominant_mt else " ")
+                    + "tried first); the big content file re-locks naturally"
+                    + (f", pinned to {pinned}" if pinned else "") + "…", "dim")
             for suspect_file, _ver, cur_mt in ordered:
                 skey = suspect_file.lower()
                 big = _is_big(suspect_file)
@@ -1897,30 +1966,15 @@ class SrrdbToolAPI:
                         self._log("  Multi-file rescue: deadline reached — "
                                   "stopping.", "dim")
                         return None
-                    self._clear_produced_volumes(out_root)
                     ov = dict(base_pins)
                     ov[skey] = n
-                    self._mt_override = ov
-                    self._recon_streams = []      # fresh combos for this attempt
-                    if pinned:
-                        SrrdbToolAPI._pref_versions = [pinned]
-                    self._log(f"    trying {suspect_file} at -mt{n}…", "dim")
-                    try:
-                        rc = self._srr_reconstruct(
-                            srr_file, content_dir, str(out_root),
-                            log_rar_pack=False)
-                    finally:
-                        self._mt_override = {}
-                        SrrdbToolAPI._pref_versions = []
-                    if not rc.get("ok"):
-                        continue
-                    v2 = self._verify_rebuilt_sfv(out_root)
-                    if v2["checked"] and not v2["bad"]:
+                    r = _attempt(ov, f"trying {suspect_file} at -mt{n}")
+                    if r:
                         self._log(
                             f"  ✓ Multi-file rescue: {suspect_file} rebuilt at "
-                            f"-mt{n} — all {v2['checked']} volume(s) now "
+                            f"-mt{n} — all {r['checked']} volume(s) now "
                             "CRC-match the SFV.", "ok")
-                        return v2
+                        return r
         finally:
             self._mt_override = {}
         self._log("  Multi-file rescue exhausted — no thread count reproduced "
