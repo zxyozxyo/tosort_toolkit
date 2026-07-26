@@ -1914,8 +1914,19 @@ class SrrdbToolAPI:
             self._force_method2 = force_method2
             SrrdbToolAPI._build_force = build_force
             self._recon_streams = []          # fresh combos for this attempt
-            if pinned:
+            if pinned and not build_force:
+                # RESTRICT the hunt to the set's locked version (not just front
+                # it). Every file in the set shares one WinRAR version, so once
+                # it's locked the correct version for a swept stream is ALWAYS
+                # `pinned`; if `pinned` at the forced -mt doesn't match, no other
+                # version will either (it's the wrong thread count). Fronting
+                # alone let rescene wander all 84 versions — twice — per failed
+                # attempt (brutal on jpg-first sets where nothing pins the hunt
+                # early). `_version_force` makes a wrong -mt fail in ~1 s. Not
+                # set during the build sweep, which deliberately tries a sibling
+                # build (`_build_force` takes precedence in _get_pref anyway).
                 SrrdbToolAPI._pref_versions = [pinned]
+                SrrdbToolAPI._version_force = pinned
             self._log(f"    {label}…", "dim")
             try:
                 rc = self._srr_reconstruct(
@@ -1924,6 +1935,7 @@ class SrrdbToolAPI:
                 self._mt_override = {}
                 self._force_method2 = False
                 SrrdbToolAPI._build_force = None
+                SrrdbToolAPI._version_force = None
                 SrrdbToolAPI._pref_versions = []
             if not rc.get("ok"):
                 return None
