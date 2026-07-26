@@ -21,6 +21,7 @@ import threading
 import subprocess
 import zlib
 import sqlite3
+import hashlib
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
@@ -1108,8 +1109,12 @@ class SrrdbToolAPI:
         con = sqlite3.connect(str(p))
         con.execute("""CREATE TABLE IF NOT EXISTS files(
             path TEXT PRIMARY KEY, crc TEXT, size INTEGER, name TEXT,
-            folder TEXT, mtime REAL)""")
+            folder TEXT, mtime REAL, sha TEXT)""")
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_crc ON files(crc, size)")
+        # Migrate stores created before the sha column existed. Old rows keep
+        # sha=NULL until the next scan backfills them (see _extras_scan).
+        if "sha" not in [r[1] for r in con.execute("PRAGMA table_info(files)")]:
+            con.execute("ALTER TABLE files ADD COLUMN sha TEXT")
         con.execute("CREATE TABLE IF NOT EXISTS folders(path TEXT PRIMARY KEY, added REAL)")
         con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         con.commit()
@@ -1126,6 +1131,52 @@ class SrrdbToolAPI:
             return f"{crc & 0xffffffff:08x}"
         except OSError:
             return None
+
+    @staticmethod
+    def _file_hashes(path: str):
+        """Streaming CRC32 + SHA-256 in ONE read pass → (crc8hex, sha64hex),
+        or (None, None) on error. SHA-256 disambiguates the astronomically rare
+        case of two DIFFERENT files sharing a CRC32 + size (see extras store)."""
+        try:
+            crc = 0
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    crc = zlib.crc32(chunk, crc)
+                    h.update(chunk)
+            return f"{crc & 0xffffffff:08x}", h.hexdigest()
+        except OSError:
+            return None, None
+
+    @staticmethod
+    def _extras_collision_groups(con):
+        """(crc, size) keys that hold TWO OR MORE distinct sha values — genuine
+        collisions where DIFFERENT files share a CRC32 + size. Returns a list of
+        (crc, size, [paths]); empty when the store is clean (the normal case).
+        Rows with no sha yet (un-rescanned) are ignored, so a collision is only
+        ever reported from real SHA-256 evidence."""
+        from collections import defaultdict
+        by_key = defaultdict(list)
+        for crc, size, sha, path in con.execute(
+                "SELECT crc, size, sha, path FROM files WHERE sha IS NOT NULL"):
+            by_key[(crc, size)].append((sha, path))
+        out = []
+        for (crc, size), items in by_key.items():
+            if len({s for s, _ in items}) > 1:
+                out.append((crc, size, [p for _, p in items]))
+        return out
+
+    def extras_collisions(self) -> list:
+        """GUI/audit helper: list the store's genuine CRC+size collisions as
+        {crc,size,files:[…]} — normally empty."""
+        con = self._extras_connect(create=False)
+        if not con:
+            return []
+        try:
+            return [{"crc": c, "size": s, "files": ps}
+                    for c, s, ps in self._extras_collision_groups(con)]
+        finally:
+            con.close()
 
     # --- GUI-facing config + scan API ---
     def extras_get_folders(self) -> dict:
@@ -1144,6 +1195,7 @@ class SrrdbToolAPI:
                 "folders": [{"path": f, "files": counts.get(f, 0)} for f in folders],
                 "total_files": total,
                 "last_scan": last[0] if last else None,
+                "collisions": len(self._extras_collision_groups(con)),
                 "scanning": bool(getattr(self, "_extras_scanning", False)),
             }
         finally:
@@ -1205,8 +1257,8 @@ class SrrdbToolAPI:
                           "warn")
                 return
             # Incremental: keep CRCs of files whose size+mtime are unchanged.
-            have = {r[0]: (r[1], r[2]) for r in
-                    con.execute("SELECT path, size, mtime FROM files")}
+            have = {r[0]: (r[1], r[2], r[3]) for r in
+                    con.execute("SELECT path, size, mtime, sha FROM files")}
             allfiles = []
             for folder in folders:
                 if not os.path.isdir(folder):
@@ -1234,17 +1286,20 @@ class SrrdbToolAPI:
                     big += 1
                     continue
                 prev = have.get(fp)
-                if prev and prev[0] == st.st_size and abs(prev[1] - st.st_mtime) < 1e-6:
+                # Skip unchanged files — but only once they carry a sha, so a
+                # store built before the sha column gets backfilled on this pass.
+                if (prev and prev[0] == st.st_size
+                        and abs(prev[1] - st.st_mtime) < 1e-6 and prev[2]):
                     skipped += 1
                     continue
-                crc = self._file_crc32(fp)
+                crc, sha = self._file_hashes(fp)
                 if crc is None:
                     continue
                 con.execute(
-                    "INSERT OR REPLACE INTO files(path,crc,size,name,folder,mtime) "
-                    "VALUES(?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO files"
+                    "(path,crc,size,name,folder,mtime,sha) VALUES(?,?,?,?,?,?,?)",
                     (fp, crc, st.st_size, os.path.basename(fp).lower(), folder,
-                     st.st_mtime))
+                     st.st_mtime, sha))
                 if prev:
                     updated += 1
                 else:
@@ -1261,11 +1316,22 @@ class SrrdbToolAPI:
                         (time.strftime("%Y-%m-%d %H:%M:%S"),))
             con.commit()
             total_now = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            coll = self._extras_collision_groups(con)
             self._log(
                 f"Extras scan done: {added:,} new, {updated:,} updated, "
                 f"{skipped:,} unchanged, {removed:,} removed"
                 + (f", {big:,} too big (skipped)" if big else "")
                 + f" — {total_now:,} file(s) indexed.", "ok")
+            if coll:
+                self._log(
+                    f"  ⚠ {len(coll)} CRC+size collision(s) — DIFFERENT files "
+                    "sharing a checksum (SHA-256 differs). When a release needs "
+                    "one of these the store surfaces all candidates so you can "
+                    "tell which is the real proof:", "warn")
+                for crc, size, paths in coll[:20]:
+                    self._log(
+                        f"    CRC {crc} · {size:,} B → "
+                        + "; ".join(os.path.basename(p) for p in paths), "dim")
             self._emit("progress", {"pct": 100, "label": ""})
             self._emit("extras", {"scanning": False, "total_files": total_now})
         finally:
@@ -1294,33 +1360,70 @@ class SrrdbToolAPI:
         """For each (packed_path, name) in items, look the SRR's exact packed
         CRC+size up in the local extras store; on a content match COPY it in
         (never move), re-verify the CRC, and point the hint at it. Returns the
-        sublist it resolved. Inert when the store is empty/absent."""
+        sublist it resolved. Inert when the store is empty/absent.
+
+        Collision-aware: if TWO OR MORE distinct files (different SHA-256) share
+        the needed CRC+size, that's a genuine checksum collision — we can't tell
+        the true packed copy from CRC alone, so we surface every candidate by
+        name and use the first (the downstream SFV verify is the real arbiter)."""
         resolved = []
-        for p, nm in items:
-            exp = packed_info.get(nm)
-            if not exp:
-                continue
-            size, crc_hex = exp
-            hit = self._extras_lookup(crc_hex, size)
-            if not hit:
-                continue
-            dest = (stored_pool / "_adds" / Path(p).name if is_wrong
-                    else stored_pool / Path(p).name)
-            try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(hit, dest)
-            except OSError:
-                continue
-            if self._file_crc32(str(dest)) != crc_hex:
+        con = self._extras_connect(create=False)
+        try:
+            for p, nm in items:
+                exp = packed_info.get(nm)
+                if not exp:
+                    continue
+                size, crc_hex = exp
+                if not crc_hex or not con:
+                    continue
+                # On-disk candidates for this exact CRC+size, one per DISTINCT
+                # content (sha). An un-hashed old row keys on its own path, so it
+                # can't masquerade as a collision with a hashed row.
+                cands, seen = [], set()
                 try:
-                    dest.unlink()
+                    for sha, path in con.execute(
+                            "SELECT sha, path FROM files WHERE crc=? AND size=?",
+                            (crc_hex, size)):
+                        if not os.path.isfile(path):
+                            continue
+                        key = sha or path
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        cands.append(path)
+                except sqlite3.Error:
+                    continue
+                if not cands:
+                    continue
+                if len(cands) > 1:
+                    self._log(
+                        f"  ⚠ Extras store: {len(cands)} DIFFERENT files share "
+                        f"CRC {crc_hex} + {size:,} B for {Path(p).name} — a real "
+                        "SHA-256 collision. Using the first; the SFV verify "
+                        "decides. Alternates: "
+                        + "; ".join(os.path.basename(c) for c in cands[1:]),
+                        "warn")
+                hit = cands[0]
+                dest = (stored_pool / "_adds" / Path(p).name if is_wrong
+                        else stored_pool / Path(p).name)
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(hit, dest)
                 except OSError:
-                    pass
-                continue
-            hints[p] = str(dest)
-            resolved.append((p, nm))
-            self._log(f"  Extras store: matched {Path(p).name} by CRC {crc_hex} "
-                      "— copied from your local pack.", "ok")
+                    continue
+                if self._file_crc32(str(dest)) != crc_hex:
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                    continue
+                hints[p] = str(dest)
+                resolved.append((p, nm))
+                self._log(f"  Extras store: matched {Path(p).name} by CRC "
+                          f"{crc_hex} — copied from your local pack.", "ok")
+        finally:
+            if con:
+                con.close()
         return resolved
 
     def _fix_text_source_endings(self, hints: dict, srr_path: str, out_dir: str):

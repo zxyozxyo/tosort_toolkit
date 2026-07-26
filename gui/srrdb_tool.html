@@ -594,7 +594,8 @@ async function refreshExtras() {
     s.textContent = 'No folders yet — add a scene extras pack (nfo/diz/proofs) to reclaim releases whose packed nfo differs from the SRR copy.';
   } else {
     s.textContent = `${(info.total_files || 0).toLocaleString()} file(s) indexed`
-      + (info.last_scan ? ` · last scan ${info.last_scan}` : ' · not scanned yet — click Rescan');
+      + (info.last_scan ? ` · last scan ${info.last_scan}` : ' · not scanned yet — click Rescan')
+      + (info.collisions ? ` · ⚠ ${info.collisions} checksum collision(s)` : '');
   }
 }
 async function extrasAddFolder() {
