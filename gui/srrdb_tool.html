@@ -84,6 +84,17 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .queue-row:last-child{border-bottom:none}
 .queue-row:hover{background:var(--bg2)}
 .qr-name{color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:4px}
+.qr-haslog{cursor:pointer}
+.qr-haslog:hover{color:var(--acc)}
+.loglink{font-family:var(--mono);font-size:9px;color:var(--acc);opacity:.6;margin-left:3px}
+.qr-haslog:hover .loglink{opacity:1}
+/* per-release log popup */
+.logmodal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:50;align-items:center;justify-content:center}
+.logmodal-bg.show{display:flex}
+.logmodal{background:var(--bg1);border:1px solid var(--border);border-radius:8px;width:min(860px,92vw);height:min(80vh,720px);display:flex;flex-direction:column;box-shadow:0 8px 40px rgba(0,0,0,.5)}
+.logmodal-hdr{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.logmodal-hdr .ttl{flex:1;min-width:0;font-size:12px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.logmodal textarea{flex:1;margin:0;border:none;outline:none;resize:none;background:var(--bg0);color:var(--text);font-family:var(--mono);font-size:11px;line-height:1.5;padding:12px 14px;white-space:pre;overflow:auto}
 .qr-rel{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:4px}
 .qr-rel input{background:none;border:none;color:var(--text);font-family:var(--font);font-size:11px;width:100%;outline:none}
 .qr-rel input:focus{border-bottom:1px solid var(--acc)}
@@ -309,7 +320,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 // ── State ─────────────────────────────────────────────────────────────────────
 let mode = 'single';
 let selectedRelease = '';
-let batchJobs = [];   // [{path, name, release, candidates, hasNFO, hasSRS, status}]
+let batchJobs = [];   // [{path, name, release, candidates, hasNFO, hasSRS, status, logLines}]
+let currentLogPath = null;   // content_dir of the release currently logging
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 window.addEventListener('pywebviewready', async () => {
@@ -365,6 +377,12 @@ window.addEventListener('pywebviewready', async () => {
 window.srrEvent = function(event, data) {
   if (event === 'log') {
     addLog(data.msg, data.cls);
+    // Bucket each line under the release currently processing, so its log can
+    // be viewed on its own later (click the folder in the queue).
+    if (currentLogPath) {
+      const j = batchJobs.find(x => x.path === currentLogPath);
+      if (j) (j.logLines || (j.logLines = [])).push(data.msg);
+    }
   } else if (event === 'status') {
     const pill = document.getElementById('status-pill');
     const go   = document.getElementById('btn-go');
@@ -378,8 +396,10 @@ window.srrEvent = function(event, data) {
     skip.style.display = running ? '' : 'none';
   } else if (event === 'job_start') {
     // Match by folder path — release names can change during auto-match
+    currentLogPath = data.content_dir;      // route log lines to this release
     const job = batchJobs.find(j => j.path === data.content_dir);
     if (job) {
+      job.logLines = [];                     // fresh capture for this run
       job.status = 'running';
       renderQueue();
     }
@@ -681,8 +701,9 @@ function renderQueue() {
     const statusLabel = job.status === 'na' ? 'n/a' : job.status;
     const row = document.createElement('div');
     row.className = 'queue-row';
+    const hasLog = job.logLines && job.logLines.length;
     row.innerHTML = `
-      <div class="qr-name" title="${job.path}">${job.name}</div>
+      <div class="qr-name${hasLog ? ' qr-haslog' : ''}" onclick="showJobLog(${i})" title="${hasLog ? 'Click to view this release’s log on its own (easy copy)' : job.path}">${job.name}${hasLog ? ' <span class="loglink">[log]</span>' : ''}</div>
       <div class="qr-rel"><input value="${esc(job.release)}" onchange="batchJobs[${i}].release=this.value" title="Edit release name"/></div>
       <div style="display:flex;gap:3px;align-items:center">
         <span class="flag ${job.hasNFO ? 'on' : ''}">NFO</span>
@@ -692,6 +713,38 @@ function renderQueue() {
     body.appendChild(row);
   });
 }
+
+// ── Per-release log popup ─────────────────────────────────────────────────────
+function showJobLog(i) {
+  const job = batchJobs[i];
+  if (!job || !job.logLines || !job.logLines.length) return;
+  document.getElementById('logmodal-title').textContent =
+    (job.release || job.name) + '  —  ' + job.logLines.length + ' line(s)';
+  const ta = document.getElementById('logmodal-text');
+  ta.value = job.logLines.join('\n');
+  document.getElementById('logmodal-bg').classList.add('show');
+  ta.scrollTop = 0;
+}
+function closeJobLog() {
+  document.getElementById('logmodal-bg').classList.remove('show');
+}
+function copyJobLog() {
+  const ta = document.getElementById('logmodal-text');
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  if (!ok && navigator.clipboard) {
+    navigator.clipboard.writeText(ta.value).catch(() => {});
+  }
+  const btn = document.getElementById('logmodal-copy');
+  const prev = btn.textContent;
+  btn.textContent = 'Copied ✓';
+  setTimeout(() => { btn.textContent = prev; }, 1200);
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeJobLog();
+});
 
 async function autoSearchAll() {
   log('Auto-searching all releases…', 'dim');
@@ -839,5 +892,16 @@ function esc(s) {
   return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 </script>
+<!-- Per-release log popup -->
+<div class="logmodal-bg" id="logmodal-bg" onclick="if(event.target===this)closeJobLog()">
+  <div class="logmodal">
+    <div class="logmodal-hdr">
+      <span class="ttl" id="logmodal-title">Release log</span>
+      <button class="btn btn-sm" id="logmodal-copy" onclick="copyJobLog()">Copy all</button>
+      <button class="btn btn-sm" onclick="closeJobLog()">Close</button>
+    </div>
+    <textarea id="logmodal-text" readonly spellcheck="false"></textarea>
+  </div>
+</div>
 </body>
 </html>
