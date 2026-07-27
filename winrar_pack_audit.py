@@ -53,10 +53,14 @@ FINALS = {
     "624": "2023-10-04",
 }
 
-# The window most console-scene (3DS/NDS/Wii/PSP) releases fall in — prioritise
-# filling beta gaps here first, it's where the "No good RAR version found"
-# walls cluster.
-SCENE_ERA = ("2004-01-01", "2017-01-01")
+# The community's m1-m5 compatibility test (pastebin 6F5dF7z7) proved the RAR3/4
+# compressor was STABLE across point releases: consecutive 3.x-4.x versions
+# produce IDENTICAL output for the standard methods, and even betas match their
+# adjacent final (400 == 401b1). So having the FINALS covers the 3.x-4.x betas —
+# hunting them is largely wasted effort. RAR5 (5.00, Oct 2013) is a new format
+# with more version-to-version variability and is where the modern "No good RAR
+# version found" walls live (2013+ 3DS/NDS/console scene). Prioritise 5.x betas.
+RAR5_START = "500"   # ver_key >= this == RAR5+ (priority for beta hunting)
 
 
 def ver_label(k):
@@ -81,9 +85,11 @@ def main():
 
     finals_by_date = sorted(FINALS.items(), key=lambda kv: kv[1])
     missing_finals = [(k, d) for k, d in finals_by_date if k not in have_finals]
-    no_beta = [(k, d) for k, d in finals_by_date
-               if k not in have_betas]
-    era_no_beta = [(k, d) for k, d in no_beta if SCENE_ERA[0] <= d < SCENE_ERA[1]]
+    no_beta = [(k, d) for k, d in finals_by_date if k not in have_betas]
+    # RAR5+ without a beta = the real priority; RAR3/4 betas are compression-
+    # redundant (finals already cover them — see the m1-m5 compatibility test).
+    era_no_beta = [(k, d) for k, d in no_beta if k >= RAR5_START]
+    redundant = [(k, d) for k, d in no_beta if k < RAR5_START]
 
     print("=" * 70)
     print(" WinRAR pack audit")
@@ -102,20 +108,21 @@ def main():
     else:
         print("- All RAR4 finals present. OK\n")
 
-    print(f"- VERSIONS WITH NO BETA in the pack ({len(no_beta)} of "
-          f"{len(FINALS)}):")
-    print("   Scene groups often packed with a BETA, so these are the likely")
-    print("   'No good RAR version found' culprits. Priority = console-scene era")
-    print(f"   ({SCENE_ERA[0][:4]}-{SCENE_ERA[1][:4]}):")
+    print(f"- BETA GAPS ({len(no_beta)} versions have no beta in the pack):")
     print()
-    print("   * PRIORITY (scene era, no beta yet):")
+    print(f"   * PRIORITY -- RAR5+ betas ({len(era_no_beta)}): the real gap. RAR5")
+    print("     is a new format; version-to-version output varies, and this is")
+    print("     where 2013+ 'No good RAR version found' walls (ABSTRAKT, EXiMiUS)")
+    print("     live. Hunt these first:")
     for k, d in era_no_beta:
         print(f"       {d}   WinRAR {ver_label(k):<5}  -> hunt wrar{k}b*.exe")
     print()
-    others = [(k, d) for k, d in no_beta if (k, d) not in era_no_beta]
-    if others:
-        print("   · other eras (lower priority):")
-        print("     " + ", ".join(ver_label(k) for k, _ in others))
+    print(f"   · LOW PRIORITY -- RAR3/4 betas ({len(redundant)}): the m1-m5")
+    print("     compatibility test shows the 3.x-4.x compressor was stable across")
+    print("     point releases (even 400 == 401b1), so the finals you already")
+    print("     have cover these. Not worth chasing unless a specific release")
+    print("     proves otherwise:")
+    print("     " + ", ".join(ver_label(k) for k, _ in redundant))
     print()
     print("=" * 70)
     print(" WHERE TO GET THEM")
