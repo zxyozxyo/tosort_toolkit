@@ -414,13 +414,25 @@ class SrrdbToolAPI:
                     pass
 
         for installer in installers:
-            # Old naming (wrar420.exe) and new naming (winrar-x64-723.exe)
-            m = (re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.IGNORECASE)
+            # 3-DIGIT naming (wrar420.exe / winrar-x64-620b1.exe) — minor is two
+            # digits. OLD 2-DIGIT naming (wrar50b3.exe = 5.00 beta 3, wrar26b8.exe
+            # = 2.60 beta 8) — minor is ONE digit with an implied trailing zero.
+            # Scene betas are very often shipped 2-digit, so accept both or the
+            # crucial 5.x betas get silently skipped. Localised/dupe names
+            # (wrar520fr.exe, wrar500_2.exe) fail the anchored $ and are ignored.
+            m = (re.match(r"wrar(\d)(\d{2})(b\d)?\.exe$", installer.name, re.I)
                  or re.match(r"winrar-x\d+-(\d)(\d{2})(b\d)?\.exe$",
-                             installer.name, re.IGNORECASE))
-            if not m:
-                continue
-            major, minor, beta = m.group(1), m.group(2), (m.group(3) or "")
+                             installer.name, re.I))
+            if m:
+                major, minor, beta = m.group(1), m.group(2), (m.group(3) or "")
+            else:
+                m = (re.match(r"wrar(\d)(\d)(b\d)?\.exe$", installer.name, re.I)
+                     or re.match(r"winrar-x\d+-(\d)(\d)(b\d)?\.exe$",
+                                 installer.name, re.I))
+                if not m:
+                    continue
+                major, minor = m.group(1), m.group(2) + "0"  # 5.0 -> 500
+                beta = m.group(3) or ""
             ver_key = f"{major}{minor}"
             if int(ver_key) >= 700:
                 skipped += 1
