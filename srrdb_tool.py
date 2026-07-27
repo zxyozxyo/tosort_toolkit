@@ -2573,6 +2573,37 @@ class SrrdbToolAPI:
                         still_missing = [x for x in still_missing if x not in r_miss]
                     if r_wrong:
                         wrong_size = [x for x in wrong_size if x not in r_wrong]
+                # Wrong-match guard: a MAIN content source (the ROM/main file, not
+                # a small extra) that's absent AND has no same-SIZE file on disk
+                # for rescene to auto-locate means this folder isn't the release's
+                # content at all — e.g. a stale queue entry pairing a PS5 name with
+                # a 3DS folder (ASTRO.BOT → LEGO_Ninjago). rescene would otherwise
+                # die mid-rebuild with a cryptic "file does not exist". A renamed
+                # main file (same size, different name) is NOT flagged — rescene
+                # auto-locates it — so this never breaks a legit renamed rebuild.
+                if still_missing:
+                    _EXTRA_EXTS = (".nfo", ".diz", ".txt", ".sfv", ".jpg", ".jpeg",
+                                   ".png", ".gif", ".ini", ".m3u", ".srs")
+                    try:
+                        disk_sizes = {f.stat().st_size for f in
+                                      Path(content_dir).rglob("*") if f.is_file()}
+                    except OSError:
+                        disk_sizes = set()
+                    orphan_main = [
+                        (p, nm) for (p, nm) in still_missing
+                        if os.path.splitext(nm)[1].lower() not in _EXTRA_EXTS
+                        and expected_sizes.get(nm) is not None
+                        and expected_sizes.get(nm) not in disk_sizes]
+                    if orphan_main:
+                        _n = ", ".join(Path(p).name for p, _ in orphan_main[:3])
+                        self._log(
+                            f"  ⚠ Main content not found in this folder: {_n}"
+                            + ("…" if len(orphan_main) > 3 else "")
+                            + " — wrong release match for this content, or the "
+                            "content simply isn't here. Skipping (can't rebuild "
+                            "without the main file).", "warn")
+                        raise RuntimeError(
+                            "main content missing — wrong release match")
                 if len(still_missing) > _MAX_FETCH_ADDS:
                     # Too many missing sources to be "extras" — a wrong match or a
                     # loose-asset release. One summary line, no per-file logging
@@ -3669,6 +3700,21 @@ class SrrdbToolAPI:
                     self._log(f"  Reconstruct ERROR: {rc.get('error', 'unknown')}", "err")
                     summary["ok"] = False
                     summary["note"] = (rc.get("error") or "reconstruct error")[:100]
+                    if "already exists" in (rc.get("error") or "").lower():
+                        # Stale-output collision surfaced by rescene — clear the
+                        # produced artifacts (keeps _stored / cached SRR) so a
+                        # re-run starts clean, and say so plainly.
+                        try:
+                            self._clear_produced_volumes(out_root)
+                            for d in ("Sample", "Subs", "Subs_NOT_PRODUCED",
+                                      "_subs_tmp", "_iso_m2ts_tmp"):
+                                shutil.rmtree(str(out_root / d), ignore_errors=True)
+                        except Exception:
+                            pass
+                        self._log("  ⚠ Stale-output collision — cleared the "
+                                  "produced files; re-run this release and it "
+                                  "should proceed.", "warn")
+                        summary["note"] = "stale output collision — cleared, re-run"
                     # If a version+mt was locked before the failure (near-miss /
                     # "Still not fine"), surface the combo so the suspect thread
                     # count is visible.
@@ -4136,9 +4182,30 @@ class SrrdbToolAPI:
             summary["note"] = "stopped"
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False, "stopped": True})
         except Exception as e:
-            self._log(f"  FAILED: {e}", "err")
+            msg = str(e)
+            if ("already exists" in msg.lower()
+                    or getattr(e, "winerror", None) == 183):
+                # Stale-output collision (Windows WinError 183): a leftover from an
+                # interrupted prior run blocked a fresh write inside rescene. Clear
+                # the PRODUCED artifacts (never _stored / the cached SRR, so a
+                # re-run stays offline) and say so plainly instead of surfacing the
+                # raw error — a re-run then starts clean.
+                try:
+                    if "out_root" in locals() and out_root.is_dir():
+                        self._clear_produced_volumes(out_root)
+                        for d in ("Sample", "Subs", "Subs_NOT_PRODUCED",
+                                  "_subs_tmp", "_iso_m2ts_tmp"):
+                            shutil.rmtree(str(out_root / d), ignore_errors=True)
+                except Exception:
+                    pass
+                self._log("  ⚠ Stale-output collision (leftover from a prior run) "
+                          "— cleared the produced files; re-run this release and "
+                          "it should proceed.", "warn")
+                summary["note"] = "stale output collision — cleared, re-run"
+            else:
+                self._log(f"  FAILED: {e}", "err")
+                summary["note"] = str(e)[:100]
             summary["ok"] = False
-            summary["note"] = str(e)[:100]
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
             # A skip only aborts THIS release — clear it so the next queued job
