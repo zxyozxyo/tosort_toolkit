@@ -1560,6 +1560,153 @@ class SrrdbToolAPI:
                 return _orig_full(rar_self)
         rm.RarExecutable.full = _full_ma4
 
+        # --- compressed-stream cache for the multi-file cross-version sweep ----
+        # The per-stream version sweep (see _rescue_multifile_crc) re-runs the
+        # WHOLE reconstruction once per candidate WinRAR build to hunt a proof
+        # jpg's true version. Every pass otherwise recompresses the big content
+        # file identically — it's pinned to one build+thread-count throughout —
+        # so a 256 MB .3ds burns ~40 s per pass for nothing. Cache that one
+        # expensive output (rescene runs it via the module's subprocess.Popen,
+        # NOT custom_popen) and replay it. Strictly gated on self._compress_cache
+        # being a live dict, which ONLY the sweep sets; when it's None the shim
+        # is a pure passthrough, so the normal reconstruction path is byte-for-
+        # byte unchanged. Correctness never rests on the cache: a hit reproduces
+        # exactly what rar.exe emits for identical (exe, args, source) inputs,
+        # and the final SFV CRC verify still guards every accepted rebuild.
+        _api = self
+        _real_sp = subprocess
+
+        def _cache_probe(cmd):
+            # A cacheable full compress: `rar a … OUT SRC` where OUT is the
+            # pyReScene_compressed.rar output and SRC is a real ≥16 MB content
+            # file (never a pyReScene_data_piece, never the small jpg we sweep).
+            if len(cmd) < 3 or str(cmd[1]).lower() != "a":
+                return None
+            out_path = src_path = None
+            for a in cmd[2:]:
+                s = str(a)
+                base = os.path.basename(s).lower()
+                if base == "pyrescene_compressed.rar":
+                    out_path = s
+                elif "pyrescene" not in base and os.path.isfile(s):
+                    try:
+                        if os.path.getsize(s) >= _LARGE_STREAM_BYTES:
+                            src_path = s
+                    except OSError:
+                        pass
+            return (src_path, out_path) if (src_path and out_path) else None
+
+        def _cache_key(cmd, src_path):
+            flags = tuple(str(a) for a in cmd
+                          if str(a) == "a" or str(a).startswith("-"))
+            st = os.stat(src_path)
+            return (os.path.basename(str(cmd[0])).lower(), flags,
+                    os.path.basename(src_path).lower(),
+                    st.st_size, int(st.st_mtime))
+
+        def _cache_dir():
+            d = getattr(_api, "_ccache_dir", None)
+            if not d:
+                d = tempfile.mkdtemp(prefix="srrdb_ccache_")
+                _api._ccache_dir = d
+            return d
+
+        def _cache_restore(entry, out_path):
+            out_dir = os.path.dirname(out_path)
+            for fname, cfile in entry:
+                dst = os.path.join(out_dir, fname)
+                try:
+                    if os.path.exists(dst):
+                        os.unlink(dst)
+                except OSError:
+                    pass
+                try:
+                    os.link(cfile, dst)         # instant, same volume
+                except OSError:
+                    shutil.copy2(cfile, dst)
+
+        def _cache_store(out_path, key, cache):
+            out_dir = os.path.dirname(out_path)
+            stem = os.path.splitext(os.path.basename(out_path))[0].lower()
+            cdir = _cache_dir()
+            entry = []
+            for f in os.listdir(out_dir):
+                if not f.lower().startswith(stem):
+                    continue
+                src = os.path.join(out_dir, f)
+                cf = os.path.join(cdir, f"{len(cache)}_{f}")
+                try:
+                    if os.path.exists(cf):
+                        os.unlink(cf)
+                    os.link(src, cf)
+                except OSError:
+                    try:
+                        shutil.copy2(src, cf)
+                    except OSError:
+                        return              # skip caching this one, no harm
+                entry.append((f, cf))
+            if entry:
+                cache[key] = entry
+
+        class _FakeProc(object):
+            returncode = 0
+            def communicate(self, *a, **k):
+                return (b"", b"")
+            def wait(self, *a, **k):
+                return 0
+            def poll(self):
+                return 0
+            def kill(self):
+                pass
+            def terminate(self):
+                pass
+
+        class _CachingProc(object):
+            def __init__(self, proc, out_path, key, cache):
+                self._p = proc
+                self._out = out_path
+                self._key = key
+                self._cache = cache
+            def communicate(self, *a, **k):
+                res = self._p.communicate(*a, **k)
+                try:
+                    if self._p.returncode == 0 and self._key not in self._cache:
+                        _cache_store(self._out, self._key, self._cache)
+                except Exception:
+                    pass
+                return res
+            def __getattr__(self, n):
+                return getattr(self._p, n)
+
+        class _SPShim(object):
+            def __getattr__(self, n):
+                return getattr(_real_sp, n)
+            def Popen(self, cmd, *a, **k):
+                cache = getattr(_api, "_compress_cache", None)
+                if cache is None:
+                    return _real_sp.Popen(cmd, *a, **k)
+                try:
+                    probe = _cache_probe(cmd)
+                except Exception:
+                    probe = None
+                if not probe:
+                    return _real_sp.Popen(cmd, *a, **k)
+                src_path, out_path = probe
+                try:
+                    key = _cache_key(cmd, src_path)
+                except Exception:
+                    return _real_sp.Popen(cmd, *a, **k)
+                entry = cache.get(key)
+                if entry:
+                    try:
+                        _cache_restore(entry, out_path)
+                        return _FakeProc()
+                    except Exception:
+                        pass                # fall through to a real compress
+                return _CachingProc(_real_sp.Popen(cmd, *a, **k),
+                                    out_path, key, cache)
+        rm.subprocess = _SPShim()
+
         # --- case-insensitive volume-set grouping for mixed-case release names ---
         # Some groups (e.g. LiGHTFORCE) pack a release whose volumes carry
         # INCONSISTENT case — LFC-BFYP.RAR, lfc-bfyp.r00, LFC-BFYP.R02… On a
@@ -1589,6 +1736,21 @@ class SrrdbToolAPI:
         _orig_get = rm.RarRepository.get_rar_executables
         def _get_pref(repo_self, date, _orig=_orig_get, _rm=rm):
             order = list(_orig(repo_self, date))
+            # Per-stream version-sweep rescue: force the ONE stream currently
+            # being compressed (a proof jpg) to a candidate build while the rest
+            # of the set stays pinned to its locked build. Keyed by the source
+            # basename (_current_src, set at the top of _crf_init). Checked
+            # FIRST so it wins over the set-wide _version_force/_set_good_rar
+            # locks — the big content file can stay on the pinned version while
+            # the swept extra tries another. Only ever set by the multi-file
+            # cross-version tier, so every other path skips this untouched.
+            sv = getattr(self, "_stream_ver_override", None)
+            if sv:
+                want = sv.get(getattr(self, "_current_src", None))
+                if want:
+                    only = [r for r in order if str(r) == want]
+                    if only:
+                        return only
             # Build-sweep rescue: restrict the hunt to ONE exact exe (by file
             # name, so a beta can be told apart from its final — rescene's
             # __str__ collapses both to e.g. "2014-05-21 5.11"). Used to retry a
@@ -1751,6 +1913,9 @@ class SrrdbToolAPI:
         def _crf_init(crf_self, first_block, blocks, src,
                       next_block=None, next_src=None, solid=False,
                       _orig=_orig_crf_init, _rm=rm, _self=self):
+            # Record which source file is about to be compressed so _get_pref's
+            # per-stream version sweep can restrict THIS stream's version hunt.
+            _self._current_src = os.path.basename(src).lower()
             # Method2 all-files rescue: once the big content stream has rebuilt
             # (archived_files non-empty), force the NEXT file's per-file rebuild
             # to raise so rescene's factory (compressed_rar_file_factory) falls
@@ -2282,10 +2447,86 @@ class SrrdbToolAPI:
                         f"{build} — all {r['checked']} volume(s) now CRC-match "
                         "the SFV.", "ok")
                     return r
+
+            # ── Per-stream cross-version sweep (cached big stream) ──────────
+            # Last resort for the proof-jpg wall: the big content file rebuilt
+            # perfectly (only the volume holding a small binary extra is wrong),
+            # NO thread count matched at the locked version, and no sibling build
+            # helped. Remaining hypothesis — the extra (a proof jpg) was added by
+            # a DIFFERENT WinRAR build than the game, a separate `rar a` the group
+            # ran with whatever WinRAR was on the box. Force JUST that extra to
+            # each pack build in turn while every big content stream stays pinned
+            # to the locked build + its thread count; the big recompress is
+            # byte-identical every pass, so the compress cache runs it once (~40 s
+            # on a 256 MB .3ds) and replays it for free thereafter. rescene still
+            # hunts the extra's own -mt at each candidate build and CRC-checks it,
+            # and the full SFV verify guards the result — a miss just falls
+            # through. Bounded by the sweep deadline + Stop/Skip.
+            bin_extras = [s for s in streams
+                          if not _is_big(s[0]) and not _is_text_meta(s[0])]
+            allv = [v for v in (getattr(self, "_all_versions", None) or [])
+                    if v and v != pinned]
+            if has_big and pinned and bin_extras and allv:
+                # Order candidates: this group's known-good history first, then
+                # release dates nearest the locked build (they share its
+                # compression era), then the rest — same priors as the
+                # single-file version sweep.
+                cand_prefs = [v for v in (getattr(self, "_recon_prefs", None)
+                                          or []) if v in allv]
+                rest = [v for v in allv if v not in cand_prefs]
+                d0 = self._version_date(pinned)
+                if d0 is not None:
+                    rest.sort(key=lambda v: (
+                        self._version_date(v) is None,
+                        abs((self._version_date(v) - d0).days)
+                        if self._version_date(v) else 1 << 30))
+                cand = cand_prefs + rest
+                # Pin every big content stream to the locked build + its locked
+                # thread count so its compress is identical (cache-hittable)
+                # across the whole sweep; text metadata rides the pinned build.
+                big_mt = {s[0].lower(): s[2] for s in streams
+                          if _is_big(s[0]) and s[2]}
+                base_ver = {s[0].lower(): pinned for s in streams}
+                extra_names = ", ".join(sorted(s[0] for s in bin_extras))
+                self._log(
+                    f"  Multi-file near-miss: sweeping {extra_names} across "
+                    f"{len(cand)} other pack build(s) — big stream pinned to "
+                    f"{pinned} and cached, nearest release date first…", "dim")
+                self._compress_cache = {}
+                try:
+                    for v in cand:
+                        if self._stop.is_set() or self._skip.is_set():
+                            return None
+                        if time.time() > sweep_deadline:
+                            self._log("  Multi-file rescue: deadline reached — "
+                                      "stopping.", "dim")
+                            return None
+                        ver_map = dict(base_ver)
+                        for s in bin_extras:
+                            ver_map[s[0].lower()] = v
+                        self._stream_ver_override = ver_map
+                        try:
+                            r = _attempt(big_mt,
+                                         f"trying {extra_names} under {v}")
+                        finally:
+                            self._stream_ver_override = None
+                        if r:
+                            self._log(
+                                f"  ✓ Multi-file rescue: {extra_names} rebuilt "
+                                f"under {v} — all {r['checked']} volume(s) now "
+                                "CRC-match the SFV.", "ok")
+                            return r
+                finally:
+                    self._compress_cache = None
         finally:
             self._mt_override = {}
             self._force_method2 = False
             SrrdbToolAPI._build_force = None
+            self._stream_ver_override = None
+            cdir = getattr(self, "_ccache_dir", None)
+            if cdir:
+                shutil.rmtree(cdir, ignore_errors=True)
+                self._ccache_dir = None
         self._log("  Multi-file rescue exhausted — no thread count reproduced "
                   "the near-miss stream(s) exactly. Kept as FAILED.", "warn")
         return None
