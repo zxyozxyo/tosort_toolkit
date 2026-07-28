@@ -168,6 +168,16 @@ _MT_RETRY_CAP = 8
 _MT_RETRY_CAP_SMALL = 32
 _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 
+# Cross-version proof-jpg sweep: a scene group packs with a CONTEMPORARY WinRAR,
+# so the proof jpg's build is almost always within a few years of the game's
+# locked build. Cap the sweep to that era (± window) plus a hard build count, so
+# a GENUINE wall gives up in minutes instead of grinding all 232 builds to the
+# 30-min deadline. Group-history builds are always kept regardless of era. A
+# winnable different-build jpg is era-adjacent and tried first anyway, so this
+# costs ~zero real rebuilds while hugely improving batch throughput on walls.
+_XVER_ERA_DAYS = 3 * 365          # ± ~3 years around the game's locked build
+_XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
+
 # A release normally packs 1–2 "extras" (proof jpg / file_id.diz) that aren't in
 # the content folder and get fetched from srrdb adds. Far more than this means a
 # wrong release match or a release whose loose files simply aren't present (e.g.
@@ -2503,11 +2513,16 @@ class SrrdbToolAPI:
                 rest = [v for v in allv if v not in cand_prefs]
                 d0 = self._version_date(pinned)
                 if d0 is not None:
-                    rest.sort(key=lambda v: (
-                        self._version_date(v) is None,
-                        abs((self._version_date(v) - d0).days)
-                        if self._version_date(v) else 1 << 30))
-                cand = cand_prefs + rest
+                    # Keep only era-adjacent builds (±_XVER_ERA_DAYS), nearest
+                    # first — a genuine wall then exhausts in minutes instead of
+                    # grinding implausibly-distant builds to the deadline.
+                    rest = sorted(
+                        (v for v in rest
+                         if self._version_date(v) is not None
+                         and abs((self._version_date(v) - d0).days)
+                         <= _XVER_ERA_DAYS),
+                        key=lambda v: abs((self._version_date(v) - d0).days))
+                cand = (cand_prefs + rest)[:_XVER_MAX_BUILDS]
                 # Pin every big content stream to the locked build + its locked
                 # thread count so its compress is identical (cache-hittable)
                 # across the whole sweep; text metadata rides the pinned build.
@@ -2517,8 +2532,8 @@ class SrrdbToolAPI:
                 extra_names = ", ".join(sorted(s[0] for s in bin_extras))
                 self._log(
                     f"  Multi-file near-miss: sweeping {extra_names} across "
-                    f"{len(cand)} other pack build(s) — big stream pinned to "
-                    f"{pinned} and cached, nearest release date first…", "dim")
+                    f"{len(cand)} era-adjacent pack build(s) — big stream pinned "
+                    f"to {pinned} and cached, nearest release date first…", "dim")
                 self._compress_cache = {}
                 try:
                     for v in cand:
