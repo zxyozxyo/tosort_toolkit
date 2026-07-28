@@ -1786,7 +1786,26 @@ class SrrdbToolAPI:
             if good:
                 only = [r for r in order if str(r) == good]
                 if only:
-                    return only
+                    # A SMALL embedded file (proof jpg) locked FIRST and set the
+                    # set version. For another SMALL file, RESTRICT to it (the
+                    # fast-fail that stops an embedded-jpg wall wandering all 232
+                    # versions). But for the BIG content file, only FRONT that
+                    # version — never restrict — so a two-stage PUSSYCAT pack
+                    # whose game was made by a DIFFERENT build than its proof jpg
+                    # (jpg 5.11 / game 4.11) can still fall through and find the
+                    # game's true version instead of dying on "No good version".
+                    if not getattr(self, "_current_is_big", False):
+                        return only
+                    # Big file: front the set version, then this group's
+                    # known-good builds, then the rest by date — so a game made
+                    # by a DIFFERENT build is found fast, not after grinding the
+                    # oldest 2.x versions first.
+                    hints = [good] + [v for v in
+                                      (getattr(self, "_recon_prefs", None) or [])
+                                      if v and v != good]
+                    front = [r for r in order if str(r) in hints]
+                    front.sort(key=lambda r: hints.index(str(r)))
+                    return front + [r for r in order if str(r) not in hints]
             prefs = getattr(SrrdbToolAPI, "_pref_versions", None) or []
             if prefs and not getattr(_rm, "archived_files", None):
                 front = [r for r in order if str(r) in prefs]
@@ -1914,8 +1933,16 @@ class SrrdbToolAPI:
                       next_block=None, next_src=None, solid=False,
                       _orig=_orig_crf_init, _rm=rm, _self=self):
             # Record which source file is about to be compressed so _get_pref's
-            # per-stream version sweep can restrict THIS stream's version hunt.
+            # per-stream version sweep can restrict THIS stream's version hunt,
+            # and whether it's a BIG content file (so the set-wide version lock
+            # only FRONTS its version for the big file, never restricts it — a
+            # small proof jpg locked FIRST must not pin the game to its build).
             _self._current_src = os.path.basename(src).lower()
+            try:
+                _self._current_is_big = (
+                    os.path.getsize(src) >= _LARGE_STREAM_BYTES)
+            except OSError:
+                _self._current_is_big = False
             # Method2 all-files rescue: once the big content stream has rebuilt
             # (archived_files non-empty), force the NEXT file's per-file rebuild
             # to raise so rescene's factory (compressed_rar_file_factory) falls
