@@ -1939,6 +1939,9 @@ class SrrdbToolAPI:
                     rest.sort(key=lambda r: -( (self._version_date(str(r))
                                                 or datetime.date.min).toordinal()))
                     order = pref_part + rest
+                    # Distinct version strings actually searched (betas collapse) —
+                    # the target the wall-cache compares _versions_tried against.
+                    self._capped_count = len({str(r) for r in order})
             return order
         rm.RarRepository.get_rar_executables = _get_pref
 
@@ -2147,6 +2150,23 @@ class SrrdbToolAPI:
                 _rm, base)
 
         rm.CompressedRarFile.__init__ = _crf_init
+
+        # --- skip the redundant "more_files" second version hunt on non-solid ---
+        # When the first version hunt fails, rescene retries by appending the NEXT
+        # source and re-hunting EVERY pack version (main.py:2156-2159). For a
+        # NON-SOLID archive the appended file can't change the target's compressed
+        # bytes, so that second full grind is guaranteed to reproduce the first's
+        # result — pure waste that DOUBLES the wall-clock on a version wall (seen:
+        # LEGO_Rock_Band NDS grinding 140 versions twice to the 30-min deadline).
+        # Skip it (return no match) for non-solid; solid archives genuinely need
+        # the cross-file dictionary, so they're untouched.
+        _orig_smre = rm.CompressedRarFile.search_matching_rar_executable
+        def _smre(crf_self, block, blocks, thread_count, more_files=False,
+                  _orig=_orig_smre):
+            if more_files and not getattr(crf_self, "solid", False):
+                return None
+            return _orig(crf_self, block, blocks, thread_count, more_files)
+        rm.CompressedRarFile.search_matching_rar_executable = _smre
         return rm
 
     def _rescue_mt_near_miss(self, orig_init, crf_self, ctor_args, rm, base):
@@ -2982,6 +3002,7 @@ class SrrdbToolAPI:
             d = self._srr_pack_date(srr_path)
             if d:
                 self._version_date_cap = d
+                self._date_cap_source = "srr"
                 self._log("  Version date-cap: no folder date — using the SRR's "
                           f"RAR timestamp {d.isoformat()} (+"
                           f"{_VERSION_CAP_MARGIN_DAYS // 365}yr, nearest first).",
@@ -3825,11 +3846,13 @@ class SrrdbToolAPI:
         except Exception:
             return ""
 
-    def _wall_cache_hit(self, release: str) -> dict | None:
+    def _wall_cache_hit(self, release: str, date_cap_on: bool = True) -> dict | None:
         """Return the prior result record if `release` is a cached version-wall
         that is still valid (same pack signature + wall-cache generation), else
-        None. A hit means: don't bother re-grinding every version — nothing has
-        changed that could make it rebuildable."""
+        None. A hit means: don't re-grind — nothing changed that could make it
+        rebuildable. A CAPPED wall (only the in-range subset was tried) is honored
+        ONLY while the date-cap is still on — turn the cap off and it re-runs the
+        whole pack, so the cap's subset is never a permanent exclusion."""
         if not release:
             return None
         try:
@@ -3841,6 +3864,8 @@ class SrrdbToolAPI:
                         and r.get("wall") == "version"
                         and r.get("wall_gen") == _WALL_CACHE_GEN
                         and r.get("pack_sig") == cur_sig):
+                    if r.get("wall_capped") and not date_cap_on:
+                        return None   # cap off → try the whole pack
                     return r
         except Exception:
             pass
@@ -3850,18 +3875,34 @@ class SrrdbToolAPI:
         try:
             release = summary.get("release") or ""
             group, platform, year = self._parse_meta(release, queue_path)
-            # Classify a pure VERSION WALL: the reconstruction failed, no version
-            # was ever locked (_last_good_rar None), AND the hunt actually tried
-            # EVERY pack version (not merely cut off early by the deadline). Only
-            # a bigger pack can fix this, so cache it (with the pack signature) to
-            # skip the ~30-min re-grind next time. A deadline that struck before
-            # all versions were tried is NOT cached — it might still be winnable.
-            allv = list(getattr(self, "_all_versions", None) or [])
+            # Classify a VERSION WALL: reconstruction failed, no version ever
+            # locked (_last_good_rar None), AND the hunt tried EVERY version it
+            # was going to (not cut off early by the deadline). Cache it (with the
+            # pack signature) so a re-run skips the grind. `_versions_tried` and
+            # `_all_versions` are compared as DISTINCT version STRINGS — betas
+            # collapse to one string (e.g. 5.00 + 5.00b1..b8 → "2013-10-12 5.00"),
+            # so 232 exes are only ~58 strings; comparing raw lengths would never
+            # match. When a date-cap was applied the search set is the in-range
+            # subset (`_capped_count` distinct strings), not the whole pack.
+            allv = set(getattr(self, "_all_versions", None) or [])
             tried = getattr(self, "_versions_tried", None) or set()
+            cap_on = bool(getattr(self, "_version_date_cap", None)
+                          and not getattr(self, "_version_cap_widen", False))
+            cap_src = getattr(self, "_date_cap_source", None)
+            searched = (getattr(self, "_capped_count", None)
+                        if cap_on else None) or len(allv)
+            exhausted = bool(allv and len(tried) >= searched)
+            no_version = getattr(self, "_last_good_rar", None) is None
+            # A capped exhaustion is a real wall only when the date is RELIABLE
+            # (from the folder). An SRR-timestamp date is noisy, so a capped
+            # SRR-dated miss stays widen-on-re-run instead of a cached wall.
             wall = ""
-            if (not summary.get("ok") and getattr(self, "_last_good_rar", None)
-                    is None and allv and len(tried) >= len(allv)):
-                wall = "version"
+            wall_capped = False
+            if not summary.get("ok") and no_version and exhausted:
+                if not cap_on:
+                    wall = "version"
+                elif cap_src == "folder":
+                    wall = "version"; wall_capped = True
             rec = {
                 "ts":          time.strftime("%Y-%m-%d %H:%M"),
                 "release":     release,
@@ -3881,15 +3922,16 @@ class SrrdbToolAPI:
                                 (getattr(self, "_recon_streams", None) or [])],
                 "note":        (summary.get("note") or "")[:120],
                 # Version-wall cache (see _wall_cache_hit): "" for anything that
-                # isn't a proven whole-pack version miss.
+                # isn't a proven version miss over its searched set.
                 "wall":        wall,
                 "wall_gen":    _WALL_CACHE_GEN if wall else None,
                 "pack_sig":    self._pack_signature() if wall else None,
+                # A capped wall only tried the in-range subset, so it's skipped on
+                # re-run ONLY while the date-cap is still on (see _wall_cache_hit).
+                "wall_capped": wall_capped,
                 # Was a release-date cap actually applied this run? A capped
-                # FAILURE triggers widen-on-re-run (see _process_one).
-                "date_capped": bool(getattr(self, "_version_date_cap", None)
-                                    and not getattr(self, "_version_cap_widen",
-                                                    False)),
+                # SRR-dated FAILURE triggers widen-on-re-run (see _process_one).
+                "date_capped": cap_on,
             }
             results = self._load_results()
             # Re-runs replace the previous record for the same release
@@ -4120,12 +4162,16 @@ class SrrdbToolAPI:
         # version, as long as the pack hasn't grown since. Saves the ~30-min
         # whole-pack re-grind on every re-run. Defeatable per-batch via config.
         if release and config.get("skip_known_walls", True):
-            hit = self._wall_cache_hit(release)
+            hit = self._wall_cache_hit(release, config.get("date_cap", True))
             if hit:
+                extra = ("all builds ≤ the release date"
+                         if hit.get("wall_capped") else "every pack version")
                 self._log(
-                    f"  ⏭ Known version-wall (no pack version matched on "
+                    f"  ⏭ Known version-wall (no match across {extra} on "
                     f"{hit.get('ts','?')}, pack unchanged since) — skipped. "
-                    "Add WinRAR versions to retry.", "warn")
+                    "Add WinRAR versions"
+                    + (" or turn off the date-cap" if hit.get("wall_capped")
+                       else "") + " to retry.", "warn")
                 summary["ok"] = False
                 summary["wall_skipped"] = True
                 summary["note"] = "known version-wall — skipped (pack unchanged)"
@@ -4144,6 +4190,8 @@ class SrrdbToolAPI:
         # pass runs only if needed. Cap disabled entirely via config.
         self._version_date_cap = None
         self._version_cap_widen = False
+        self._date_cap_source = None   # "folder" | "srr" — reliability of the date
+        self._capped_count = None      # distinct version strings in the capped set
         # NB: derive the date from the dated FOLDER (queue_path) even when the
         # release name isn't confirmed yet (auto-match jobs enter here with an
         # empty `release`) — the cap needs the folder, not the name. A missing
@@ -4152,6 +4200,8 @@ class SrrdbToolAPI:
         self._date_cap_enabled = bool(config.get("date_cap", True))
         if self._date_cap_enabled:
             self._version_date_cap = self._release_date(release, queue_path)
+            if self._version_date_cap:
+                self._date_cap_source = "folder"
             if release:   # widen-on-re-run needs a known release name to look up
                 try:
                     prev = next((r for r in self._load_results()
