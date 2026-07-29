@@ -187,6 +187,15 @@ _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 # auto-invalidates the cache so every wall gets one fresh attempt.
 _WALL_CACHE_GEN = 1
 
+# Release-date version cap: a scene group can't pack with a WinRAR newer than the
+# release date — so on the main version hunt, drop far-future builds and try those
+# NEAREST the release date first. The real build is found fast and a wall exhausts
+# far fewer versions. A generous margin AFTER the date is the safety net (repacks,
+# slightly-off folder dates, a group on a marginally newer build); group-history
+# builds are ALWAYS kept regardless. If a capped run still fails, the re-run widens
+# to the whole pack — so nothing is permanently excluded.
+_VERSION_CAP_MARGIN_DAYS = 3 * 365   # ~3 years after the release date (2–4 yr band)
+
 # A release normally packs 1–2 "extras" (proof jpg / file_id.diz) that aren't in
 # the content folder and get fetched from srrdb adds. Far more than this means a
 # wrong release match or a release whose loose files simply aren't present (e.g.
@@ -1895,6 +1904,31 @@ class SrrdbToolAPI:
                 front = [r for r in order if str(r) in prefs]
                 front.sort(key=lambda r: prefs.index(str(r)))
                 order = front + [r for r in order if str(r) not in prefs]
+            # Release-date cap (main first-file hunt only): drop builds newer than
+            # release_date + margin and try the rest NEAREST the release date
+            # first. Group-history builds (prefs + _recon_prefs) are always kept.
+            # Skipped when widened (a prior capped run failed) or no date known.
+            cap = getattr(self, "_version_date_cap", None)
+            if (cap and not getattr(self, "_version_cap_widen", False)
+                    and not getattr(_rm, "archived_files", None)
+                    and not getattr(self, "_set_good_rar", None)):
+                import datetime
+                cutoff = cap + datetime.timedelta(days=_VERSION_CAP_MARGIN_DAYS)
+                keepset = set(prefs) | set(getattr(self, "_recon_prefs", None)
+                                           or [])
+                capped, dropped = [], 0
+                for r in order:
+                    d = self._version_date(str(r))
+                    if str(r) in keepset or d is None or d <= cutoff:
+                        capped.append(r)
+                    else:
+                        dropped += 1
+                if dropped:
+                    pref_part = [r for r in capped if str(r) in keepset]
+                    rest = [r for r in capped if str(r) not in keepset]
+                    rest.sort(key=lambda r: -( (self._version_date(str(r))
+                                                or datetime.date.min).toordinal()))
+                    order = pref_part + rest
             return order
         rm.RarRepository.get_rar_executables = _get_pref
 
@@ -2732,6 +2766,25 @@ class SrrdbToolAPI:
             return datetime.date(int(m[1]), int(m[2]), int(m[3]))
         except ValueError:
             return None
+
+    def _release_date(self, release: str, queue_path: str):
+        """Best-effort scene RELEASE date for the version cap. Primary source is
+        the dats.site dated folder prefix (YYYY-MM-DD-Release…), which is exactly
+        the release date; a plain YYYY year prefix maps to that year-end (so the
+        +3yr margin still spans the era). Returns a date, or None when no reliable
+        date is present (→ no cap, the hunt tries the whole pack as before)."""
+        import datetime
+        name = Path(queue_path).name if queue_path else ""
+        m = re.match(r"^(\d{4})[-._](\d{2})[-._](\d{2})", name)
+        if m:
+            try:
+                return datetime.date(int(m[1]), int(m[2]), int(m[3]))
+            except ValueError:
+                pass
+        m = re.match(r"^(\d{4})[-._]", name)
+        if m and 1990 <= int(m[1]) <= 2099:
+            return datetime.date(int(m[1]), 12, 31)
+        return None
 
     def _rescue_version_near_miss(self, srr_file: str, content_dir: str,
                                   out_root: Path):
@@ -3756,6 +3809,11 @@ class SrrdbToolAPI:
                 "wall":        wall,
                 "wall_gen":    _WALL_CACHE_GEN if wall else None,
                 "pack_sig":    self._pack_signature() if wall else None,
+                # Was a release-date cap actually applied this run? A capped
+                # FAILURE triggers widen-on-re-run (see _process_one).
+                "date_capped": bool(getattr(self, "_version_date_cap", None)
+                                    and not getattr(self, "_version_cap_widen",
+                                                    False)),
             }
             results = self._load_results()
             # Re-runs replace the previous record for the same release
@@ -4001,6 +4059,31 @@ class SrrdbToolAPI:
                     self._running = False
                     self._emit("status", {"state": "done"})
                 return summary
+
+        # Release-date version cap: try builds near the release date first and
+        # drop far-future ones (a group can't use a WinRAR newer than the
+        # release). WIDEN to the whole pack when a prior capped run for THIS
+        # release already failed — so the fast pass runs first, the thorough
+        # pass runs only if needed. Cap disabled entirely via config.
+        self._version_date_cap = None
+        self._version_cap_widen = False
+        if release and config.get("date_cap", True):
+            self._version_date_cap = self._release_date(release, queue_path)
+            try:
+                prev = next((r for r in self._load_results()
+                             if r.get("release") == release), None)
+                if prev and prev.get("date_capped") and not prev.get("ok"):
+                    self._version_cap_widen = True
+                    self._log("  Version date-cap: prior capped run failed — "
+                              "widening to the whole pack this time.", "dim")
+            except Exception:
+                pass
+            if self._version_date_cap and not self._version_cap_widen:
+                self._log(
+                    "  Version date-cap: trying builds up to "
+                    f"~{_VERSION_CAP_MARGIN_DAYS // 365}yr after "
+                    f"{self._version_date_cap.isoformat()} first (release-dated), "
+                    "nearest first.", "dim")
 
         # Resolve double-nesting: if the selected folder has no files (only one subdir),
         # descend into it. Handles the case where batch source → release folder → content.
