@@ -2819,6 +2819,36 @@ class SrrdbToolAPI:
             return datetime.date(int(m[1]), 12, 31)
         return None
 
+    def _srr_pack_date(self, srr_path: str):
+        """Fallback release date from the SRR's own RAR file timestamps — every
+        packed-file block carries the pack-time datetime, so a release with no
+        dated folder/name can STILL be capped. Returns the LATEST plausible file
+        date (an upper bound for 'no WinRAR newer than this'), or None. A noisy
+        signal (some groups set rounded/placeholder times), but with the +3yr
+        margin and widen-on-re-run it only ever helps — never permanently
+        excludes the true version."""
+        import datetime
+        try:
+            from rescene.rar import RarReader, BlockType
+            today = datetime.date.today()
+            best = None
+            for b in RarReader(srr_path):
+                if b.rawtype != BlockType.RarPackedFile:
+                    continue
+                dt = getattr(b, "file_datetime", None)
+                if not dt or len(dt) < 3:
+                    continue
+                try:
+                    d = datetime.date(int(dt[0]), int(dt[1]), int(dt[2]))
+                except (ValueError, TypeError):
+                    continue
+                # WinRAR era only, and never a future date (guards junk stamps).
+                if 1998 <= d.year <= today.year and (best is None or d > best):
+                    best = d
+            return best
+        except Exception:
+            return None
+
     def _rescue_version_near_miss(self, srr_file: str, content_dir: str,
                                   out_root: Path):
         """Rescue a near-miss where rescene locked a WinRAR version whose
@@ -2943,6 +2973,19 @@ class SrrdbToolAPI:
         self._pending_mt = None
 
         rar_dir = self._find_rar_dir()
+        # No dated folder/name? Fall back to the SRR's own RAR timestamps so the
+        # version cap can still arm on auto-matched / undated releases. Set once
+        # per release (idempotent — a later widen leaves _version_date_cap as-is).
+        if (getattr(self, "_date_cap_enabled", True)
+                and getattr(self, "_version_date_cap", None) is None
+                and not getattr(self, "_version_cap_widen", False)):
+            d = self._srr_pack_date(srr_path)
+            if d:
+                self._version_date_cap = d
+                self._log("  Version date-cap: no folder date — using the SRR's "
+                          f"RAR timestamp {d.isoformat()} (+"
+                          f"{_VERSION_CAP_MARGIN_DAYS // 365}yr, nearest first).",
+                          "dim")
         if log_rar_pack:
             if rar_dir:
                 rar_exes = [f.name for f in Path(rar_dir).iterdir()
@@ -4101,17 +4144,24 @@ class SrrdbToolAPI:
         # pass runs only if needed. Cap disabled entirely via config.
         self._version_date_cap = None
         self._version_cap_widen = False
-        if release and config.get("date_cap", True):
+        # NB: derive the date from the dated FOLDER (queue_path) even when the
+        # release name isn't confirmed yet (auto-match jobs enter here with an
+        # empty `release`) — the cap needs the folder, not the name. A missing
+        # folder date is filled later from the SRR's own RAR timestamps (see
+        # _srr_reconstruct). Cap disabled entirely via config.
+        self._date_cap_enabled = bool(config.get("date_cap", True))
+        if self._date_cap_enabled:
             self._version_date_cap = self._release_date(release, queue_path)
-            try:
-                prev = next((r for r in self._load_results()
-                             if r.get("release") == release), None)
-                if prev and prev.get("date_capped") and not prev.get("ok"):
-                    self._version_cap_widen = True
-                    self._log("  Version date-cap: prior capped run failed — "
-                              "widening to the whole pack this time.", "dim")
-            except Exception:
-                pass
+            if release:   # widen-on-re-run needs a known release name to look up
+                try:
+                    prev = next((r for r in self._load_results()
+                                 if r.get("release") == release), None)
+                    if prev and prev.get("date_capped") and not prev.get("ok"):
+                        self._version_cap_widen = True
+                        self._log("  Version date-cap: prior capped run failed — "
+                                  "widening to the whole pack this time.", "dim")
+                except Exception:
+                    pass
             if self._version_date_cap and not self._version_cap_widen:
                 self._log(
                     "  Version date-cap: trying builds up to "
