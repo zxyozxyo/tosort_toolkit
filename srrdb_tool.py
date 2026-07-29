@@ -2128,6 +2128,46 @@ class SrrdbToolAPI:
                     pass
         return removed
 
+    def _mt_freq_rank(self) -> list:
+        """Winning -mt values across all past OK rebuilds, most-frequent first.
+        A data-driven prior for the sweeps: our own results DB shows the real
+        distribution (mt8 dominates, then 1, 3, 4, …), and the ReScene community
+        likewise notes packers use a small set of common thread counts. Ordering
+        the -mt sweep by this rank finds the answer far sooner on average — pure
+        reorder, coverage unchanged. Empty (natural order) until wins exist."""
+        try:
+            cnt: dict = {}
+            for r in self._load_results():
+                if not r.get("ok"):
+                    continue
+                for c in (r.get("combos") or []):
+                    if len(c) >= 3 and c[2] is not None:
+                        cnt[int(c[2])] = cnt.get(int(c[2]), 0) + 1
+            return [mt for mt, _ in
+                    sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))]
+        except Exception:
+            return []
+
+    def _order_mts(self, candidates, front=()) -> list:
+        """Order candidate -mt ints by: `front` values first (in given order),
+        then by global win-frequency (_mt_freq_rank), then ascending. De-duped.
+        A pure reordering of whatever set is passed in — never adds or drops a
+        value, so every sweep keeps its exact coverage and just tries the
+        likeliest counts first."""
+        rank = getattr(self, "_mt_rank_cache", None)
+        if rank is None:
+            rank = self._mt_freq_rank()
+            self._mt_rank_cache = rank
+        ri = {mt: i for i, mt in enumerate(rank)}
+        cand = list(dict.fromkeys(int(x) for x in candidates))
+        out, seen = [], set()
+        for mt in front:
+            if mt in cand and mt not in seen:
+                out.append(mt); seen.add(mt)
+        rest = sorted((mt for mt in cand if mt not in seen),
+                      key=lambda mt: (ri.get(mt, 1 << 30), mt))
+        return out + rest
+
     def _rescue_multifile_crc(self, srr_file: str, content_dir: str,
                               out_root: Path):
         """Rescue a multi-file NON-SOLID CRC near-miss: one or more compressed
@@ -2219,6 +2259,8 @@ class SrrdbToolAPI:
         # every suspect: a jpg that piece-locked a low count almost always needs
         # exactly this. Turns a Captain-Toad-style 20-attempt sweep into ~1.
         dominant_mt = max((s[2] for s in streams if s[2]), default=0)
+        # Data-driven -mt ordering for every sweep below (computed once here).
+        self._mt_rank_cache = self._mt_freq_rank()
         # The sweep needs its OWN wall-clock budget: each attempt calls
         # _srr_reconstruct, which resets self._recon_deadline to 0 on exit, so
         # we can't lean on that here. Budget the whole sweep (each attempt still
@@ -2334,11 +2376,12 @@ class SrrdbToolAPI:
                          if not _is_big(s[0]) and not _is_text_meta(s[0])]
             if len(bin_small) >= 2:
                 cap = _MT_RETRY_CAP_SMALL
-                shared_order = list(range(1, cap + 1))
-                if dominant_mt and dominant_mt <= cap:
-                    shared_order = ([dominant_mt]
-                                    + [n for n in shared_order
-                                       if n != dominant_mt])
+                # Dominant first (the whole set's likely shared count), then by
+                # global win-frequency — pure reorder of 1..cap.
+                shared_order = self._order_mts(
+                    range(1, cap + 1),
+                    front=([dominant_mt] if dominant_mt and dominant_mt <= cap
+                           else ()))
                 self._log(
                     f"  Multi-file near-miss: {len(bin_small)} binary extras "
                     "share the volume — trying one shared -mt for all of them "
@@ -2381,22 +2424,26 @@ class SrrdbToolAPI:
                 base_pins = {s[0].lower(): s[2] for s in suspects
                              if s[0].lower() != skey and not _is_big(s[0])}
                 cap = _MT_RETRY_CAP if big else _MT_RETRY_CAP_SMALL
+                # Front the archive's real thread count (dominant_mt) — the
+                # single likeliest value for a mid-size extra that piece-locked
+                # too low — then order the rest by global win-frequency.
+                front = ([dominant_mt] if dominant_mt and dominant_mt != cur_mt
+                         and dominant_mt <= cap else [])
                 if _is_text_meta(suspect_file):
                     # Inherited a spurious high count; the truth is almost always
-                    # single-threaded, so climb from 1.
-                    order = [n for n in range(1, cap + 1) if n != cur_mt]
+                    # single-threaded, so keep -mt1 near the front too.
+                    order = self._order_mts(
+                        (n for n in range(1, cap + 1) if n != cur_mt),
+                        front=front + ([1] if 1 != cur_mt else []))
                 else:
                     # The original hunt locks the FIRST -mt whose piece matched
                     # the size (ascending), so every value BELOW cur_mt already
-                    # failed and would only fast-fail again after a full
-                    # recompress. The true count usually lies at cur_mt+1..cap.
-                    order = (list(range(cur_mt + 1, cap + 1))
-                             + list(range(1, cur_mt)))
-                # Try the archive's real thread count first (see above): it's the
-                # single likeliest value for a mid-size extra that piece-locked
-                # too low. De-dup so it isn't retried later in the sweep.
-                if dominant_mt and dominant_mt != cur_mt and dominant_mt <= cap:
-                    order = [dominant_mt] + [n for n in order if n != dominant_mt]
+                    # failed the size test — keep those LAST. Above cur_mt is the
+                    # live range; order both halves by win-frequency.
+                    above = self._order_mts(range(cur_mt + 1, cap + 1),
+                                            front=front)
+                    below = self._order_mts(range(1, cur_mt))
+                    order = above + [n for n in below if n not in above]
                 self._log(
                     f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt}, "
                     f"trying -mt{min(order)}–{max(order)})"
@@ -2445,7 +2492,7 @@ class SrrdbToolAPI:
                     f"for a small file — trying -mt2–{cap})"
                     + (f"; holding {', '.join(sorted(base_pins))}"
                        if base_pins else "") + "…", "dim")
-                for n in range(2, cap + 1):
+                for n in self._order_mts(range(2, cap + 1)):
                     if self._stop.is_set() or self._skip.is_set():
                         return None
                     if time.time() > sweep_deadline:
