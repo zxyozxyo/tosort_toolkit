@@ -178,6 +178,15 @@ _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 _XVER_ERA_DAYS = 3 * 365          # ± ~3 years around the game's locked build
 _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 
+# Version-wall cache: a release whose main content file matches NO pack version
+# (rescene tried every one, none reproduced it) is a pure version wall — only a
+# bigger WinRAR pack can ever fix it, and re-grinding all 232 versions wastes
+# ~30 min every re-run. Record such walls tagged with the pack signature; on a
+# re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
+# _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
+# auto-invalidates the cache so every wall gets one fresh attempt.
+_WALL_CACHE_GEN = 1
+
 # A release normally packs 1–2 "extras" (proof jpg / file_id.diz) that aren't in
 # the content folder and get fetched from srrdb adds. Far more than this means a
 # wrong release match or a release whose loose files simply aren't present (e.g.
@@ -1890,6 +1899,13 @@ class SrrdbToolAPI:
                     # Lock this version for the rest of the CURRENT set so the
                     # next compressed stream's hunt can fast-fail (see _get_pref).
                     _self._set_good_rar = ver
+                # Track every version rescene actually TESTS ("Trying <ver>.")
+                # so the version-wall cache can tell a genuine whole-pack miss
+                # from a deadline that struck before all versions were tried.
+                elif msg.startswith("Trying ") and msg.endswith("."):
+                    vt = getattr(_self, "_versions_tried", None)
+                    if vt is not None:
+                        vt.add(msg[len("Trying "):-1].strip())
                 # --- observational: record the winning (version, -mt) per
                 # stream. Read-side only — parses rescene's own log messages
                 # and touches no reconstruction state. rescene fires the rar
@@ -3552,10 +3568,56 @@ class SrrdbToolAPI:
         except Exception:
             return []
 
+    def _pack_signature(self) -> str:
+        """Stable fingerprint of the current WinRAR pack: version count + a short
+        hash of the sorted exe basenames. Changes when versions are added/removed,
+        so a cached version-wall is re-attempted after the pack grows."""
+        try:
+            rar_dir = self._find_rar_dir()
+            names = sorted(f.lower() for f in os.listdir(rar_dir)
+                           if _EXE_RE.search(f))
+            h = hashlib.sha1("\n".join(names).encode("utf-8")).hexdigest()[:12]
+            return f"{len(names)}:{h}"
+        except Exception:
+            return ""
+
+    def _wall_cache_hit(self, release: str) -> dict | None:
+        """Return the prior result record if `release` is a cached version-wall
+        that is still valid (same pack signature + wall-cache generation), else
+        None. A hit means: don't bother re-grinding every version — nothing has
+        changed that could make it rebuildable."""
+        if not release:
+            return None
+        try:
+            cur_sig = self._pack_signature()
+            if not cur_sig:
+                return None
+            for r in self._load_results():
+                if (r.get("release") == release
+                        and r.get("wall") == "version"
+                        and r.get("wall_gen") == _WALL_CACHE_GEN
+                        and r.get("pack_sig") == cur_sig):
+                    return r
+        except Exception:
+            pass
+        return None
+
     def _record_result(self, summary: dict, queue_path: str):
         try:
             release = summary.get("release") or ""
             group, platform, year = self._parse_meta(release, queue_path)
+            # Classify a pure VERSION WALL: the reconstruction failed, no version
+            # was ever locked (_last_good_rar None), AND the hunt actually tried
+            # EVERY pack version (not merely cut off early by the deadline). Only
+            # a bigger pack can fix this, so cache it (with the pack signature) to
+            # skip the ~30-min re-grind next time. A deadline that struck before
+            # all versions were tried is NOT cached — it might still be winnable.
+            allv = list(getattr(self, "_all_versions", None) or [])
+            tried = getattr(self, "_versions_tried", None) or set()
+            wall = ""
+            if (not summary.get("ok") and getattr(self, "_last_good_rar", None)
+                    is None and allv and len(tried) >= len(allv)):
+                wall = "version"
             rec = {
                 "ts":          time.strftime("%Y-%m-%d %H:%M"),
                 "release":     release,
@@ -3574,6 +3636,11 @@ class SrrdbToolAPI:
                 "combos":      [list(c) for c in
                                 (getattr(self, "_recon_streams", None) or [])],
                 "note":        (summary.get("note") or "")[:120],
+                # Version-wall cache (see _wall_cache_hit): "" for anything that
+                # isn't a proven whole-pack version miss.
+                "wall":        wall,
+                "wall_gen":    _WALL_CACHE_GEN if wall else None,
+                "pack_sig":    self._pack_signature() if wall else None,
             }
             results = self._load_results()
             # Re-runs replace the previous record for the same release
@@ -3794,8 +3861,31 @@ class SrrdbToolAPI:
         }
         self._last_good_rar = None  # set by the rescene event stream
         self._last_good_exe = None  # exact build (exe) rescene invoked
+        self._all_versions = []     # full pack list, captured during the hunt
+        self._versions_tried = set()  # versions rescene actually tested this job
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
+
+        # Version-wall cache: skip a release proven last time to match NO pack
+        # version, as long as the pack hasn't grown since. Saves the ~30-min
+        # whole-pack re-grind on every re-run. Defeatable per-batch via config.
+        if release and config.get("skip_known_walls", True):
+            hit = self._wall_cache_hit(release)
+            if hit:
+                self._log(
+                    f"  ⏭ Known version-wall (no pack version matched on "
+                    f"{hit.get('ts','?')}, pack unchanged since) — skipped. "
+                    "Add WinRAR versions to retry.", "warn")
+                summary["ok"] = False
+                summary["wall_skipped"] = True
+                summary["note"] = "known version-wall — skipped (pack unchanged)"
+                self._emit("job_done", {"content_dir": queue_path,
+                                        "release": release, "ok": False,
+                                        "note": summary["note"]})
+                if not batch_mode:
+                    self._running = False
+                    self._emit("status", {"state": "done"})
+                return summary
 
         # Resolve double-nesting: if the selected folder has no files (only one subdir),
         # descend into it. Handles the case where batch source → release folder → content.
@@ -4670,9 +4760,14 @@ class SrrdbToolAPI:
         # Metadata-only releases (DIRFIX/NFOFIX) have nothing to rebuild — don't
         # count them as failures against the success ratio; list them apart.
         na = [r for r in results if r.get("metadata_only")]
-        rebuildable = [r for r in results if not r.get("metadata_only")]
+        walls = [r for r in results
+                 if r.get("wall_skipped") and not r.get("metadata_only")]
+        rebuildable = [r for r in results
+                       if not r.get("metadata_only") and not r.get("wall_skipped")]
         ok_n = sum(1 for r in rebuildable if r["ok"])
         tail = f"  ({len(na)} n/a — metadata only)" if na else ""
+        if walls:
+            tail += f"  ({len(walls)} skipped — known version-walls)"
         self._log(f"\n══ Batch summary — {ok_n}/{len(rebuildable)} succeeded{tail} ══",
                   "info")
         for r in results:
@@ -4680,6 +4775,9 @@ class SrrdbToolAPI:
                 self._log(f"  ⊘ {r['release']} — "
                           f"{r.get('note') or 'metadata only, nothing to rebuild'}",
                           "dim")
+            elif r.get("wall_skipped"):
+                self._log(f"  ⏭ {r['release']} — known version-wall, skipped "
+                          "(add WinRAR versions to retry)", "dim")
             elif r["ok"]:
                 parts = []
                 if r["rars"] is not None:
