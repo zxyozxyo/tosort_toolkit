@@ -201,6 +201,15 @@ _MAX_FETCH_ADDS = 8
 # bytes and both are kept, matched to a rebuild by the SRR's exact packed CRC.
 _EXTRAS_MAX_FILE_BYTES = 200 * 1024 * 1024
 
+# Auto-harvest: small extras (esp. file_id.diz) that we CRC-verify as real packed
+# sources get copied into a managed folder + registered in the extras store, so
+# the SAME bytes resolve offline for a group's OTHER releases. A file_id.diz is
+# group-constant and NOT stored in the SRR (it's compressed content), so a group's
+# later release often can't get it ("need the diz to rescene but it's inside the
+# rar" catch-22) — harvesting one release's diz breaks it for the rest.
+_HARVEST_EXTS = (".diz", ".nfo", ".sfv", ".jpg", ".jpeg", ".png", ".txt")
+_HARVEST_MAX_BYTES = 4 * 1024 * 1024
+
 # Scene "fix" releases (DIRFIX/NFOFIX) are metadata-only follow-ups — a
 # corrected NFO or directory-name note, with NO packed content. There is
 # nothing for rescene to rebuild, so a content-CRC / name match legitimately
@@ -1386,6 +1395,62 @@ class SrrdbToolAPI:
         finally:
             con.close()
         return None
+
+    @property
+    def _harvest_dir(self) -> Path:
+        return Path(__file__).parent / "srrdb_harvest"
+
+    def _harvest_extra(self, src_path, name=None):
+        """Copy a CRC-verified small extra into the managed harvest folder and
+        register it in the extras store, so the SAME file (by content CRC+size)
+        resolves OFFLINE for other releases — chiefly a group's constant
+        file_id.diz fetched as a srrdb add on one release, breaking the catch-22
+        on the group's later releases that srrdb has no add for.
+
+        Best-effort and fully guarded: any failure is swallowed, and it only ADDS
+        a resolution source — never removes or changes existing behaviour. Skips
+        when the exact content is already resolvable from the store."""
+        try:
+            src = Path(src_path)
+            nm = name or src.name
+            if src.suffix.lower() not in _HARVEST_EXTS or not src.is_file():
+                return
+            size = src.stat().st_size
+            if size == 0 or size > _HARVEST_MAX_BYTES:
+                return
+            crc, sha = self._file_hashes(str(src))
+            if not crc:
+                return
+            con = self._extras_connect(create=True)
+            if not con:
+                return
+            try:
+                # Already resolvable from a LIVE store file? Then nothing to do.
+                for (pp,) in con.execute(
+                        "SELECT path FROM files WHERE crc=? AND size=?",
+                        (crc, size)):
+                    if os.path.isfile(pp):
+                        return
+                hdir = self._harvest_dir
+                hdir.mkdir(parents=True, exist_ok=True)
+                dest = hdir / f"{crc}_{size}_{nm}"
+                if not dest.exists():
+                    shutil.copyfile(str(src), str(dest))
+                con.execute(
+                    "INSERT OR REPLACE INTO files"
+                    "(path,crc,size,name,folder,mtime,sha) VALUES(?,?,?,?,?,?,?)",
+                    (str(dest), crc, size, nm, str(hdir),
+                     dest.stat().st_mtime, sha))
+                con.execute(
+                    "INSERT OR IGNORE INTO folders(path, added) VALUES(?, ?)",
+                    (str(hdir), time.time()))
+                con.commit()
+                self._log(f"  Harvested {nm} → extras store (reusable for this "
+                          "group's other releases).", "dim")
+            finally:
+                con.close()
+        except Exception:
+            pass
 
     def _resolve_from_extras(self, items, is_wrong, hints, stored_pool, packed_info):
         """For each (packed_path, name) in items, look the SRR's exact packed
@@ -3030,6 +3095,9 @@ class SrrdbToolAPI:
                             hints[p] = str(dest); fetched.append(Path(p).name)
                             self._log(f"    ✓ fetched {Path(p).name} "
                                       f"({res['size']:,} B, CRC verified)", "ok")
+                            # Harvest this CRC-verified add (esp. file_id.diz) so
+                            # the group's other releases resolve it offline.
+                            self._harvest_extra(dest, Path(p).name)
                         else:
                             self._log(f"    ✗ {Path(p).name}: {res['error']}", "warn")
                     if no_match:
