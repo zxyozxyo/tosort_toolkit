@@ -173,7 +173,10 @@ _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 # for yet — tried before the odd/rare fill so a high-core release (mt16/24/32) is
 # reached sooner. Our own win-frequency (from the results DB) still ranks FIRST;
 # this only orders the not-yet-seen tail. NOT a filter — every value still runs.
-_MT_COMMON = (1, 2, 4, 6, 8, 12, 16, 24, 32)
+# -mt0 is a DISTINCT algorithm rescene otherwise skips (issue #173); include it
+# late in the prior so it's tried after the mainstream counts but before the odd
+# tail. Sweeps must add 0 to their candidate set for it to be reached.
+_MT_COMMON = (1, 2, 4, 6, 8, 12, 16, 24, 32, 0)
 
 # Cross-version proof-jpg sweep: a scene group packs with a CONTEMPORARY WinRAR,
 # so the proof jpg's build is almost always within a few years of the game's
@@ -1974,6 +1977,23 @@ class SrrdbToolAPI:
             return _orig(args_self, file_list)
         rm.RarArguments.set_extra_files_after = _sefa
 
+        # --- honor an explicit -mt0 (rescene issue #173) ---
+        # rescene's increase_thread_count floors the thread count at 1, so -mt0
+        # — a DISTINCT compression algorithm, not the same as -mt1 — is silently
+        # skipped and any release packed with it can't be reconstructed. When our
+        # sweep forces exactly [0], set "-mt0" directly (bypassing the floor).
+        # Gated on mt_set == [0], which ONLY our forced overrides ever set, so
+        # the normal auto hunt (never sets mt_set=[0]) is completely unchanged.
+        _orig_inc = rm.RarArguments.increase_thread_count
+        def _inc_mt0(args_self, rarbin, _orig=_orig_inc, _rm=rm):
+            if list(_rm.RarArguments.mt_settings.mt_set or []) == [0]:
+                if not args_self.threads:
+                    args_self.threads = "-mt0"
+                    return True
+                return False        # 0 tried, nothing higher in a [0] set
+            return _orig(args_self, rarbin)
+        rm.RarArguments.increase_thread_count = _inc_mt0
+
         # --- disable the "method2" ALL-files fallback during a -mt rescue ---
         # THE expensive path: when a stream's CompressedRarFile fails, rescene
         # falls back to CompressedRarFileAll (main.py:2032), which recompresses
@@ -2168,7 +2188,7 @@ class SrrdbToolAPI:
         self._log(
             f"    rescene: near-miss at -mt{cur} — retrying other thread "
             f"counts (up to -mt{_MT_RETRY_CAP}) before giving up…", "dim")
-        for n in self._order_mts(n for n in range(1, _MT_RETRY_CAP + 1)
+        for n in self._order_mts(n for n in range(0, _MT_RETRY_CAP + 1)
                                  if n != cur):
             if self._stop.is_set() or self._skip.is_set():
                 break
@@ -2491,7 +2511,7 @@ class SrrdbToolAPI:
                 # Dominant first (the whole set's likely shared count), then by
                 # global win-frequency — pure reorder of 1..cap.
                 shared_order = self._order_mts(
-                    range(1, cap + 1),
+                    range(0, cap + 1),
                     front=([dominant_mt] if dominant_mt and dominant_mt <= cap
                            else ()))
                 self._log(
@@ -2554,7 +2574,7 @@ class SrrdbToolAPI:
                     # live range; order both halves by win-frequency.
                     above = self._order_mts(range(cur_mt + 1, cap + 1),
                                             front=front)
-                    below = self._order_mts(range(1, cur_mt))
+                    below = self._order_mts(range(0, cur_mt))
                     order = above + [n for n in below if n not in above]
                 self._log(
                     f"  sweeping -mt for {suspect_file} (locked -mt{cur_mt}, "
@@ -2604,7 +2624,7 @@ class SrrdbToolAPI:
                     f"for a small file — trying -mt2–{cap})"
                     + (f"; holding {', '.join(sorted(base_pins))}"
                        if base_pins else "") + "…", "dim")
-                for n in self._order_mts(range(2, cap + 1)):
+                for n in self._order_mts([0, *range(2, cap + 1)]):
                     if self._stop.is_set() or self._skip.is_set():
                         return None
                     if time.time() > sweep_deadline:
