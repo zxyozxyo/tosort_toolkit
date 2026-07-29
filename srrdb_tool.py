@@ -168,6 +168,13 @@ _MT_RETRY_CAP = 8
 _MT_RETRY_CAP_SMALL = 32
 _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 
+# Common thread counts scene packers actually use (rescene-forum tip: odd counts
+# are rarely if ever used). Ordering prior for -mt values we have NO win history
+# for yet — tried before the odd/rare fill so a high-core release (mt16/24/32) is
+# reached sooner. Our own win-frequency (from the results DB) still ranks FIRST;
+# this only orders the not-yet-seen tail. NOT a filter — every value still runs.
+_MT_COMMON = (1, 2, 4, 6, 8, 12, 16, 24, 32)
+
 # Cross-version proof-jpg sweep: a scene group packs with a CONTEMPORARY WinRAR,
 # so the proof jpg's build is almost always within a few years of the game's
 # locked build. Cap the sweep to that era (± window) plus a hard build count, so
@@ -2161,9 +2168,8 @@ class SrrdbToolAPI:
         self._log(
             f"    rescene: near-miss at -mt{cur} — retrying other thread "
             f"counts (up to -mt{_MT_RETRY_CAP}) before giving up…", "dim")
-        for n in range(1, _MT_RETRY_CAP + 1):
-            if n == cur:
-                continue
+        for n in self._order_mts(n for n in range(1, _MT_RETRY_CAP + 1)
+                                 if n != cur):
             if self._stop.is_set() or self._skip.is_set():
                 break
             if time.time() > getattr(self, "_recon_deadline", float("inf")):
@@ -2249,22 +2255,29 @@ class SrrdbToolAPI:
 
     def _order_mts(self, candidates, front=()) -> list:
         """Order candidate -mt ints by: `front` values first (in given order),
-        then by global win-frequency (_mt_freq_rank), then ascending. De-duped.
-        A pure reordering of whatever set is passed in — never adds or drops a
-        value, so every sweep keeps its exact coverage and just tries the
-        likeliest counts first."""
+        then our own win-frequency (_mt_freq_rank), then the common scene counts
+        (_MT_COMMON), then the odd/rare tail ascending. De-duped. A pure
+        reordering of whatever set is passed in — never adds or drops a value, so
+        every sweep keeps its exact coverage and just tries the likeliest first."""
         rank = getattr(self, "_mt_rank_cache", None)
         if rank is None:
             rank = self._mt_freq_rank()
             self._mt_rank_cache = rank
         ri = {mt: i for i, mt in enumerate(rank)}
+        ci = {mt: i for i, mt in enumerate(_MT_COMMON)}
         cand = list(dict.fromkeys(int(x) for x in candidates))
         out, seen = [], set()
         for mt in front:
             if mt in cand and mt not in seen:
                 out.append(mt); seen.add(mt)
-        rest = sorted((mt for mt in cand if mt not in seen),
-                      key=lambda mt: (ri.get(mt, 1 << 30), mt))
+
+        def _key(mt):
+            if mt in ri:                       # proven winner — our data first
+                return (0, ri[mt])
+            if mt in ci:                       # common scene count, not yet won
+                return (1, ci[mt])
+            return (2, mt)                     # odd/rare — ascending
+        rest = sorted((mt for mt in cand if mt not in seen), key=_key)
         return out + rest
 
     def _rescue_multifile_crc(self, srr_file: str, content_dir: str,
@@ -4036,6 +4049,7 @@ class SrrdbToolAPI:
         self._last_good_exe = None  # exact build (exe) rescene invoked
         self._all_versions = []     # full pack list, captured during the hunt
         self._versions_tried = set()  # versions rescene actually tested this job
+        self._mt_rank_cache = None   # recompute -mt win-frequency per job
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
 
