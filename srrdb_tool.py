@@ -1643,6 +1643,10 @@ class SrrdbToolAPI:
             # exhausts and returns; the heartbeat also kills the running one.
             deadline = getattr(self, "_recon_deadline", 0)
             if deadline and time.time() > deadline:
+                # Mark that the hunt was CUT OFF (not a clean exhaustion) so the
+                # wall-cache won't treat a deadline-truncated run as "tried
+                # everything" — some betas may be untested.
+                self._recon_hit_deadline = True
                 raise RuntimeError("reconstruction deadline exceeded")
             try:
                 cmd = _inject(cmd)
@@ -3891,7 +3895,11 @@ class SrrdbToolAPI:
             cap_src = getattr(self, "_date_cap_source", None)
             searched = (getattr(self, "_capped_count", None)
                         if cap_on else None) or len(allv)
-            exhausted = bool(allv and len(tried) >= searched)
+            # Only a CLEAN finish counts as exhaustion — a deadline-truncated
+            # hunt may have logged every distinct version string while some betas
+            # of the last few went untested, so never cache it as a wall.
+            hit_deadline = bool(getattr(self, "_recon_hit_deadline", False))
+            exhausted = bool(allv and len(tried) >= searched and not hit_deadline)
             no_version = getattr(self, "_last_good_rar", None) is None
             # A capped exhaustion is a real wall only when the date is RELIABLE
             # (from the folder). An SRR-timestamp date is noisy, so a capped
@@ -4154,6 +4162,7 @@ class SrrdbToolAPI:
         self._last_good_exe = None  # exact build (exe) rescene invoked
         self._all_versions = []     # full pack list, captured during the hunt
         self._versions_tried = set()  # versions rescene actually tested this job
+        self._recon_hit_deadline = False  # cut off by the deadline (not exhausted)
         self._mt_rank_cache = None   # recompute -mt win-frequency per job
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
