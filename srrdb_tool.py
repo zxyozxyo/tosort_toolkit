@@ -4258,6 +4258,17 @@ class SrrdbToolAPI:
                 summary["note"] = f"{fixtag} — metadata only, nothing to rebuild"
                 raise RuntimeError(summary["note"])
 
+            # Empty-folder guard: nothing to match or rebuild. Report it plainly
+            # instead of letting the content-CRC lookup fail with the misleading
+            # "likely NON-SCENE" message — common with leftover/half-moved folders.
+            if content_dir and Path(content_dir).is_dir() and not any(
+                    f.is_file() for f in Path(content_dir).rglob("*")):
+                self._log("  ⊘ Folder is empty (no content files) — skipped.",
+                          "warn")
+                summary["empty"] = True
+                summary["note"] = "folder empty — nothing to rebuild"
+                raise RuntimeError(summary["note"])
+
             # If no confirmed release name, score candidates against content folder
             if not release:
                 if not content_dir or not Path(content_dir).is_dir():
@@ -5101,20 +5112,28 @@ class SrrdbToolAPI:
         # Metadata-only releases (DIRFIX/NFOFIX) have nothing to rebuild — don't
         # count them as failures against the success ratio; list them apart.
         na = [r for r in results if r.get("metadata_only")]
-        walls = [r for r in results
-                 if r.get("wall_skipped") and not r.get("metadata_only")]
+        empties = [r for r in results
+                   if r.get("empty") and not r.get("metadata_only")]
+        walls = [r for r in results if r.get("wall_skipped")
+                 and not r.get("metadata_only") and not r.get("empty")]
         rebuildable = [r for r in results
-                       if not r.get("metadata_only") and not r.get("wall_skipped")]
+                       if not r.get("metadata_only") and not r.get("wall_skipped")
+                       and not r.get("empty")]
         ok_n = sum(1 for r in rebuildable if r["ok"])
         tail = f"  ({len(na)} n/a — metadata only)" if na else ""
         if walls:
             tail += f"  ({len(walls)} skipped — known version-walls)"
+        if empties:
+            tail += f"  ({len(empties)} empty folders)"
         self._log(f"\n══ Batch summary — {ok_n}/{len(rebuildable)} succeeded{tail} ══",
                   "info")
         for r in results:
             if r.get("metadata_only"):
                 self._log(f"  ⊘ {r['release']} — "
                           f"{r.get('note') or 'metadata only, nothing to rebuild'}",
+                          "dim")
+            elif r.get("empty"):
+                self._log(f"  ⊘ {r['release']} — empty folder (no content files)",
                           "dim")
             elif r.get("wall_skipped"):
                 self._log(f"  ⏭ {r['release']} — known version-wall, skipped "
