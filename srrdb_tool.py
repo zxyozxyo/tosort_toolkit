@@ -3649,7 +3649,11 @@ class SrrdbToolAPI:
         level, md, solid = s["level"], s["md"], s["solid"]
         work = Path(tempfile.mkdtemp(prefix="recipe-"))
         try:
-            cmd_files, checks = self._stage_sweep_sources(work, s, srcs)
+            cmd_files, checks = self._calibrated_stage(
+                work, s, srcs, level, md, solid, Path(rar_dir), reps, RarStream)
+            if cmd_files is None:
+                self._sweep_skipped = True
+                return None
             n_crc = sum(len(c[1]) for c in checks)
             if not n_crc:
                 # Sizes alone are exactly the weak evidence that makes rescene
@@ -3709,7 +3713,58 @@ class SrrdbToolAPI:
         finally:
             shutil.rmtree(str(work), ignore_errors=True)
 
-    def _stage_sweep_sources(self, work: Path, s: dict, srcs: dict):
+    def _calibrated_stage(self, work: Path, s: dict, srcs: dict, level, md,
+                          solid, rar_dir: Path, reps: list, RarStream):
+        """Stage the sources, then PROVE the truncation is deep enough.
+
+        The cut size can only be estimated from the file's OVERALL ratio, and a
+        file whose head compresses better than its average blows that estimate:
+        Miffys_World…EXiMiUS packs 67 MB → 40 MB (1.66:1), but its first 11.8 MB
+        compress 4.55:1, so the staged input yielded 2,589,751 stream bytes when
+        the first volume needs 2,811,143. The check then CANNOT pass at any
+        build, and the sweep reports a confident "genuine wall" for a release the
+        probe cracks in a minute.
+
+        So: compress once and look. If a truncated file didn't produce enough to
+        cover its checked prefix, re-cut using the ratio actually OBSERVED (plus
+        margin) and try again; give up on truncating rather than on the release.
+        Returns (cmd_files, checks), or (None, None) if it can't be staged."""
+        scale = 1.0
+        ref = next((r for r in reps if not self._R5_EXE.search(r)), None) or reps[0]
+        probe = work / "calib.rar"
+        for attempt in range(4):
+            stage = work / f"s{attempt}"
+            cmd_files, checks = self._stage_sweep_sources(work, s, srcs,
+                                                          scale=scale,
+                                                          into=stage)
+            need = [(n, c[1][-1][0] + c[1][-1][1]) for n, c in
+                    ((c[0], c) for c in checks) if c[1]]
+            if not need or not self._sweep_compress(rar_dir / ref, level, md,
+                                                    solid, 1, cmd_files, probe):
+                return cmd_files, checks      # nothing to calibrate against
+            short = 0.0
+            for name, want in need:
+                try:
+                    with RarStream(str(probe), packed_file_name=name,
+                                   compressed=True) as rs:
+                        got = len(rs.read())
+                except Exception:
+                    got = 0
+                if got < want:
+                    short = max(short, want / max(1, got))
+            if not short:
+                return cmd_files, checks      # deep enough — sweep for real
+            if all(Path(f).stat().st_size == Path(srcs[n]).stat().st_size
+                   for n, f in zip(s["order"], cmd_files)):
+                return cmd_files, checks      # already full files; nothing more
+            scale *= max(1.6, short * 1.35)
+            self._log(f"  Recipe sweep: staged sources compressed further than "
+                      f"estimated — re-cutting {scale:.1f}× deeper so the "
+                      "checked prefix is actually produced.", "dim")
+        return cmd_files, checks
+
+    def _stage_sweep_sources(self, work: Path, s: dict, srcs: dict,
+                             scale: float = 1.0, into: Path = None):
         """Copy the set's sources into `work` in ARCHIVE ORDER, truncating the
         first oversized split file, and return (command file list, checks).
 
@@ -3721,8 +3776,12 @@ class SrrdbToolAPI:
         files after it would be compressed in a different context, so their
         streams are no longer comparable and are dropped from `checks`. The
         preceding files keep full verification, and every file stays in the
-        command so the in-context relationship is preserved."""
-        wsrc = work / "src"
+        command so the in-context relationship is preserved.
+
+        `scale` deepens the cut when the caller measured that the estimate was
+        too shallow (see _calibrated_stage) — the file-average ratio understates
+        how well a head that compresses unusually well will pack."""
+        wsrc = into or (work / "src")
         wsrc.mkdir(parents=True, exist_ok=True)
         cmd_files: list = []
         checks: list = []
@@ -3735,7 +3794,7 @@ class SrrdbToolAPI:
             need = size
             if cut_at is None and size > _RECIPE_TRUNC_MIN and len(blocks) >= 2:
                 ratio = max(1.0, size / max(1, total_packed))
-                need = min(size, int(blocks[0][0] * ratio * 1.4)
+                need = min(size, int(blocks[0][0] * ratio * 1.4 * scale)
                            + int(s["dict"]) + (1 << 20))
                 cut_at = idx
             elif cut_at is not None:
