@@ -6106,6 +6106,19 @@ class SrrdbToolAPI:
                     if dest_f.exists():
                         f.unlink()  # duplicate — NFO/SFV were already copied up
                         continue
+                    # rescene files an extra that lived INSIDE an archive under a
+                    # folder named after that archive (_stored/xms-wcre.rar/…).
+                    # At the release root that name is the produced VOLUME, so
+                    # mkdir would collide with it (WinError 183). Such a file is
+                    # already inside the rebuilt archive — leave it in _stored
+                    # rather than crashing the job over it.
+                    clash = next((p for p in dest_f.parents
+                                  if p != out_root and p.is_file()), None)
+                    if clash is not None:
+                        self._log(f"  Kept {f.name} in _stored — its path "
+                                  f"collides with the rebuilt {clash.name} "
+                                  "(it is packed inside that archive).", "dim")
+                        continue
                     dest_f.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(f), str(dest_f))
                     moved += 1
@@ -6221,13 +6234,21 @@ class SrrdbToolAPI:
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False, "stopped": True})
         except Exception as e:
             msg = str(e)
-            if ("already exists" in msg.lower()
-                    or getattr(e, "winerror", None) == 183):
+            if ((("already exists" in msg.lower())
+                 or getattr(e, "winerror", None) == 183)
+                    and not summary.get("ok")):
                 # Stale-output collision (Windows WinError 183): a leftover from an
                 # interrupted prior run blocked a fresh write inside rescene. Clear
                 # the PRODUCED artifacts (never _stored / the cached SRR, so a
                 # re-run stays offline) and say so plainly instead of surfacing the
                 # raw error — a re-run then starts clean.
+                #
+                # NEVER when the rebuild already succeeded: a name clash raised by
+                # a POST-rebuild step (Winx_Club…EXiMiUS — moving the stored extra
+                # `_stored/xms-wcre.rar/xms-wcre.jpg` tried to mkdir a DIRECTORY
+                # over the freshly produced volume of the same name) was landing
+                # here and deleting 19 CRC-verified volumes. A verified rebuild is
+                # never "stale output".
                 try:
                     if "out_root" in locals() and out_root.is_dir():
                         self._clear_produced_volumes(out_root)
@@ -6240,10 +6261,21 @@ class SrrdbToolAPI:
                           "— cleared the produced files; re-run this release and "
                           "it should proceed.", "warn")
                 summary["note"] = "stale output collision — cleared, re-run"
+                summary["ok"] = False
+            elif summary.get("ok") and (summary.get("rars") or 0) > 0:
+                # The rebuild finished and VERIFIED; only a tidy-up step after it
+                # failed. Keep the release — report the blemish, don't discard
+                # good volumes over it.
+                self._log(f"  ⚠ Rebuild succeeded, but a post-rebuild step "
+                          f"failed: {e}", "warn")
+                summary["note"] = f"rebuilt; post-step failed: {str(e)[:70]}"
+                self._emit("job_done", {"release": release,
+                                        "content_dir": queue_path, "ok": True})
+                return summary
             else:
                 self._log(f"  FAILED: {e}", "err")
                 summary["note"] = str(e)[:100]
-            summary["ok"] = False
+                summary["ok"] = False
             self._emit("job_done", {"release": release, "content_dir": queue_path, "ok": False})
         finally:
             # A skip only aborts THIS release — clear it so the next queued job
