@@ -3528,11 +3528,13 @@ class SrrdbToolAPI:
                 best = (name, tot, s)
         return best[2] if best else None
 
-    def _locate_sweep_sources(self, order, content_dir: str, out_root) -> dict:
+    def _locate_sweep_sources(self, order, content_dir: str, out_root,
+                              srr_file: str = "") -> dict:
         """{packed name -> source path} for every file in the set, searched in the
-        content folder and the SRR's own _stored extras. {} when ANY file is
-        missing — the sweep needs the exact set the group packed, and source
-        location/renaming is the normal path's job."""
+        content folder, the SRR's own _stored extras, and the local extras store
+        (by the SRR's packed CRC+size). {} when ANY file is missing — the sweep
+        needs the exact set the group packed, and locating a renamed or
+        downloadable source is the normal path's job."""
         index: dict = {}
         for root in (Path(content_dir), Path(out_root) / "_stored"):
             if not root.is_dir():
@@ -3540,9 +3542,25 @@ class SrrdbToolAPI:
             for f in root.rglob("*"):
                 if f.is_file():
                     index.setdefault(f.name.lower(), str(f))
+        # A packed extra (proof jpg / diz) is often NOT loose in the content
+        # folder — the rebuild pulls it from the local extras store by content
+        # CRC while it runs. The sweep happens BEFORE that, so it has to resolve
+        # the same way or it bails on releases it could otherwise crack
+        # (iCarly…EXiMiUS: only the .nds was loose, so the sweep skipped and the
+        # doomed 12-minute hunt ran instead).
+        packed = self._srr_packed_info(srr_file) if srr_file else {}
         found: dict = {}
         for name in order:
-            hit = index.get(Path(name).name.lower())
+            key = Path(name).name.lower()
+            hit = index.get(key)
+            if not hit:
+                size, crc_hex = packed.get(key, (None, None))
+                if crc_hex is not None:
+                    hit = self._extras_lookup(crc_hex, size)
+                    if hit:
+                        self._log(f"  Recipe sweep: sourcing {Path(name).name} "
+                                  f"from the extras store (CRC {crc_hex}).",
+                                  "dim")
             if not hit:
                 return {}
             found[name] = hit
@@ -3593,10 +3611,16 @@ class SrrdbToolAPI:
                 f"({cached.get('ts', 'earlier')}, pack unchanged since) — not "
                 "repeating it. Add WinRAR versions to retry.", "dim")
             return None
-        srcs = self._locate_sweep_sources(s["order"], content_dir, out_root)
+        srcs = self._locate_sweep_sources(s["order"], content_dir, out_root,
+                                          srr_file)
         if not srcs:
-            self._log("  Recipe sweep: not every packed file is available "
-                      "locally — skipping.", "dim")
+            # Not a verdict — the sources may be resolved later in the rebuild
+            # (a downloaded srrdb "add", a renamed file). Say so, and leave the
+            # release eligible for the last-resort sweep once they exist.
+            self._log("  Recipe sweep: not every packed file is available yet — "
+                      "skipping for now (will retry if the rebuild resolves "
+                      "them).", "dim")
+            self._sweep_skipped = True
             return None
         try:
             from rescene.rarstream import RarStream  # type: ignore
@@ -3865,7 +3889,13 @@ class SrrdbToolAPI:
         (reconstruct rc, verify dict) on success, else None."""
         if self._stop.is_set() or self._skip.is_set():
             return None
+        self._sweep_skipped = False
         recipe = self._recipe_sweep(srr_file, content_dir, out_root)
+        if recipe is None and self._sweep_skipped:
+            # The sweep never actually ran (sources not present yet). That is NOT
+            # a verdict, so _recipe_found stays "skip" and the last-resort rescue
+            # can try again after the rebuild has resolved the missing extra.
+            return None
         self._recipe_found = recipe        # recorded in the results DB
         if not recipe:
             return None
@@ -5374,6 +5404,7 @@ class SrrdbToolAPI:
         # sweep, and _record_result can persist the measured recipe).
         self._recipe_found = "skip"
         self._sweep_exhausted = False
+        self._sweep_skipped = False
         self._release_name = release
         # Builds a PREVIOUS run already tested before it was cut off. Not a
         # skip-list (a truncated run can leave a version half-tested) — just an
