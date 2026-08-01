@@ -3124,9 +3124,11 @@ class SrrdbToolAPI:
             return f"{m[1]} {m[2]}.{m[3]}" if m else fn
 
         cap = getattr(self, "_version_date_cap", None)
+        # The NEWER cap ALWAYS applies — a group can't use a build that didn't
+        # exist yet. (Widen only re-opens the OLDER end, so it must NOT drop the
+        # newer cap; otherwise the sweep grinds 2023/2024 builds on a 2014 file.)
         limit = (cap + datetime.timedelta(days=_VERSION_CAP_MARGIN_DAYS)
-                 if (cap and not getattr(self, "_version_cap_widen", False))
-                 else None)
+                 if cap else None)
         cand = [e for e in exe_reps
                 if not (limit and _date(e) and _date(e) > limit)] or list(exe_reps)
         prefs = getattr(self, "_recon_prefs", None) or []
@@ -3140,10 +3142,28 @@ class SrrdbToolAPI:
             return (1, abs((d - d0).days) if (d and d0) else 1 << 30)
 
         cand.sort(key=_key)
+        # Force the -mt too. rescene rebuilds each file at its PIECE-detected
+        # thread count, but the piece is often mt-insensitive so it locks a low
+        # -mt while the FULL file needs a higher one (1001: jpg locked -mt2, real
+        # is -mt8). So per exe we force every packed source's -mt (only the real
+        # (exe, -mt) reproduces the archive — this is exactly the recipe probe's
+        # search, verified via the SFV). A wrong (exe, -mt) fails the piece test
+        # fast, so it stays bounded.
+        sizes = self._srr_packed_sizes(srr_file) or {}
+        # Force -mt only on the SMALLEST packed file (the proof jpg / extra that
+        # rescene rebuilds per-file at a wrong piece-locked -mt). The bigger
+        # content file then rebuilds via method2, which INHERITS that thread
+        # count — so the whole set ends up at the forced -mt (the probe recipe).
+        small = min(sizes, key=sizes.get) if sizes else None
+        mts: list = []
+        for m in (self._mt_freq_rank() + [8, 4, 2, 1, 3, 6, 5, 7, 0]):
+            if m not in mts:
+                mts.append(m)
         self._log(
             f"  Version near-miss: '{detected}' matched the test piece but the "
             f"full archive was off — sweeping {len(cand)} distinct-output "
-            "build(s) by EXACT exe (final≠beta), nearest release first…", "dim")
+            f"build(s) × -mt {mts} by EXACT exe (final≠beta), nearest first…",
+            "dim")
         sweep_deadline = time.time() + _RECON_TIMEOUT_S
         self._in_version_sweep = True
         try:
@@ -3154,28 +3174,40 @@ class SrrdbToolAPI:
                     self._log("  Version rescue: deadline reached — stopping.",
                               "dim")
                     return None
-                self._clear_produced_volumes(out_root)
-                self._recon_streams = []
-                SrrdbToolAPI._build_force = fn
-                self._log(f"    trying {_vstr(fn)}  ({fn})…", "dim")
-                try:
-                    rc = self._srr_reconstruct(
-                        srr_file, content_dir, str(out_root), log_rar_pack=False)
-                finally:
-                    SrrdbToolAPI._build_force = None
-                if not rc.get("ok"):
-                    continue
-                v2 = self._verify_rebuilt_sfv(out_root)
-                if v2["checked"] and not v2["bad"]:
-                    self._log(
-                        f"  ✓ Version rescue: rebuilt with {_vstr(fn)} ({fn}) — "
-                        f"all {v2['checked']} volume(s) CRC-match the SFV.", "ok")
-                    return v2
+                self._log(f"    trying {_vstr(fn)}  ({fn}) × -mt…", "dim")
+                for mt in mts:
+                    if self._stop.is_set() or self._skip.is_set():
+                        return None
+                    if time.time() > sweep_deadline:
+                        self._log("  Version rescue: deadline reached — "
+                                  "stopping.", "dim")
+                        return None
+                    self._clear_produced_volumes(out_root)
+                    self._recon_streams = []
+                    SrrdbToolAPI._build_force = fn
+                    self._mt_override = {small: mt} if small else {}
+                    try:
+                        rc = self._srr_reconstruct(
+                            srr_file, content_dir, str(out_root),
+                            log_rar_pack=False)
+                    finally:
+                        SrrdbToolAPI._build_force = None
+                        self._mt_override = {}
+                    if not rc.get("ok"):
+                        continue
+                    v2 = self._verify_rebuilt_sfv(out_root)
+                    if v2["checked"] and not v2["bad"]:
+                        self._log(
+                            f"  ✓ Version rescue: rebuilt with {_vstr(fn)} "
+                            f"-mt{mt}  ({fn}) — all {v2['checked']} volume(s) "
+                            "CRC-match the SFV.", "ok")
+                        return v2
         finally:
             self._in_version_sweep = False
             SrrdbToolAPI._build_force = None
-        self._log("  Version rescue exhausted — no distinct-output pack build "
-                  "reproduced the archive exactly. Kept as FAILED.", "warn")
+            self._mt_override = {}
+        self._log("  Version rescue exhausted — no distinct-output pack build × "
+                  "-mt reproduced the archive exactly. Kept as FAILED.", "warn")
         return None
 
     def _rescue_version_near_miss(self, srr_file: str, content_dir: str,
