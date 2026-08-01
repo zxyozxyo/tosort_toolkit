@@ -2043,15 +2043,28 @@ class SrrdbToolAPI:
             return _orig(args_self, file_list)
         rm.RarArguments.set_extra_files_after = _sefa
 
-        # --- honor an explicit -mt0 (rescene issue #173) ---
-        # rescene's increase_thread_count floors the thread count at 1, so -mt0
-        # — a DISTINCT compression algorithm, not the same as -mt1 — is silently
-        # skipped and any release packed with it can't be reconstructed. When our
-        # sweep forces exactly [0], set "-mt0" directly (bypassing the floor).
-        # Gated on mt_set == [0], which ONLY our forced overrides ever set, so
-        # the normal auto hunt (never sets mt_set=[0]) is completely unchanged.
+        # --- global -mt PIN + explicit -mt0 (rescene issue #173) ------------
+        # Two forced-thread paths share this wrapper:
+        #  • _mt_pin (PUSSYCAT jpg+content class): pin EVERY stream — method1
+        #    AND method2's all-files pack — to the ONE forced -mt, so the whole
+        #    set is built at (forced build, forced -mt), exactly like the recipe
+        #    probe's single `rar a jpg nds` command. Crucially it does NOT
+        #    disable method2 (unlike _mt_override) — this class NEEDS the
+        #    all-files pass to reproduce the in-context content. pin==0 ⇒ -mt0.
+        #  • -mt0: rescene's increase_thread_count floors the thread count at 1,
+        #    so -mt0 — a DISTINCT algorithm, not -mt1 — is silently skipped and
+        #    any release packed with it can't be reconstructed. When our sweep
+        #    forces exactly [0], set "-mt0" directly (bypassing the floor).
+        # Both are gated on flags ONLY our forced sweeps set, so the normal auto
+        # hunt is completely unchanged.
         _orig_inc = rm.RarArguments.increase_thread_count
         def _inc_mt0(args_self, rarbin, _orig=_orig_inc, _rm=rm):
+            pin = getattr(self, "_mt_pin", None)
+            if pin is not None:
+                if not args_self.threads:
+                    args_self.threads = "-mt%d" % pin
+                    return True
+                return False        # only the pinned value; nothing higher
             if list(_rm.RarArguments.mt_settings.mt_set or []) == [0]:
                 if not args_self.threads:
                     args_self.threads = "-mt0"
@@ -3145,16 +3158,13 @@ class SrrdbToolAPI:
         # Force the -mt too. rescene rebuilds each file at its PIECE-detected
         # thread count, but the piece is often mt-insensitive so it locks a low
         # -mt while the FULL file needs a higher one (1001: jpg locked -mt2, real
-        # is -mt8). So per exe we force every packed source's -mt (only the real
-        # (exe, -mt) reproduces the archive — this is exactly the recipe probe's
-        # search, verified via the SFV). A wrong (exe, -mt) fails the piece test
-        # fast, so it stays bounded.
-        sizes = self._srr_packed_sizes(srr_file) or {}
-        # Force -mt only on the SMALLEST packed file (the proof jpg / extra that
-        # rescene rebuilds per-file at a wrong piece-locked -mt). The bigger
-        # content file then rebuilds via method2, which INHERITS that thread
-        # count — so the whole set ends up at the forced -mt (the probe recipe).
-        small = min(sizes, key=sizes.get) if sizes else None
+        # is -mt8). So per exe we PIN the whole reconstruct's -mt: method1 (the
+        # jpg) and method2 (all files together — the in-context .nds) both build
+        # at (this exe, this -mt), exactly reproducing the recipe probe's single
+        # `rar a jpg nds` command. Only the true (exe, -mt) CRC-matches the SFV;
+        # a wrong one fails the piece test in ~1s, so the sweep stays bounded.
+        # NB: _mt_pin, NOT _mt_override — the latter disables method2, which this
+        # jpg+content class relies on to reproduce the in-context content.
         mts: list = []
         for m in (self._mt_freq_rank() + [8, 4, 2, 1, 3, 6, 5, 7, 0]):
             if m not in mts:
@@ -3185,14 +3195,14 @@ class SrrdbToolAPI:
                     self._clear_produced_volumes(out_root)
                     self._recon_streams = []
                     SrrdbToolAPI._build_force = fn
-                    self._mt_override = {small: mt} if small else {}
+                    self._mt_pin = mt
                     try:
                         rc = self._srr_reconstruct(
                             srr_file, content_dir, str(out_root),
                             log_rar_pack=False)
                     finally:
                         SrrdbToolAPI._build_force = None
-                        self._mt_override = {}
+                        self._mt_pin = None
                     if not rc.get("ok"):
                         continue
                     v2 = self._verify_rebuilt_sfv(out_root)
@@ -3205,7 +3215,7 @@ class SrrdbToolAPI:
         finally:
             self._in_version_sweep = False
             SrrdbToolAPI._build_force = None
-            self._mt_override = {}
+            self._mt_pin = None
         self._log("  Version rescue exhausted — no distinct-output pack build × "
                   "-mt reproduced the archive exactly. Kept as FAILED.", "warn")
         return None
