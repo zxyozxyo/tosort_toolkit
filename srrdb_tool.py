@@ -195,11 +195,33 @@ _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 # re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
 # _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
 # auto-invalidates the cache so every wall gets one fresh attempt.
-_WALL_CACHE_GEN = 3   # 2026-07-31: bumped to 3 so the stored-extra method2
-                      # rescue (_rescue_stored_extra_method2) gets one fresh
-                      # attempt at every cached "No good RAR version found" wall
-                      # (the jpg-bearing EXiMiUS class). (gen 2 was a reverted
-                      # detection-rescue experiment.)
+_WALL_CACHE_GEN = 4   # 2026-08-01: bumped to 4 so the SRR-driven recipe sweep
+                      # (_recipe_sweep) gets one fresh attempt at every cached
+                      # wall. (gen 3 = stored-extra method2 rescue; gen 2 was a
+                      # reverted detection-rescue experiment.)
+
+# ── SRR-driven recipe sweep ──────────────────────────────────────────────────
+# rescene detects a build by compressing each packed file IN ISOLATION. When a
+# set was packed by ONE `rar a <extra> <content>` command, WinRAR's -mt pipeline
+# makes every stream depend on the OTHER files in the same command — measured on
+# Art_Academy…EXiMiUS: the .nds alone is 11 bytes off at the TRUE build+-mt, and
+# the .jpg alone matches NO build × -mt (0/2295). Isolated detection is therefore
+# doomed for the whole class, and rescene's own "size == packed_size" test for a
+# file that fits in one volume is size-only, so it locks a WRONG build and then
+# grinds the pack to the 30-min deadline.
+#
+# The sweep replaces that with a direct measurement: compress ALL the set's files
+# together (exactly as the group did) at each distinct-output build × -mt, and
+# check the result against the per-volume stream CRCs the SRR already carries.
+# For a file split over volumes, every non-final block's file_crc IS the CRC32 of
+# that volume's slice of the COMPRESSED stream — hard, byte-level evidence that
+# needs no copy of the original RARs.
+_RECIPE_SWEEP_BUDGET_S = 900      # 15 min ceiling; a hit normally lands in <60 s
+# Sources bigger than this are TRUNCATED for the sweep: only enough input to
+# produce the first volume's compressed slice is needed, and that prefix is
+# byte-identical to the full file's (verified across 8/12/16/24/33 MB cuts). Keeps
+# the sweep seconds-cheap on multi-GB releases instead of minutes per candidate.
+_RECIPE_TRUNC_MIN = 48 * 1024 * 1024
 
 # Release-date version cap: a scene group can't pack with a WinRAR newer than the
 # release date — so on the main version hunt, drop far-future builds and try those
@@ -2005,6 +2027,18 @@ class SrrdbToolAPI:
                     # Distinct version strings actually searched (betas collapse) —
                     # the target the wall-cache compares _versions_tried against.
                     self._capped_count = len({str(r) for r in order})
+            # Resume a hunt a previous run's deadline cut off: builds that run
+            # already tested move to the BACK, so this pass spends its 30 minutes
+            # on NEW ground instead of repeating the same head of the list. They
+            # stay in the order (a truncated run can leave a version partly
+            # tested), so nothing is permanently excluded. First-file hunt only —
+            # once a version is locked the set-scoped ordering owns the sequence.
+            done = getattr(self, "_retry_tried_versions", None)
+            if (done and not getattr(_rm, "archived_files", None)
+                    and not getattr(self, "_set_good_rar", None)):
+                fresh = [r for r in order if str(r) not in done]
+                if fresh:
+                    order = fresh + [r for r in order if str(r) in done]
             return order
         rm.RarRepository.get_rar_executables = _get_pref
 
@@ -3050,16 +3084,22 @@ class SrrdbToolAPI:
             return None
         return str(max(small, key=lambda f: f.stat().st_size))
 
-    def _pack_family_reps(self, srr_file: str, content_dir: str, out_root: Path):
+    def _pack_family_reps(self, srr_file: str, content_dir: str, out_root: Path,
+                          rar4_only: bool = False):
         """EXE FILENAMES of the pack builds that emit DISTINCT compressed output
         at this release's recipe — one representative per family, keeping a final
         and its betas SEPARATE (they can differ, and the sweep must be able to
         force the EXACT winning exe, not just the version string — 1001's winner
         is rar360.exe while rescene's string sweep grabs rar360b8). RAR3/4 point
         releases are byte-identical so ~232 exes still collapse hard. CACHED per
-        (level,md,solid) recipe across releases, so only the FIRST stubborn
-        release pays the fingerprint cost. Returns an ORDERED list of exe
-        filenames, or None if it can't run (→ string-sweep fallback)."""
+        (level,md,solid,rar4_only) recipe across releases, so only the FIRST
+        stubborn release pays the fingerprint cost. Returns an ORDERED list of
+        exe filenames, or None if it can't run (→ string-sweep fallback).
+
+        rar4_only drops the RAR5/6 binaries BEFORE fingerprinting. For a RAR4
+        archive they can't produce the format at all, and running ~100 exes that
+        have never been executed on this machine is the expensive part (each
+        first launch is scanned by the OS) — roughly ten minutes of pure waste."""
         recipe = self._srr_recipe(srr_file)
         if not recipe:
             return None
@@ -3067,12 +3107,17 @@ class SrrdbToolAPI:
         cache = getattr(self, "_fam_cache", None)
         if cache is None:
             cache = self._fam_cache = {}
-        key = (level, md, solid)
+        key = (level, md, solid, rar4_only)
         if key in cache:
             return cache[key]
         disc = self._disc_source(content_dir, out_root)
         rar_dir = self._find_rar_dir()
         exes = sorted(Path(rar_dir).glob("*_rar*.exe")) if rar_dir else []
+        if rar4_only:
+            r4 = [e for e in exes
+                  if re.match(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d", e.name)]
+            if r4:
+                exes = r4
         if not disc or not exes:
             cache[key] = None
             return None
@@ -3328,19 +3373,24 @@ class SrrdbToolAPI:
         return None
 
     def _make_rar_exe(self, rm, build: str):
-        """Build a rescene RarExecutable object for a version STRING like
-        '2012-03-15 4.11' from the local pack. Used to SEED method2 when no
-        prior compressed file exists to borrow a version from. Returns the
+        """Build a rescene RarExecutable object from the local pack. `build` is
+        either an EXACT exe filename ('2005-11-21_rar360.exe' — what the recipe
+        sweep returns, so a beta can be told apart from its final) or a version
+        STRING like '2012-03-15 4.11'. Used to SEED method2 when no prior
+        compressed file exists to borrow a version from. Returns the
         RarExecutable, or None if the exe isn't in the pack / can't be parsed."""
         rar_dir = self._find_rar_dir()
         if not rar_dir:
             return None
-        try:
-            date, ver = build.split(" ")
-            major, minor = ver.split(".")
-            fname = f"{date}_rar{major}{minor}.exe"   # final build (no beta)
-        except Exception:
-            return None
+        if build.lower().endswith(".exe"):
+            fname = build
+        else:
+            try:
+                date, ver = build.split(" ")
+                major, minor = ver.split(".")
+                fname = f"{date}_rar{major}{minor}.exe"   # final build (no beta)
+            except Exception:
+                return None
         if not (Path(rar_dir) / fname).exists():
             return None
         try:
@@ -3359,10 +3409,15 @@ class SrrdbToolAPI:
         fblocks = rm.get_archived_file_blocks(blocks, block)
         file_blocks = [b for b in fblocks if getattr(b, "packed_size", 0)]
         prev = rm.previous_block(block, fblocks)
-        # Need a genuine PRECEDING file to compress in-context (jpg-first /
-        # content-second). prev is block ⇒ the compressed file is first ⇒ not
-        # this case; <2 file blocks ⇒ nothing to compress alongside.
-        if len(file_blocks) < 2 or prev is block:
+        # Need something to compress alongside; <2 file blocks ⇒ nothing to do.
+        if len(file_blocks) < 2:
+            return None
+        # Normally the failing file must have a PRECEDING one (stored jpg first /
+        # content second) — method2 borrows that file's build. The recipe sweep
+        # arms _m2_seed_first because it has PROVEN the recipe, and in its class
+        # the leading file is itself in-context (no build reproduces it alone), so
+        # method2 has to serve the set from the very first block.
+        if prev is block and not getattr(self, "_m2_seed_first", False):
             return None
         exe = self._make_rar_exe(rm, build)
         if exe is None:
@@ -3372,10 +3427,25 @@ class SrrdbToolAPI:
                 block, os.path.join(rm.get_temp_directory(), "seed.rar"), [src])
         except Exception:
             return None
+        # A pinned -mt must be on the args BEFORE method2's first compress:
+        # CompressedRarFileAll packs immediately, and an empty `threads` would
+        # pack at rar's default count. That pass could size-match by luck and be
+        # accepted with the wrong bytes, and at best it's a wasted full compress.
+        pin = getattr(self, "_mt_pin", None)
+        if pin is not None:
+            exe.args.threads = "-mt%d" % pin
         class _Seed:
-            pass
+            solid = False        # keeps the non-solid prepend/append skips valid
         s = _Seed(); s.good_rar = exe
-        rm.archived_files[prev.file_name] = s
+        # Key it OUTSIDE the packed-file namespace when seeding from the first
+        # block: rescene fetches a file's data object with
+        # archived_files.setdefault(name, factory(...)), so a seed parked under a
+        # REAL file name would be handed back as that file's data source (it has
+        # no read()) and the rebuild dies. CompressedRarFileAll falls back to
+        # "any entry" when the previous block's name isn't a key, which is
+        # exactly what a dummy key gives it.
+        rm.archived_files["\x00srrdb_m2_seed" if prev is block
+                          else prev.file_name] = s
         # Prioritise the group's likely thread counts for method2's internal
         # size sweep (mt8 usually wins for these groups).
         rm.RarArguments.mt_settings = rm.RarMtSettings()
@@ -3383,13 +3453,422 @@ class SrrdbToolAPI:
             getattr(self, "_m2_mt_pref", None) or [])
         self._log(
             f"    seeding method2 all-files rebuild with {build} (compressing "
-            "the stored extra + content together; skipping the redundant "
-            "isolated hunt)…", "dim")
+            "the whole set together; skipping the redundant isolated hunt)…",
+            "dim")
         m2 = rm.CompressedRarFileAll(
             fblocks, block, blocks, (in_folder, hints, auto_locate_renamed))
         rm.regular_method_failed = m2
         self._m2_seeded = True     # a seed actually happened (see fast-path)
         return m2
+
+    # ── SRR-driven recipe sweep (the in-context wall breaker) ────────────────
+
+    def _srr_sweep_targets(self, srr_file: str) -> dict:
+        """Per-RAR-set packing recipe + per-volume stream targets, read from the
+        SRR ALONE (no original archives needed).
+
+        {set_prefix: {"order": [name…],            # archive order
+                      "files": {name: {"unpacked": int,
+                                       "blocks": [(packed_size, file_crc)…]}},
+                      "level": int|None, "md": "-mdG", "solid": bool,
+                      "dict": bytes, "rar_version": int}}
+
+        The block list is per VOLUME, in order. For a file split across volumes
+        every block except the last carries file_crc = CRC32 of THAT volume's
+        slice of the compressed stream (RAR4 stores the unpacked-file CRC only in
+        the final block) — which is what makes a candidate testable offline."""
+        from rescene.rar import RarReader, BlockType  # type: ignore
+        sets: dict = {}
+        cur = None
+        for b in RarReader(str(srr_file)).read_all():
+            if b.rawtype == BlockType.SrrRarFile:
+                cur = self._rar_set_prefix(getattr(b, "file_name", "") or "")
+                sets.setdefault(cur, {"order": [], "files": {}, "level": None,
+                                      "md": "-mdG", "solid": False,
+                                      "dict": 4 << 20, "rar_version": 0})
+            elif b.rawtype == BlockType.RarPackedFile and cur is not None:
+                s = sets[cur]
+                name = getattr(b, "file_name", "") or ""
+                if not name:
+                    continue
+                if name not in s["files"]:
+                    s["order"].append(name)
+                    s["files"][name] = {"unpacked": b.unpacked_size,
+                                        "blocks": []}
+                s["files"][name]["blocks"].append((b.packed_size, b.file_crc))
+                if (getattr(b, "flags", 0) or 0) & 0x10:
+                    s["solid"] = True
+                s["rar_version"] = max(s["rar_version"],
+                                       getattr(b, "rar_version", 0) or 0)
+                if s["level"] is None:
+                    cp = b.get_compression_parameter()
+                    if cp and cp != "-m0":
+                        try:
+                            s["level"] = int(cp[2:])
+                        except ValueError:
+                            continue
+                        s["md"] = b.get_dictionary_size_parameter() or s["md"]
+                        s["dict"] = b.get_dict_size() or s["dict"]
+        return sets
+
+    def _sweep_set(self, srr_file: str):
+        """The one RAR set worth sweeping: multi-file, has a compressed member,
+        and the most content behind it. None when no set qualifies (a single-file
+        set can't be packed in-context, so rescene's isolated hunt is correct)."""
+        try:
+            sets = self._srr_sweep_targets(srr_file)
+        except Exception:
+            return None
+        best = None
+        for name, s in sets.items():
+            if s["level"] is None or len(s["order"]) < 2:
+                continue
+            tot = sum(f["unpacked"] for f in s["files"].values())
+            if best is None or tot > best[1]:
+                best = (name, tot, s)
+        return best[2] if best else None
+
+    def _locate_sweep_sources(self, order, content_dir: str, out_root) -> dict:
+        """{packed name -> source path} for every file in the set, searched in the
+        content folder and the SRR's own _stored extras. {} when ANY file is
+        missing — the sweep needs the exact set the group packed, and source
+        location/renaming is the normal path's job."""
+        index: dict = {}
+        for root in (Path(content_dir), Path(out_root) / "_stored"):
+            if not root.is_dir():
+                continue
+            for f in root.rglob("*"):
+                if f.is_file():
+                    index.setdefault(f.name.lower(), str(f))
+        found: dict = {}
+        for name in order:
+            hit = index.get(Path(name).name.lower())
+            if not hit:
+                return {}
+            found[name] = hit
+        return found
+
+    def _recipe_sweep(self, srr_file: str, content_dir: str, out_root) -> dict:
+        """Find the (exe, -mt) that reproduces this set's compressed streams by
+        packing ALL its files in ONE `rar a` — the way the group did — and
+        checking the output against the SRR's per-volume stream CRCs.
+
+        This is the measurement rescene never makes: it hunts each file in
+        isolation, which cannot reproduce an in-context pack at ANY build. The
+        sweep is decisive in both directions — a hit is byte-level proof of the
+        recipe (the caller then pins it and rebuilds), and a clean exhaustion
+        proves no pack build can do it, so no grind is worth starting.
+
+        Cheap by construction: builds that emit identical output are collapsed to
+        one representative (_pack_family_reps, cached per recipe), sources past
+        the first volume's worth are truncated, and -mt is swept OUTERMOST so the
+        counts that actually win (mt8 leads this dataset) are tried across every
+        build first. Returns {"exe", "version", "mt"} or None."""
+        s = self._sweep_set(srr_file)
+        if not s:
+            return None
+        # A sweep is DETERMINISTIC in (pack, SRR, sources): re-running one that
+        # already exhausted the pack just burns the same minutes again. Honour
+        # the cached verdict while the pack is unchanged — and re-sweep the
+        # moment it grows, since a new build is exactly what could crack it.
+        cached = self._sweep_cache_hit(getattr(self, "_release_name", ""))
+        if cached is not None:
+            if cached.get("found"):
+                self._log(
+                    f"  Recipe (measured {cached.get('ts', 'earlier')}): "
+                    f"{cached['found']['version']} -mt{cached['found']['mt']} "
+                    "— reusing it instead of re-sweeping.", "dim")
+                return dict(cached["found"])
+            self._log(
+                f"  Recipe sweep already exhausted the pack for this release "
+                f"({cached.get('ts', 'earlier')}, pack unchanged since) — not "
+                "repeating it. Add WinRAR versions to retry.", "dim")
+            return None
+        srcs = self._locate_sweep_sources(s["order"], content_dir, out_root)
+        if not srcs:
+            self._log("  Recipe sweep: not every packed file is available "
+                      "locally — skipping.", "dim")
+            return None
+        try:
+            from rescene.rarstream import RarStream  # type: ignore
+        except Exception:
+            return None
+        rar_dir = self._find_rar_dir()
+        if not rar_dir:
+            return None
+
+        # Candidate builds: distinct-output families only, era-filtered (a RAR4
+        # archive can never be produced by a RAR5/6 binary's default format).
+        rar4_only = bool(s["rar_version"] and s["rar_version"] < 50)
+        reps = self._pack_family_reps(srr_file, content_dir, out_root,
+                                      rar4_only=rar4_only)
+        if not reps:
+            reps = sorted(p.name for p in Path(rar_dir).glob("*_rar*.exe"))
+            if rar4_only:
+                r4 = [n for n in reps
+                      if re.match(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d", n)]
+                if r4:
+                    reps = r4
+        if not reps:
+            return None
+
+        level, md, solid = s["level"], s["md"], s["solid"]
+        work = Path(tempfile.mkdtemp(prefix="recipe-"))
+        try:
+            cmd_files, checks = self._stage_sweep_sources(work, s, srcs)
+            n_crc = sum(len(c[1]) for c in checks)
+            if not n_crc:
+                # Sizes alone are exactly the weak evidence that makes rescene
+                # lock the wrong build on a single-volume file. Without at least
+                # one real stream CRC the sweep can't be decisive, so don't
+                # pretend it is — leave the release to the normal path.
+                self._log("  Recipe sweep: this set has no volume-split file, so "
+                          "the SRR carries no stream CRC to match against — "
+                          "skipping (nothing here would be decisive).", "dim")
+                return None
+            mts: list = []
+            for m in (self._mt_freq_rank() + list(_MT_COMMON)):
+                if m not in mts:
+                    mts.append(m)
+            self._log(
+                f"  Recipe sweep: packing all {len(cmd_files)} file(s) together "
+                f"(-m{level} {md} {'-s' if solid else '-s-'}) across "
+                f"{len(reps)} distinct build(s) × -mt {mts} — matching against "
+                f"{n_crc} stream CRC(s) from the SRR…", "dim")
+            probe = work / "probe.rar"
+            deadline = time.time() + _RECIPE_SWEEP_BUDGET_S
+            tried = 0
+            for mt in mts:
+                for fn in reps:
+                    if self._stop.is_set() or self._skip.is_set():
+                        return None
+                    if time.time() > deadline:
+                        self._log("  Recipe sweep: budget reached — stopping "
+                                  f"after {tried} combo(s).", "dim")
+                        return None
+                    tried += 1
+                    if not self._sweep_compress(Path(rar_dir) / fn, level, md,
+                                                solid, mt, cmd_files, probe):
+                        continue
+                    if self._sweep_matches(probe, checks, RarStream):
+                        hit = {"exe": fn, "version": self._exe_version_str(fn),
+                               "mt": mt}
+                        # Never let a logging hiccup discard a PROVEN recipe.
+                        try:
+                            self._log(
+                                f"  ✓ Recipe sweep: {hit['version']} -mt{mt}  "
+                                f"({fn}) reproduces this set's streams "
+                                f"byte-exact ({tried} combo(s) tried).", "ok")
+                        except Exception:
+                            pass
+                        return hit
+            self._log(
+                f"  Recipe sweep: no pack build × -mt reproduces this set "
+                f"({tried} combo(s) across {len(reps)} distinct build(s)) — a "
+                "genuine wall, not a search-order problem.", "warn")
+            self._sweep_exhausted = True    # a CLEAN miss, safe to cache
+            return None
+        except Exception as e:
+            self._log(f"  Recipe sweep error: {e}", "dim")
+            return None
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
+
+    def _stage_sweep_sources(self, work: Path, s: dict, srcs: dict):
+        """Copy the set's sources into `work` in ARCHIVE ORDER, truncating the
+        first oversized split file, and return (command file list, checks).
+
+        checks = [(name, [(offset, length, crc32)…], exact_total|None)…]
+
+        Truncation is safe because a compressed stream's prefix depends only on
+        the input prefix — cutting the tail leaves the first volume's slice
+        byte-identical (measured) — but only the FIRST oversized file may be cut:
+        files after it would be compressed in a different context, so their
+        streams are no longer comparable and are dropped from `checks`. The
+        preceding files keep full verification, and every file stays in the
+        command so the in-context relationship is preserved."""
+        wsrc = work / "src"
+        wsrc.mkdir(parents=True, exist_ok=True)
+        cmd_files: list = []
+        checks: list = []
+        cut_at = None
+        for idx, name in enumerate(s["order"]):
+            real = Path(srcs[name])
+            size = real.stat().st_size
+            blocks = s["files"][name]["blocks"]
+            total_packed = sum(b[0] for b in blocks)
+            need = size
+            if cut_at is None and size > _RECIPE_TRUNC_MIN and len(blocks) >= 2:
+                ratio = max(1.0, size / max(1, total_packed))
+                need = min(size, int(blocks[0][0] * ratio * 1.4)
+                           + int(s["dict"]) + (1 << 20))
+                cut_at = idx
+            elif cut_at is not None:
+                # Past the cut nothing is verifiable, so a file is only here to
+                # keep "another file follows" true. Cap it — a second multi-GB
+                # disc would otherwise be copied in full for no information.
+                need = min(size, 2 * int(s["dict"]) + (1 << 20))
+            dst = wsrc / Path(name).name
+            if need < size:
+                left = need
+                with open(real, "rb") as f, open(dst, "wb") as o:
+                    while left > 0:
+                        chunk = f.read(min(left, 1 << 22))
+                        if not chunk:
+                            break
+                        o.write(chunk)
+                        left -= len(chunk)
+            else:
+                shutil.copy2(str(real), str(dst))
+            cmd_files.append(str(dst))
+            if cut_at is not None and idx > cut_at:
+                continue                 # past the cut: context differs, unusable
+            off, crcs = 0, []
+            last = len(blocks) - 1
+            for k, (psz, crc) in enumerate(blocks):
+                # The final block holds the UNPACKED file's CRC, not a stream
+                # CRC, so it is never a byte-level check.
+                if k != last and (need == size or off + psz <= blocks[0][0]):
+                    crcs.append((off, psz, crc))
+                off += psz
+            if crcs or need == size:
+                checks.append((Path(name).name, crcs,
+                               total_packed if need == size else None))
+        return cmd_files, [c for c in checks if c[1] or c[2] is not None]
+
+    def _sweep_compress(self, exe: Path, level: int, md: str, solid: bool,
+                        mt: int, files: list, out: Path) -> bool:
+        """One `rar a` of the whole set at (exe, -mt). False when the build can't
+        run the recipe at all (pre-mt RAR 2.x rejects -mt, old builds reject a
+        4 MB dictionary) — those fail in milliseconds, which is why sweeping the
+        full pack stays cheap."""
+        try:
+            for stale in list(out.parent.glob(out.stem + ".*")):
+                stale.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(
+                [str(exe), "a", f"-m{level}", md, "-s" if solid else "-s-",
+                 "-ds", f"-mt{mt}", "-o+", "-ep", "-idcd", str(out), *files],
+                capture_output=True, timeout=900)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return r.returncode == 0 and out.is_file()
+
+    def _sweep_matches(self, probe: Path, checks: list, RarStream) -> bool:
+        """True when the probe archive reproduces every verifiable stream: exact
+        total packed size for fully-present files, and CRC32-per-volume-slice for
+        every split file's non-final blocks."""
+        for name, crcs, exact in checks:
+            try:
+                with RarStream(str(probe), packed_file_name=name,
+                               compressed=True) as rs:
+                    data = rs.read()
+            except Exception:
+                return False
+            if exact is not None and len(data) != exact:
+                return False
+            for off, ln, crc in crcs:
+                if len(data) < off + ln:
+                    return False
+                if zlib.crc32(data[off:off + ln]) & 0xFFFFFFFF != crc:
+                    return False
+        return True
+
+    @staticmethod
+    def _exe_version_str(fname: str) -> str:
+        """'2005-11-21_rar360.exe' → '2005-11-21 3.60' (rescene's own naming)."""
+        m = re.match(r"(\d{4}-\d{2}-\d{2})_rar(\d)(\d\d)", fname)
+        return f"{m.group(1)} {m.group(2)}.{m.group(3)}" if m else fname
+
+    def _rebuild_with_recipe(self, recipe: dict, srr_file: str,
+                             content_dir: str, out_root: Path):
+        """Rebuild the release at a recipe the sweep already PROVED byte-exact.
+
+        The whole reconstruction is pinned to that one (exe, -mt) and method2 is
+        armed, so every stream comes out of a single all-files `rar a` — the same
+        command the group ran. Pinning matters as much as the build: with -mt free
+        rescene would re-derive a thread count per stream from its size-only test
+        and drift off the proven recipe. The SFV verify stays the arbiter, so a
+        sweep hit that somehow doesn't rebuild is still reported as a failure."""
+        self._clear_produced_volumes(out_root)
+        self._recon_streams = []
+        self._m2_seeded = False
+        SrrdbToolAPI._build_force = recipe["exe"]
+        self._mt_pin = recipe["mt"]
+        self._m2_seed_build = recipe["exe"]
+        self._m2_seed_first = True     # the leading extra is in-context too
+        self._m2_mt_pref = [recipe["mt"]]
+        try:
+            rc = self._srr_reconstruct(str(srr_file), content_dir,
+                                       str(out_root), log_rar_pack=False)
+        finally:
+            SrrdbToolAPI._build_force = None
+            self._mt_pin = None
+            self._m2_seed_build = None
+            self._m2_seed_first = False
+            self._m2_mt_pref = None
+        if not rc.get("ok"):
+            self._log(f"  Recipe rebuild failed: {rc.get('error', 'unknown')}",
+                      "warn")
+            return None
+        v2 = self._verify_rebuilt_sfv(out_root)
+        if v2["checked"] and not v2["bad"]:
+            self._log(
+                f"  ✓ Rebuilt with {recipe['version']} -mt{recipe['mt']} "
+                f"({recipe['exe']}) — all {v2['checked']} volume(s) CRC-match "
+                "the SFV.", "ok")
+            self._last_good_rar = recipe["version"]
+            rc["verified"] = v2
+            return rc, v2
+        self._log(f"  Recipe rebuild produced {v2.get('bad', 0)} mismatched "
+                  "volume(s) — not accepted.", "warn")
+        return None
+
+    def _rescue_recipe_sweep(self, srr_file: str, content_dir: str,
+                             out_root: Path):
+        """Measure the true packing recipe, then rebuild at it. The one rescue
+        that can crack an IN-CONTEXT pack (one `rar a` over several files), which
+        no amount of isolated version hunting can reach. Returns
+        (reconstruct rc, verify dict) on success, else None."""
+        if self._stop.is_set() or self._skip.is_set():
+            return None
+        recipe = self._recipe_sweep(srr_file, content_dir, out_root)
+        self._recipe_found = recipe        # recorded in the results DB
+        if not recipe:
+            return None
+        return self._rebuild_with_recipe(recipe, srr_file, content_dir, out_root)
+
+    def _is_extra_before_content_shape(self, srr_path: str) -> bool:
+        """True when a smaller packed extra precedes the bigger content in a
+        NON-SOLID set — the shape that gets packed by ONE `rar a` command and so
+        compresses in-context. Unlike _is_stored_extra_shape this does NOT require
+        the extra to be STORED: a COMPRESSED leading jpg is the same wall (its own
+        stream is in-context too, so no build reproduces it in isolation either),
+        and it is exactly the case the recipe sweep settles cheaply."""
+        try:
+            from rescene.rar import RarReader, BlockType  # type: ignore
+            sizes: dict = {}
+            order: list = []
+            solid = False
+            for block in RarReader(str(srr_path)).read_all():
+                if block.rawtype != BlockType.RarPackedFile:
+                    continue
+                name = getattr(block, "file_name", "")
+                if not name:
+                    continue
+                if getattr(block, "flags", 0) & 0x10:
+                    solid = True
+                if name not in sizes:
+                    order.append(name)
+                sizes[name] = max(sizes.get(name, 0),
+                                  getattr(block, "unpacked_size", 0) or 0)
+            if solid or len(order) < 2:
+                return False
+            return sizes[order[0]] < max(sizes.values())
+        except Exception:
+            return False
 
     def _is_stored_extra_shape(self, srr_path: str) -> bool:
         """True when the SRR shows a STORED extra BEFORE the sole compressed
@@ -3447,7 +3926,26 @@ class SrrdbToolAPI:
         failures where the hunt never reaches the rescue). Falls back to the full
         normal reconstruct if the shape doesn't match, there's no group build, or
         no build verifies. SFV verify still guards, so a false pass is
-        impossible; correctness is unchanged, only speed."""
+        impossible; correctness is unchanged, only speed.
+
+        Ahead of that, an extra-before-content set (stored OR compressed extra)
+        gets the RECIPE SWEEP: it measures the true (build, -mt) against the
+        SRR's stream CRCs in seconds and settles the release either way, instead
+        of letting the isolated hunt grind to the 30-min deadline on a shape it
+        can never match. A miss costs only the sweep and falls through to the
+        untouched normal path."""
+        if self._is_extra_before_content_shape(srr_file):
+            self._log(
+                "  A smaller extra precedes the content in a non-solid set — "
+                "the group packed them in ONE `rar a`, so every stream is "
+                "compressed in-context and the isolated hunt cannot match it. "
+                "Measuring the real recipe first…", "dim")
+            rescued = self._rescue_recipe_sweep(srr_file, content_dir,
+                                                Path(out_root))
+            if rescued:
+                return rescued[0]
+            self._clear_produced_volumes(Path(out_root))
+            self._recon_streams = []
         prefs = list(getattr(self, "_recon_prefs", None) or [])
         if not (prefs and self._is_stored_extra_shape(srr_file)):
             return self._srr_reconstruct(str(srr_file), content_dir,
@@ -4495,6 +4993,46 @@ class SrrdbToolAPI:
             pass
         return None
 
+    def _prior_versions_tried(self, release: str) -> set:
+        """Versions a previous, INCOMPLETE run of `release` already tested (same
+        pack). Empty when there's no such record — a clean exhaustion is handled
+        by the wall cache instead, and a different pack invalidates the list."""
+        if not release:
+            return set()
+        try:
+            cur = self._pack_signature()
+            if not cur:
+                return set()
+            for r in self._load_results():
+                if (r.get("release") == release and not r.get("ok")
+                        and r.get("tried_pack_sig") == cur):
+                    return set(r.get("versions_tried") or [])
+        except Exception:
+            pass
+        return set()
+
+    def _sweep_cache_hit(self, release: str) -> dict | None:
+        """The stored recipe-sweep verdict for `release`, or None to sweep now.
+
+        {"found": {exe, version, mt}|None, "ts": …}. Only a verdict recorded
+        against the CURRENT pack signature counts: a bigger pack can turn an
+        exhausted miss into a hit, so growing the pack always re-opens it."""
+        if not release:
+            return None
+        try:
+            cur = self._pack_signature()
+            if not cur:
+                return None
+            for r in self._load_results():
+                if r.get("release") != release:
+                    continue
+                sw = r.get("sweep") or {}
+                if sw.get("pack_sig") == cur and sw.get("gen") == _WALL_CACHE_GEN:
+                    return {"found": sw.get("found"), "ts": r.get("ts")}
+        except Exception:
+            pass
+        return None
+
     def _record_result(self, summary: dict, queue_path: str):
         try:
             release = summary.get("release") or ""
@@ -4561,6 +5099,22 @@ class SrrdbToolAPI:
                 # SRR-dated FAILURE triggers widen-on-re-run (see _process_one).
                 "date_capped": cap_on,
             }
+            # ── what this run actually TRIED, so a re-run doesn't repeat it ──
+            # The recipe sweep's verdict (see _sweep_cache_hit). Recorded for a
+            # hit, and for a CLEAN exhaustion; a sweep cut short by the budget or
+            # by Stop is deliberately NOT cached, since it proved nothing.
+            recipe = getattr(self, "_recipe_found", "skip")
+            if recipe != "skip" and (recipe
+                                     or getattr(self, "_sweep_exhausted", False)):
+                rec["sweep"] = {"pack_sig": self._pack_signature(),
+                                "gen": _WALL_CACHE_GEN,
+                                "found": recipe or None}
+            # Versions the hunt actually tested. On a deadline-truncated failure
+            # a re-run reorders these to the BACK (see _process_one), so a second
+            # pass explores NEW builds instead of grinding the same ones again.
+            if tried and not summary.get("ok"):
+                rec["versions_tried"] = sorted(tried)
+                rec["tried_pack_sig"] = self._pack_signature()
             results = self._load_results()
             # Re-runs replace the previous record for the same release
             results = [r for r in results if r.get("release") != release]
@@ -4784,6 +5338,22 @@ class SrrdbToolAPI:
         self._versions_tried = set()  # versions rescene actually tested this job
         self._recon_hit_deadline = False  # cut off by the deadline (not exhausted)
         self._mt_rank_cache = None   # recompute -mt win-frequency per job
+        # "skip" = the recipe sweep hasn't run for this release yet; a dict/None
+        # after it has (so the last-resort rescue never repeats the fast-path's
+        # sweep, and _record_result can persist the measured recipe).
+        self._recipe_found = "skip"
+        self._sweep_exhausted = False
+        self._release_name = release
+        # Builds a PREVIOUS run already tested before it was cut off. Not a
+        # skip-list (a truncated run can leave a version half-tested) — just an
+        # ordering hint, so the retry reaches untested builds first instead of
+        # re-grinding the same head of the list into the same timeout.
+        self._retry_tried_versions = self._prior_versions_tried(release)
+        if self._retry_tried_versions:
+            self._log(
+                f"  Previous run timed out after testing "
+                f"{len(self._retry_tried_versions)} build(s) — trying the "
+                "untested ones first this time.", "info")
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
 
@@ -5122,6 +5692,26 @@ class SrrdbToolAPI:
                             summary["ok"] = True
                             summary["verified"] = rescued
                             summary["rars"] = rescued["checked"]
+                            summary["note"] = ""
+                            self._log_recon_combos("dim")
+
+                    # Last resort, whatever the failure was (including a deadline
+                    # timeout, which no other rescue can follow): measure the
+                    # real recipe against the SRR's stream CRCs and rebuild at
+                    # it. Skipped when the fast-path already swept this release.
+                    if (not summary["ok"]
+                            and getattr(self, "_recipe_found", "skip") == "skip"
+                            and not (self._stop.is_set() or self._skip.is_set())):
+                        rescued = self._rescue_recipe_sweep(
+                            str(srr_file), content_dir, out_root)
+                        if rescued:
+                            rc, v2 = rescued
+                            produced = [f for f in (rc.get("files") or [])
+                                        if Path(f).suffix.lower()
+                                        not in META_EXTS]
+                            summary["ok"] = True
+                            summary["verified"] = v2
+                            summary["rars"] = len(produced) or v2["checked"]
                             summary["note"] = ""
                             self._log_recon_combos("dim")
 
