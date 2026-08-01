@@ -814,13 +814,19 @@ class MiscToolsAPI:
             # inflate the family count (≈20 real → 134 seen). Drop them.
             era = max((i.extract_version or 0) for i in infos)
             if era and era < 50:
+                # A RAR4 archive is most likely from a RAR4-era build, so probe
+                # those FIRST — but do NOT drop the RAR5/6 binaries: with -ma4
+                # they emit RAR4 too, and they are the only way a RAR4 archive
+                # can carry -mt above 16 (RAR3/4 reject it). Dropping them was
+                # excluding a real answer, not just a slow one.
                 r4 = [e for e in exes
                       if re.match(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d", e.name)]
                 if r4 and len(r4) < len(exes):
+                    late = [e for e in exes if e not in set(r4)]
                     L(f"  RAR4 archive (extract-v{era/10:.1f}) — probing the "
-                      f"{len(r4)} RAR4-era builds only (dropped "
-                      f"{len(exes) - len(r4)} RAR5/6).", "dim")
-                    exes = r4
+                      f"{len(r4)} RAR4-era builds first, then {len(late)} "
+                      "RAR5/6 in RAR4 mode (-ma4).", "dim")
+                    exes = r4 + late
 
             # Newer-than-release cap (SAFE — the older end is NOT capped, since
             # 1001 proved the real build can be a decade older). A group can't
@@ -864,91 +870,70 @@ class MiscToolsAPI:
             if not all(Path(f).is_file() for f in src_files):
                 L(f"  Extraction incomplete (rc={xr.returncode}) — abort.", "err")
                 shutil.rmtree(work, ignore_errors=True); return {"ok": False}
-            # Family-dedup must key on a COMPRESSED file — a stored extra (e.g. an
-            # EXiMiUS proof jpg) compresses identically on every build and would
-            # wrongly collapse all families into one. Use the SMALLEST compressed
-            # file as the discriminator, and only dedup when it's small enough
-            # that 232 test-compresses are cheap.
-            comp_idx = [k for k, i in enumerate(infos)
-                        if (i.compress_type or 0x30) != 0x30]
-            disc_idx = min(comp_idx, key=lambda k: infos[k].file_size,
-                           default=None)
-            dedup = (disc_idx is not None
-                     and infos[disc_idx].file_size <= 8 * 1024 * 1024)
         finally:
             rf.close()
 
-        def _families(exes):
-            """Collapse builds that emit identical output into one representative
-            — compress the SMALLEST compressed file at -mt1 and hash it."""
-            seen, reps = {}, []
-            probe = work / "fam.rar"
-            dname = order[disc_idx]
-            total = len(exes)
-            for idx, ex in enumerate(exes, 1):
-                if self._stop_flag.is_set():
-                    break
-                try:
-                    probe.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                cmd = [str(ex), "a", f"-m{level}", f"-md{md}",
-                       "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
-                       "-idcd", str(probe), src_files[disc_idx]]
-                try:
-                    subprocess.run(cmd, capture_output=True, timeout=300)
-                except subprocess.TimeoutExpired:
-                    continue   # a build that hangs/stalls — skip it
-                try:
-                    with RarStream(str(probe), packed_file_name=dname,
-                                   compressed=True) as rs:
-                        sig = hashlib.sha1(rs.read()).digest()
-                except Exception:
-                    sig = ("ERR", ex.name)
-                if sig not in seen:
-                    seen[sig] = ex
-                    reps.append(ex)
-                if idx % 8 == 0 or idx == total:
-                    self._probe_progress(
-                        f"fingerprinting builds… {idx}/{total}  "
-                        f"({len(reps)} distinct so far)")
-            return reps
+        # NO family dedup — it produced FALSE WALLS. Fingerprinting one small
+        # file cannot tell apart builds that differ only on larger input: on
+        # Bravissi-Mots_PROPER…EXiMiUS, 29 builds emitted a byte-exact 78 KB jpg
+        # at -mt8 but only TWO distinct .nds streams, so the true build (3.90)
+        # was folded into the 3.60 family, only 3.60 was probed, it missed by 5
+        # bytes, and the probe declared a "genuine wall" — the exact opposite of
+        # the truth. Fingerprinting the REAL input per build is just the probe
+        # itself, so dedup saves nothing when done correctly. Instead every build
+        # is probed with -mt swept OUTERMOST, so the counts that actually win
+        # (mt8 first) cover the whole pack before any rarer count is tried — a
+        # full pass over 135 builds measured ~64 s.
+        reps = exes
+        L(f"  Probing all {len(exes)} builds × -mt (thread count swept first, "
+          "so the common counts cover every build early)…", "dim")
 
-        if dedup:
-            L(f"  De-duping {len(exes)} pack builds by output family "
-              f"(via {order[disc_idx]})…", "dim")
-            reps = _families(exes)
-            L(f"  → {len(reps)} distinct build famil"
-              f"{'y' if len(reps) == 1 else 'ies'} to probe × up to -mt{max_mt}.",
-              "dim")
-        else:
-            reps = exes
-            L(f"  No small compressed file to dedup on — probing all {len(exes)} "
-              f"builds × up to -mt{max_mt} (early-exit on match).", "dim")
-
+        # RAR 3.x/4.x reject -mt above 16 outright ("Unknown option: mt17");
+        # only RAR5+ accept up to 32 — and a RAR5 binary can still emit RAR4 via
+        # -ma4, which is the ONLY way a RAR4 archive can carry -mt>16.
         mts = [n for n in (8, 4, 2, 1, 3, 6, 5, 7, 0,
                            *range(9, max_mt + 1)) if n <= max_mt]
+        _r5 = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$", re.I)
+        _mdkb = {"A": 64, "B": 128, "C": 256, "D": 512, "E": 1024, "F": 2048,
+                 "G": 4096}
+
+        def _args(ex, n):
+            """Per-build command prefix; None when the build can't run this
+            (exe, -mt) combination at all."""
+            if _r5.search(ex.name):
+                return [str(ex), "a", f"-m{level}", "-ma4",
+                        f"-md{_mdkb.get(md.upper(), 4096)}k"]
+            if n > 16:
+                return None
+            return [str(ex), "a", f"-m{level}", f"-md{md}"]
+
         probe = work / "probe.rar"
         tried = 0
         try:
-            for fi, ex in enumerate(reps, 1):
+            # -mt OUTERMOST: one full pass over every build per thread count, so
+            # the counts that actually win are exhausted across the whole pack
+            # before a rare count is tried anywhere.
+            for mi, n in enumerate(mts, 1):
                 if self._stop_flag.is_set():
                     L("  Stopped.", "warn"); break
-                ver = self._exe_label(ex.name)
-                for n in mts:
+                for ex in reps:
                     if self._stop_flag.is_set():
                         break
+                    pre = _args(ex, n)
+                    if pre is None:
+                        continue          # build can't do this thread count
+                    ver = self._exe_label(ex.name)
                     tried += 1
-                    self._probe_progress(
-                        f"probing {ver} -mt{n}…  (build {fi}/{len(reps)}, "
-                        f"{tried} combos tried)")
+                    if tried % 8 == 0:
+                        self._probe_progress(
+                            f"probing -mt{n} ({mi}/{len(mts)}) … {ver}  "
+                            f"({tried} combos tried)")
                     try:
                         probe.unlink(missing_ok=True)
                     except Exception:
                         pass
-                    cmd = [str(ex), "a", f"-m{level}", f"-md{md}",
-                           "-s" if solid else "-s-", "-ds", f"-mt{n}",
-                           "-o+", "-ep", "-idcd", str(probe), *src_files]
+                    cmd = pre + ["-s" if solid else "-s-", "-ds", f"-mt{n}",
+                                 "-o+", "-ep", "-idcd", str(probe), *src_files]
                     try:
                         subprocess.run(cmd, capture_output=True, timeout=300)
                     except subprocess.TimeoutExpired:
@@ -969,12 +954,13 @@ class MiscToolsAPI:
                           f"reproduces all {len(targets)} stream(s) byte-exact.",
                           "ok")
                         return {"ok": True, "version": ver, "mt": n,
+                                "exe": ex.name,
                                 "level": level, "dict_kb": dkb, "solid": solid,
                                 "tried": tried}
             L(f"  ✗ No pack build × -mt (0–{max_mt}) reproduces this archive "
-              f"({tried} combos tried across {len(reps)} families). Genuine wall "
-              "— the exact build/setting is outside the pack (a .srr2 case).",
-              "err")
+              f"({tried} combos tried across {len(reps)} builds, RAR4 and "
+              "RAR5-in-RAR4-mode). Genuine wall — the exact build/setting is "
+              "outside the pack (a .srr2 case).", "err")
             return {"ok": False, "wall": True, "tried": tried}
         finally:
             shutil.rmtree(work, ignore_errors=True)

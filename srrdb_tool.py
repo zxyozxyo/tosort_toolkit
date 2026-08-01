@@ -3559,11 +3559,20 @@ class SrrdbToolAPI:
         recipe (the caller then pins it and rebuilds), and a clean exhaustion
         proves no pack build can do it, so no grind is worth starting.
 
-        Cheap by construction: builds that emit identical output are collapsed to
-        one representative (_pack_family_reps, cached per recipe), sources past
-        the first volume's worth are truncated, and -mt is swept OUTERMOST so the
-        counts that actually win (mt8 leads this dataset) are tried across every
-        build first. Returns {"exe", "version", "mt"} or None."""
+        EVERY build is tried — deliberately NOT collapsed into "families" first.
+        Family dedup fingerprints one small file, and a small file cannot tell
+        apart builds that differ only on larger input: on
+        Bravissi-Mots_PROPER…EXiMiUS, 29 builds produced a byte-exact 78 KB jpg
+        at -mt8 but only TWO distinct .nds streams, so dedup folded the true
+        build (3.90) into the 3.60 family, tested 3.60 as its representative,
+        missed by 5 bytes, and reported a "genuine wall". Doing the dedup
+        properly would mean compressing the real input per build — which IS the
+        sweep, so it saves nothing. Cost is controlled instead by era-filtering,
+        truncating sources, and sweeping -mt OUTERMOST so the counts that
+        actually win (mt8 leads this dataset) cover every build first: a full
+        pass over 135 builds measured ~64 s.
+
+        Returns {"exe", "version", "mt"} or None."""
         s = self._sweep_set(srr_file)
         if not s:
             return None
@@ -3597,18 +3606,19 @@ class SrrdbToolAPI:
         if not rar_dir:
             return None
 
-        # Candidate builds: distinct-output families only, era-filtered (a RAR4
-        # archive can never be produced by a RAR5/6 binary's default format).
+        # Candidate builds: EVERY exe of the right era (see the docstring on why
+        # family dedup is not used here). A RAR4 archive is swept with the RAR4
+        # binaries first; RAR5/6 binaries can still emit RAR4 via -ma4, so they
+        # follow as a second phase rather than being dropped outright.
+        allexe = sorted(p.name for p in Path(rar_dir).glob("*_rar*.exe"))
         rar4_only = bool(s["rar_version"] and s["rar_version"] < 50)
-        reps = self._pack_family_reps(srr_file, content_dir, out_root,
-                                      rar4_only=rar4_only)
-        if not reps:
-            reps = sorted(p.name for p in Path(rar_dir).glob("*_rar*.exe"))
-            if rar4_only:
-                r4 = [n for n in reps
-                      if re.match(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d", n)]
-                if r4:
-                    reps = r4
+        if rar4_only:
+            era = [n for n in allexe
+                   if re.match(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d", n)]
+            late = [n for n in allexe if n not in set(era)]
+            reps = (era or allexe) + late
+        else:
+            reps = allexe
         if not reps:
             return None
 
@@ -3633,7 +3643,7 @@ class SrrdbToolAPI:
             self._log(
                 f"  Recipe sweep: packing all {len(cmd_files)} file(s) together "
                 f"(-m{level} {md} {'-s' if solid else '-s-'}) across "
-                f"{len(reps)} distinct build(s) × -mt {mts} — matching against "
+                f"{len(reps)} build(s) × -mt {mts} — matching against "
                 f"{n_crc} stream CRC(s) from the SRR…", "dim")
             probe = work / "probe.rar"
             deadline = time.time() + _RECIPE_SWEEP_BUDGET_S
@@ -3664,8 +3674,9 @@ class SrrdbToolAPI:
                         return hit
             self._log(
                 f"  Recipe sweep: no pack build × -mt reproduces this set "
-                f"({tried} combo(s) across {len(reps)} distinct build(s)) — a "
-                "genuine wall, not a search-order problem.", "warn")
+                f"({tried} combo(s) across {len(reps)} build(s), RAR4 and "
+                "RAR5-in-RAR4-mode) — a genuine wall, not a search-order "
+                "problem.", "warn")
             self._sweep_exhausted = True    # a CLEAN miss, safe to cache
             return None
         except Exception as e:
@@ -3736,22 +3747,42 @@ class SrrdbToolAPI:
                                total_packed if need == size else None))
         return cmd_files, [c for c in checks if c[1] or c[2] is not None]
 
+    # RAR 3.x/4.x reject -mt above 16 outright ("Unknown option: mt17"); only
+    # RAR5+ binaries accept up to 32. Measured, not assumed.
+    _RAR4_MT_MAX = 16
+    _R5_EXE = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$", re.I)
+    _MD_KB = {"a": 64, "b": 128, "c": 256, "d": 512, "e": 1024, "f": 2048,
+              "g": 4096}
+
     def _sweep_compress(self, exe: Path, level: int, md: str, solid: bool,
                         mt: int, files: list, out: Path) -> bool:
         """One `rar a` of the whole set at (exe, -mt). False when the build can't
-        run the recipe at all (pre-mt RAR 2.x rejects -mt, old builds reject a
-        4 MB dictionary) — those fail in milliseconds, which is why sweeping the
-        full pack stays cheap."""
+        run the recipe at all (pre-mt RAR 2.x rejects -mt, RAR3/4 reject -mt>16,
+        old builds reject a 4 MB dictionary) — those fail in milliseconds, which
+        is why sweeping the whole pack stays cheap.
+
+        A RAR5/6 binary is asked for RAR4 output with -ma4 (and the -md letter
+        rewritten to the size form it wants), so a RAR4 archive packed by a
+        modern WinRAR — which is also the only way to get -mt above 16 — stays
+        reachable instead of being written off as a wall."""
+        is_r5 = bool(self._R5_EXE.search(exe.name))
+        if not is_r5 and mt > self._RAR4_MT_MAX:
+            return False
+        args = [str(exe), "a", f"-m{level}"]
+        if is_r5:
+            kb = self._MD_KB.get(md[3:].lower()) if len(md) > 3 else None
+            args += ["-ma4", f"-md{kb}k" if kb else md]
+        else:
+            args += [md]
+        args += ["-s" if solid else "-s-", "-ds", f"-mt{mt}", "-o+", "-ep",
+                 "-idcd", str(out)]
         try:
             for stale in list(out.parent.glob(out.stem + ".*")):
                 stale.unlink(missing_ok=True)
         except Exception:
             pass
         try:
-            r = subprocess.run(
-                [str(exe), "a", f"-m{level}", md, "-s" if solid else "-s-",
-                 "-ds", f"-mt{mt}", "-o+", "-ep", "-idcd", str(out), *files],
-                capture_output=True, timeout=900)
+            r = subprocess.run(args + files, capture_output=True, timeout=900)
         except (subprocess.TimeoutExpired, OSError):
             return False
         return r.returncode == 0 and out.is_file()
