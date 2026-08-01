@@ -808,6 +808,36 @@ class MiscToolsAPI:
             L(f"  Recipe to match: -m{level} -md{md} ({dkb} KB) "
               f"{'-s (SOLID)' if solid else '-s-'} · {len(infos)} file(s)", "dim")
 
+            # Format era: a RAR4 archive (min-extract-version < 50) can ONLY be
+            # reproduced by RAR4-era builds (≤4.20). RAR5/6 default to a different
+            # format — they can't match AND each emits distinct output, so they
+            # inflate the family count (≈20 real → 134 seen). Drop them.
+            era = max((i.extract_version or 0) for i in infos)
+            if era and era < 50:
+                r4 = [e for e in exes
+                      if re.match(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d", e.name)]
+                if r4 and len(r4) < len(exes):
+                    L(f"  RAR4 archive (extract-v{era/10:.1f}) — probing the "
+                      f"{len(r4)} RAR4-era builds only (dropped "
+                      f"{len(exes) - len(r4)} RAR5/6).", "dim")
+                    exes = r4
+
+            # Newer-than-release cap (SAFE — the older end is NOT capped, since
+            # 1001 proved the real build can be a decade older). A group can't
+            # use a build that didn't exist when it packed, so drop builds dated
+            # well after the archive's own pack year (+3yr margin — timestamps
+            # can be massaged). Cheap; helps most on OLD archives.
+            years = [i.date_time[0] for i in infos
+                     if getattr(i, "date_time", None) and i.date_time[0] >= 1990]
+            if years and all(e.name[:4].isdigit() for e in exes):
+                cutoff = max(years) + 4   # generous — timestamps can be massaged
+                newer = [e for e in exes if int(e.name[:4]) <= cutoff]
+                if newer and len(newer) < len(exes):
+                    L(f"  Packed ~{max(years)} — dropping "
+                      f"{len(exes) - len(newer)} build(s) newer than {cutoff} "
+                      "(couldn't have been used).", "dim")
+                    exes = newer
+
             # Target: each packed stream's exact bytes (header-independent).
             targets = {}
             for i in infos:
@@ -865,7 +895,10 @@ class MiscToolsAPI:
                 cmd = [str(ex), "a", f"-m{level}", f"-md{md}",
                        "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
                        "-idcd", str(probe), src_files[disc_idx]]
-                subprocess.run(cmd, capture_output=True)
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=300)
+                except subprocess.TimeoutExpired:
+                    continue   # a build that hangs/stalls — skip it
                 try:
                     with RarStream(str(probe), packed_file_name=dname,
                                    compressed=True) as rs:
@@ -916,7 +949,10 @@ class MiscToolsAPI:
                     cmd = [str(ex), "a", f"-m{level}", f"-md{md}",
                            "-s" if solid else "-s-", "-ds", f"-mt{n}",
                            "-o+", "-ep", "-idcd", str(probe), *src_files]
-                    subprocess.run(cmd, capture_output=True)
+                    try:
+                        subprocess.run(cmd, capture_output=True, timeout=300)
+                    except subprocess.TimeoutExpired:
+                        continue   # a build that hangs/stalls — skip it
                     ok = True
                     for name, (tlen, tsha) in targets.items():
                         try:

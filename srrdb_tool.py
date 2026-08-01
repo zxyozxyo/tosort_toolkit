@@ -3125,9 +3125,33 @@ class SrrdbToolAPI:
         allv = list(getattr(self, "_all_versions", None) or [])
         if not allv:
             return None
-        candidates = [v for v in allv if v != detected]
+        # `_all_versions` lists one entry PER EXE (betas collapse to the same
+        # string), so dedupe to UNIQUE version-strings — else the sweep retries
+        # the same version many times (3.60 = a final + 8 betas → 9× the string).
+        seen: set = set()
+        candidates = [v for v in allv
+                      if v != detected and not (v in seen or seen.add(v))]
         if not candidates:
             return None
+        # Newer-than-release cap: a group can't use a build that didn't exist
+        # when they packed, so drop builds dated past the release-date cap (+its
+        # margin) — same rule the initial hunt uses, but the sweep skipped it and
+        # was grinding 5.7/5.8-era builds on a 2014 release. Only the NEWER end
+        # is capped; older builds stay (1001 proved the real build can be a
+        # decade older). Skipped if no release date, or if the run was widened.
+        cap = getattr(self, "_version_date_cap", None)
+        if cap and not getattr(self, "_version_cap_widen", False):
+            import datetime
+            limit = cap + datetime.timedelta(days=_VERSION_CAP_MARGIN_DAYS)
+            kept = [v for v in candidates
+                    if not (self._version_date(v)
+                            and self._version_date(v) > limit)]
+            if kept and len(kept) < len(candidates):
+                self._log(
+                    f"    dropped {len(candidates) - len(kept)} build(s) newer "
+                    f"than the release +{_VERSION_CAP_MARGIN_DAYS // 365}yr "
+                    "(couldn't have been used)", "dim")
+                candidates = kept
         # Ordering. The winning build must itself pass the piece-CRC test (it
         # produced the real archive), so we can't know it a priori — but two
         # priors help: (1) this group's known-good history (what OTHER releases
