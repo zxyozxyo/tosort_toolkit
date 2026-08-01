@@ -7,7 +7,10 @@ Miscellaneous Utilities Backend
 import os
 import re
 import json
+import time
 import shutil
+import hashlib
+import tempfile
 import threading
 import subprocess
 from pathlib import Path
@@ -655,13 +658,27 @@ class MiscToolsAPI:
                         dict_kbs.add(self._DICT_KB[d])
 
             L(f"  Packed files ({len(infos)}):", "dim")
-            for i in infos[:10]:
+            for i in infos[:12]:
                 m = self._METHODS.get(i.compress_type, hex(i.compress_type or 0))
                 ratio = (100 * (i.compress_size or 0) / i.file_size) if i.file_size else 100
-                L(f"    {i.filename}  {i.file_size:,} B → {i.compress_size:,} B "
-                  f"({ratio:.1f}%)  [{m}]", "dim")
-            if len(infos) > 10:
-                L(f"    … and {len(infos) - 10} more", "dim")
+                crc = getattr(i, "CRC", None)
+                crc_s = f"  CRC={crc & 0xFFFFFFFF:08X}" if crc is not None else ""
+                dt = getattr(i, "date_time", None)
+                ts = ("  %04d-%02d-%02d %02d:%02d:%02d" % dt) if dt else ""
+                # Exact packed bytes are the single most diagnostic field on a
+                # near-miss: same packed_size + wrong CRC → a byte-level (build/
+                # header/comment) diff, NOT version/-mt; different packed_size →
+                # a compression diff (version/-mt/dict).
+                L(f"    {i.filename}  {i.file_size:,} B → "
+                  f"{i.compress_size:,} B ({ratio:.1f}%)  [{m}]{crc_s}{ts}", "dim")
+            if len(infos) > 12:
+                L(f"    … and {len(infos) - 12} more", "dim")
+            # Comments change the archive hash and must be reproduced exactly —
+            # a hidden comment is a classic silent near-miss cause.
+            cmt = getattr(rf, "comment", None)
+            if cmt:
+                L(f"  ⚠ Archive comment present ({len(cmt)} B) — affects the "
+                  "archive hash; must be reproduced exactly to rebuild.", "warn")
 
             for v in sorted(vers):
                 era = self._EXTRACT_VER.get(v, f"unknown (version byte {v})")
@@ -700,6 +717,240 @@ class MiscToolsAPI:
                       "more version-sensitive.", "warn")
         finally:
             rf.close()
+
+    # ── Recipe Probe ──────────────────────────────────────────────────────────
+    # Find the exact (WinRAR build, -mt) that reproduces an ORIGINAL rar's
+    # compressed streams byte-for-byte — the recipe an SRR can't store. This is
+    # the diagnostic that turns "stubborn near-miss" into a definitive answer,
+    # and the core capture step for the future .srr2 format.
+
+    _MD_LETTER = {64: "A", 128: "B", 256: "C", 512: "D",
+                  1024: "E", 2048: "F", 4096: "G"}
+
+    def stop_probe(self) -> dict:
+        """Signal the recipe probe to stop after the current attempt."""
+        self._stop_flag.set()
+        return {"ok": True}
+
+    def _probe_progress(self, msg: str):
+        """Update the single transient progress line (overwrites in place, so the
+        live counter never fills the log). Milestones use _log (permanent)."""
+        self._emit("progress", {"msg": msg, "target": "rai"})
+
+    def probe_recipe(self, folder: str, max_mt: int = 16) -> dict:
+        """Launch the recipe probe in the background (it runs many rar.exe
+        compresses, so it must not block the GUI thread). Progress + result go
+        to the log; a 'probe_done' event re-enables the buttons when finished."""
+        if getattr(self, "_probe_running", False):
+            return {"ok": False, "error": "A probe is already running"}
+        self._stop_flag.clear()
+
+        def _bg():
+            self._probe_running = True
+            try:
+                self._probe_run(folder, max_mt)
+            except Exception as e:
+                self._log(f"Probe error: {e}", "err", "rai")
+            finally:
+                self._probe_running = False
+                self._emit("progress", {"msg": "", "target": "rai"})
+                self._emit("probe_done", {})
+
+        threading.Thread(target=_bg, daemon=True).start()
+        return {"ok": True, "started": True}
+
+    def _probe_run(self, folder: str, max_mt: int = 16) -> dict:
+        """For an ORIGINAL rar set in `folder`, recompress its own content across
+        pack build × thread-count and find which combo reproduces every packed
+        stream BYTE-EXACT (compared via RarStream, header-independent). Reports
+        the winning (build, -mt) — or proves no pack combo matches (a genuine
+        wall). Builds are DE-DUPED by output family (RAR3/4 point releases emit
+        identical bytes), so 232 exes collapse to ~a couple dozen real tries."""
+        L = lambda m, c="info": self._log(m, c, "rai")
+        self._stop_flag.clear()
+        base = Path((folder or "").strip())
+        if not base.is_dir():
+            L("Folder not found.", "err"); return {"ok": False}
+        try:
+            import rarfile
+            from rescene.rarstream import RarStream  # type: ignore
+        except ImportError as e:
+            L(f"Missing dependency: {e} (need rarfile + rescene).", "err")
+            return {"ok": False}
+        pack = Path(__file__).parent / "apps" / "winrar_pack-4.20"
+        exes = sorted(pack.glob("*_rar*.exe")) if pack.is_dir() else []
+        if not exes:
+            L("WinRAR pack not found (apps/winrar_pack-4.20/*.exe).", "err")
+            return {"ok": False}
+
+        heads = [p for p in sorted(base.rglob("*.rar"))
+                 if not re.search(r"\.part0*(?!1\b)\d+\.rar$", p.name, re.I)
+                 or re.search(r"\.part0*1\.rar$", p.name, re.I)]
+        if not heads:
+            L("No .rar set found under this folder.", "err"); return {"ok": False}
+        head = heads[0]
+        L("", ""); L(f"══ PROBE: {head.relative_to(base)} ══", "info")
+
+        rf = rarfile.RarFile(str(head))
+        try:
+            infos = [i for i in rf.infolist() if i.is_file()]
+            if not infos:
+                L("  No packed files.", "warn"); return {"ok": False}
+            # Compression recipe to replicate (from the first compressed file).
+            comp = next((i for i in infos if (i.compress_type or 0x30) != 0x30),
+                        infos[0])
+            level = (comp.compress_type or 0x30) - 0x30
+            dkb = 4096
+            if comp.flags is not None:
+                dkb = self._DICT_KB.get((comp.flags >> 5) & 7, 4096)
+            solid = any((i.flags or 0) & 0x10 for i in infos)
+            md = self._MD_LETTER.get(dkb, "G")
+            L(f"  Recipe to match: -m{level} -md{md} ({dkb} KB) "
+              f"{'-s (SOLID)' if solid else '-s-'} · {len(infos)} file(s)", "dim")
+
+            # Target: each packed stream's exact bytes (header-independent).
+            targets = {}
+            for i in infos:
+                try:
+                    with RarStream(str(head), packed_file_name=i.filename,
+                                   compressed=True) as rs:
+                        data = rs.read()
+                    targets[i.filename] = (len(data), hashlib.sha1(data).digest())
+                except Exception as e:
+                    L(f"  ⚠ couldn't read original stream {i.filename}: {e}", "warn")
+            if not targets:
+                L("  Couldn't read any original compressed streams — abort.", "err")
+                return {"ok": False}
+
+            # Extract the sources from the original (via a pack rar.exe, so no
+            # unrar backend is needed), preserving names.
+            work = Path(tempfile.mkdtemp(prefix="probe-"))
+            src = work / "src"; src.mkdir()
+            xr = subprocess.run(
+                [str(exes[-1]), "x", "-y", "-o+", str(head), str(src) + os.sep],
+                capture_output=True)
+            order = [i.filename for i in infos]
+            src_files = [str(src / n) for n in order]
+            if not all(Path(f).is_file() for f in src_files):
+                L(f"  Extraction incomplete (rc={xr.returncode}) — abort.", "err")
+                shutil.rmtree(work, ignore_errors=True); return {"ok": False}
+            # Family-dedup must key on a COMPRESSED file — a stored extra (e.g. an
+            # EXiMiUS proof jpg) compresses identically on every build and would
+            # wrongly collapse all families into one. Use the SMALLEST compressed
+            # file as the discriminator, and only dedup when it's small enough
+            # that 232 test-compresses are cheap.
+            comp_idx = [k for k, i in enumerate(infos)
+                        if (i.compress_type or 0x30) != 0x30]
+            disc_idx = min(comp_idx, key=lambda k: infos[k].file_size,
+                           default=None)
+            dedup = (disc_idx is not None
+                     and infos[disc_idx].file_size <= 8 * 1024 * 1024)
+        finally:
+            rf.close()
+
+        def _families(exes):
+            """Collapse builds that emit identical output into one representative
+            — compress the SMALLEST compressed file at -mt1 and hash it."""
+            seen, reps = {}, []
+            probe = work / "fam.rar"
+            dname = order[disc_idx]
+            total = len(exes)
+            for idx, ex in enumerate(exes, 1):
+                if self._stop_flag.is_set():
+                    break
+                try:
+                    probe.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                cmd = [str(ex), "a", f"-m{level}", f"-md{md}",
+                       "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
+                       "-idcd", str(probe), src_files[disc_idx]]
+                subprocess.run(cmd, capture_output=True)
+                try:
+                    with RarStream(str(probe), packed_file_name=dname,
+                                   compressed=True) as rs:
+                        sig = hashlib.sha1(rs.read()).digest()
+                except Exception:
+                    sig = ("ERR", ex.name)
+                if sig not in seen:
+                    seen[sig] = ex
+                    reps.append(ex)
+                if idx % 8 == 0 or idx == total:
+                    self._probe_progress(
+                        f"fingerprinting builds… {idx}/{total}  "
+                        f"({len(reps)} distinct so far)")
+            return reps
+
+        if dedup:
+            L(f"  De-duping {len(exes)} pack builds by output family "
+              f"(via {order[disc_idx]})…", "dim")
+            reps = _families(exes)
+            L(f"  → {len(reps)} distinct build famil"
+              f"{'y' if len(reps) == 1 else 'ies'} to probe × up to -mt{max_mt}.",
+              "dim")
+        else:
+            reps = exes
+            L(f"  No small compressed file to dedup on — probing all {len(exes)} "
+              f"builds × up to -mt{max_mt} (early-exit on match).", "dim")
+
+        mts = [n for n in (8, 4, 2, 1, 3, 6, 5, 7, 0,
+                           *range(9, max_mt + 1)) if n <= max_mt]
+        probe = work / "probe.rar"
+        tried = 0
+        try:
+            for fi, ex in enumerate(reps, 1):
+                if self._stop_flag.is_set():
+                    L("  Stopped.", "warn"); break
+                ver = self._exe_label(ex.name)
+                for n in mts:
+                    if self._stop_flag.is_set():
+                        break
+                    tried += 1
+                    self._probe_progress(
+                        f"probing {ver} -mt{n}…  (build {fi}/{len(reps)}, "
+                        f"{tried} combos tried)")
+                    try:
+                        probe.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    cmd = [str(ex), "a", f"-m{level}", f"-md{md}",
+                           "-s" if solid else "-s-", "-ds", f"-mt{n}",
+                           "-o+", "-ep", "-idcd", str(probe), *src_files]
+                    subprocess.run(cmd, capture_output=True)
+                    ok = True
+                    for name, (tlen, tsha) in targets.items():
+                        try:
+                            with RarStream(str(probe), packed_file_name=name,
+                                           compressed=True) as rs:
+                                d = rs.read()
+                        except Exception:
+                            ok = False; break
+                        if len(d) != tlen or hashlib.sha1(d).digest() != tsha:
+                            ok = False; break
+                    if ok:
+                        L(f"  ✓ RECIPE FOUND: {ver}  -mt{n}  "
+                          f"(-m{level} -md{md} {'-s' if solid else '-s-'}) — "
+                          f"reproduces all {len(targets)} stream(s) byte-exact.",
+                          "ok")
+                        return {"ok": True, "version": ver, "mt": n,
+                                "level": level, "dict_kb": dkb, "solid": solid,
+                                "tried": tried}
+            L(f"  ✗ No pack build × -mt (0–{max_mt}) reproduces this archive "
+              f"({tried} combos tried across {len(reps)} families). Genuine wall "
+              "— the exact build/setting is outside the pack (a .srr2 case).",
+              "err")
+            return {"ok": False, "wall": True, "tried": tried}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    @staticmethod
+    def _exe_label(fname: str) -> str:
+        """'2012-03-15_rar411.exe' → '2012-03-15 4.11' (matches srrdb_tool)."""
+        m = re.match(r"(\d{4}-\d{2}-\d{2})_rar(\d)(\d\d)(b\d)?", fname)
+        if not m:
+            return fname
+        d, maj, mnr, beta = m.groups()
+        return f"{d} {maj}.{mnr}" + (f" {beta}" if beta else "")
 
 
 def main():

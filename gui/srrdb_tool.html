@@ -321,6 +321,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 let mode = 'single';
 let selectedRelease = '';
 let batchJobs = [];   // [{path, name, release, candidates, hasNFO, hasSRS, status, logLines}]
+let queueSearched = false;   // has Auto-Search run since the last scan? (guards Process)
 let currentLogPath = null;   // content_dir of the release currently logging
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -530,6 +531,7 @@ async function scanSource(folder) {
       hasSRS:     false,
       status:     'pending',
     }));
+    queueSearched = false;   // fresh scan → releases not matched yet
     renderQueue();
     log(`Found ${batchJobs.length} subfolder(s)`, 'info');
   }
@@ -781,12 +783,14 @@ async function autoSearchAll() {
     }
     renderQueue();
   }
+  queueSearched = true;   // releases have now been matched → Process is allowed
   log(`Auto-search done — ${matched} matched, ${ambiguous} ambiguous, ${missing} not found`, 'info');
   if (ambiguous > 0) log('Edit ambiguous release names in the queue and re-run Auto-Search, or type exact name.', 'warn');
 }
 
 function clearQueue() {
   batchJobs = [];
+  queueSearched = false;
   queueWarnDismissed = false;   // a fresh batch should warn again
   renderQueue();
 }
@@ -838,6 +842,13 @@ async function doProcess() {
   } else {
     // Batch
     if (!batchJobs.length) { log('Scan a source folder first.', 'warn'); return; }
+    // Guard: pressing Process before matching releases would send raw folder-name
+    // guesses to the backend and fail every job. Prompt to Auto-Search instead.
+    if (!queueSearched) {
+      log('⚠ Run "Auto-Search" first — the queue needs its releases matched on '
+          + 'srrdb.com before processing. (Scan → Auto-Search → Process.)', 'warn');
+      return;
+    }
     const src = document.getElementById('src-folder').value.trim();
     const maxTest = parseInt(document.getElementById('max-test').value) || 5;
     const jobs = batchJobs

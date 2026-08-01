@@ -116,9 +116,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <button class="btn" onclick="browseRai()">Browse</button>
         </div>
         <div class="row" style="justify-content:flex-end">
+          <button class="btn" id="btn-rai-probe" onclick="runProbe()" disabled title="Recompress the ORIGINAL rar's own content across pack build × thread-count and find the exact (build, -mt) that reproduces it byte-for-byte — or prove none in the pack does (a wall). Needs the original rars, not just an SRR.">Probe recipe</button>
+          <button class="btn" id="btn-rai-stop" onclick="stopProbe()" style="display:none">Stop</button>
           <button class="btn btn-go" id="btn-rai-go" onclick="runRarInspect()" disabled>Analyze</button>
         </div>
         <div class="log-w" id="rai-log" style="height:300px"></div>
+        <div id="rai-progress" style="min-height:1.3em;margin-top:4px;font-family:monospace;font-size:12px;color:var(--text3);white-space:pre"></div>
       </div>
     </div>
 
@@ -281,6 +284,14 @@ window.miscEvent = function(event, data) {
   if (event === 'log') {
     const logId = {mtf: 'mtf-log', rai: 'rai-log', bak: 'bak-log'}[data.target] || 'ext-log';
     addLog(logId, data.msg, data.cls);
+  } else if (event === 'progress') {
+    const el = document.getElementById('rai-progress');
+    if (el) el.textContent = data.msg || '';
+  } else if (event === 'probe_done') {
+    document.getElementById('btn-rai-probe').disabled = false;
+    document.getElementById('btn-rai-go').disabled = false;
+    document.getElementById('btn-rai-stop').style.display = 'none';
+    const pg = document.getElementById('rai-progress'); if (pg) pg.textContent = '';
   } else if (event === 'status') {
     const pill = document.getElementById('ext-pill');
     const go   = document.getElementById('btn-ext-go');
@@ -310,6 +321,7 @@ async function browseRai() {
   if (!path) return;
   document.getElementById('rai-folder').value = path;
   document.getElementById('btn-rai-go').disabled = false;
+  document.getElementById('btn-rai-probe').disabled = false;
 }
 
 async function runRarInspect() {
@@ -324,6 +336,26 @@ async function runRarInspect() {
     document.getElementById('btn-rai-go').disabled = false;
   }
 }
+
+async function runProbe() {
+  const folder = document.getElementById('rai-folder').value.trim();
+  if (!folder) return;
+  document.getElementById('rai-log').innerHTML = '';
+  document.getElementById('btn-rai-probe').disabled = true;
+  document.getElementById('btn-rai-go').disabled = true;
+  document.getElementById('btn-rai-stop').style.display = '';
+  // Fire-and-forget: the probe runs in a background thread and re-enables the
+  // buttons via the 'probe_done' event (it can run for a while).
+  const res = await window.pywebview.api.probe_recipe(folder);
+  if (res && !res.ok && res.error) {
+    addLog('rai-log', res.error, 'warn');
+    document.getElementById('btn-rai-probe').disabled = false;
+    document.getElementById('btn-rai-go').disabled = false;
+    document.getElementById('btn-rai-stop').style.display = 'none';
+  }
+}
+
+function stopProbe() { window.pywebview.api.stop_probe(); }
 
 // ── Move to Folder ────────────────────────────────────────────────────────────
 async function browseMtf() {

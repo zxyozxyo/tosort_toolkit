@@ -195,7 +195,11 @@ _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 # re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
 # _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
 # auto-invalidates the cache so every wall gets one fresh attempt.
-_WALL_CACHE_GEN = 1
+_WALL_CACHE_GEN = 3   # 2026-07-31: bumped to 3 so the stored-extra method2
+                      # rescue (_rescue_stored_extra_method2) gets one fresh
+                      # attempt at every cached "No good RAR version found" wall
+                      # (the jpg-bearing EXiMiUS class). (gen 2 was a reverted
+                      # detection-rescue experiment.)
 
 # Release-date version cap: a scene group can't pack with a WinRAR newer than the
 # release date — so on the main version hunt, drop far-future builds and try those
@@ -262,6 +266,16 @@ def _canon_release(s: str) -> str:
     underscores match the same release stored with dots on srrdb, while still
     telling siblings apart (Pac_World_2 ≠ Pac_World)."""
     return re.sub(r"[._\s]+", ".", s or "").strip(".").lower()
+
+
+def _strip_date_prefix(name: str) -> str:
+    """Drop a leading dats.site / pre pre-date (YYYY-MM-DD-Release → Release).
+    Scene names never start with such a date, so it is pure folder noise — and
+    if left on it corrupts canon comparisons (folder canon gets a '2009-05-10-'
+    prefix the srrdb release name lacks, so an otherwise-exact match is missed).
+    Mirrors the strip search_srrdb_progressive already does for the query."""
+    m = re.match(r"^\d{4}[-._]\d{2}[-._]\d{2}[-._](.+)$", name or "")
+    return m.group(1) if m and len(m.group(1)) >= 4 else (name or "")
 
 
 def _find_script(base_name: str) -> str | None:
@@ -785,6 +799,16 @@ class SrrdbToolAPI:
         self._log(f"  CRC32 = {crc:08X} ({time.time() - t0:.0f}s)", "dim")
         return self.search_by_crc(f"{crc:08X}")
 
+    def _release_platform(self, name: str) -> str:
+        """Platform token of a release/folder name ('' if none) — used to reject
+        a content-CRC hit whose platform contradicts the folder's. Mirrors the
+        detection in _parse_meta; tokens split on the usual scene separators."""
+        toks = set(re.split(r"[._\-\s]+", (name or "").upper()))
+        p = next((p for p in self._PLATFORMS if p in toks), "")
+        if not p and toks & self._VIDEO_TOKENS:
+            p = "video"
+        return p
+
     def search_from_folder(self, folder: str) -> dict:
         """
         Progressive name search (NFO/SFV stem preferred over folder name), then
@@ -810,41 +834,76 @@ class SrrdbToolAPI:
         # So: try the folder name first, and only ACCEPT a result that is an
         # EXACT name match to the hint or folder — a fuzzy single hit is never
         # trusted over CRC.
-        folder_canon = _canon_release(_normalize_name(base.name))
+        folder_canon = _canon_release(_normalize_name(_strip_date_prefix(base.name)))
         hint_candidates: list[str] = [base.name]
         if nfo_paths and nfo_paths[0].stem not in hint_candidates:
             hint_candidates.append(nfo_paths[0].stem)
         if sfv_paths and sfv_paths[0].stem not in hint_candidates:
             hint_candidates.append(sfv_paths[0].stem)
 
+        self._log(f"  [DIAG] folder={base.name!r} folder_canon={folder_canon!r} "
+                  f"hints={hint_candidates}", "dim")
         best: dict | None = None
         best_trimmed = False
         for hint in hint_candidates:
             res = self.search_srrdb_progressive(hint)
             trimmed = res.pop("query_trimmed", False)
+            names = [r.get("release", "") for r in res.get("results", [])]
+            self._log(f"  [DIAG] hint={hint!r} → query={res.get('query')!r} "
+                      f"count={res.get('count')} trimmed={trimmed} "
+                      f"results={names[:6]}", "dim")
             if not (res.get("ok") and res.get("count", 0) > 0):
                 continue
-            hint_canon = _canon_release(_normalize_name(hint))
+            hint_canon = _canon_release(_normalize_name(_strip_date_prefix(hint)))
             exact = next(
                 (r for r in res["results"]
                  if _canon_release(r.get("release", "")) in (hint_canon, folder_canon)),
                 None,
             )
             if exact:
+                self._log(f"  [DIAG] EXACT-path pin → {exact.get('release')!r}", "dim")
                 return {"ok": True, "count": 1, "results": [exact],
                         "query": res.get("query", hint),
                         "method": ("name (simplified)" if trimmed else "name")}
             if best is None:
                 best, best_trimmed = res, trimmed
 
-        # No EXACT name match — an exact content CRC beats any fuzzy name guess
+        # No EXACT name match — an exact content CRC beats any fuzzy name guess.
         hres = self.search_by_content_hash(folder)
         if hres.get("ok") and hres.get("count", 0) > 0:
-            hres["method"] = f"content CRC32 ({hres.get('query', '')})"
-            return hres
+            results = hres.get("results", [])
+            # One inner-file CRC can be shared by SEVERAL releases (the same cart
+            # dumped by different groups/regions — Jackass EUR: PUPPA + LiTE both
+            # carry the identical .nds). So never blind-pick results[0]:
+            #   1. prefer the release whose (date-stripped) name matches THIS
+            #      folder — that's unambiguously the right one;
+            #   2. else drop any result whose PLATFORM contradicts the folder's
+            #      (an NDS folder must not resolve to a PS3 release — guards a
+            #      CRC collision / wrong hashed file, e.g. Yu-Gi-Oh KOR NDS →
+            #      Biohazard JPN PS3);
+            #   3. only if nothing disambiguates do we keep the raw hits.
+            name_match = [r for r in results
+                          if _canon_release(r.get("release", "")) == folder_canon]
+            fp = self._release_platform(_strip_date_prefix(base.name))
+            if name_match:
+                results = name_match
+            elif fp:
+                same_plat = [r for r in results
+                             if self._release_platform(r.get("release", "")) == fp]
+                results = same_plat  # may be [] → cross-platform collision, drop
+            self._log(f"  [DIAG] CONTENT-CRC path → raw="
+                      f"{[r.get('release','') for r in hres.get('results',[])][:6]} "
+                      f"folder_plat={fp!r} → kept="
+                      f"{[r.get('release','') for r in results][:6]}", "dim")
+            if results:
+                hres = {**hres, "results": results, "count": len(results)}
+                hres["method"] = f"content CRC32 ({hres.get('query', '')})"
+                return hres
 
         # Last resort: a fuzzy name hit — flag it so it isn't blindly trusted
         if best:
+            self._log(f"  [DIAG] FUZZY-best path → "
+                      f"{[r.get('release','') for r in best.get('results',[])][:6]}", "dim")
             best["method"] = "name (fuzzy — verify)"
             return best
 
@@ -2171,6 +2230,46 @@ class SrrdbToolAPI:
                 return None
             return _orig(crf_self, block, blocks, thread_count, more_files)
         rm.CompressedRarFile.search_matching_rar_executable = _smre
+
+        # --- stored-extra method2 seed (jpg-wall rescue) ---------------------
+        # A release packed in ONE `rar a jpg nds` command compresses the .nds
+        # IN-CONTEXT of the stored proof jpg; WinRAR's -mt pipeline makes that
+        # differ from the .nds compressed alone. rescene detects the .nds in
+        # ISOLATION (a stored file is never a CompressedRarFile, so it's not in
+        # archived_files and the "previous file" test can't run) → no build
+        # matches → "No good RAR version found". Its method2 fallback (compress
+        # ALL files together, which WOULD reproduce the in-context .nds) refuses
+        # to engage because it needs a prior compressed file for its version
+        # (main.py: `assert len(archived_files) != 0`, and the factory only
+        # falls to method2 when archived_files is non-empty). When the sole
+        # compressed file IS the one that failed, that never happens.
+        #
+        # Fix: wrap the factory so that — ONLY when our rescue armed it with a
+        # candidate build (_m2_seed_build) — a detection failure with nothing
+        # rebuilt yet seeds archived_files with that build and drives method2.
+        # method2 then compresses all files together (in archive order) and
+        # sweeps the thread count itself; the outer SFV verify is the arbiter.
+        # Pure pass-through when _m2_seed_build is unset, so the normal path and
+        # every other rescue are byte-for-byte untouched.
+        _orig_factory = rm.compressed_rar_file_factory
+        def _factory(block, blocks, src, in_folder, hints,
+                     auto_locate_renamed, _orig=_orig_factory, _rm=rm):
+            build = getattr(self, "_m2_seed_build", None)
+            # Armed rescue: the normal isolated version hunt is ALREADY known to
+            # fail for this release (that's what triggered the rescue), so skip
+            # it and seed method2 up-front — saving a full redundant pack grind
+            # (~10-15 min per big file). Non-solid + nothing rebuilt yet only.
+            # Returns None (→ fall through to the untouched normal factory) when
+            # the set isn't the stored-extra shape. Pure no-op when unarmed.
+            if (build and not (block.flags & block.SOLID)
+                    and len(_rm.archived_files) == 0):
+                m2 = self._seed_method2(_rm, build, block, blocks, src,
+                                        in_folder, hints, auto_locate_renamed)
+                if m2 is not None:
+                    return m2
+            return _orig(block, blocks, src, in_folder, hints,
+                         auto_locate_renamed)
+        rm.compressed_rar_file_factory = _factory
         return rm
 
     def _rescue_mt_near_miss(self, orig_init, crf_self, ctor_args, rm, base):
@@ -2209,42 +2308,65 @@ class SrrdbToolAPI:
                 del streams[base:]
                 streams.extend(orig_records)
             raise ValueError("Still not fine :(.")
+        # PIN the hunt to the already-locked build for every retry. This is a
+        # THREAD-COUNT near-miss (the version was detected good; only -mt is
+        # wrong), so the version is fixed — matching this method's contract.
+        # Without the pin each wrong -mt sends rescene wandering the WHOLE pack
+        # again: the locked build's data-piece no longer matches at the changed
+        # -mt, so it falls through to trying all 232 builds — and _set_good_rar's
+        # big-file branch even fronts-then-lists every build, sailing past the
+        # release-date cap. A 2009 release then grinds builds up to 2023 × every
+        # -mt → the 30-min deadline (seen on Dragon_Quest_9…NDS-Caravan). Pinned,
+        # a wrong -mt fails against the one build in ~1s. Same lever the
+        # multi-file rescue uses (_version_force); restored in the finally.
+        locked_ver = None
+        try:
+            locked_ver = str(crf_self.good_rar)
+        except Exception:
+            locked_ver = getattr(self, "_last_good_rar", None)
+        _prev_force = getattr(SrrdbToolAPI, "_version_force", None)
+        if locked_ver:
+            SrrdbToolAPI._version_force = locked_ver
         self._log(
             f"    rescene: near-miss at -mt{cur} — retrying other thread "
-            f"counts (up to -mt{_MT_RETRY_CAP}) before giving up…", "dim")
-        for n in self._order_mts(n for n in range(0, _MT_RETRY_CAP + 1)
-                                 if n != cur):
-            if self._stop.is_set() or self._skip.is_set():
-                break
-            if time.time() > getattr(self, "_recon_deadline", float("inf")):
-                self._log("    rescene: deadline reached — stopping mt "
-                          "retries.", "dim")
-                break
-            # Fresh temp dir each attempt: the failed __init__ called close()
-            # which rmtree'd the previous working_temp_dir.
-            rm.working_temp_dir = rm.get_temp_directory()
-            rm.RarArguments.mt_settings = rm.RarMtSettings()
-            rm.RarArguments.mt_settings.mt_set = [n]
-            try:
-                orig_init(crf_self, first_block, blocks, src,
-                          next_block, next_src, solid)
-                self._log(f"    rescene: exact size matched at -mt{n} ✓ "
-                          "(final CRC still checked by the SFV verify)", "ok")
-                # Collapse the per-attempt combo records to just the winning one.
-                if base is not None:
-                    winning = streams[-1] if len(streams) > base else None
-                    del streams[base:]
-                    if winning is not None:
-                        streams.append(winning)
-                return
-            except rm.RarNotFound:
-                continue  # this thread count didn't even match the piece
-            except ValueError as e2:
-                if "still not fine" not in str(e2).lower():
-                    raise
-                continue  # size still off; try the next thread count
-            finally:
+            f"counts (up to -mt{_MT_RETRY_CAP}) before giving up…"
+            + (f" (pinned to {locked_ver})" if locked_ver else ""), "dim")
+        try:
+            for n in self._order_mts(n for n in range(0, _MT_RETRY_CAP + 1)
+                                     if n != cur):
+                if self._stop.is_set() or self._skip.is_set():
+                    break
+                if time.time() > getattr(self, "_recon_deadline", float("inf")):
+                    self._log("    rescene: deadline reached — stopping mt "
+                              "retries.", "dim")
+                    break
+                # Fresh temp dir each attempt: the failed __init__ called close()
+                # which rmtree'd the previous working_temp_dir.
+                rm.working_temp_dir = rm.get_temp_directory()
                 rm.RarArguments.mt_settings = rm.RarMtSettings()
+                rm.RarArguments.mt_settings.mt_set = [n]
+                try:
+                    orig_init(crf_self, first_block, blocks, src,
+                              next_block, next_src, solid)
+                    self._log(f"    rescene: exact size matched at -mt{n} ✓ "
+                              "(final CRC still checked by the SFV verify)", "ok")
+                    # Collapse per-attempt combo records to just the winning one.
+                    if base is not None:
+                        winning = streams[-1] if len(streams) > base else None
+                        del streams[base:]
+                        if winning is not None:
+                            streams.append(winning)
+                    return
+                except rm.RarNotFound:
+                    continue  # this thread count didn't even match the piece
+                except ValueError as e2:
+                    if "still not fine" not in str(e2).lower():
+                        raise
+                    continue  # size still off; try the next thread count
+                finally:
+                    rm.RarArguments.mt_settings = rm.RarMtSettings()
+        finally:
+            SrrdbToolAPI._version_force = _prev_force
         # Nothing matched — restore the original near-miss record and fail
         # exactly as rescene would have.
         if base is not None:
@@ -2873,6 +2995,109 @@ class SrrdbToolAPI:
         except Exception:
             return None
 
+    def _srr_recipe(self, srr_file: str):
+        """(level:int, md_param:str, solid:bool) from the SRR's first COMPRESSED
+        packed block — the `rar a` recipe to replicate for a probe/dedup. None
+        if unreadable or all-stored."""
+        try:
+            from rescene.rar import RarReader, BlockType  # type: ignore
+            level = None
+            md = "-mdG"
+            solid = False
+            for b in RarReader(str(srr_file)).read_all():
+                if b.rawtype != BlockType.RarPackedFile:
+                    continue
+                if (getattr(b, "flags", 0) or 0) & 0x10:
+                    solid = True
+                if level is None:
+                    cp = b.get_compression_parameter()          # '-m5'
+                    if cp and cp != "-m0":
+                        level = int(cp[2:])
+                        dp = b.get_dictionary_size_parameter()   # '-mdG' etc.
+                        if dp:
+                            md = dp
+            return (level, md, solid) if level is not None else None
+        except Exception:
+            return None
+
+    def _disc_source(self, content_dir: str, out_root: Path):
+        """A small-ish COMPRESSIBLE source file to fingerprint pack builds with —
+        the largest file ≤4MB (a better discriminator than a tiny nfo, still
+        cheap to compress 232×). None if every source is >4MB (skip dedup)."""
+        cands = []
+        for d in (Path(out_root) / "_stored", Path(content_dir)):
+            if d.is_dir():
+                for f in d.rglob("*"):
+                    if (f.is_file() and f.stat().st_size > 256
+                            and f.suffix.lower() not in
+                            (".sfv", ".srr", ".srs", ".nfo")):
+                        cands.append(f)
+        small = [f for f in cands if f.stat().st_size <= 4 * 1024 * 1024]
+        if not small:
+            return None
+        return str(max(small, key=lambda f: f.stat().st_size))
+
+    def _pack_family_reps(self, srr_file: str, content_dir: str, out_root: Path):
+        """Version-STRINGS of the pack builds that emit DISTINCT compressed output
+        at this release's recipe — one representative per family. RAR3/4 point
+        releases are byte-identical, so ~232 exes collapse to ~20 families, which
+        lets the version sweep try ~20 builds not ~230. CACHED per (level,md,
+        solid) recipe across releases, so only the FIRST stubborn release pays
+        the fingerprint cost. Returns a set, or None if it can't run (→ no
+        dedup, safe fallback)."""
+        recipe = self._srr_recipe(srr_file)
+        if not recipe:
+            return None
+        level, md, solid = recipe
+        cache = getattr(self, "_fam_cache", None)
+        if cache is None:
+            cache = self._fam_cache = {}
+        key = (level, md, solid)
+        if key in cache:
+            return cache[key]
+        disc = self._disc_source(content_dir, out_root)
+        rar_dir = self._find_rar_dir()
+        exes = sorted(Path(rar_dir).glob("*_rar*.exe")) if rar_dir else []
+        if not disc or not exes:
+            cache[key] = None
+            return None
+        try:
+            from rescene.rarstream import RarStream  # type: ignore
+        except Exception:
+            cache[key] = None
+            return None
+        dname = Path(disc).name
+        tmp = Path(tempfile.mkdtemp(prefix="fam-"))
+        probe = tmp / "fam.rar"
+        seen, reps = set(), set()
+        try:
+            for ex in exes:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None           # don't cache a partial result
+                try:
+                    probe.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                subprocess.run(
+                    [str(ex), "a", f"-m{level}", md,
+                     "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
+                     "-idcd", str(probe), disc], capture_output=True)
+                try:
+                    with RarStream(str(probe), packed_file_name=dname,
+                                   compressed=True) as rs:
+                        sig = hashlib.sha1(rs.read()).digest()
+                except Exception:
+                    sig = ("ERR", ex.name)
+                if sig not in seen:
+                    seen.add(sig)
+                    m = re.match(r"(\d{4}-\d{2}-\d{2})_rar(\d)(\d\d)", ex.name)
+                    if m:
+                        reps.add(f"{m.group(1)} {m.group(2)}.{m.group(3)}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        cache[key] = reps or None
+        return cache[key]
+
     def _rescue_version_near_miss(self, srr_file: str, content_dir: str,
                                   out_root: Path):
         """Rescue a near-miss where rescene locked a WinRAR version whose
@@ -2919,6 +3144,26 @@ class SrrdbToolAPI:
                                      abs((self._version_date(v) - d0).days)
                                      if self._version_date(v) else 1 << 30))
         candidates = prefs + rest
+        # Speed: collapse the pack to builds that emit DISTINCT compressed output
+        # (RAR3/4 point releases are byte-identical), so the sweep tries ~20
+        # builds not ~230 — the family fingerprint the recipe probe proved out.
+        # Group-history prefs are ALWAYS kept. Cached per recipe across releases,
+        # so only the first stubborn release pays the fingerprint cost. Any
+        # failure → no dedup (full sweep), so it can't lose a winnable build.
+        try:
+            reps = self._pack_family_reps(srr_file, content_dir, out_root)
+            if reps:
+                keep = set(prefs) | reps
+                deduped = [c for c in candidates if c in keep]
+                if deduped:
+                    self._log(
+                        f"    de-duped {len(candidates)} builds → "
+                        f"{len(deduped)} distinct-output famil"
+                        f"{'y' if len(deduped) == 1 else 'ies'} "
+                        "(RAR3/4 point releases share output)", "dim")
+                    candidates = deduped
+        except Exception:
+            pass
         self._log(
             f"  Version near-miss: '{detected}' matched the test piece but the "
             f"full archive was off — sweeping {len(candidates)} other pack "
@@ -2956,6 +3201,257 @@ class SrrdbToolAPI:
             SrrdbToolAPI._version_force = None
         self._log("  Version rescue exhausted — no pack build reproduced the "
                   "archive exactly. Kept as FAILED.", "warn")
+        return None
+
+    def _make_rar_exe(self, rm, build: str):
+        """Build a rescene RarExecutable object for a version STRING like
+        '2012-03-15 4.11' from the local pack. Used to SEED method2 when no
+        prior compressed file exists to borrow a version from. Returns the
+        RarExecutable, or None if the exe isn't in the pack / can't be parsed."""
+        rar_dir = self._find_rar_dir()
+        if not rar_dir:
+            return None
+        try:
+            date, ver = build.split(" ")
+            major, minor = ver.split(".")
+            fname = f"{date}_rar{major}{minor}.exe"   # final build (no beta)
+        except Exception:
+            return None
+        if not (Path(rar_dir) / fname).exists():
+            return None
+        try:
+            return rm.RarExecutable(rar_dir, fname)
+        except Exception:
+            return None
+
+    def _seed_method2(self, rm, build, block, blocks, src,
+                      in_folder, hints, auto_locate_renamed):
+        """Seed rescene's method2 (compress-all-together) with `build` so it can
+        run WITHOUT a prior compressed file, and drive it. Returns the
+        CompressedRarFileAll, or None if this isn't the stored-extra shape (a
+        genuine preceding packed file + ≥2 file blocks) — the caller then uses
+        the untouched normal factory. Only invoked with _m2_seed_build armed,
+        `block` non-solid, and archived_files empty (see _factory)."""
+        fblocks = rm.get_archived_file_blocks(blocks, block)
+        file_blocks = [b for b in fblocks if getattr(b, "packed_size", 0)]
+        prev = rm.previous_block(block, fblocks)
+        # Need a genuine PRECEDING file to compress in-context (jpg-first /
+        # content-second). prev is block ⇒ the compressed file is first ⇒ not
+        # this case; <2 file blocks ⇒ nothing to compress alongside.
+        if len(file_blocks) < 2 or prev is block:
+            return None
+        exe = self._make_rar_exe(rm, build)
+        if exe is None:
+            return None
+        try:
+            exe.args = rm.RarArguments(
+                block, os.path.join(rm.get_temp_directory(), "seed.rar"), [src])
+        except Exception:
+            return None
+        class _Seed:
+            pass
+        s = _Seed(); s.good_rar = exe
+        rm.archived_files[prev.file_name] = s
+        # Prioritise the group's likely thread counts for method2's internal
+        # size sweep (mt8 usually wins for these groups).
+        rm.RarArguments.mt_settings = rm.RarMtSettings()
+        rm.RarArguments.mt_settings.mt_set = list(
+            getattr(self, "_m2_mt_pref", None) or [])
+        self._log(
+            f"    seeding method2 all-files rebuild with {build} (compressing "
+            "the stored extra + content together; skipping the redundant "
+            "isolated hunt)…", "dim")
+        m2 = rm.CompressedRarFileAll(
+            fblocks, block, blocks, (in_folder, hints, auto_locate_renamed))
+        rm.regular_method_failed = m2
+        self._m2_seeded = True     # a seed actually happened (see fast-path)
+        return m2
+
+    def _is_stored_extra_shape(self, srr_path: str) -> bool:
+        """True when the SRR shows a STORED extra BEFORE the sole compressed
+        content (non-solid) — the EXiMiUS shape whose content is compressed
+        IN-CONTEXT of a stored proof jpg, so isolated detection is DOOMED
+        (grinds the whole pack, sometimes past the 30-min deadline — and a
+        deadline timeout never even reaches the post-fail rescue). Detecting it
+        up-front lets us skip straight to method2, which reproduces the
+        in-context content while the stored jpg is a trivial re-store.
+
+        The leading extra MUST be STORED (-m0). A COMPRESSED leading extra (a
+        PUSSYCAT-style proof jpg) is a SEPARATE compression that method2 cannot
+        conjure if it's a reproduction wall (Rayman/Yo-Kai class) — those are
+        left to the normal hunt + near-miss rescues, so the fast-path never
+        wastes doomed method2 passes on them. Heuristic: ≥2 distinct packed
+        files, non-solid, FIRST packed file is STORED and not the largest (a
+        stored extra precedes the bigger compressed content)."""
+        try:
+            from rescene.rar import RarReader, BlockType  # type: ignore
+            sizes: dict = {}
+            order: list = []
+            first_stored = None
+            solid = False
+            for block in RarReader(str(srr_path)).read_all():
+                if block.rawtype != BlockType.RarPackedFile:
+                    continue
+                name = getattr(block, "file_name", "")
+                if not name:
+                    continue
+                if getattr(block, "flags", 0) & 0x10:   # RAR4 SOLID file flag
+                    solid = True
+                if name not in sizes:
+                    order.append(name)
+                    if first_stored is None:            # the archive-first file
+                        try:
+                            first_stored = (
+                                block.get_compression_parameter() == "-m0")
+                        except Exception:
+                            first_stored = False
+                sz = getattr(block, "unpacked_size", 0) or 0
+                sizes[name] = max(sizes.get(name, 0), sz)
+            if solid or len(order) < 2 or not first_stored:
+                return False
+            return sizes[order[0]] < max(sizes.values())
+        except Exception:
+            return False
+
+    def _reconstruct_with_m2_fastpath(self, srr_file: str, content_dir: str,
+                                      out_root):
+        """Fast-path around the main reconstruct: when the SRR has a packed extra
+        BEFORE the sole compressed content (see _is_stored_extra_shape), the
+        normal isolated version hunt is DOOMED, so seed method2 (compress all
+        files together, in-context) at the group's known build(s) FIRST and
+        SFV-verify — skipping ~10-25 min of pointless grinding (and the timeout
+        failures where the hunt never reaches the rescue). Falls back to the full
+        normal reconstruct if the shape doesn't match, there's no group build, or
+        no build verifies. SFV verify still guards, so a false pass is
+        impossible; correctness is unchanged, only speed."""
+        prefs = list(getattr(self, "_recon_prefs", None) or [])
+        if not (prefs and self._is_stored_extra_shape(srr_file)):
+            return self._srr_reconstruct(str(srr_file), content_dir,
+                                         str(out_root))
+        mts: list[int] = []
+        for m in (self._mt_freq_rank() + [8, 4, 16, 2, 1, 6, 3]):
+            if m not in mts:
+                mts.append(m)
+        self._m2_mt_pref = mts[:8]
+        self._log(
+            "  A STORED extra precedes the sole compressed file — its content "
+            "was compressed IN-CONTEXT, so the isolated hunt can't match it. "
+            f"Trying method2 (all-files together) at {prefs} FIRST, skipping the "
+            "doomed hunt.", "dim")
+        deadline = time.time() + _RECON_TIMEOUT_S
+        try:
+            for build in prefs:
+                if self._stop.is_set() or self._skip.is_set():
+                    break
+                if time.time() > deadline:
+                    break
+                self._clear_produced_volumes(out_root)
+                self._recon_streams = []
+                self._m2_seeded = False
+                self._m2_seed_build = build
+                self._log(f"    method2 all-files with {build}…", "dim")
+                try:
+                    rc = self._srr_reconstruct(
+                        str(srr_file), content_dir, str(out_root))
+                finally:
+                    self._m2_seed_build = None
+                if rc.get("ok") and rc.get("files"):
+                    v2 = self._verify_rebuilt_sfv(out_root)
+                    if v2["checked"] and not v2["bad"]:
+                        self._log(
+                            f"  ✓ method2 fast-path: rebuilt with {build} — all "
+                            f"{v2['checked']} volume(s) CRC-match (skipped the "
+                            "isolated hunt).", "ok")
+                        return rc
+                # If seeding never actually happened (e.g. the block-level guards
+                # didn't match), don't keep re-running the same doomed path per
+                # build — bail to the normal reconstruct.
+                if not getattr(self, "_m2_seeded", False):
+                    break
+        finally:
+            self._m2_seed_build = None
+            self._m2_mt_pref = None
+        self._log("  method2 fast-path didn't rebuild — falling back to the "
+                  "normal version hunt…", "dim")
+        self._clear_produced_volumes(out_root)
+        self._recon_streams = []   # drop the fast-path's stream records so the
+        # normal hunt + multi-file rescue see a clean slate (no duplicate combos)
+        return self._srr_reconstruct(str(srr_file), content_dir, str(out_root))
+
+    def _rescue_stored_extra_method2(self, srr_file: str, content_dir: str,
+                                     out_root: Path):
+        """Rescue the STORED-EXTRA + SOLE-COMPRESSED-FILE wall: a release packed
+        in ONE `rar a <stored jpg> <compressed nds>` command, where the .nds
+        was compressed IN-CONTEXT of the stored extra so rescene's isolated
+        detection matches no build → 'No good RAR version found', and its own
+        method2 (compress-all-together) can't engage because the failing file is
+        the only compressed one (no prior file to borrow a version from).
+
+        We drive method2 ourselves: for each of the group's known-good builds we
+        arm the factory seed (_m2_seed_build) so method2 compresses ALL files
+        together at that build — sweeping the thread count internally by size —
+        then CRC-verify the whole set against the SFV. The SFV verify is the
+        arbiter, so a false pass is impossible.
+
+        Only ever called after the normal hunt raised 'No good RAR version
+        found' with NO version locked AND the set has ≥2 packed files, so any
+        release that rebuilds today is untouched. Needs group history to target
+        a build. Returns the winning verify dict on success, else None."""
+        if getattr(self, "_last_good_rar", None):
+            return None
+        builds = list(getattr(self, "_recon_prefs", None) or [])
+        if not builds:
+            return None                      # no group build to seed method2
+        sizes = self._srr_packed_sizes(srr_file) or {}
+        if len(sizes) < 2:
+            return None                      # need a stored extra + the content
+        # Thread-count priority for method2's internal size sweep: this dataset's
+        # winning -mt first (mt8 dominates), then a common fallback set.
+        mts: list[int] = []
+        for m in (self._mt_freq_rank() + [8, 4, 16, 2, 1, 6, 3]):
+            if m not in mts:
+                mts.append(m)
+        self._m2_mt_pref = mts[:8]
+        self._log(
+            f"  Stored-extra method2 rescue: the sole compressed file failed "
+            f"detection but the set has {len(sizes)} packed files — the content "
+            f"was likely compressed IN-CONTEXT of a stored extra. Compressing "
+            f"ALL files together at {builds} (mt priority {self._m2_mt_pref}).",
+            "dim")
+        deadline = time.time() + _RECON_TIMEOUT_S
+        try:
+            for build in builds:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() > deadline:
+                    self._log("  method2 rescue: deadline reached — stopping.",
+                              "dim")
+                    return None
+                self._clear_produced_volumes(out_root)
+                self._recon_streams = []
+                self._m2_seed_build = build
+                self._log(f"    method2 all-files with {build}…", "dim")
+                try:
+                    rc = self._srr_reconstruct(
+                        srr_file, content_dir, str(out_root),
+                        log_rar_pack=False)
+                finally:
+                    self._m2_seed_build = None
+                if not rc.get("ok"):
+                    continue
+                v2 = self._verify_rebuilt_sfv(out_root)
+                if v2["checked"] and not v2["bad"]:
+                    self._log(
+                        f"  ✓ Stored-extra method2 rescue: rebuilt with {build} "
+                        f"(all files compressed together) — all {v2['checked']} "
+                        "volume(s) CRC-match the SFV.", "ok")
+                    return v2
+        finally:
+            self._m2_seed_build = None
+            self._m2_mt_pref = None
+        self._log(
+            "  Stored-extra method2 rescue exhausted — no group build "
+            "reproduced the in-context content. Kept as FAILED.", "warn")
         return None
 
     def _log_recon_combos(self, style: str = "dim") -> None:
@@ -4412,7 +4908,8 @@ class SrrdbToolAPI:
                         "first (this group's history)", "info",
                     )
                 try:
-                    rc = self._srr_reconstruct(str(srr_file), content_dir, str(out_root))
+                    rc = self._reconstruct_with_m2_fastpath(
+                        str(srr_file), content_dir, out_root)
                 finally:
                     SrrdbToolAPI._pref_versions = []
                 for line in (rc.get("output") or "").splitlines():
@@ -4481,6 +4978,21 @@ class SrrdbToolAPI:
                         # CRC while a later build reproduces the whole archive.
                         # Sweep the other pack builds before writing it off.
                         rescued = self._rescue_version_near_miss(
+                            str(srr_file), content_dir, out_root)
+                        if rescued:
+                            summary["ok"] = True
+                            summary["verified"] = rescued
+                            summary["rars"] = rescued["checked"]
+                            summary["note"] = ""
+                            self._log_recon_combos("dim")
+                    elif not getattr(self, "_last_good_rar", None) and \
+                            "no good rar version" in _err:
+                        # Detection failed with NOTHING locked. If the set has a
+                        # stored extra alongside the sole compressed file, the
+                        # content was likely compressed IN-CONTEXT of that extra
+                        # (one `rar a` command) and isolated detection can't
+                        # match. Drive method2 (compress all files together).
+                        rescued = self._rescue_stored_extra_method2(
                             str(srr_file), content_dir, out_root)
                         if rescued:
                             summary["ok"] = True
@@ -4569,6 +5081,19 @@ class SrrdbToolAPI:
                         # affected.
                         rescued = self._rescue_multifile_crc(
                             str(srr_file), content_dir, out_root)
+                        if not rescued:
+                            # The -mt rescue couldn't help — often because the
+                            # 2nd file went to method2 so only ONE stream was
+                            # recorded (len<2 bail), and nothing tried another
+                            # VERSION. The near-miss may just be a wrong build
+                            # locked spuriously off a tiny first file (Petz
+                            # class: a 579 KB jpg piece-matches 4.11 but the
+                            # archive was really 5.11/4.20/3.80). Sweep the other
+                            # pack builds (group history first) on the whole
+                            # archive before giving up — deadline-bounded, SFV
+                            # verify is the arbiter.
+                            rescued = self._rescue_version_near_miss(
+                                str(srr_file), content_dir, out_root)
                         if rescued:
                             summary["ok"] = True
                             summary["verified"] = rescued
