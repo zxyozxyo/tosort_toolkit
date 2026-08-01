@@ -3038,13 +3038,15 @@ class SrrdbToolAPI:
         return str(max(small, key=lambda f: f.stat().st_size))
 
     def _pack_family_reps(self, srr_file: str, content_dir: str, out_root: Path):
-        """Version-STRINGS of the pack builds that emit DISTINCT compressed output
-        at this release's recipe — one representative per family. RAR3/4 point
-        releases are byte-identical, so ~232 exes collapse to ~20 families, which
-        lets the version sweep try ~20 builds not ~230. CACHED per (level,md,
-        solid) recipe across releases, so only the FIRST stubborn release pays
-        the fingerprint cost. Returns a set, or None if it can't run (→ no
-        dedup, safe fallback)."""
+        """EXE FILENAMES of the pack builds that emit DISTINCT compressed output
+        at this release's recipe — one representative per family, keeping a final
+        and its betas SEPARATE (they can differ, and the sweep must be able to
+        force the EXACT winning exe, not just the version string — 1001's winner
+        is rar360.exe while rescene's string sweep grabs rar360b8). RAR3/4 point
+        releases are byte-identical so ~232 exes still collapse hard. CACHED per
+        (level,md,solid) recipe across releases, so only the FIRST stubborn
+        release pays the fingerprint cost. Returns an ORDERED list of exe
+        filenames, or None if it can't run (→ string-sweep fallback)."""
         recipe = self._srr_recipe(srr_file)
         if not recipe:
             return None
@@ -3069,7 +3071,8 @@ class SrrdbToolAPI:
         dname = Path(disc).name
         tmp = Path(tempfile.mkdtemp(prefix="fam-"))
         probe = tmp / "fam.rar"
-        seen, reps = set(), set()
+        seen: set = set()
+        reps: list = []
         try:
             for ex in exes:
                 if self._stop.is_set() or self._skip.is_set():
@@ -3078,10 +3081,14 @@ class SrrdbToolAPI:
                     probe.unlink(missing_ok=True)
                 except Exception:
                     pass
-                subprocess.run(
-                    [str(ex), "a", f"-m{level}", md,
-                     "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
-                     "-idcd", str(probe), disc], capture_output=True)
+                try:
+                    subprocess.run(
+                        [str(ex), "a", f"-m{level}", md,
+                         "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
+                         "-idcd", str(probe), disc],
+                        capture_output=True, timeout=180)
+                except subprocess.TimeoutExpired:
+                    continue
                 try:
                     with RarStream(str(probe), packed_file_name=dname,
                                    compressed=True) as rs:
@@ -3090,13 +3097,86 @@ class SrrdbToolAPI:
                     sig = ("ERR", ex.name)
                 if sig not in seen:
                     seen.add(sig)
-                    m = re.match(r"(\d{4}-\d{2}-\d{2})_rar(\d)(\d\d)", ex.name)
-                    if m:
-                        reps.add(f"{m.group(1)} {m.group(2)}.{m.group(3)}")
+                    reps.append(ex.name)   # exact exe — final≠beta kept apart
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         cache[key] = reps or None
         return cache[key]
+
+    def _sweep_build_exes(self, exe_reps: list, srr_file: str, content_dir: str,
+                          out_root: Path, detected):
+        """Version-near-miss sweep by EXACT exe. `exe_reps` are one filename per
+        distinct-output pack family (a final and its betas are SEPARATE), so
+        forcing each via `_build_force` tests the exact winning build — which the
+        version-STRING sweep can't (it grabs a beta that near-misses while the
+        final matches). Drops builds newer than the release cap, orders
+        group-history-first then nearest-release, SFV-verifies each. Returns the
+        winning verify dict, or None. A wrong exe fails the piece test in ~1s, so
+        the sweep stays bounded even with many families."""
+        import datetime
+
+        def _date(fn):
+            m = re.match(r"(\d{4})-(\d{2})-(\d{2})_rar", fn)
+            return datetime.date(int(m[1]), int(m[2]), int(m[3])) if m else None
+
+        def _vstr(fn):
+            m = re.match(r"(\d{4}-\d{2}-\d{2})_rar(\d)(\d\d)", fn)
+            return f"{m[1]} {m[2]}.{m[3]}" if m else fn
+
+        cap = getattr(self, "_version_date_cap", None)
+        limit = (cap + datetime.timedelta(days=_VERSION_CAP_MARGIN_DAYS)
+                 if (cap and not getattr(self, "_version_cap_widen", False))
+                 else None)
+        cand = [e for e in exe_reps
+                if not (limit and _date(e) and _date(e) > limit)] or list(exe_reps)
+        prefs = getattr(self, "_recon_prefs", None) or []
+        d0 = self._version_date(detected) if detected else None
+
+        def _key(fn):
+            vs = _vstr(fn)
+            if vs in prefs:
+                return (0, prefs.index(vs))
+            d = _date(fn)
+            return (1, abs((d - d0).days) if (d and d0) else 1 << 30)
+
+        cand.sort(key=_key)
+        self._log(
+            f"  Version near-miss: '{detected}' matched the test piece but the "
+            f"full archive was off — sweeping {len(cand)} distinct-output "
+            "build(s) by EXACT exe (final≠beta), nearest release first…", "dim")
+        sweep_deadline = time.time() + _RECON_TIMEOUT_S
+        self._in_version_sweep = True
+        try:
+            for fn in cand:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() > sweep_deadline:
+                    self._log("  Version rescue: deadline reached — stopping.",
+                              "dim")
+                    return None
+                self._clear_produced_volumes(out_root)
+                self._recon_streams = []
+                SrrdbToolAPI._build_force = fn
+                self._log(f"    trying {_vstr(fn)}  ({fn})…", "dim")
+                try:
+                    rc = self._srr_reconstruct(
+                        srr_file, content_dir, str(out_root), log_rar_pack=False)
+                finally:
+                    SrrdbToolAPI._build_force = None
+                if not rc.get("ok"):
+                    continue
+                v2 = self._verify_rebuilt_sfv(out_root)
+                if v2["checked"] and not v2["bad"]:
+                    self._log(
+                        f"  ✓ Version rescue: rebuilt with {_vstr(fn)} ({fn}) — "
+                        f"all {v2['checked']} volume(s) CRC-match the SFV.", "ok")
+                    return v2
+        finally:
+            self._in_version_sweep = False
+            SrrdbToolAPI._build_force = None
+        self._log("  Version rescue exhausted — no distinct-output pack build "
+                  "reproduced the archive exactly. Kept as FAILED.", "warn")
+        return None
 
     def _rescue_version_near_miss(self, srr_file: str, content_dir: str,
                                   out_root: Path):
@@ -3122,43 +3202,41 @@ class SrrdbToolAPI:
 
         Returns the winning verify-result dict on success, else None."""
         detected = getattr(self, "_last_good_rar", None)
+
+        # PRIMARY: sweep SPECIFIC EXES — one per DISTINCT-OUTPUT family, keeping a
+        # final apart from its betas. Only this can crack the beta/final class:
+        # the version-STRING sweep below hands rescene a string, which resolves
+        # to a beta that near-misses while the FINAL matches (1001_Crosswords:
+        # winner rar360.exe, rescene picked rar360b8.exe). The recipe probe
+        # proved these are crackable exactly this way.
+        rar_dir = self._find_rar_dir()
+        try:
+            exe_reps = self._pack_family_reps(srr_file, content_dir, out_root)
+        except Exception:
+            exe_reps = None
+        if exe_reps and rar_dir:
+            return self._sweep_build_exes(
+                exe_reps, srr_file, content_dir, out_root, detected)
+
+        # FALLBACK: version-STRING sweep (no fingerprint available) — can't tell a
+        # beta from a final, but better than nothing. `_all_versions` lists one
+        # entry per exe (betas collapse to one string), so dedupe to unique, drop
+        # builds newer than the release cap, group-history first then nearest.
         allv = list(getattr(self, "_all_versions", None) or [])
         if not allv:
             return None
-        # `_all_versions` lists one entry PER EXE (betas collapse to the same
-        # string), so dedupe to UNIQUE version-strings — else the sweep retries
-        # the same version many times (3.60 = a final + 8 betas → 9× the string).
         seen: set = set()
         candidates = [v for v in allv
                       if v != detected and not (v in seen or seen.add(v))]
         if not candidates:
             return None
-        # Newer-than-release cap: a group can't use a build that didn't exist
-        # when they packed, so drop builds dated past the release-date cap (+its
-        # margin) — same rule the initial hunt uses, but the sweep skipped it and
-        # was grinding 5.7/5.8-era builds on a 2014 release. Only the NEWER end
-        # is capped; older builds stay (1001 proved the real build can be a
-        # decade older). Skipped if no release date, or if the run was widened.
         cap = getattr(self, "_version_date_cap", None)
         if cap and not getattr(self, "_version_cap_widen", False):
             import datetime
             limit = cap + datetime.timedelta(days=_VERSION_CAP_MARGIN_DAYS)
-            kept = [v for v in candidates
-                    if not (self._version_date(v)
-                            and self._version_date(v) > limit)]
-            if kept and len(kept) < len(candidates):
-                self._log(
-                    f"    dropped {len(candidates) - len(kept)} build(s) newer "
-                    f"than the release +{_VERSION_CAP_MARGIN_DAYS // 365}yr "
-                    "(couldn't have been used)", "dim")
-                candidates = kept
-        # Ordering. The winning build must itself pass the piece-CRC test (it
-        # produced the real archive), so we can't know it a priori — but two
-        # priors help: (1) this group's known-good history (what OTHER releases
-        # by the same group packed with — the release-era build, directly
-        # answering "the locked version is implausibly old"); then (2) release
-        # dates nearest the locked build, which tend to share its compression
-        # engine. Group history first, then nearest-date, then the rest.
+            candidates = [v for v in candidates
+                          if not (self._version_date(v)
+                                  and self._version_date(v) > limit)] or candidates
         prefs = [v for v in (getattr(self, "_recon_prefs", None) or [])
                  if v in candidates]
         rest = [v for v in candidates if v not in prefs]
@@ -3168,26 +3246,6 @@ class SrrdbToolAPI:
                                      abs((self._version_date(v) - d0).days)
                                      if self._version_date(v) else 1 << 30))
         candidates = prefs + rest
-        # Speed: collapse the pack to builds that emit DISTINCT compressed output
-        # (RAR3/4 point releases are byte-identical), so the sweep tries ~20
-        # builds not ~230 — the family fingerprint the recipe probe proved out.
-        # Group-history prefs are ALWAYS kept. Cached per recipe across releases,
-        # so only the first stubborn release pays the fingerprint cost. Any
-        # failure → no dedup (full sweep), so it can't lose a winnable build.
-        try:
-            reps = self._pack_family_reps(srr_file, content_dir, out_root)
-            if reps:
-                keep = set(prefs) | reps
-                deduped = [c for c in candidates if c in keep]
-                if deduped:
-                    self._log(
-                        f"    de-duped {len(candidates)} builds → "
-                        f"{len(deduped)} distinct-output famil"
-                        f"{'y' if len(deduped) == 1 else 'ies'} "
-                        "(RAR3/4 point releases share output)", "dim")
-                    candidates = deduped
-        except Exception:
-            pass
         self._log(
             f"  Version near-miss: '{detected}' matched the test piece but the "
             f"full archive was off — sweeping {len(candidates)} other pack "
