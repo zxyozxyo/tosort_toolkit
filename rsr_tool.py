@@ -1332,7 +1332,13 @@ class RsrToolAPI:
         """A v1 .srr embedded verbatim, so a .rsr can always emit one for the
         existing ecosystem without us re-deriving the block structure."""
         try:
-            import rescene.main as rm
+            # A PRIVATE rescene: the srrdb rebuilder shares this process and
+            # patches the shared module with its own stop flags, reconstruct
+            # deadline and log subscriber. Importing normally meant our SRR
+            # progress printed into ITS window, and an srrdb Stop could abort
+            # a capture that has nothing to do with it. See rescene_guard.
+            from rescene_guard import load_private
+            rm = load_private()
         except ImportError:
             return None
         heads = []

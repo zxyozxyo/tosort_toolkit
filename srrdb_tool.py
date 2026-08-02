@@ -1695,14 +1695,18 @@ class SrrdbToolAPI:
         return declined
 
     def _fresh_rescene(self):
-        """Import a pristine rescene.main (purging any cached copy) and apply our
-        patches. Called once per reconstruction so no module-level global state
-        (archived_files, temp dirs, repository, event subscribers) can leak from
-        one release into the next during a long batch."""
-        for name in [n for n in list(sys.modules)
-                     if n == "rescene" or n.startswith("rescene.")]:
-            del sys.modules[name]
-        import rescene.main as rm  # type: ignore
+        """Import a pristine rescene.main and apply our patches. Called once per
+        reconstruction so no module-level global state (archived_files, temp
+        dirs, repository, event subscribers) can leak from one release into the
+        next during a long batch.
+
+        Goes through rescene_guard so the copy is PRIVATE to this tool: the RSR
+        scanner runs in the same process and writes legacy .srr files through
+        pyReScene too, and it was picking up the subscriber and the popen patch
+        installed here — logging its own progress into this window, and running
+        under this tool's stop flags and reconstruct deadline."""
+        from rescene_guard import load_private
+        rm = load_private()  # type: ignore
 
         # --- -ma4 + dictionary-switch injection for RAR 5.x/6.x binaries ---
         _orig_popen = rm.custom_popen
