@@ -22,6 +22,22 @@ EXTRA_EXTS   = {'.nfo', '.diz', '.jpg', '.jpeg', '.png', '.sfv', '.nzb'}
 EXTRA_DIRS   = {'proof', 'sample'}
 
 
+def _num(value, fallback, cast):
+    """Coerce a settings value, falling back to the stored one on junk.
+
+    These come straight off GUI form fields, and a single unparseable field
+    used to raise out of backup_save_settings — losing every OTHER setting in
+    the same save, silently, because the caller only sees a failed promise."""
+    for candidate in (value, fallback):
+        if candidate is None or candidate == "":
+            continue
+        try:
+            return cast(candidate)
+        except (TypeError, ValueError):
+            continue
+    return cast(0)
+
+
 class MiscToolsAPI:
     def __init__(self, auto_loop: bool = True):
         self._window    = None
@@ -290,6 +306,7 @@ class MiscToolsAPI:
             "auto":        bool(b.get("auto", False)),
             "startup":     bool(b.get("startup", False)),
             "interval_h":  float(b.get("interval_h", 6)),
+            "keep":        int(b.get("keep", 0) or 0),
             "last_backup": float(b.get("last_backup", 0)),
         }
 
@@ -304,7 +321,13 @@ class MiscToolsAPI:
             # from the Misc Tools form, which doesn't own those fields (the home
             # checkbox sets `startup`; a completed backup writes `last_backup`).
             "startup":     bool(settings.get("startup", prev.get("startup", False))),
-            "interval_h":  max(0.25, float(settings.get("interval_h", 6) or 6)),
+            "interval_h":  max(0.25, _num(settings.get("interval_h"),
+                                          prev.get("interval_h", 6), float)),
+            # How many timestamped FULL backups to keep per destination.
+            # 0 = keep everything (the default, so nothing is ever deleted
+            # unless the user asks for it).
+            "keep":        max(0, _num(settings.get("keep"),
+                                       prev.get("keep", 0), int)),
             "last_backup": float(prev.get("last_backup", 0)),
         }
         self._save_cfg(cfg)
@@ -363,7 +386,7 @@ class MiscToolsAPI:
             return {"ran": False, "reason": "not_due"}
         _say(f"Startup backup running ({s['mode']}, "
              f"{len(s['dests'])} destination(s))…", "info")
-        self._backup_thread(s["dests"], s["mode"], True)
+        self._backup_thread(s["dests"], s["mode"], True, s["keep"])
         _say("Startup backup complete.", "ok")
         return {"ran": True}
 
@@ -386,10 +409,49 @@ class MiscToolsAPI:
         if self._running:
             return {"ok": False, "error": "Another operation is running"}
         threading.Thread(target=self._backup_thread,
-                         args=(s["dests"], s["mode"], False), daemon=True).start()
+                         args=(s["dests"], s["mode"], False, s["keep"]),
+                         daemon=True).start()
         return {"ok": True}
 
-    def _backup_thread(self, dests: list, mode: str, auto: bool):
+    # Folders this tool creates in FULL mode. Pruning matches this and nothing
+    # else — a destination is the user's own folder and may hold anything.
+    _BACKUP_DIR_RE = re.compile(r"^tosort_toolkit_backup_\d{8}-\d{4}$")
+
+    def _prune_old_backups(self, dst_root: Path, keep: int, current: Path, L):
+        """Keep the newest `keep` timestamped backups in dst_root, delete older.
+
+        Deliberately narrow: only DIRECT CHILDREN of the destination whose name
+        matches _BACKUP_DIR_RE exactly, never the backup just written, and only
+        when there are more than `keep` of them. The timestamp format sorts
+        chronologically as text, so no mtime guesswork is involved."""
+        try:
+            found = sorted((p for p in dst_root.iterdir()
+                            if p.is_dir() and self._BACKUP_DIR_RE.match(p.name)),
+                           key=lambda p: p.name)
+        except Exception as e:
+            L(f"  Could not list {dst_root} to prune old backups — {e}", "warn")
+            return
+        old = [p for p in found[:-keep] if p.resolve() != current.resolve()] \
+            if len(found) > keep else []
+        if not old:
+            L(f"  Retention: {len(found)} backup(s) here, keeping {keep} — "
+              "nothing to remove.", "dim")
+            return
+        L(f"  Retention: {len(found)} backup(s) here, keeping the newest "
+          f"{keep} — removing {len(old)}.", "info")
+        removed = 0
+        for p in old:
+            try:
+                shutil.rmtree(str(p))
+                removed += 1
+                L(f"    removed {p.name}", "dim")
+            except Exception as e:
+                L(f"    could NOT remove {p.name} — {e}", "warn")
+        L(f"  Retention: removed {removed} old backup(s).",
+          "ok" if removed == len(old) else "warn")
+
+    def _backup_thread(self, dests: list, mode: str, auto: bool,
+                       keep: int = 0):
         self._running = True
         L = lambda m, c="info": self._log(m, c, "bak")
         src = Path(__file__).parent
@@ -440,6 +502,16 @@ class MiscToolsAPI:
                 L(f"  ✓ {target} — {copied} file(s), {total:,} B"
                   + (f", {errors} error(s)" if errors else ""),
                   "ok" if not errors else "warn")
+                # Retention. Only after a CLEAN full backup: if this run had
+                # errors the new copy may be incomplete, and that is exactly
+                # when the older ones must not be thrown away.
+                if mode != "quick" and keep > 0:
+                    if errors:
+                        L(f"  Keeping all old backups in {dest} — this run had "
+                          f"{errors} error(s), so the new copy isn't trusted "
+                          "enough to prune against.", "warn")
+                    else:
+                        self._prune_old_backups(dst_root, keep, target, L)
             L(f"{tag}Backup run complete.", "ok")
             # Stamp completion so the startup auto-backup knows whether a fresh
             # one is due (prevents a backup on every quick restart).
@@ -466,7 +538,7 @@ class MiscToolsAPI:
             _t.sleep(max(900, s["interval_h"] * 3600))
             s = self.backup_get_settings()   # re-read: user may have toggled
             if s["auto"] and s["dests"] and not self._running:
-                self._backup_thread(s["dests"], s["mode"], True)
+                self._backup_thread(s["dests"], s["mode"], True, s["keep"])
 
     # ── RAR Inspector ─────────────────────────────────────────────────────────
 

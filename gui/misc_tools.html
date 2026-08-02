@@ -149,6 +149,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <span style="font-size:11px;opacity:.7">hours</span>
         </div>
         <div class="row">
+          <span class="lbl" title="After a clean Full backup, delete the oldest timestamped backups in each destination so only this many remain. Only folders named tosort_toolkit_backup_<date>-<time> are ever touched, and nothing is deleted if the backup that just ran had errors.">Keep</span>
+          <input class="txt" id="bak-keep" type="number" min="0" step="1" value="0"
+                 style="max-width:60px" onchange="saveBakCfg()"/>
+          <span style="font-size:11px;opacity:.7" id="bak-keep-note">newest backups per destination — 0 keeps everything</span>
+        </div>
+        <div class="row">
           <span class="lbl">Destinations</span>
           <button class="btn" onclick="addBakDest()">+ Add Destination</button>
           <button class="btn btn-go" id="btn-bak-go" onclick="runBackupNow()" style="margin-left:auto">Backup Now</button>
@@ -240,7 +246,9 @@ async function saveBakCfg() {
     mode:       document.getElementById('bak-mode').value,
     auto:       document.getElementById('bak-auto').checked,
     interval_h: parseFloat(document.getElementById('bak-interval').value) || 6,
+    keep:       Math.max(0, parseInt(document.getElementById('bak-keep').value) || 0),
   });
+  syncKeepNote();
 }
 
 async function loadBakCfg() {
@@ -249,7 +257,23 @@ async function loadBakCfg() {
   document.getElementById('bak-mode').value        = s.mode || 'quick';
   document.getElementById('bak-auto').checked      = !!s.auto;
   document.getElementById('bak-interval').value    = s.interval_h || 6;
+  document.getElementById('bak-keep').value        = s.keep || 0;
+  syncKeepNote();
   renderBakDests();
+}
+
+// Quick mode reuses ONE rolling folder, so there is never more than one copy
+// to retain — say so rather than letting the box look broken.
+function syncKeepNote() {
+  const quick = document.getElementById('bak-mode').value === 'quick';
+  const keep  = Math.max(0, parseInt(document.getElementById('bak-keep').value) || 0);
+  const note  = document.getElementById('bak-keep-note');
+  document.getElementById('bak-keep').disabled = quick;
+  note.style.opacity = quick ? 0.45 : 0.7;
+  note.textContent = quick
+    ? 'Full mode only — Quick mode reuses one rolling folder'
+    : (keep ? `newest backups per destination — older ones are deleted after a clean backup`
+            : 'newest backups per destination — 0 keeps everything');
 }
 
 async function runBackupNow() {
