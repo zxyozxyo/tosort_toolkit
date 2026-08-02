@@ -155,6 +155,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             Retry other dictionary sizes if the header's is wrong</label>
           <div class="row" style="margin-top:2px">
             <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
+            <button class="btn btn-sm" id="btn-skip" onclick="skipFile()" disabled
+                    title="Abandon the release being captured right now and move to the next">Skip file</button>
             <button class="btn btn-stop" id="btn-stop" onclick="stopRun()" disabled>Stop</button>
           </div>
         </div>
@@ -276,6 +278,7 @@ function setBusy(on) {
   $('btn-scan').disabled = on;
   $('btn-rebuild').disabled = on;
   $('btn-stop').disabled = !on;
+  $('btn-skip').disabled = !on;
   const p = $('status-pill');
   p.textContent = on ? 'running' : 'idle';
   p.className = 'pill' + (on ? ' running' : '');
@@ -300,6 +303,18 @@ async function startRebuild() {
 }
 
 function stopRun() { window.pywebview.api.stop(); }
+
+// Hard skip: the button stays live, since skipping several in a row is a
+// normal thing to want when a folder turns out to be full of duds.
+async function skipFile() {
+  const b = $('btn-skip');
+  b.disabled = true;
+  const r = await window.pywebview.api.skip();
+  if (!r.ok) log('✗ ' + r.error, 'err');
+  // Re-arm once the skip has landed, but only while a run is still going —
+  // btn-scan is disabled exactly when one is.
+  setTimeout(() => { b.disabled = !$('btn-scan').disabled; }, 600);
+}
 
 function log(msg, cls) {
   const w = $('log');

@@ -427,7 +427,10 @@ class RsrToolAPI:
     def __init__(self):
         self._window = None
         self._stop = threading.Event()
+        self._skip = threading.Event()
         self._running = False
+        self._procs: set = set()
+        self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
 
     # ── plumbing ──────────────────────────────────────────────────────────
@@ -479,8 +482,69 @@ class RsrToolAPI:
 
     def stop(self) -> dict:
         self._stop.set()
+        self._kill_procs()
         self._log("Stop requested — finishing the current step…", "warn")
         return {"ok": True}
+
+    def skip(self) -> dict:
+        """Abandon the release being captured RIGHT NOW and move to the next.
+
+        A hard skip: it kills the rar.exe currently running, because the thing
+        worth skipping is almost always a sweep grinding through 232 builds on
+        a set that will not match, and 'skip after the current step' there
+        means waiting out the whole step. The event is cleared as the next
+        release starts, so a skip never leaks into the one after it."""
+        if not self._running:
+            return {"ok": False, "error": "nothing running"}
+        self._skip.set()
+        self._kill_procs()
+        self._log("  ⏭ Skip requested — abandoning this release now.", "warn")
+        return {"ok": True}
+
+    def _kill_procs(self):
+        """Kill whatever rar.exe is running for this job. Safe to call when
+        nothing is: the set is empty and the loop does nothing."""
+        with self._proc_lock:
+            procs = list(self._procs)
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def _run(self, cmd: list, timeout: int) -> bool:
+        """Run a pack/extract command so that stop and skip can interrupt it.
+
+        subprocess.run() is unkillable from another thread, so a skip pressed
+        during a 900 s sweep step did nothing until that step finished. This
+        polls instead, and terminates the child the moment either event is set.
+        Returns True only if the command ran to completion on its own."""
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        except Exception:
+            return False
+        with self._proc_lock:
+            self._procs.add(p)
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    p.wait(timeout=0.25)
+                    return True
+                except subprocess.TimeoutExpired:
+                    pass
+                if (self._stop.is_set() or self._skip.is_set()
+                        or time.monotonic() > deadline):
+                    try:
+                        p.kill()
+                        p.wait(timeout=10)
+                    except Exception:
+                        pass
+                    return False
+        finally:
+            with self._proc_lock:
+                self._procs.discard(p)
 
     # ── settings ──────────────────────────────────────────────────────────
 
@@ -546,6 +610,7 @@ class RsrToolAPI:
         def _bg():
             self._running = True
             self._stop.clear()
+            self._skip.clear()
             try:
                 self._scan_run(src, Path(s["store"]), s)
             except Exception as e:
@@ -593,6 +658,10 @@ class RsrToolAPI:
                 self._log("Stopped.", "warn")
                 break
             rel = _release_name(folder)
+            # Clear any skip from the PREVIOUS release here, not when the skip
+            # fires — otherwise a skip pressed late in one release could still
+            # be set as the next one starts and silently skip that too.
+            self._skip.clear()
             self._emit("row", {"name": rel, "status": "running"})
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
@@ -608,6 +677,14 @@ class RsrToolAPI:
                 self._log(f"  ERROR: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
                 res = {"ok": False, "error": str(e)}
+            if self._skip.is_set():
+                # Skipped by hand: not a failure, and nothing partial is left
+                # in the store — _capture_release only writes a .rsr after its
+                # own rebuild has verified.
+                self._log("  ⏭ Skipped by request — nothing written.", "warn")
+                self._emit("row", {"name": rel, "status": "skipped"})
+                skipped += 1
+                continue
             done += 1
             if res.get("ok"):
                 ok += 1
@@ -648,8 +725,10 @@ class RsrToolAPI:
         all_ok = True
         try:
             for si, st in enumerate(sets):
-                if self._stop.is_set():
-                    return {"ok": False, "error": "stopped"}
+                if self._stop.is_set() or self._skip.is_set():
+                    return {"ok": False,
+                            "error": "skipped" if self._skip.is_set()
+                            else "stopped"}
                 res = self._capture_set(st, si, folder, work / f"set{si}",
                                         s, exes, embedded)
                 if not res.get("ok"):
@@ -660,6 +739,21 @@ class RsrToolAPI:
 
             if not manifest["sets"]:
                 return {"ok": False, "error": "nothing captured"}
+
+            # A .rsr is only ever written when EVERY set captured and verified.
+            # Writing a partial one is worse than writing none: it cannot
+            # rebuild the set that failed, and `skip_done` would then pass over
+            # the release on every future run, so the failure becomes permanent
+            # and invisible. (Caught by the skip test — an abandoned release
+            # still produced an 8 MB "PARTIAL" .rsr, because the failed set
+            # recorded no content classification and the loose content then
+            # looked like a sidecar.)
+            verified = all(x.get("verify") in ("exact", "delta")
+                           for x in manifest["sets"] if "recipe" in x)
+            if not (all_ok and verified):
+                self._log("  ✗ Not every set captured and verified — writing "
+                          "NO .rsr, so a re-run still sees this release.", "err")
+                return {"ok": False, "error": "one or more sets unverified"}
 
             # Sidecars: everything loose in the release folder that is not a
             # volume — .nfo, .sfv, proof jpg, file_id.diz, Proof/ and Sample/
@@ -695,17 +789,13 @@ class RsrToolAPI:
                 (out_dir / f"{rel}.srr").write_bytes(embedded["release.srr"])
 
             self._db_record(manifest, rsr_path)
-            verified = all(x.get("verify") in ("exact", "delta")
-                           for x in manifest["sets"] if "recipe" in x)
             recipe = next((x["recipe"] for x in manifest["sets"]
                            if x.get("recipe")), {})
             self._log(f"  ✓ {rsr_path.name} written "
-                      f"({rsr_path.stat().st_size:,} B) — "
-                      f"{'VERIFIED' if verified and all_ok else 'PARTIAL'}",
-                      "ok" if verified and all_ok else "warn")
-            return {"ok": all_ok and verified,
+                      f"({rsr_path.stat().st_size:,} B) — VERIFIED", "ok")
+            return {"ok": True,
                     "recipe": f"{recipe.get('version', '?')} -mt{recipe.get('mt', '?')}",
-                    "error": "" if all_ok else "one or more sets unverified"}
+                    "error": ""}
         finally:
             _rmtree(work)
 
@@ -827,13 +917,16 @@ class RsrToolAPI:
         # needed), into our work dir — the scanned folder is never touched.
         srcdir = work / "src"
         srcdir.mkdir(exist_ok=True)
-        xr = subprocess.run([str(exes[-1]), "x", "-y", "-o+", str(head),
-                             str(srcdir) + os.sep], capture_output=True)
+        ok_x = self._run([str(exes[-1]), "x", "-y", "-o+", str(head),
+                          str(srcdir) + os.sep], timeout=3600)
+        if self._skip.is_set() or self._stop.is_set():
+            return {"ok": False, "error": "skipped"}
         order = [f["name"] for f in meta]
         src_files = [srcdir / n for n in order]
         if not all(p.is_file() for p in src_files):
             return {"ok": False,
-                    "error": f"extraction incomplete (rc={xr.returncode})"}
+                    "error": "extraction incomplete"
+                             + ("" if ok_x else " (extract did not finish)")}
 
         # The timestamp rar.exe just restored is the one that will be written
         # back into the header, at full 100 ns resolution. Record THAT rather
@@ -914,8 +1007,9 @@ class RsrToolAPI:
         cands = self._dict_candidates(st["format"], dict_kb, s["dict_ladder"])
         recipe = None
         for di, dkb in enumerate(cands):
-            if self._stop.is_set():
-                return {"ok": False, "error": "stopped"}
+            if self._stop.is_set() or self._skip.is_set():
+                return {"ok": False,
+                        "error": "skipped" if self._skip.is_set() else "stopped"}
             if di:
                 self._log(f"    retrying with -md{dkb}KB "
                           f"(header dictionary didn't reproduce)", "dim")
@@ -1086,10 +1180,10 @@ class RsrToolAPI:
         srcs = [str(p) for p in src_files]
         tried = 0
         for mi, n in enumerate(mts, 1):
-            if self._stop.is_set():
+            if self._stop.is_set() or self._skip.is_set():
                 return None
             for ex in exes:
-                if self._stop.is_set():
+                if self._stop.is_set() or self._skip.is_set():
                     return None
                 pre = self._pack_args(ex, fmt, level, dict_kb, n)
                 if pre is None:
@@ -1105,9 +1199,7 @@ class RsrToolAPI:
                         pass
                 cmd = pre + ["-s" if solid else "-s-", "-ds", f"-mt{n}",
                              "-o+", "-ep", "-idcd", str(probe), *srcs]
-                try:
-                    subprocess.run(cmd, capture_output=True, timeout=900)
-                except subprocess.TimeoutExpired:
+                if not self._run(cmd, timeout=900):
                     continue
                 if not probe.is_file():
                     continue
@@ -1166,9 +1258,7 @@ class RsrToolAPI:
                                [str(p) for p in src_files], cfile, fmt)
         if cmd is None:
             return None
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=3600)
-        except subprocess.TimeoutExpired:
+        if not self._run(cmd, timeout=3600):
             return None
         made = sorted(p for p in out.iterdir() if p.is_file())
         if not made:
