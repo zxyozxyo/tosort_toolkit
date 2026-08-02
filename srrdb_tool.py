@@ -195,10 +195,16 @@ _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 # re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
 # _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
 # auto-invalidates the cache so every wall gets one fresh attempt.
-_WALL_CACHE_GEN = 4   # 2026-08-01: bumped to 4 so the SRR-driven recipe sweep
-                      # (_recipe_sweep) gets one fresh attempt at every cached
-                      # wall. (gen 3 = stored-extra method2 rescue; gen 2 was a
-                      # reverted detection-rescue experiment.)
+_WALL_CACHE_GEN = 5   # 2026-08-02: gen 4's sweep could exhaust its candidates
+                      # for reasons that were NOT the archive's fault (a
+                      # calibration probe that picked a build unable to run the
+                      # recipe; single-file sets refused outright; a confirm pass
+                      # that looked for the wrong basename when a source came
+                      # from the extras store). Every one of those recorded a
+                      # clean "no build reproduces this" miss. Bumping re-opens
+                      # them. (gen 4 = SRR-driven recipe sweep; gen 3 =
+                      # stored-extra method2 rescue; gen 2 was a reverted
+                      # detection-rescue experiment.)
 
 # ── SRR-driven recipe sweep ──────────────────────────────────────────────────
 # rescene detects a build by compressing each packed file IN ISOLATION. When a
@@ -5235,21 +5241,38 @@ class SrrdbToolAPI:
     def _sweep_cache_hit(self, release: str) -> dict | None:
         """The stored recipe-sweep verdict for `release`, or None to sweep now.
 
-        {"found": {exe, version, mt}|None, "ts": …}. Only a verdict recorded
-        against the CURRENT pack signature counts: a bigger pack can turn an
-        exhausted miss into a hit, so growing the pack always re-opens it."""
+        {"found": {exe, version, mt}|None, "ts": …}.
+
+        A HIT and a MISS are not the same kind of claim, and are not cached on
+        the same terms:
+
+        * A hit is a measurement — that exe reproduced this set's streams
+          byte-exact. That stays true no matter how the pack changes or how the
+          sweep's search order is rewritten, so it is honoured across pack
+          signatures and generations. The one thing that can invalidate it is
+          the exe no longer being in the pack.
+        * A miss is only ever "the search I ran didn't find one". A bigger pack
+          or a fixed search can both turn it into a hit, so it counts only when
+          recorded against the CURRENT pack signature AND generation."""
         if not release:
             return None
         try:
             cur = self._pack_signature()
-            if not cur:
-                return None
             for r in self._load_results():
                 if r.get("release") != release:
                     continue
                 sw = r.get("sweep") or {}
-                if sw.get("pack_sig") == cur and sw.get("gen") == _WALL_CACHE_GEN:
-                    return {"found": sw.get("found"), "ts": r.get("ts")}
+                if not sw:
+                    continue
+                found = sw.get("found")
+                if found:
+                    exe = found.get("exe") or ""
+                    if exe and (Path(self._find_rar_dir()) / exe).is_file():
+                        return {"found": found, "ts": r.get("ts")}
+                    continue
+                if cur and sw.get("pack_sig") == cur \
+                        and sw.get("gen") == _WALL_CACHE_GEN:
+                    return {"found": None, "ts": r.get("ts")}
         except Exception:
             pass
         return None
