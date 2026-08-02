@@ -3673,6 +3673,13 @@ class SrrdbToolAPI:
                 f"(-m{level} {md} {'-s' if solid else '-s-'}) across "
                 f"{len(reps)} build(s) × -mt {mts} — matching against "
                 f"{n_crc} stream CRC(s) from the SRR…", "dim")
+            # A truncated sweep can only check volume one, so any hit has to be
+            # re-proved on the real files against every block the SRR describes.
+            full_files = [srcs[n] for n in s["order"]]
+            full_checks = self._full_checks(s)
+            truncated = any(
+                os.path.getsize(f) != os.path.getsize(srcs[n])
+                for n, f in zip(s["order"], cmd_files))
             probe = work / "probe.rar"
             deadline = time.time() + _RECIPE_SWEEP_BUDGET_S
             tried = 0
@@ -3689,6 +3696,14 @@ class SrrdbToolAPI:
                                                 solid, mt, cmd_files, probe):
                         continue
                     if self._sweep_matches(probe, checks, RarStream):
+                        if truncated and not self._confirm_recipe(
+                                Path(rar_dir) / fn, level, md, solid, mt,
+                                full_files, full_checks, work / "confirm.rar",
+                                RarStream):
+                            self._log(f"    {self._exe_version_str(fn)} -mt{mt} "
+                                      "matches volume one but not the whole "
+                                      "stream — keeping looking.", "dim")
+                            continue
                         hit = {"exe": fn, "version": self._exe_version_str(fn),
                                "mt": mt}
                         # Never let a logging hiccup discard a PROVEN recipe.
@@ -3869,6 +3884,35 @@ class SrrdbToolAPI:
         except (subprocess.TimeoutExpired, OSError):
             return False
         return r.returncode == 0 and out.is_file()
+
+    def _full_checks(self, s: dict) -> list:
+        """Checks covering EVERY verifiable byte the SRR describes: each file's
+        exact total packed size plus a CRC for every non-final block. Used to
+        CONFIRM a candidate on untruncated sources — the truncated sweep can only
+        see the first volume's slice, and builds that agree there still diverge
+        later (Murder_on_the_Titanic: 3.60 -mt8 matches the first 4.7 MB, then
+        runs 55 bytes long over the whole stream; 3.90 -mt8 is the real recipe)."""
+        checks = []
+        for name in s["order"]:
+            blocks = s["files"][name]["blocks"]
+            off, crcs = 0, []
+            for k, (psz, crc) in enumerate(blocks):
+                if k != len(blocks) - 1:
+                    crcs.append((off, psz, crc))
+                off += psz
+            checks.append((Path(name).name, crcs, off))
+        return checks
+
+    def _confirm_recipe(self, exe: Path, level, md, solid, mt, full_files,
+                        full_checks, probe: Path, RarStream) -> bool:
+        """Re-pack the FULL sources at a candidate (exe, -mt) and require every
+        block to match. A truncated prefilter hit is a shortlist, never a verdict:
+        without this the sweep hands the rebuild a recipe that reproduces volume
+        one and nothing after it, and method2 rightly refuses it ("Our options
+        are exhausted") after a full compress."""
+        if not self._sweep_compress(exe, level, md, solid, mt, full_files, probe):
+            return False
+        return self._sweep_matches(probe, full_checks, RarStream)
 
     def _sweep_matches(self, probe: Path, checks: list, RarStream) -> bool:
         """True when the probe archive reproduces every verifiable stream: exact
