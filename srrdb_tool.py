@@ -329,6 +329,11 @@ class SrrdbToolAPI:
         self._srs_script = None
         self._live_procs = []      # rar.exe subprocesses of the current rebuild
         self._recon_deadline = 0   # wall-clock abort time for current rebuild
+        # ── "run it fresh" prompt (see _use_db_history) ──
+        self._fresh_reply  = threading.Event()  # GUI answered the prompt
+        self._fresh_choice = None    # "fresh" | "history" | "always"
+        self._fresh_all    = False   # latched: ignore history for the whole run
+        self._fresh_release = None   # this release's decision (one prompt each)
 
     def set_window(self, w):
         self._window = w
@@ -3613,6 +3618,11 @@ class SrrdbToolAPI:
         # the cached verdict while the pack is unchanged — and re-sweep the
         # moment it grows, since a new build is exactly what could crack it.
         cached = self._sweep_cache_hit(getattr(self, "_release_name", ""))
+        if cached is not None and not self._use_db_history(
+                "sweep", "recipe %s recorded %s"
+                % ("found" if cached.get("found") else "sweep exhausted",
+                   cached.get("ts", "earlier"))):
+            cached = None
         if cached is not None:
             if cached.get("found"):
                 self._log(
@@ -5529,8 +5539,64 @@ class SrrdbToolAPI:
             return False
         self._stop.clear()
         self._skip.clear()
+        self._fresh_all = False   # "always fresh" latches per RUN, not forever
         threading.Thread(target=self._process_one, args=(config,), daemon=True).start()
         return True
+
+    # ── "run it fresh" prompt ────────────────────────────────────────────────
+    # Three things a re-run reuses from the results DB: a cached version-wall
+    # (skip the release outright), a cached recipe-sweep verdict, and the list
+    # of builds a timed-out run already tested (an ordering hint). Each saves
+    # real time — and each is only as good as the code that recorded it, so
+    # after a fix the stored verdict can be stale in a way nothing detects.
+    # Rather than hand-editing srrdb_results.json, pause and offer to ignore it.
+    #
+    # Deliberately ONE prompt per release (the wall check and the tried-builds
+    # hint both fire at job start) and it always AUTO-CONTINUES, so an
+    # unattended overnight batch behaves exactly as it does today.
+    _FRESH_PROMPT_SECS = 30
+
+    def fresh_prompt_reply(self, choice: str):
+        """GUI answer to the pause: 'fresh', 'history', or 'always'."""
+        self._fresh_choice = choice
+        self._fresh_reply.set()
+
+    def _use_db_history(self, kind: str, detail: str = "") -> bool:
+        """True = reuse what the DB stored, False = ignore it and run fresh."""
+        if self._fresh_all:
+            return False
+        if self._fresh_release is not None:      # already decided this release
+            return self._fresh_release
+        if not getattr(self, "_fresh_prompt_on", False):
+            return True
+        secs = self._FRESH_PROMPT_SECS
+        self._fresh_choice = None
+        self._fresh_reply.clear()
+        self._emit("fresh_prompt", {"kind": kind, "detail": detail,
+                                    "release": self._release_name or "",
+                                    "secs": secs})
+        self._log(f"  ⏸ Reusing stored history ({detail}). Pausing {secs}s — "
+                  "choose 'Run fresh' in the banner to ignore it.", "warn")
+        # Poll rather than one long wait so Stop/Skip still land immediately.
+        end = time.time() + secs
+        while time.time() < end:
+            if self._stop.is_set() or self._skip.is_set():
+                break
+            if self._fresh_reply.wait(0.25):
+                break
+        self._emit("fresh_prompt_done", {})
+        choice = self._fresh_choice
+        if choice == "always":
+            self._fresh_all = True
+            self._log("  ↻ Ignoring stored DB history for the REST of this run.",
+                      "warn")
+        elif choice == "fresh":
+            self._log("  ↻ Ignoring stored DB history — running this release "
+                      "from scratch.", "warn")
+        else:
+            self._log("  ▶ Continuing with the stored history.", "dim")
+        self._fresh_release = choice not in ("fresh", "always")
+        return self._fresh_release
 
     def stop_process(self, scope: str = "all"):
         """Interrupt the running work.
@@ -5593,12 +5659,20 @@ class SrrdbToolAPI:
         # skip-list (a truncated run can leave a version half-tested) — just an
         # ordering hint, so the retry reaches untested builds first instead of
         # re-grinding the same head of the list into the same timeout.
+        # One "run it fresh" decision per release (see _use_db_history).
+        self._fresh_release = None
+        self._fresh_prompt_on = bool(config.get("fresh_prompt", False))
+        if config.get("ignore_db_history"):
+            self._fresh_all = True
         self._retry_tried_versions = self._prior_versions_tried(release)
         if self._retry_tried_versions:
-            self._log(
-                f"  Previous run timed out after testing "
-                f"{len(self._retry_tried_versions)} build(s) — trying the "
-                "untested ones first this time.", "info")
+            n = len(self._retry_tried_versions)
+            if self._use_db_history("tried", f"{n} build(s) already tested"):
+                self._log(
+                    f"  Previous run timed out after testing {n} build(s) — "
+                    "trying the untested ones first this time.", "info")
+            else:
+                self._retry_tried_versions = set()
 
         self._emit("job_start", {"content_dir": queue_path, "release": release})
 
@@ -5607,6 +5681,9 @@ class SrrdbToolAPI:
         # whole-pack re-grind on every re-run. Defeatable per-batch via config.
         if release and config.get("skip_known_walls", True):
             hit = self._wall_cache_hit(release, config.get("date_cap", True))
+            if hit and not self._use_db_history(
+                    "wall", f"version-wall recorded {hit.get('ts', '?')}"):
+                hit = None
             if hit:
                 extra = ("all builds ≤ the release date"
                          if hit.get("wall_capped") else "every pack version")
@@ -6610,6 +6687,7 @@ class SrrdbToolAPI:
             return False
         self._stop.clear()
         self._skip.clear()
+        self._fresh_all = False   # "always fresh" latches per RUN, not forever
         threading.Thread(target=self._batch_thread, args=(jobs,), daemon=True).start()
         return True
 

@@ -217,6 +217,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             Delete source folder after successful rebuild
             <span style="opacity:0.7;font-size:0.85em"> — removes the input folder INCLUDING old nfo/jpg once the RARs are verified</span>
           </label>
+          <label class="chk-row" title="A re-run reuses three things the results DB stored: a cached version-wall (release skipped outright), a cached recipe-sweep verdict, and the builds a timed-out run already tested. Tick this to ignore all of it and search from scratch.">
+            <input type="checkbox" id="ignore-db-history"> Ignore stored DB history — search every release from scratch
+          </label>
+          <label class="chk-row" title="Instead of ignoring stored history outright, pause 30s the first time a release would reuse it and offer the choice. Always auto-continues, so an unattended batch is unaffected.">
+            <input type="checkbox" id="fresh-prompt"> Ask first (30s pause) when a release would reuse stored history
+          </label>
           <div class="row" style="flex-wrap:wrap">
             <span class="lbl">Results DB</span>
             <button class="btn btn-sm" onclick="viewStats()">View Stats</button>
@@ -304,6 +310,20 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="dot" style="background:var(--text3)"></div>
           Log
           <button class="btn btn-sm" style="margin-left:auto" onclick="clearLog()">Clear</button>
+        </div>
+        <!-- 30s "run it fresh" pause: shown when a release is about to reuse
+             what the results DB stored about it. Auto-continues on timeout. -->
+        <div id="fresh-bar" style="display:none;margin:6px 10px 0;padding:8px 10px;border-radius:6px;background:rgba(230,170,40,0.12);border:1px solid var(--warn);font-size:11px;line-height:1.45">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <div style="flex:1;min-width:180px">
+              <b>Reusing stored DB history</b> — <span id="fresh-detail"></span>
+              <div style="opacity:0.75;margin-top:2px" id="fresh-release"></div>
+            </div>
+            <span id="fresh-count" style="flex:0 0 auto;font-variant-numeric:tabular-nums;opacity:0.8"></span>
+            <button class="btn btn-sm" style="flex:0 0 auto" onclick="freshReply('fresh')">Run fresh</button>
+            <button class="btn btn-sm" style="flex:0 0 auto" onclick="freshReply('always')" title="Ignore stored history for every remaining release in this run">Fresh for all</button>
+            <button class="btn btn-sm" style="flex:0 0 auto" onclick="freshReply('history')">Use history</button>
+          </div>
         </div>
         <div class="pbody" style="flex:1;min-height:0;padding-bottom:10px">
           <div class="log-w" id="log"></div>
@@ -435,12 +455,52 @@ window.srrEvent = function(event, data) {
   } else if (event === 'progress') {
     const s = document.getElementById('extras-stats');
     if (s && data.label) s.textContent = data.label;
+  } else if (event === 'fresh_prompt') {
+    showFreshBar(data);
+  } else if (event === 'fresh_prompt_done') {
+    hideFreshBar();
   } else if (event === 'extras') {
     const b = document.getElementById('btn-extras-rescan');
     if (b) { b.disabled = false; b.textContent = 'Rescan'; }
     refreshExtras();
   }
 };
+
+// ── "Run it fresh" pause ──────────────────────────────────────────────────────
+// The backend blocks for its 30s and continues by itself on timeout, so this is
+// purely a display + a reply channel; nothing here can hang the run.
+let freshTimer = null;
+const FRESH_TEXT = {
+  wall:  'this release is a cached version-wall, so it would be skipped entirely',
+  sweep: 'a stored recipe-sweep verdict would be reused instead of re-measuring',
+  tried: 'builds a previous timed-out run tested would be pushed to the back'
+};
+function showFreshBar(data) {
+  const bar = document.getElementById('fresh-bar');
+  document.getElementById('fresh-detail').textContent =
+    (FRESH_TEXT[data.kind] || 'stored history would be reused')
+    + (data.detail ? ' (' + data.detail + ')' : '');
+  document.getElementById('fresh-release').textContent = data.release || '';
+  bar.style.display = '';
+  let left = data.secs || 30;
+  const tick = () => {
+    document.getElementById('fresh-count').textContent =
+      'continuing in ' + left + 's';
+    if (left-- <= 0) hideFreshBar();
+  };
+  clearInterval(freshTimer);
+  tick();
+  freshTimer = setInterval(tick, 1000);
+}
+function hideFreshBar() {
+  clearInterval(freshTimer);
+  freshTimer = null;
+  document.getElementById('fresh-bar').style.display = 'none';
+}
+async function freshReply(choice) {
+  hideFreshBar();
+  try { await window.pywebview.api.fresh_prompt_reply(choice); } catch (e) {}
+}
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 function log(msg, cls) { addLog(msg, cls); }
@@ -822,6 +882,8 @@ async function doProcess() {
   const extractIsoM2ts = document.getElementById('extract-iso-m2ts').checked;
   const nonSceneSample = document.getElementById('nonscene-sample').checked;
   const deleteSource   = document.getElementById('delete-source').checked;
+  const ignoreHistory  = document.getElementById('ignore-db-history').checked;
+  const freshPrompt    = document.getElementById('fresh-prompt').checked;
 
   if (!dest) { log('Set an output folder first.', 'warn'); return; }
 
@@ -838,6 +900,8 @@ async function doProcess() {
       extract_iso_m2ts: extractIsoM2ts,
       non_scene_sample: nonSceneSample,
       delete_source:    deleteSource,
+      ignore_db_history: ignoreHistory,
+      fresh_prompt:     freshPrompt,
     });
   } else {
     // Batch
@@ -862,6 +926,8 @@ async function doProcess() {
         extract_iso_m2ts: extractIsoM2ts,
         non_scene_sample: nonSceneSample,
         delete_source:    deleteSource,
+        ignore_db_history: ignoreHistory,
+        fresh_prompt:     freshPrompt,
         max_test:         maxTest,
       }));
     if (!jobs.length) { log('All jobs already done.', 'dim'); return; }

@@ -116,6 +116,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <button class="btn" onclick="browseRai()">Browse</button>
         </div>
         <div class="row" style="justify-content:flex-end">
+          <button class="btn" id="btn-rai-copy" onclick="copyRaiLog()" style="margin-right:auto" title="Copy everything in the output window below to the clipboard">Copy all</button>
           <button class="btn" id="btn-rai-probe" onclick="runProbe()" disabled title="Recompress the ORIGINAL rar's own content across pack build × thread-count and find the exact (build, -mt) that reproduces it byte-for-byte — or prove none in the pack does (a wall). Needs the original rars, not just an SRR.">Probe recipe</button>
           <button class="btn" id="btn-rai-stop" onclick="stopProbe()" style="display:none">Stop</button>
           <button class="btn btn-go" id="btn-rai-go" onclick="runRarInspect()" disabled>Analyze</button>
@@ -356,6 +357,40 @@ async function runProbe() {
 }
 
 function stopProbe() { window.pywebview.api.stop_probe(); }
+
+// Copy the whole Archive Inspector output. Uses a detached textarea because
+// execCommand('copy') needs a real selection, and the log is a div of spans —
+// selecting it directly would also drag in the page's own styling/newlines.
+function copyRaiLog() {
+  const log  = document.getElementById('rai-log');
+  const prog = document.getElementById('rai-progress');
+  let text = (log.innerText || '').replace(/\n{3,}/g, '\n\n').trimEnd();
+  if (prog && prog.textContent.trim()) text += '\n' + prog.textContent.trimEnd();
+  const btn = document.getElementById('btn-rai-copy');
+  if (!text) { flashBtn(btn, 'Nothing to copy'); return; }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  if (!ok && navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(
+      () => flashBtn(btn, 'Copied ✓'), () => flashBtn(btn, 'Copy failed'));
+    return;
+  }
+  flashBtn(btn, ok ? 'Copied ✓' : 'Copy failed');
+}
+function flashBtn(btn, msg) {
+  if (!btn) return;
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = msg;
+  clearTimeout(btn._flash);
+  btn._flash = setTimeout(() => { btn.textContent = btn.dataset.label; }, 1400);
+}
 
 // ── Move to Folder ────────────────────────────────────────────────────────────
 async function browseMtf() {
