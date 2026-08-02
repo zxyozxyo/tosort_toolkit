@@ -5100,8 +5100,14 @@ class SrrdbToolAPI:
                     continue
                 n = getattr(b, "file_name", "")
                 crc = getattr(b, "file_crc", None)
-                if not n or crc is None or n in want:
+                if not n or crc is None:
                     continue
+                # LAST block wins. A file spanning volumes has a header in
+                # EVERY volume and only the FINAL part carries the whole-file
+                # CRC — the earlier ones hold per-piece values. Reading the
+                # first block made every split file look wrong: Shin_Megami…XPA
+                # shows 21 blocks with 21 DISTINCT CRCs, first E4010FF0, last
+                # 394744E6, and the correct .nds on disk is 394744E6.
                 want[n] = (getattr(b, "unpacked_size", 0), crc & 0xFFFFFFFF)
         except Exception:
             return []
