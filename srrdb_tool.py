@@ -4413,6 +4413,22 @@ class SrrdbToolAPI:
         a build. Returns the winning verify dict on success, else None."""
         if getattr(self, "_last_good_rar", None):
             return None
+        # The seed can only engage when the failing compressed file has a
+        # PRECEDING packed block to borrow a build from — i.e. the STORED-extra
+        # shape this rescue is named for. On any other shape _seed_method2
+        # returns None and rescene silently falls back to its normal factory,
+        # which re-runs the ENTIRE isolated hunt that just failed — once per
+        # candidate build. Measured on FabStyle_JAP_NDS-PUSSYCAT (content-first,
+        # 268 MB .nds): ~28 min of identical churn per build, ~110 min for the
+        # four group builds, and it consumed the budget the recipe sweep below
+        # actually needed. Refusing here costs nothing: those passes never had
+        # a way to succeed.
+        if not self._is_stored_extra_shape(srr_file):
+            self._log(
+                "  (method2 rescue not applicable — no stored extra precedes "
+                "the content, so there is no build for it to borrow; leaving "
+                "the budget to the recipe sweep.)", "dim")
+            return None
         builds = list(getattr(self, "_recon_prefs", None) or [])
         if not builds:
             return None                      # no group build to seed method2
