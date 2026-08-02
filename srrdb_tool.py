@@ -5064,6 +5064,82 @@ class SrrdbToolAPI:
 
     _VERIFY_SKIP_DIRS = {"_stored", "_subs_tmp", "_iso_m2ts_tmp", "Sample"}
 
+    def _check_source_crcs(self, srr_path: str, content_dir: Path) -> list:
+        """Verify the content we are about to rebuild FROM against the CRC32s
+        the SRR recorded for it. Returns the mismatching names (empty = fine).
+
+        Every packed-file block in an SRR carries the UNPACKED file's CRC32, so
+        "is this the right file?" is answerable in one read, before any version
+        hunting. Without it a wrong dump is indistinguishable from a settings
+        wall: it fails at every build and every thread count, for the obvious
+        reason that different bytes cannot compress to the same stream, and the
+        tool reports a genuine wall after an hour of work.
+
+        Only files we actually HAVE are checked. A missing source is normal here
+        — archive-only extras arrive later from the SRR's stored files or an
+        srrdb add — and is not this check's business.
+
+        Files the SRR also carries STORED are exempt, even when the loose copy
+        is wrong. The rebuild already prefers the SRR's verbatim copy for those
+        ("Using SRR-stored file(s) as sources: …"), so a stale proof jpg in the
+        content folder is recovered rather than fatal — flagging it would fail
+        releases that succeed today. What cannot be recovered is the CONTENT: it
+        is far too big to be stored in an SRR, so a mismatch there is final."""
+        try:
+            from rescene.rar import RarReader, BlockType  # type: ignore
+        except Exception:
+            return []
+        want: dict = {}
+        stored: set = set()
+        try:
+            for b in RarReader(str(srr_path)).read_all():
+                if b.rawtype == BlockType.SrrStoredFile:
+                    stored.add(Path(getattr(b, "file_name", "")).name.lower())
+                    continue
+                if b.rawtype != BlockType.RarPackedFile:
+                    continue
+                n = getattr(b, "file_name", "")
+                crc = getattr(b, "file_crc", None)
+                if not n or crc is None or n in want:
+                    continue
+                want[n] = (getattr(b, "unpacked_size", 0), crc & 0xFFFFFFFF)
+        except Exception:
+            return []
+        want = {n: v for n, v in want.items()
+                if Path(n).name.lower() not in stored}
+        if not want:
+            return []
+
+        bad = []
+        for name, (size, crc) in want.items():
+            p = content_dir / Path(name).name
+            if not p.is_file():
+                continue
+            try:
+                if p.stat().st_size != size:
+                    # A size mismatch is already decisive; don't spend the read.
+                    bad.append((name, size, p.stat().st_size, crc, None))
+                    continue
+                got = self._crc32_file(str(p)) & 0xFFFFFFFF
+            except OSError:
+                continue
+            if got != crc:
+                bad.append((name, size, size, crc, got))
+
+        for name, size, got_size, crc, got in bad:
+            if got is None:
+                self._log(f"  ✗ {name}: the SRR describes {size:,} B but this "
+                          f"file is {got_size:,} B — wrong file.", "err")
+            else:
+                self._log(f"  ✗ {name}: right size, but CRC {got:08X} ≠ the "
+                          f"SRR's {crc:08X} — this is NOT the file this release "
+                          "packed.", "err")
+        if bad:
+            self._log("  Skipping the rebuild: no WinRAR version or thread "
+                      "count can reproduce a stream from different bytes. Get "
+                      "the correct dump and re-queue.", "warn")
+        return [b[0] for b in bad]
+
     @staticmethod
     def _force_rmtree(path: Path, attempts: int = 5) -> list:
         """Delete a tree, surviving the two Windows failures that make
@@ -6111,6 +6187,23 @@ class SrrdbToolAPI:
                     self._log(f"    {tag:>14}  {ci.name}", "dim")
                 if len(citems) > 12:
                     self._log(f"    … and {len(citems) - 12} more", "dim")
+
+                # Is the source even the right FILE? The SRR records each packed
+                # file's unpacked CRC32, so this is knowable in one pass before
+                # any hunting. Tokutenryoku…Chuu_2_5-PUSSYCAT burned 30 minutes
+                # of version hunt plus a full 3248-combo sweep and was reported
+                # as a "genuine wall", when its .nds was simply the wrong dump —
+                # right size, CRC 9A6F1A4B against the SRR's 3FAA3B11. No build
+                # or thread count can reproduce a stream from different bytes,
+                # so the whole search was doomed from the first second.
+                bad_src = self._check_source_crcs(str(srr_file), cdir)
+                if bad_src:
+                    # Raise rather than return: the established failure path
+                    # emits job_done and records the result, and returning here
+                    # would leave the GUI row stuck on "running".
+                    summary["note"] = ("source does not match the SRR: "
+                                       + ", ".join(bad_src[:3]))
+                    raise ValueError(summary["note"])
 
                 self._log("  Reconstructing RARs…", "dim")
                 # Clear any RAR volumes left in the output by a PREVIOUS run.
