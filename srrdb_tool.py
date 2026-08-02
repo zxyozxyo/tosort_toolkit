@@ -3687,6 +3687,13 @@ class SrrdbToolAPI:
         level, md, solid = s["level"], s["md"], s["solid"]
         work = Path(tempfile.mkdtemp(prefix="recipe-"))
         try:
+            # No volume-split file means the SRR carries no compressed-stream
+            # CRC at all, so sizes are the only evidence. Sizes SHORTLIST and
+            # the SFV confirms (see _sweep_by_size) — and there is nothing for
+            # the truncation calibration to prove, so skip straight past it.
+            if not any(len(s["files"][n]["blocks"]) > 1 for n in s["order"]):
+                return self._sweep_by_size(srr_file, content_dir, out_root, s,
+                                           srcs, work, rar_dir, reps, RarStream)
             cmd_files, checks = self._calibrated_stage(
                 work, s, srcs, level, md, solid, Path(rar_dir), reps, RarStream)
             if cmd_files is None:
@@ -3694,13 +3701,8 @@ class SrrdbToolAPI:
                 return None
             n_crc = sum(len(c[1]) for c in checks)
             if not n_crc:
-                # Sizes alone are exactly the weak evidence that makes rescene
-                # lock the wrong build on a single-volume file. Without at least
-                # one real stream CRC the sweep can't be decisive, so don't
-                # pretend it is — leave the release to the normal path.
-                self._log("  Recipe sweep: this set has no volume-split file, so "
-                          "the SRR carries no stream CRC to match against — "
-                          "skipping (nothing here would be decisive).", "dim")
+                self._log("  Recipe sweep: the staged set produced no checkable "
+                          "stream CRC — skipping rather than guessing.", "dim")
                 return None
             mts: list = []
             for m in (self._mt_freq_rank() + list(_MT_COMMON)):
@@ -4013,6 +4015,153 @@ class SrrdbToolAPI:
         m = re.match(r"(\d{4}-\d{2}-\d{2})_rar(\d)(\d\d)", fname)
         return f"{m.group(1)} {m.group(2)}.{m.group(3)}" if m else fname
 
+    # Distinct size-matching candidates worth a full rebuild. Measured on
+    # Jewel_Link…PUSSYCAT: 113 combos reproduce both packed sizes and ALL 113
+    # emit byte-identical output, so the real number is 1. The cap is only a
+    # guard against a set where it isn't.
+    _SIZE_SWEEP_MAX_CANDS = 6
+
+    def _sweep_by_size(self, srr_file: str, content_dir: str, out_root: Path,
+                       s: dict, srcs: dict, work: Path, rar_dir: str,
+                       reps: list, RarStream) -> dict | None:
+        """Recipe sweep for a set with NO volume-split file.
+
+        Every file fits in one volume, so each block's `file_crc` is the
+        UNPACKED file's CRC and the SRR describes no compressed-stream bytes at
+        all. The only per-file evidence left is the exact packed SIZE — the same
+        weak test that makes rescene lock the wrong build, so it is used to
+        SHORTLIST and never to decide:
+
+          1. pack all files together at each (build, -mt) and keep the combos
+             that reproduce EVERY file's packed size exactly;
+          2. dedupe those on the actual compressed bytes. This is safe dedup —
+             unlike the family-dedup removed in 208503f, every combo here has
+             compressed the real content, so merging is an OBSERVATION that two
+             combos are indistinguishable, not a prediction that they will be;
+          3. rebuild at each new distinct candidate AS IT IS FOUND, letting the
+             SFV arbitrate exactly as on every other path.
+
+        Confirming inline rather than after a full pass matters: sweeping the
+        whole grid first cost 701 s on Jewel_Link when the answer was the first
+        candidate found. A wrong candidate only costs one rebuild, and combos
+        that emit bytes already rejected are skipped without one.
+
+        Returns {"exe", "version", "mt", "rebuilt": (rc, verify)} or None."""
+        from rescene.rar import RarReader, BlockType  # type: ignore
+        level, md, solid = s["level"], s["md"], s["solid"]
+        want = {Path(n).name: sum(p for p, _ in s["files"][n]["blocks"])
+                for n in s["order"]}
+        # Full, correctly-named sources: sizes must be the REAL ones (no
+        # truncation), and `rar a -ep` stores whatever basename it is handed.
+        named = work / "named"
+        files = []
+        for n in s["order"]:
+            p = Path(srcs[n])
+            if p.name.lower() == Path(n).name.lower():
+                files.append(str(p))
+                continue
+            named.mkdir(parents=True, exist_ok=True)
+            link = named / Path(n).name
+            if not link.exists():
+                try:
+                    os.link(str(p), str(link))
+                except OSError:
+                    shutil.copy2(str(p), str(link))
+            files.append(str(link))
+
+        mts: list = []
+        for m in (self._mt_freq_rank() + list(_MT_COMMON)):
+            if m not in mts:
+                mts.append(m)
+        self._log(
+            f"  Recipe sweep: no volume-split file, so the SRR carries no stream "
+            f"CRC — matching all {len(files)} file(s) on exact packed SIZE across "
+            f"{len(reps)} build(s) × -mt {mts}, then confirming against the SFV.",
+            "dim")
+
+        probe = work / "probe.rar"
+        deadline = time.time() + _RECIPE_SWEEP_BUDGET_S
+        seen: dict = {}          # output hash -> first (exe, mt) that made it
+        cands: list = []
+        tried = 0
+        for mt in mts:
+            for fn in reps:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                if time.time() > deadline:
+                    self._log("  Recipe sweep: budget reached — confirming the "
+                              f"{len(cands)} candidate(s) found so far.", "dim")
+                    break
+                tried += 1
+                if not self._sweep_compress(Path(rar_dir) / fn, level, md,
+                                            solid, mt, files, probe):
+                    continue
+                got: dict = {}
+                try:
+                    for b in RarReader(str(probe)).read_all():
+                        if b.rawtype == BlockType.RarPackedFile:
+                            got[b.file_name] = (got.get(b.file_name, 0)
+                                                + b.packed_size)
+                except Exception:
+                    continue
+                if got != want:
+                    continue
+                h = self._sweep_output_hash(probe, s["order"], RarStream)
+                if h is None or h in seen:
+                    continue          # byte-identical to one already rejected
+                seen[h] = (fn, mt)
+                cand = {"exe": fn, "version": self._exe_version_str(fn),
+                        "mt": mt}
+                cands.append(cand)
+                self._log(
+                    f"    Distinct output #{len(cands)} reproduces every packed "
+                    f"size: {cand['version']} -mt{mt} ({fn}) — rebuilding to let "
+                    "the SFV decide.", "dim")
+                got = self._rebuild_with_recipe(cand, srr_file, content_dir,
+                                                out_root)
+                if got:
+                    self._log(f"  ✓ Recipe sweep: {cand['version']} -mt{mt} "
+                              f"({fn}) rebuilds this set to the SFV "
+                              f"({tried} combo(s) tried).", "ok")
+                    out = dict(cand)
+                    out["rebuilt"] = got
+                    return out
+                if len(cands) >= self._SIZE_SWEEP_MAX_CANDS:
+                    self._log("  Recipe sweep: "
+                              f"{self._SIZE_SWEEP_MAX_CANDS} distinct outputs "
+                              "matched the sizes and none rebuilt — stopping.",
+                              "warn")
+                    return None
+            if time.time() > deadline:
+                break
+
+        if not cands:
+            self._log(
+                f"  Recipe sweep: no pack build × -mt reproduces even the packed "
+                f"SIZES of this set ({tried} combo(s)) — a genuine wall.", "warn")
+            self._sweep_exhausted = True
+            return None
+        self._log(f"  Recipe sweep: {len(cands)} distinct output(s) matched every "
+                  "packed size but none rebuilt to the SFV — the sizes agree and "
+                  "the bytes don't.", "warn")
+        return None
+
+    def _sweep_output_hash(self, probe: Path, order: list, RarStream):
+        """SHA-256 over every packed file's COMPRESSED bytes, in order."""
+        h = hashlib.sha256()
+        try:
+            for n in order:
+                with RarStream(str(probe), packed_file_name=Path(n).name,
+                               compressed=True) as rs:
+                    while True:
+                        chunk = rs.read(1 << 20)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+        except Exception:
+            return None
+        return h.hexdigest()
+
     def _rebuild_with_recipe(self, recipe: dict, srr_file: str,
                              content_dir: str, out_root: Path):
         """Rebuild the release at a recipe the sweep already PROVED byte-exact.
@@ -4072,9 +4221,15 @@ class SrrdbToolAPI:
             # a verdict, so _recipe_found stays "skip" and the last-resort rescue
             # can try again after the rebuild has resolved the missing extra.
             return None
-        self._recipe_found = recipe        # recorded in the results DB
         if not recipe:
+            self._recipe_found = recipe    # recorded in the results DB
             return None
+        # The size-only path (no volume-split file — see _sweep_by_size) proves
+        # a candidate by REBUILDING it, so a hit there arrives already built.
+        rebuilt = recipe.pop("rebuilt", None)
+        self._recipe_found = recipe        # recorded in the results DB
+        if rebuilt is not None:
+            return rebuilt
         return self._rebuild_with_recipe(recipe, srr_file, content_dir, out_root)
 
     def _is_extra_before_content_shape(self, srr_path: str) -> bool:
