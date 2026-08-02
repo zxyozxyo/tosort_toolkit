@@ -716,7 +716,7 @@ class RsrToolAPI:
         self._log(f"{len(folders)} release folder(s) under {src}", "info")
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
-        done = ok = failed = skipped = 0
+        done = ok = failed = skipped = zips = 0
         for i, folder in enumerate(folders, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -749,6 +749,13 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped"})
                 skipped += 1
                 continue
+            if res.get("error") == "zip release":
+                # Out of scope, not a failure. Counted apart so the summary's
+                # "failed" figure stays a number worth reading.
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "zip"})
+                zips += 1
+                continue
             done += 1
             if res.get("ok"):
                 ok += 1
@@ -761,7 +768,9 @@ class RsrToolAPI:
 
         self._log("", "")
         self._log(f"Capture complete — {ok} verified, {failed} failed, "
-                  f"{skipped} skipped.", "ok" if failed == 0 else "warn")
+                  f"{skipped} skipped"
+                  + (f", {zips} ZIP release(s) out of scope" if zips else "")
+                  + ".", "ok" if failed == 0 else "warn")
 
     # ── one release ───────────────────────────────────────────────────────
 
@@ -770,7 +779,18 @@ class RsrToolAPI:
         rel = _release_name(folder)
         sets = group_archive_sets(folder)
         if not sets:
-            self._log("  No archive set found in this folder.", "warn")
+            # Say WHICH kind of nothing. A third of the NDS corpus is ZIP
+            # releases (3308 of 9328 folders), which v1 does not do and is not
+            # a defect — but reported identically to a RAR set we failed to
+            # find, it would hide real misses in thousands of expected ones.
+            kinds = {p.suffix.lower() for p in folder.rglob("*") if p.is_file()}
+            if ".zip" in kinds:
+                self._log("  ZIP release — not supported in v1 (needs preflate "
+                          "to reproduce the deflate streams). Skipping.", "dim")
+                return {"ok": False, "error": "zip release"}
+            self._log("  No archive set found in this folder"
+                      + (f" (contains: {', '.join(sorted(k for k in kinds if k)[:6])})"
+                         if kinds else " — folder is empty") + ".", "warn")
             return {"ok": False, "error": "no archive"}
 
         work = Path(tempfile.mkdtemp(prefix="rsr-"))
