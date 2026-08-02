@@ -24,6 +24,16 @@ srrdb_extras.db-journal
 srrdb_extras.db-wal
 srrdb_extras.db-shm
 srr_cache/
+srrdb_harvest/
+srrdb_results.json.bak*
+
+# RSR scanner — settings, index and the captured store are all local data
+rsr_tool.json
+rsr_index.db
+rsr_index.db-journal
+rsr_index.db-wal
+rsr_index.db-shm
+rsr_store/
 ia_upload_profiles.json
 misc_tools.json
 reference_fingerprint_db.json
