@@ -165,6 +165,10 @@ def _rmtree(path: Path):
     shutil.rmtree(path, onerror=_onerror)
 
 
+def _zip_entry_size(sizes: dict, name: str) -> int:
+    return int(sizes.get(name, 0) or 0)
+
+
 def _release_name(folder: Path) -> str:
     """Folder name with any dats.site date prefix stripped, so the store is
     keyed by the ACTUAL release name (point 5 — browsable by hand)."""
@@ -732,7 +736,11 @@ class RsrToolAPI:
             if s["skip_done"] and self._existing_rsr(store, folder, rel):
                 self._log("  Already captured — skipping "
                           "(untick 'Skip captured' to redo).", "dim")
-                self._emit("row", {"name": rel, "status": "skipped"})
+                # Say WHY it was skipped in the row itself. A resumed run is
+                # mostly these, and "skipped" alone does not distinguish
+                # "captured on an earlier run" from "you pressed Skip".
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "already captured"})
                 skipped += 1
                 continue
             try:
@@ -746,7 +754,8 @@ class RsrToolAPI:
                 # in the store — _capture_release only writes a .rsr after its
                 # own rebuild has verified.
                 self._log("  ⏭ Skipped by request — nothing written.", "warn")
-                self._emit("row", {"name": rel, "status": "skipped"})
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "skipped by hand"})
                 skipped += 1
                 continue
             if res.get("error") == "zip release":
@@ -1808,6 +1817,96 @@ class RsrToolAPI:
             return {"ok": True, "manifest": manifest, "entries": names}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def release_info(self, key: str) -> dict:
+        """Everything known about one captured release, for the detail popup.
+
+        `key` is whatever the GUI has to hand — a release NAME from a queue row
+        or a .rsr PATH from the database list — because the queue only ever
+        knew the name, and requiring the caller to resolve it would duplicate
+        the lookup in JavaScript."""
+        key = (key or "").strip()
+        if not key:
+            return {"ok": False, "error": "no release given"}
+        path = Path(key)
+        if not (path.suffix.lower() == ".rsr" and path.is_file()):
+            if not self._db_path.is_file():
+                return {"ok": False, "error": "nothing captured yet"}
+            con = self._db()
+            try:
+                row = con.execute("SELECT rsr_path FROM releases WHERE name=?",
+                                  (key,)).fetchone()
+            finally:
+                con.close()
+            if not row:
+                return {"ok": False,
+                        "error": f"'{key}' is not in the index — it may have "
+                                 "been skipped, failed, or captured before the "
+                                 "index existed."}
+            path = Path(row[0])
+        if not path.is_file():
+            return {"ok": False,
+                    "error": f"indexed, but the .rsr is gone from {path}"}
+
+        try:
+            manifest, z = self.read_rsr(path)
+            entries = z.namelist()
+            entries_info = {n: z.getinfo(n).file_size for n in entries}
+            z.close()
+        except Exception as e:
+            return {"ok": False, "error": f"cannot read {path.name}: {e}"}
+
+        sets = []
+        for st in manifest.get("sets", []):
+            rec = st.get("recipe") or {}
+            vols = st.get("volumes", [])
+            sets.append({
+                "stem": st.get("stem", ""),
+                "format": st.get("format", ""),
+                "scheme": st.get("scheme", ""),
+                "solid": bool(rec.get("solid")),
+                "verify": st.get("verify", st.get("error", "—")),
+                "recipe": (f"{rec.get('version', '?')} -mt{rec.get('mt', '?')}"
+                           if rec else "—"),
+                "exe": rec.get("exe", ""),
+                "settings": (f"-m{rec.get('level', '?')} "
+                             f"-md{rec.get('dict_kb', '?')}KB "
+                             f"{'-s' if rec.get('solid') else '-s-'}"
+                             if rec else ""),
+                "volumes": len(vols),
+                "volume_bytes": sum(v.get("size", 0) for v in vols),
+                "deltas": sum(1 for v in vols if v.get("delta")),
+                # Size the patches from the container itself — the manifest
+                # records which entry holds each delta, not how big it is, and
+                # "9 volumes patched" reads very differently at 600 B than at
+                # 600 KB (the latter would mean the replay is near-but-not-on
+                # and the delta is hiding a stream difference).
+                "delta_bytes": sum(
+                    _zip_entry_size(entries_info, v["delta"])
+                    for v in vols if v.get("delta")),
+                "files": [{
+                    "name": f.get("name", ""),
+                    "size": f.get("size", 0),
+                    "packed": f.get("packed_size", 0),
+                    "crc32": "%08X" % (f.get("crc32") or 0),
+                    "source": f.get("source", ""),
+                } for f in st.get("files", [])],
+            })
+        return {"ok": True, "info": {
+            "name": manifest.get("release", path.stem),
+            "system": manifest.get("system", "—"),
+            "year": manifest.get("year", "—"),
+            "created": manifest.get("created_utc", ""),
+            "tool": manifest.get("tool", ""),
+            "source_folder": manifest.get("source_folder", ""),
+            "path": str(path),
+            "rsr_bytes": path.stat().st_size,
+            "has_srr": "release.srr" in entries,
+            "sets": sets,
+            "sidecars": [{"name": s.get("name", ""), "size": s.get("size", 0)}
+                         for s in manifest.get("sidecars", [])],
+            "extras": [e for e in entries if e.startswith("extras/")],
+        }}
 
 
 def main():

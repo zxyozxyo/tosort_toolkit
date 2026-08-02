@@ -63,6 +63,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .queue-row{padding:5px 8px;border-bottom:1px solid var(--border);font-size:11px}
 .queue-row:last-child{border-bottom:none}
 .queue-row:hover{background:var(--bg2)}
+.queue-row{cursor:pointer}
 .qr-name{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:4px}
 .qr-recipe{color:var(--text2);font-family:var(--mono);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .qr-status{font-family:var(--mono);font-size:9px;text-align:center}
@@ -83,6 +84,37 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .log-w .ok{color:var(--acc)}
 .log-w .warn{color:var(--warn)}
 .log-w .err{color:var(--danger)}
+
+/* Release detail popup */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
+  align-items:center;justify-content:center;z-index:50}
+.modal-bg.on{display:flex}
+.modal{background:var(--bg1);border:1px solid var(--border);border-radius:6px;
+  width:min(760px,92vw);max-height:86vh;display:flex;flex-direction:column;
+  box-shadow:0 10px 40px rgba(0,0,0,.5)}
+.modal-hdr{display:flex;align-items:center;gap:8px;padding:8px 12px;
+  border-bottom:1px solid var(--border);background:var(--bg2);border-radius:6px 6px 0 0}
+.modal-hdr .t{flex:1;font-size:12px;font-weight:700;color:var(--text);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modal-body{padding:10px 12px;overflow-y:auto;font-size:11px;color:var(--text2);
+  user-select:text}
+.mi-grid{display:grid;grid-template-columns:96px 1fr;gap:2px 10px;margin-bottom:10px}
+.mi-grid .k{color:var(--text3);font-size:10px;text-transform:uppercase;
+  letter-spacing:.3px;padding-top:1px}
+.mi-grid .v{color:var(--text);font-family:var(--mono);font-size:11px;
+  word-break:break-all}
+.mi-sec{margin:10px 0 4px;font-size:10px;font-weight:700;color:var(--text3);
+  text-transform:uppercase;letter-spacing:.4px;border-top:1px solid var(--border);
+  padding-top:8px}
+.mi-tbl{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10px}
+.mi-tbl th{text-align:left;color:var(--text3);font-weight:400;padding:2px 6px 2px 0}
+.mi-tbl td{padding:2px 6px 2px 0;color:var(--text2);vertical-align:top}
+.mi-tbl td.n{color:var(--text)}
+.mi-tbl td.r{text-align:right}
+.tag{display:inline-block;padding:0 5px;border-radius:6px;font-size:9px;
+  border:1px solid var(--border);color:var(--text3)}
+.tag.content{border-color:var(--warn);color:var(--warn)}
+.tag.extra{border-color:var(--acc);color:var(--acc)}
 
 .db-list{max-height:190px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;margin-top:2px}
 .db-item{padding:4px 7px;border-radius:4px;border:1px solid transparent;display:flex;align-items:center;gap:7px;cursor:pointer;font-size:11px}
@@ -231,6 +263,18 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
   </div>
 </div>
 
+<!-- Release detail: click any release in the queue or the database list -->
+<div class="modal-bg" id="modal-bg" onclick="if(event.target===this)closeInfo()">
+  <div class="modal">
+    <div class="modal-hdr">
+      <div class="t" id="mi-title">Release</div>
+      <button class="btn btn-sm" id="mi-open" onclick="openInfoFolder()">Open folder</button>
+      <button class="btn btn-sm" onclick="closeInfo()">Close</button>
+    </div>
+    <div class="modal-body" id="mi-body"></div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const rows = new Map();
@@ -355,6 +399,8 @@ function upsertRow(d) {
     el.className = 'queue-row';
     el.innerHTML = '<div class="qr-name"></div><div class="qr-recipe"></div>'
                  + '<div class="qr-status"></div>';
+    el.title = 'Click for capture details';
+    el.onclick = () => showInfo(d.name);
     $('queue').appendChild(el);
     rows.set(d.name, el);
     $('queue-count').textContent = rows.size + ' release(s)';
@@ -377,6 +423,87 @@ window.rsrEvent = function (event, data) {
   else if (event === 'scan_done') { setBusy(false); refreshStats(); dbSearch(); }
 };
 
+/* ── release detail popup ─────────────────────────────────────────────── */
+let infoPath = '';
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const bytes = n => Number(n || 0).toLocaleString() + ' B';
+
+function closeInfo() { $('modal-bg').classList.remove('on'); }
+function openInfoFolder() { if (infoPath) window.pywebview.api.open_store(infoPath); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeInfo(); });
+
+async function showInfo(key) {
+  $('mi-title').textContent = key;
+  $('mi-body').innerHTML = '<div class="hint">loading…</div>';
+  $('modal-bg').classList.add('on');
+  const r = await window.pywebview.api.release_info(key);
+  if (!r.ok) {
+    infoPath = '';
+    $('mi-open').style.display = 'none';
+    $('mi-body').innerHTML = '<div class="hint">' + esc(r.error) + '</div>';
+    return;
+  }
+  const i = r.info;
+  infoPath = i.path;
+  $('mi-open').style.display = '';
+  $('mi-title').textContent = i.name;
+
+  let h = '<div class="mi-grid">'
+    + row2('System', i.system + ' · ' + i.year)
+    + row2('Captured', (i.created || '').replace('T', ' ').replace('+00:00', ' UTC'))
+    + row2('.rsr size', bytes(i.rsr_bytes) + (i.has_srr ? '  (includes a legacy .srr)' : ''))
+    + row2('Stored at', i.path)
+    + (i.source_folder ? row2('Scanned', i.source_folder) : '')
+    + '</div>';
+
+  for (const s of i.sets) {
+    h += '<div class="mi-sec">Set: ' + esc(s.stem) + '</div>';
+    h += '<div class="mi-grid">'
+      + row2('Recipe', s.recipe + (s.exe ? '   (' + s.exe + ')' : ''))
+      + row2('Settings', s.settings + (s.solid ? '  · SOLID' : ''))
+      + row2('Archive', s.format + ' · ' + s.scheme + ' naming · '
+             + s.volumes + ' volume(s) · ' + bytes(s.volume_bytes))
+      + row2('Verified', s.verify === 'exact'
+          ? 'byte-exact replay'
+          : s.verify === 'delta'
+            ? ('replay + header delta on ' + s.deltas + ' volume(s)'
+               + (s.delta_bytes ? ' (' + bytes(s.delta_bytes) + ')' : ''))
+            : esc(s.verify))
+      + '</div>';
+    if (s.files.length) {
+      h += '<table class="mi-tbl"><tr><th>Packed file</th><th class="r">Size</th>'
+         + '<th class="r">Packed</th><th>CRC32</th><th>Role</th></tr>';
+      for (const f of s.files) {
+        const cls = f.source === 'content' ? 'content'
+                  : f.source === 'extra' ? 'extra' : '';
+        h += '<tr><td class="n">' + esc(f.name) + '</td>'
+           + '<td class="r">' + Number(f.size).toLocaleString() + '</td>'
+           + '<td class="r">' + Number(f.packed).toLocaleString() + '</td>'
+           + '<td>' + esc(f.crc32) + '</td>'
+           + '<td><span class="tag ' + cls + '">' + esc(f.source) + '</span></td></tr>';
+      }
+      h += '</table>';
+    }
+  }
+
+  if (i.extras.length) {
+    h += '<div class="mi-sec">Carried inside the .rsr</div><div class="v">'
+       + i.extras.map(e => esc(e.replace(/^extras\//, ''))).join(', ') + '</div>';
+  }
+  if (i.sidecars.length) {
+    h += '<div class="mi-sec">Sidecars (loose in the release folder)</div>'
+       + '<div class="v">'
+       + i.sidecars.map(s => esc(s.name) + ' (' + bytes(s.size) + ')').join(', ')
+       + '</div>';
+  }
+  $('mi-body').innerHTML = h;
+}
+
+function row2(k, v) {
+  return '<div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div>';
+}
+
 async function refreshStats() {
   try {
     const s = await window.pywebview.api.db_stats();
@@ -396,8 +523,10 @@ async function dbSearch() {
   for (const row of r.rows) {
     const d = document.createElement('div');
     d.className = 'db-item';
-    d.title = row.path;
-    d.onclick = () => { $('rb-rsr').value = row.path; };
+    d.title = row.path + '\n(click for details, double-click to open the folder)';
+    // Single click also arms the rebuild box — that was the old behaviour and
+    // it is still the common next action after looking at a release.
+    d.onclick = () => { $('rb-rsr').value = row.path; showInfo(row.path); };
     d.ondblclick = () => window.pywebview.api.open_store(row.path);
     d.innerHTML =
       `<span class="${row.verified ? 'tick' : 'cross'}">${row.verified ? '✓' : '✗'}</span>`
