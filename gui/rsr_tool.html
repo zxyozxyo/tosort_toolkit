@@ -140,6 +140,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <input class="num" id="max_mt" type="number" min="0" max="32" value="16">
             <span class="hint">thread counts swept 0–N</span>
           </div>
+          <div class="row">
+            <div class="lbl">Embed cap</div>
+            <input class="num" id="embed_max_mb" type="number" min="0" max="4096" value="16">
+            <span class="hint">MB — larger packed files count as content</span>
+          </div>
           <label class="chk-row"><input type="checkbox" id="embed_extras" checked>
             Embed archive-only extras (required to rebuild them)</label>
           <label class="chk-row"><input type="checkbox" id="write_srr" checked>
@@ -235,6 +240,7 @@ window.addEventListener('pywebviewready', async () => {
   $('source').value = s.source || '';
   $('store').value = s.store || '';
   $('max_mt').value = s.max_mt;
+  $('embed_max_mb').value = s.embed_max_mb;
   $('embed_extras').checked = s.embed_extras;
   $('write_srr').checked = s.write_srr;
   $('skip_done').checked = s.skip_done;
@@ -248,6 +254,7 @@ function cfg() {
     source: $('source').value.trim(),
     store: $('store').value.trim(),
     max_mt: $('max_mt').value,
+    embed_max_mb: $('embed_max_mb').value,
     embed_extras: $('embed_extras').checked,
     write_srr: $('write_srr').checked,
     skip_done: $('skip_done').checked,

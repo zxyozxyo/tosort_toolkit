@@ -498,6 +498,7 @@ class RsrToolAPI:
             "store": cfg.get("store", str(self._app_dir / "rsr_store")),
             "max_mt": _num(cfg.get("max_mt"), 16, int),
             "embed_extras": bool(cfg.get("embed_extras", True)),
+            "embed_max_mb": _num(cfg.get("embed_max_mb"), 16, int),
             "write_srr": bool(cfg.get("write_srr", True)),
             "skip_done": bool(cfg.get("skip_done", True)),
             "dict_ladder": bool(cfg.get("dict_ladder", True)),
@@ -511,6 +512,8 @@ class RsrToolAPI:
             "store": (s.get("store") or cur["store"]).strip(),
             "max_mt": max(0, min(32, _num(s.get("max_mt"), cur["max_mt"], int))),
             "embed_extras": bool(s.get("embed_extras", cur["embed_extras"])),
+            "embed_max_mb": max(0, min(4096, _num(s.get("embed_max_mb"),
+                                                  cur["embed_max_mb"], int))),
             "write_srr": bool(s.get("write_srr", cur["write_srr"])),
             "skip_done": bool(s.get("skip_done", cur["skip_done"])),
             "dict_ladder": bool(s.get("dict_ladder", cur["dict_ladder"])),
@@ -658,6 +661,14 @@ class RsrToolAPI:
             if not manifest["sets"]:
                 return {"ok": False, "error": "nothing captured"}
 
+            # Sidecars: everything loose in the release folder that is not a
+            # volume — .nfo, .sfv, proof jpg, file_id.diz, Proof/ and Sample/
+            # subfolders. They are part of the release but appear in no
+            # archive, so nothing above ever looked at them and a rebuild
+            # produced a folder missing its own nfo. Kilobytes; carry them.
+            manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
+                                                          manifest)
+
             # Optional legacy .srr, embedded verbatim so a .rsr can always emit
             # one for the existing ecosystem without us re-deriving structure.
             if s["write_srr"]:
@@ -671,10 +682,11 @@ class RsrToolAPI:
             rsr_path = out_dir / f"{rel}.rsr"
             self._write_rsr(rsr_path, manifest, embedded)
 
-            # Extras are ALSO written loose beside the .rsr — point 5/6: a
-            # human should be able to open the release folder and look.
+            # Extras and sidecars are ALSO written loose beside the .rsr —
+            # point 5/6: a human should be able to open the release folder in
+            # the store and just look at the proof.
             for name, data in embedded.items():
-                if not name.startswith("extras/"):
+                if not name.split("/")[0] in ("extras", "sidecars"):
                     continue
                 dst = out_dir / name
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -696,6 +708,66 @@ class RsrToolAPI:
                     "error": "" if all_ok else "one or more sets unverified"}
         finally:
             _rmtree(work)
+
+    # ── release-folder sidecars ───────────────────────────────────────────
+
+    def _capture_sidecars(self, folder: Path, s: dict, embedded: dict,
+                          manifest: dict) -> list[dict]:
+        """Loose files in the release folder that belong to no archive.
+
+        The .nfo and .sfv are the obvious ones, but this also picks up a proof
+        jpg sitting beside the rars and whole Proof/ and Sample/ subfolders.
+        None of them appear in any packed-file list, so the per-set capture is
+        blind to them and a rebuilt folder came out without its own nfo.
+
+        The embed cap applies here too: a big loose file is content or a stray
+        unpacked copy, and either way is not a sidecar worth carrying."""
+        cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+        # A proof jpg that is BOTH packed and loose is the normal scene shape,
+        # and it was already embedded as an extra. Point the sidecar at those
+        # same bytes rather than storing an identical second copy — that alone
+        # was 827 KB of the 1.66 MB Monster_High .rsr.
+        by_hash = {_sha256(v): k for k, v in embedded.items()}
+        # A loose copy of the CONTENT is not a sidecar. It is under the cap
+        # whenever the content is (an 8 MB rom unpacked beside its own rars),
+        # and embedding it would put back the very bytes the content rule just
+        # took out. Identify it by the (size, crc32) the set capture recorded.
+        content_ids = {(f.get("size"), f.get("crc32"))
+                       for st in manifest.get("sets", [])
+                       for f in st.get("files", [])
+                       if f.get("source") == "content"}
+        out: list[dict] = []
+        for p in sorted(folder.rglob("*")):
+            if not p.is_file() or _classify_volume(p.name):
+                continue
+            rel = p.relative_to(folder).as_posix()
+            size = p.stat().st_size
+            if (size, _file_crc32(p)) in content_ids:
+                self._log(f"    (skipping loose {rel} — it is the set's "
+                          "content, supplied at rebuild)", "dim")
+                continue
+            if cap and size >= cap:
+                self._log(f"    (skipping loose {rel} — {size:,} B is over the "
+                          "embed cap, treated as content)", "dim")
+                continue
+            data = p.read_bytes()
+            sha = _sha256(data)
+            rec = {"name": rel, "size": size, "crc32": _file_crc32(p),
+                   "sha256": sha, "mtime_ns": p.stat().st_mtime_ns,
+                   "win_attrs": _win_attrs(p)}
+            if s.get("embed_extras", True):
+                key = by_hash.get(sha)
+                if key is None:
+                    key = f"sidecars/{rel}"
+                    embedded[key] = data
+                    by_hash[sha] = key
+                rec["stored"] = key
+            out.append(rec)
+        if out:
+            self._log(f"  {len(out)} sidecar(s) captured: "
+                      + ", ".join(x["name"] for x in out[:6])
+                      + (" …" if len(out) > 6 else ""), "ok")
+        return out
 
     # ── one archive set ───────────────────────────────────────────────────
 
@@ -773,17 +845,49 @@ class RsrToolAPI:
             f["mtime_ns"] = stt.st_mtime_ns
             f["win_attrs"] = _win_attrs(sp)
 
-        # Which files must travel INSIDE the .rsr? Anything not already loose
-        # in the release folder — the archive-only proof jpg / file_id.diz that
-        # a v1 SRR leaves with no source anywhere on earth.
+        # Which files must travel INSIDE the .rsr?
+        #
+        # There are exactly two kinds of packed file, and the split is by ROLE,
+        # not by where a copy happens to sit today:
+        #
+        #   CONTENT — the thing the release exists to carry. The operator has
+        #     it in their unpacked set and hands it to the rebuild, so its bytes
+        #     must NEVER be embedded. The original test ("anything not loose in
+        #     the release folder") got this exactly backwards: in a real scene
+        #     folder (rars + nfo + sfv + jpg) the content is the ONE file that
+        #     is never loose, so it was embedded every time — a 67 MB .rsr for
+        #     Monster_High…PUSSYCAT.
+        #
+        #   EXTRA — proof jpg, file_id.diz, sample stub. These travel inside,
+        #     UNCONDITIONALLY. Being loose in the source folder today is not a
+        #     reason to leave one out: at rebuild the operator supplies the
+        #     content folder, which holds the game and nothing else, so a
+        #     skipped loose jpg is a source that exists nowhere (exactly how
+        #     Monster_High failed to rebuild once the content fix went in).
+        #     The .rsr must be self-sufficient bar the content.
+        #
+        # Content is identified two ways, because a size cap alone cannot do it
+        # — small NDS roms are 8 MB, under any cap generous enough to hold a
+        # proof jpg:
+        #   * the LARGEST file in the set is content by definition, and
+        #   * anything at or over the embed cap is content regardless of rank.
+        # What remains is always smaller than what it is proof OF, so embedding
+        # it costs kilobytes.
+        cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+        biggest = max((f["size"] or 0) for f in meta) if meta else 0
         extras = []
+        content_only = []
         for f, sp in zip(meta, src_files):
             loose = folder / Path(f["name"]).name
-            have = (loose.is_file() and loose.stat().st_size == f["size"]
-                    and _file_crc32(loose) == f["crc32"])
-            f["source"] = "folder" if have else "extra"
-            if have:
+            f["loose"] = (loose.is_file() and loose.stat().st_size == f["size"]
+                          and _file_crc32(loose) == f["crc32"])
+            if (f["size"] or 0) >= biggest or (cap and (f["size"] or 0) >= cap):
+                # Content: recorded in the manifest so the rebuild demands it,
+                # but its bytes stay out of the .rsr.
+                f["source"] = "content"
+                content_only.append(f["name"])
                 continue
+            f["source"] = "extra"
             data = sp.read_bytes()
             f["sha256"] = _sha256(data)
             base = Path(f["name"]).name
@@ -795,12 +899,16 @@ class RsrToolAPI:
                 f["stored"] = key
             extras.append(f["name"])
         if extras:
-            self._log(f"    {len(extras)} archive-only file(s) captured: "
+            self._log(f"    {len(extras)} extra(s) captured: "
                       + ", ".join(Path(x).name for x in extras[:6])
                       + (" …" if len(extras) > 6 else ""), "ok")
             if not s["embed_extras"]:
                 self._log("    ⚠ 'Embed extras' is OFF — these bytes exist "
                           "nowhere else, so this .rsr will NOT rebuild.", "warn")
+        if content_only:
+            self._log("    content (supplied at rebuild, not embedded): "
+                      + ", ".join(Path(x).name for x in content_only[:4])
+                      + (" …" if len(content_only) > 4 else ""), "dim")
 
         # ── find the recipe ───────────────────────────────────────────────
         cands = self._dict_candidates(st["format"], dict_kb, s["dict_ladder"])
@@ -1241,6 +1349,7 @@ class RsrToolAPI:
                         ok_all = False
                         continue
                     ok_all &= self._rebuild_set(st, manifest, z, content, out, work)
+                self._restore_sidecars(manifest, z, out)
             finally:
                 _rmtree(work)
             self._log("", "")
@@ -1342,6 +1451,32 @@ class RsrToolAPI:
 
         self._restore_extras(st, z, out)
         return True
+
+    def _restore_sidecars(self, manifest, z, out: Path):
+        """Put the .nfo / .sfv / proof back beside the rebuilt volumes, with the
+        timestamps and attributes they were captured with — a release folder
+        without its nfo is not the release."""
+        n = 0
+        for f in manifest.get("sidecars", []):
+            if not f.get("stored"):
+                continue
+            dst = out / f["name"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            data = z.read(f["stored"])
+            if f.get("sha256") and _sha256(data) != f["sha256"]:
+                self._log(f"    ✗ sidecar {f['name']}: stored bytes do not "
+                          "match the captured hash.", "err")
+                continue
+            dst.write_bytes(data)
+            try:
+                if f.get("mtime_ns"):
+                    os.utime(dst, ns=(f["mtime_ns"], f["mtime_ns"]))
+            except Exception:
+                pass
+            _set_win_attrs(dst, f.get("win_attrs"))
+            n += 1
+        if n:
+            self._log(f"    ✓ {n} sidecar(s) restored.", "ok")
 
     @staticmethod
     def _restore_extras(st, z, out: Path):
