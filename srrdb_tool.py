@@ -5060,6 +5060,46 @@ class SrrdbToolAPI:
 
     _VERIFY_SKIP_DIRS = {"_stored", "_subs_tmp", "_iso_m2ts_tmp", "Sample"}
 
+    @staticmethod
+    def _force_rmtree(path: Path, attempts: int = 5) -> list:
+        """Delete a tree, surviving the two Windows failures that make
+        delete-source look flaky rather than broken.
+
+        `shutil.rmtree` walks bottom-up and raises on the FIRST file it cannot
+        remove — after it has already deleted everything it reached. So a single
+        stubborn file does not skip the delete, it leaves a half-emptied source
+        folder and one error line, which is exactly the "it deleted most of
+        them but left a few" shape. The two causes here:
+
+          * a read-only attribute (scene extras often carry one), which rmtree
+            reports as PermissionError, and
+          * a handle the just-finished rar.exe, the SFV verify pass, or an AV
+            scanner has not released yet — transient, and gone within a second.
+
+        Clearing the attribute handles the first; retrying handles the second.
+        Returns the paths that STILL exist afterwards — empty means success, so
+        the caller can report what survived instead of guessing."""
+        import stat as _stat
+
+        def _clear(fn, p, _exc):
+            try:
+                os.chmod(p, _stat.S_IWRITE)
+                fn(p)
+            except Exception:
+                pass
+
+        for i in range(attempts):
+            try:
+                shutil.rmtree(str(path), onerror=_clear)
+            except Exception:
+                pass
+            if not path.exists():
+                return []
+            time.sleep(0.4 * (i + 1))
+        left = [str(p) for p in path.rglob("*") if p.is_file()] \
+            if path.exists() else []
+        return left or ([str(path)] if path.exists() else [])
+
     def _verify_rebuilt_sfv(self, out_root: Path) -> dict:
         """CRC32-check the produced RAR volumes against every SFV under out_root.
 
@@ -6635,9 +6675,31 @@ class SrrdbToolAPI:
             # never delete the only copy of the source.
             _v = summary.get("verified") or {}
             fully_verified = bool(_v.get("checked")) and not _v.get("bad") and not _v.get("missing")
-            if (delete_source and summary["ok"] and (summary.get("rars") or 0) > 0
-                    and fully_verified
-                    and queue_path and Path(queue_path).is_dir()):
+            # Every path below states its reason. The old chain had branches
+            # that fell through logging NOTHING (rars == 0; a queue_path that
+            # is no longer a directory; ok False while fully_verified True), so
+            # a source that survived looked like a bug with no evidence for it.
+            # An unexplained skip is indistinguishable from a broken delete.
+            if not delete_source:
+                pass
+            elif (summary.get("rars") or 0) <= 0:
+                self._log("  Source delete SKIPPED — the rebuild produced no RAR "
+                          "volumes, so there is nothing proven to keep instead.",
+                          "warn")
+            elif not summary.get("ok"):
+                self._log("  Source delete SKIPPED — the job did not finish "
+                          "cleanly; keeping the source.", "warn")
+            elif not fully_verified:
+                why = ("no SFV entry was checkable" if not _v.get("checked")
+                       else f"{len(_v.get('bad') or [])} volume(s) wrong, "
+                            f"{len(_v.get('missing') or [])} missing")
+                self._log("  Source delete SKIPPED — rebuild not fully "
+                          f"CRC-verified against the SFV ({why}); keeping the "
+                          "source.", "warn")
+            elif not (queue_path and Path(queue_path).is_dir()):
+                self._log(f"  Source delete SKIPPED — source folder is no longer "
+                          f"a directory: {queue_path!r}", "warn")
+            else:
                 try:
                     qp = Path(queue_path).resolve()
                     orp = out_root.resolve()
@@ -6648,15 +6710,18 @@ class SrrdbToolAPI:
                         self._log("  Source delete SKIPPED — source and output "
                                   "folders overlap", "warn")
                     else:
-                        shutil.rmtree(str(qp))
-                        self._log(f"  Source folder DELETED (option enabled): {qp}",
-                                  "warn")
+                        left = self._force_rmtree(qp)
+                        if not left:
+                            self._log(f"  Source folder DELETED (option enabled): "
+                                      f"{qp}", "warn")
+                        else:
+                            self._log(
+                                f"  ⚠ Source delete INCOMPLETE — {len(left)} "
+                                f"file(s) survived in {qp} (locked or in use). "
+                                "e.g. " + ", ".join(Path(x).name for x in left[:4]),
+                                "err")
                 except Exception as e:
                     self._log(f"  Source delete failed: {e}", "err")
-            elif (delete_source and (summary.get("rars") or 0) > 0
-                    and not fully_verified):
-                self._log("  Source delete SKIPPED — rebuild not fully "
-                          "CRC-verified against the SFV; keeping the source.", "warn")
 
             if summary["ok"]:
                 self._log(f"  ✓ Done → {out_root}", "ok")
