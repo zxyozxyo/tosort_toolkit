@@ -6288,6 +6288,28 @@ class SrrdbToolAPI:
                         # affected.
                         rescued = self._rescue_multifile_crc(
                             str(srr_file), content_dir, out_root)
+                        if (not rescued
+                                and getattr(self, "_recipe_found", "skip") == "skip"
+                                and not (self._stop.is_set()
+                                         or self._skip.is_set())):
+                            # Measure the real recipe against the SRR's stream
+                            # CRCs and rebuild at it. This tier was only wired
+                            # into the reconstruct-ERROR path, so a set that
+                            # PRODUCED volumes and merely failed the SFV could
+                            # never reach it — Puzzler_World_2012…PUSSYCAT is
+                            # the case: the probe proves 3.60 -mt8 reproduces
+                            # both streams, and the version sweep below even
+                            # ran rar360.exe at -mt8, yet still missed, because
+                            # it compresses each file in ISOLATION while the
+                            # release was packed by ONE `rar a jpg nds`. Only
+                            # the sweep issues that command. Run it FIRST: it
+                            # is seconds rather than minutes and its verdict is
+                            # a measurement, so it can only save the version
+                            # sweep work it would otherwise do blind.
+                            swept = self._rescue_recipe_sweep(
+                                str(srr_file), content_dir, out_root)
+                            if swept:
+                                rescued = swept[1]      # (rc, verify) → verify
                         if not rescued:
                             # The -mt rescue couldn't help — often because the
                             # 2nd file went to method2 so only ONE stream was
