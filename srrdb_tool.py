@@ -3512,16 +3512,24 @@ class SrrdbToolAPI:
         return sets
 
     def _sweep_set(self, srr_file: str):
-        """The one RAR set worth sweeping: multi-file, has a compressed member,
-        and the most content behind it. None when no set qualifies (a single-file
-        set can't be packed in-context, so rescene's isolated hunt is correct)."""
+        """The RAR set worth sweeping: has a compressed member, and the most
+        content behind it.
+
+        Single-file sets count too. They can't be packed in-context, so the
+        in-context ARGUMENT for sweeping doesn't apply — but the sweep's other
+        property does: it settles build × -mt against the SRR's stream CRCs in
+        minutes, where rescene's isolated hunt recompresses the whole file per
+        candidate and times out. Excluding them meant Pocoyo_Racing,
+        My_Ballet_Studio and Tsumiki_Block_Drop_Mania (one packed file each,
+        5-8 volumes, so real stream CRCs available) got no sweep at all and were
+        left to the hunt that had already failed them."""
         try:
             sets = self._srr_sweep_targets(srr_file)
         except Exception:
             return None
         best = None
         for name, s in sets.items():
-            if s["level"] is None or len(s["order"]) < 2:
+            if s["level"] is None or not s["order"]:
                 continue
             tot = sum(f["unpacked"] for f in s["files"].values())
             if best is None or tot > best[1]:
@@ -3645,6 +3653,20 @@ class SrrdbToolAPI:
             reps = allexe
         if not reps:
             return None
+        # Front this group's known-good builds. Scene groups re-use one packing
+        # machine, so the build that cracked their last release is overwhelmingly
+        # likely here too — and on a big release the sweep is budget-bound, so
+        # WHERE in the order the answer sits decides whether it is found at all
+        # (Pokemon_Black_Version_2 and Mon_Coach_Personnel both ran out of budget
+        # partway through the pack). Ordering only; nothing is dropped.
+        prefs = [v for v in (getattr(self, "_recon_prefs", None) or []) if v]
+        if prefs:
+            front = [n for n in reps if self._exe_version_str(n) in prefs]
+            if front:
+                front.sort(key=lambda n: prefs.index(self._exe_version_str(n)))
+                reps = front + [n for n in reps if n not in set(front)]
+                self._log(f"  Recipe sweep: trying this group's known builds "
+                          f"first ({', '.join(prefs[:3])}).", "dim")
 
         level, md, solid = s["level"], s["md"], s["solid"]
         work = Path(tempfile.mkdtemp(prefix="recipe-"))
@@ -3675,7 +3697,27 @@ class SrrdbToolAPI:
                 f"{n_crc} stream CRC(s) from the SRR…", "dim")
             # A truncated sweep can only check volume one, so any hit has to be
             # re-proved on the real files against every block the SRR describes.
-            full_files = [srcs[n] for n in s["order"]]
+            # Those files must carry their PACKED names: the extras store keeps
+            # content-addressed copies (61ce0998_2188997_xms-mswe.jpg), and `rar
+            # a -ep` stores whatever basename it is handed — so passing the raw
+            # path archives the wrong name and every check then fails with "File
+            # not found in the archive", regardless of build. Link (or copy) any
+            # mismatched source under its real name first.
+            named = work / "named"
+            full_files = []
+            for n in s["order"]:
+                p = Path(srcs[n])
+                if p.name.lower() == Path(n).name.lower():
+                    full_files.append(str(p))
+                    continue
+                named.mkdir(parents=True, exist_ok=True)
+                link = named / Path(n).name
+                if not link.exists():
+                    try:
+                        os.link(str(p), str(link))     # instant, same volume
+                    except OSError:
+                        shutil.copy2(str(p), str(link))
+                full_files.append(str(link))
             full_checks = self._full_checks(s)
             truncated = any(
                 os.path.getsize(f) != os.path.getsize(srcs[n])
@@ -3745,18 +3787,33 @@ class SrrdbToolAPI:
         margin) and try again; give up on truncating rather than on the release.
         Returns (cmd_files, checks), or (None, None) if it can't be staged."""
         scale = 1.0
-        ref = next((r for r in reps if not self._R5_EXE.search(r)), None) or reps[0]
         probe = work / "calib.rar"
+        ref = None
         for attempt in range(4):
             stage = work / f"s{attempt}"
             cmd_files, checks = self._stage_sweep_sources(work, s, srcs,
                                                           scale=scale,
                                                           into=stage)
-            need = [(n, c[1][-1][0] + c[1][-1][1]) for n, c in
-                    ((c[0], c) for c in checks) if c[1]]
-            if not need or not self._sweep_compress(rar_dir / ref, level, md,
-                                                    solid, 1, cmd_files, probe):
+            need = [(c[0], c[1][-1][0] + c[1][-1][1]) for c in checks if c[1]]
+            if not need:
                 return cmd_files, checks      # nothing to calibrate against
+            # The reference must be a build that can actually RUN this recipe.
+            # Picking blindly took the oldest exe in the pack, and RAR 2.50
+            # rejects it outright (rc=7) — the probe then "failed", calibration
+            # was skipped, and Miffys_World…EXiMiUS swept 232 builds against a
+            # checkpoint its shallow cut could never reach: a 14-minute false
+            # wall for a release that rebuilds at 3.60 -mt8.
+            if ref is None:
+                for cand in reps:
+                    if self._sweep_compress(rar_dir / cand, level, md, solid,
+                                            1, cmd_files, probe):
+                        ref = cand
+                        break
+                if ref is None:
+                    return cmd_files, checks  # no build runs it; sweep will say so
+            elif not self._sweep_compress(rar_dir / ref, level, md, solid, 1,
+                                          cmd_files, probe):
+                return cmd_files, checks
             short = 0.0
             for name, want in need:
                 try:
