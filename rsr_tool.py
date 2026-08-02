@@ -171,6 +171,47 @@ def _release_name(folder: Path) -> str:
     return _DATE_PREFIX.sub("", folder.name)
 
 
+# Scene platform tags, matched on the underscore/dot/dash separated TOKENS of a
+# release name and never as a substring — "WII" and "PC" appear inside plenty of
+# ordinary words. Aliases fold the variants that are not worth their own shelf:
+# a DSi-enhanced game is still an NDS release, and `NDS_DSi` tokenises to both.
+_PLATFORMS = (
+    "3DS", "NDS", "NGC", "WIIU", "WII", "PS5", "PS4", "PS3", "PS2", "PS1",
+    "PSP", "PSV", "PSX", "XBOX360", "XBOX", "GBA", "GBC", "SWITCH", "MAC",
+    "LINUX", "PC",
+)
+_PLAT_LOOKUP = {p: p for p in _PLATFORMS}
+_PLAT_LOOKUP.update({"DSI": "NDS", "NSW": "SWITCH", "XBONE": "XBOX"})
+
+
+def _release_system(rel: str) -> str:
+    """The platform tag in a release name, or 'Unknown'.
+
+    Tokens only. A release is `Name_REGION_LANG_PLATFORM-GROUP`, so splitting on
+    the scene separators and looking each token up is exact and cheap. First hit
+    wins: the platform sits at the end of the name, before the group, and the
+    only tag that follows it is a qualifier of it (`NDS_DSi`)."""
+    for t in re.split(r"[._\-]+", rel):
+        hit = _PLAT_LOOKUP.get(t.upper())
+        if hit:
+            return hit
+    return "Unknown"
+
+
+def _release_year(folder: Path, rel: str) -> str:
+    """The release YEAR: the dats.site date prefix when the folder carries one
+    (authoritative — it is the scene pre date), else a 19xx/20xx token in the
+    name, else 'Unknown'. Never guessed from file mtimes, which say when the
+    files were copied, not when the release happened."""
+    m = re.match(r"^(\d{4})-\d{2}-\d{2}[-_]", folder.name)
+    if m:
+        return m.group(1)
+    for t in re.split(r"[._\-]+", rel):
+        if re.fullmatch(r"(19|20)\d{2}", t):
+            return t
+    return "Unknown"
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Volume discovery
 # ══════════════════════════════════════════════════════════════════════════
@@ -635,6 +676,29 @@ class RsrToolAPI:
         subs = [p for p in sorted(src.iterdir()) if p.is_dir()]
         return subs or [src]
 
+    @staticmethod
+    def _store_dir(store: Path, folder: Path, rel: str) -> Path:
+        """Where a release's .rsr and its extras live: store/SYSTEM/YEAR/RELEASE.
+
+        A flat store is fine for a test run and unusable at corpus scale — the
+        NDS + 3DS sets alone are thousands of folders in one directory. System
+        then year is the split that matches how the source is already organised
+        and how anyone would go looking."""
+        return store / _release_system(rel) / _release_year(folder, rel) / rel
+
+    @staticmethod
+    def _existing_rsr(store: Path, folder: Path, rel: str) -> Path | None:
+        """The .rsr for this release if one is already captured.
+
+        Checks the flat legacy location as well as the current layout, so
+        introducing the subdirectories does not make every previously captured
+        release look uncaptured and get redone."""
+        for cand in (RsrToolAPI._store_dir(store, folder, rel) / f"{rel}.rsr",
+                     store / rel / f"{rel}.rsr"):
+            if cand.is_file():
+                return cand
+        return None
+
     def _scan_run(self, src: Path, store: Path, s: dict):
         exes = self._pack_exes()
         if not exes:
@@ -665,7 +729,7 @@ class RsrToolAPI:
             self._emit("row", {"name": rel, "status": "running"})
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
-            if s["skip_done"] and (store / rel / f"{rel}.rsr").is_file():
+            if s["skip_done"] and self._existing_rsr(store, folder, rel):
                 self._log("  Already captured — skipping "
                           "(untick 'Skip captured' to redo).", "dim")
                 self._emit("row", {"name": rel, "status": "skipped"})
@@ -718,6 +782,8 @@ class RsrToolAPI:
             "host": {"platform": platform.platform(),
                      "python": platform.python_version()},
             "release": rel,
+            "system": _release_system(rel),
+            "year": _release_year(folder, rel),
             "source_folder": str(folder),
             "sets": [],
         }
@@ -771,7 +837,7 @@ class RsrToolAPI:
                     embedded["release.srr"] = srr
                     manifest["srr"] = "release.srr"
 
-            out_dir = store / rel
+            out_dir = self._store_dir(store, folder, rel)
             out_dir.mkdir(parents=True, exist_ok=True)
             rsr_path = out_dir / f"{rel}.rsr"
             self._write_rsr(rsr_path, manifest, embedded)
