@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RSR Scanner — ToSort Toolkit</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@400;500;600&display=swap');
+
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;--border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+[data-theme="amber"]{--bg0:#0f0c06;--bg1:#1a1508;--bg2:#241e0c;--bg3:#2e2710;--acc:#f0b030;--acc2:#c08010;--warn:#f07030;--danger:#e04040;--info:#60b0f0;--text:#e8d8a0;--text2:#a09060;--text3:#606040;--border:#3a3010}
+[data-theme="slate"]{--bg0:#0a0c10;--bg1:#12151c;--bg2:#1a1e28;--bg3:#222738;--acc:#60a0f8;--acc2:#4080d8;--warn:#f0c030;--danger:#f04060;--info:#60d0f0;--text:#c0ccdc;--text2:#7080a0;--text3:#404860;--border:#252a38}
+[data-theme="red"]{--bg0:#0f0808;--bg1:#1a1010;--bg2:#241818;--bg3:#2e2020;--acc:#f04060;--acc2:#c02040;--warn:#f08030;--danger:#f04040;--info:#60a0f0;--text:#e8c8c8;--text2:#a07070;--text3:#605050;--border:#3a2020}
+[data-theme="light"]{--bg0:#f0f2f5;--bg1:#ffffff;--bg2:#e8eaed;--bg3:#d8dbe0;--acc:#1a8a5a;--acc2:#1a8a5a;--warn:#d4780a;--danger:#c0392b;--info:#2471a3;--text:#1a1d23;--text2:#5a6478;--text3:#8a94a8;--border:#c8cdd8}
+
+html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
+#app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 14px;display:flex;align-items:center;gap:10px;-webkit-app-region:drag;user-select:none;flex-shrink:0}
+.logo{font-family:var(--mono);font-size:13px;color:var(--acc);letter-spacing:2px}
+.sub{font-size:10px;color:var(--text2)}
+.tb-right{margin-left:auto;-webkit-app-region:no-drag;display:flex;align-items:center;gap:8px}
+
+.body{flex:1;display:flex;overflow:hidden}
+.left-col{width:350px;flex-shrink:0;display:flex;flex-direction:column;overflow-y:auto;border-right:1px solid var(--border);padding:10px;gap:8px}
+.right-col{flex:1;display:flex;flex-direction:column;overflow:hidden;padding:10px;gap:8px}
+
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:6px;overflow:hidden;flex-shrink:0}
+.panel.grow{flex:1;display:flex;flex-direction:column;min-height:0}
+.phdr{background:var(--bg2);padding:6px 10px;font-size:10px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:6px;letter-spacing:.5px;text-transform:uppercase}
+.phdr .dot{width:6px;height:6px;border-radius:50%;background:var(--acc);flex-shrink:0}
+.pbody{padding:9px 10px;display:flex;flex-direction:column;gap:7px}
+.panel.grow .pbody{flex:1;min-height:0}
+
+.row{display:flex;align-items:center;gap:6px}
+.lbl{font-size:11px;color:var(--text2);min-width:64px;flex-shrink:0}
+.txt{flex:1;min-width:0;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:4px 8px;color:var(--text);font-family:var(--font);font-size:12px;outline:none}
+.txt:focus{border-color:var(--acc)}
+.txt::placeholder{color:var(--text3)}
+.hint{font-size:10px;color:var(--text3);line-height:1.5}
+
+.btn{padding:3px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;transition:.12s;flex-shrink:0;white-space:nowrap}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn:disabled{opacity:.35;pointer-events:none}
+.btn-go{border-color:var(--acc2);color:var(--acc);font-weight:600;padding:5px 18px}
+.btn-go:hover{background:var(--acc2);color:#000}
+.btn-stop{border-color:var(--danger);color:var(--danger)}
+.btn-stop:hover{background:var(--danger);color:#fff}
+.btn-sm{padding:2px 8px;font-size:10px}
+
+.chk-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer}
+.chk-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
+.num{width:58px;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-family:var(--font);font-size:11px;outline:none}
+
+.queue{flex:1;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px;min-height:90px}
+.queue-hdr,.queue-row{display:grid;grid-template-columns:1fr 150px 66px;align-items:center}
+.queue-hdr{background:var(--bg2);padding:4px 8px;font-size:10px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.4px;position:sticky;top:0;z-index:1}
+.queue-row{padding:5px 8px;border-bottom:1px solid var(--border);font-size:11px}
+.queue-row:last-child{border-bottom:none}
+.queue-row:hover{background:var(--bg2)}
+.qr-name{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:4px}
+.qr-recipe{color:var(--text2);font-family:var(--mono);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qr-status{font-family:var(--mono);font-size:9px;text-align:center}
+.qs-pending{color:var(--text3)}
+.qs-running{color:var(--warn)}
+.qs-done{color:var(--acc)}
+.qs-error{color:var(--danger)}
+.qs-skipped{color:var(--text3)}
+
+.pill{display:inline-block;padding:1px 8px;border-radius:8px;font-size:9px;font-family:var(--mono);border:1px solid var(--border);color:var(--text2)}
+.pill.running{border-color:var(--warn);color:var(--warn)}
+.pill.done{border-color:var(--acc);color:var(--acc)}
+.pill.error{border-color:var(--danger);color:var(--danger)}
+
+.log-w{flex:1;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-family:var(--mono);font-size:11px;line-height:1.6;user-select:text;min-height:120px}
+.log-w .info{color:var(--text)}
+.log-w .dim{color:var(--text3)}
+.log-w .ok{color:var(--acc)}
+.log-w .warn{color:var(--warn)}
+.log-w .err{color:var(--danger)}
+
+.db-list{max-height:190px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;margin-top:2px}
+.db-item{padding:4px 7px;border-radius:4px;border:1px solid transparent;display:flex;align-items:center;gap:7px;cursor:pointer;font-size:11px}
+.db-item:hover{background:var(--bg2);border-color:var(--border)}
+.db-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.db-meta{font-family:var(--mono);font-size:9px;color:var(--text3);flex-shrink:0}
+.tick{color:var(--acc)}
+.cross{color:var(--danger)}
+.progress{font-family:var(--mono);font-size:10px;color:var(--warn);min-height:14px}
+.banner{padding:6px 10px;font-size:11px;border-radius:4px;border:1px solid var(--info);color:var(--info);background:rgba(64,160,240,.06);line-height:1.5}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div class="titlebar">
+    <div>
+      <div class="logo">RSR SCANNER</div>
+      <div class="sub">Capture reproducible scene releases · .rsr</div>
+    </div>
+    <div class="tb-right">
+      <span id="db-stats" class="pill">db: —</span>
+      <span id="status-pill" class="pill">idle</span>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <!-- ── Left column ─────────────────────────────────────── -->
+    <div class="left-col">
+
+      <div class="banner">
+        Point this at folders holding the <b>ORIGINAL</b> rar sets. Each release
+        is packed again with every WinRAR build until the bytes match, then the
+        recipe is <b>replayed and verified</b> before the .rsr is written.
+        Nothing is ever written back into the scanned folder.
+      </div>
+
+      <!-- Capture -->
+      <div class="panel">
+        <div class="phdr"><span class="dot"></span>Capture</div>
+        <div class="pbody">
+          <div class="row">
+            <div class="lbl">Originals</div>
+            <input class="txt" id="source" placeholder="folder of releases, or one release">
+            <button class="btn btn-sm" onclick="pick('source')">…</button>
+          </div>
+          <div class="row">
+            <div class="lbl">Store</div>
+            <input class="txt" id="store" placeholder="where the .rsr files go">
+            <button class="btn btn-sm" onclick="pick('store')">…</button>
+          </div>
+          <div class="row">
+            <div class="lbl">Max -mt</div>
+            <input class="num" id="max_mt" type="number" min="0" max="32" value="16">
+            <span class="hint">thread counts swept 0–N</span>
+          </div>
+          <label class="chk-row"><input type="checkbox" id="embed_extras" checked>
+            Embed archive-only extras (required to rebuild them)</label>
+          <label class="chk-row"><input type="checkbox" id="write_srr" checked>
+            Also embed a legacy .srr</label>
+          <label class="chk-row"><input type="checkbox" id="skip_done" checked>
+            Skip releases already captured</label>
+          <label class="chk-row"><input type="checkbox" id="dict_ladder" checked>
+            Retry other dictionary sizes if the header's is wrong</label>
+          <div class="row" style="margin-top:2px">
+            <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
+            <button class="btn btn-stop" id="btn-stop" onclick="stopRun()" disabled>Stop</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Rebuild -->
+      <div class="panel">
+        <div class="phdr"><span class="dot"></span>Rebuild from .rsr</div>
+        <div class="pbody">
+          <div class="row">
+            <div class="lbl">.rsr file</div>
+            <input class="txt" id="rb-rsr" placeholder="captured .rsr">
+            <button class="btn btn-sm" onclick="pickRsr()">…</button>
+          </div>
+          <div class="row">
+            <div class="lbl">Content</div>
+            <input class="txt" id="rb-content" placeholder="folder holding the release files">
+            <button class="btn btn-sm" onclick="pick('rb-content')">…</button>
+          </div>
+          <div class="row">
+            <div class="lbl">Output</div>
+            <input class="txt" id="rb-out" placeholder="where to write the rar set">
+            <button class="btn btn-sm" onclick="pick('rb-out')">…</button>
+          </div>
+          <div class="row">
+            <button class="btn btn-go" id="btn-rebuild" onclick="startRebuild()">Rebuild</button>
+            <span class="hint">extras come out of the .rsr automatically</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Database -->
+      <div class="panel">
+        <div class="phdr"><span class="dot"></span>Database</div>
+        <div class="pbody">
+          <div class="row">
+            <input class="txt" id="db-q" placeholder="release, packed file name, or CRC32"
+                   onkeydown="if(event.key==='Enter')dbSearch()">
+            <button class="btn btn-sm" onclick="dbSearch()">Search</button>
+          </div>
+          <div class="db-list" id="db-list"></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ── Right column ────────────────────────────────────── -->
+    <div class="right-col">
+
+      <div class="panel" style="flex:0 0 auto;max-height:34%;display:flex;flex-direction:column">
+        <div class="phdr"><span class="dot"></span>Releases
+          <span id="queue-count" style="margin-left:auto;color:var(--text3)"></span>
+        </div>
+        <div class="pbody" style="flex:1;min-height:0;padding:6px">
+          <div class="queue-hdr"><div>Release</div><div>Recipe</div><div>Status</div></div>
+          <div class="queue" id="queue"></div>
+        </div>
+      </div>
+
+      <div class="panel grow">
+        <div class="phdr"><span class="dot"></span>Log
+          <button class="btn btn-sm" style="margin-left:auto" onclick="copyLog(this)">Copy all</button>
+          <button class="btn btn-sm" onclick="clearLog()">Clear</button>
+        </div>
+        <div class="pbody" style="padding:6px">
+          <div class="progress" id="progress"></div>
+          <div class="log-w" id="log"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const rows = new Map();
+
+window.addEventListener('pywebviewready', async () => {
+  const saved = localStorage.getItem('rv_theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+  const s = await window.pywebview.api.get_settings();
+  $('source').value = s.source || '';
+  $('store').value = s.store || '';
+  $('max_mt').value = s.max_mt;
+  $('embed_extras').checked = s.embed_extras;
+  $('write_srr').checked = s.write_srr;
+  $('skip_done').checked = s.skip_done;
+  $('dict_ladder').checked = s.dict_ladder;
+  refreshStats();
+  dbSearch();
+});
+
+function cfg() {
+  return {
+    source: $('source').value.trim(),
+    store: $('store').value.trim(),
+    max_mt: $('max_mt').value,
+    embed_extras: $('embed_extras').checked,
+    write_srr: $('write_srr').checked,
+    skip_done: $('skip_done').checked,
+    dict_ladder: $('dict_ladder').checked,
+  };
+}
+
+async function pick(id) {
+  const p = await window.pywebview.api.browse_folder();
+  if (p) { $(id).value = p; if (id === 'source' || id === 'store') save(); }
+}
+async function pickRsr() {
+  const p = await window.pywebview.api.browse_rsr();
+  if (p) $('rb-rsr').value = p;
+}
+function save() { window.pywebview.api.save_settings(cfg()); }
+
+function setBusy(on) {
+  $('btn-scan').disabled = on;
+  $('btn-rebuild').disabled = on;
+  $('btn-stop').disabled = !on;
+  const p = $('status-pill');
+  p.textContent = on ? 'running' : 'idle';
+  p.className = 'pill' + (on ? ' running' : '');
+}
+
+async function startScan() {
+  if (!$('source').value.trim()) { log('Pick a folder of originals first.', 'warn'); return; }
+  rows.clear(); $('queue').innerHTML = ''; $('queue-count').textContent = '';
+  setBusy(true);
+  const r = await window.pywebview.api.scan_start(cfg());
+  if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
+}
+
+async function startRebuild() {
+  setBusy(true);
+  const r = await window.pywebview.api.rebuild_start({
+    rsr: $('rb-rsr').value.trim(),
+    content: $('rb-content').value.trim(),
+    out: $('rb-out').value.trim(),
+  });
+  if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
+}
+
+function stopRun() { window.pywebview.api.stop(); }
+
+function log(msg, cls) {
+  const w = $('log');
+  const d = document.createElement('div');
+  d.className = cls || 'info';
+  d.textContent = msg;
+  w.appendChild(d);
+  w.scrollTop = w.scrollHeight;
+}
+function clearLog() { $('log').innerHTML = ''; }
+
+function copyLog(btn) {
+  const text = Array.from($('log').children).map(d => d.textContent).join('\n');
+  const ta = document.createElement('textarea');
+  ta.style.position = 'fixed'; ta.style.opacity = '0';
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  if (!ok && navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(() => flash(btn, 'Copied'));
+    return;
+  }
+  flash(btn, ok ? 'Copied' : 'Failed');
+}
+function flash(btn, msg) {
+  const old = btn.textContent;
+  btn.textContent = msg;
+  setTimeout(() => { btn.textContent = old; }, 1200);
+}
+
+function upsertRow(d) {
+  let el = rows.get(d.name);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'queue-row';
+    el.innerHTML = '<div class="qr-name"></div><div class="qr-recipe"></div>'
+                 + '<div class="qr-status"></div>';
+    $('queue').appendChild(el);
+    rows.set(d.name, el);
+    $('queue-count').textContent = rows.size + ' release(s)';
+  }
+  el.children[0].textContent = d.name;
+  el.children[0].title = d.name;
+  if (d.recipe !== undefined) {
+    el.children[1].textContent = d.recipe || '';
+    el.children[1].title = d.recipe || '';
+  }
+  el.children[2].textContent = d.status;
+  el.children[2].className = 'qr-status qs-' + d.status;
+  el.scrollIntoView({block: 'nearest'});
+}
+
+window.rsrEvent = function (event, data) {
+  if (event === 'log') log(data.msg, data.cls);
+  else if (event === 'progress') $('progress').textContent = data.msg || '';
+  else if (event === 'row') upsertRow(data);
+  else if (event === 'scan_done') { setBusy(false); refreshStats(); dbSearch(); }
+};
+
+async function refreshStats() {
+  try {
+    const s = await window.pywebview.api.db_stats();
+    $('db-stats').textContent =
+      `db: ${s.releases} rel · ${s.verified} verified · ${s.extras || 0} extras`;
+  } catch (e) {}
+}
+
+async function dbSearch() {
+  const r = await window.pywebview.api.db_search($('db-q').value.trim());
+  const list = $('db-list');
+  list.innerHTML = '';
+  if (!r.rows || !r.rows.length) {
+    list.innerHTML = '<div class="hint" style="padding:4px 6px">nothing captured yet</div>';
+    return;
+  }
+  for (const row of r.rows) {
+    const d = document.createElement('div');
+    d.className = 'db-item';
+    d.title = row.path;
+    d.onclick = () => { $('rb-rsr').value = row.path; };
+    d.ondblclick = () => window.pywebview.api.open_store(row.path);
+    d.innerHTML =
+      `<span class="${row.verified ? 'tick' : 'cross'}">${row.verified ? '✓' : '✗'}</span>`
+      + `<span class="db-name"></span>`
+      + `<span class="db-meta">${row.version || '?'} -mt${row.mt}</span>`;
+    d.querySelector('.db-name').textContent = row.name;
+    list.appendChild(d);
+  }
+}
+</script>
+</body>
+</html>

@@ -258,6 +258,17 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <div class="card-desc">Download SRR files from srrdb.com and reconstruct byte-perfect scene RAR sets. Extracts NFO/SFV, recreates samples. Supports single or batch folder processing.</div>
       </div>
 
+      <div class="card" onclick="openTool('rsr')">
+        <div class="card-top">
+          <div class="card-icon">🧬</div>
+          <div>
+            <div class="card-title">RSR Scanner</div>
+            <div class="card-tag">Capture · .rsr</div>
+          </div>
+        </div>
+        <div class="card-desc">Scan original scene RAR sets and capture the exact recipe that made them — build, thread count, settings, plus any extras that live only inside the archives. Verified by replay, so rebuilds are guaranteed rather than hoped for. Handles RAR5, solid and .001 sets.</div>
+      </div>
+
       <div class="card misc" onclick="openTool('misc')">
         <div class="card-top">
           <div class="card-icon">🛠️</div>
@@ -331,6 +342,7 @@ function openTool(tool) {
     case 'rclone': api.open_rclone();   break;
     case 'scene':  api.open_scene_recreator(); break;
     case 'srrdb':  api.open_srrdb_tool();   break;
+    case 'rsr':    api.open_rsr_tool();     break;
     case 'misc':   api.open_misc_tools(); break;
   }
 }

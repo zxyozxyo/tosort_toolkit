@@ -17,6 +17,7 @@ from ia_folder_packer import IAFolderPackerAPI
 from scene_recreator import SceneRecreatorAPI
 from misc_tools import MiscToolsAPI
 from srrdb_tool import SrrdbToolAPI
+from rsr_tool import RsrToolAPI
 
 _dat_api = None
 _ia_api  = None
@@ -137,6 +138,21 @@ def open_srrdb_tool():
     _srr_api.set_window(srr_window)
 
 
+def open_rsr_tool():
+    """Open RSR Scanner window."""
+    _rsr_api = RsrToolAPI()
+    rsr_window = webview.create_window(
+        title="RSR Scanner — ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "rsr_tool.html"),
+        js_api=_rsr_api,
+        width=1000,
+        height=800,
+        min_size=(760, 560),
+        background_color="#0d0f12",
+    )
+    _rsr_api.set_window(rsr_window)
+
+
 def open_misc_tools():
     """Open Miscellaneous Tools window."""
     _misc_api = MiscToolsAPI()
@@ -172,6 +188,7 @@ class LauncherAPI:
     def open_scene_recreator(self): open_scene_recreator()
     def open_misc_tools(self):    open_misc_tools()
     def open_srrdb_tool(self):    open_srrdb_tool()
+    def open_rsr_tool(self):      open_rsr_tool()
 
     # --- startup auto-backup (settings shared with Misc Tools → Local Backup) ---
     def backup_startup_info(self):
