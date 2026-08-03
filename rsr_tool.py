@@ -129,6 +129,12 @@ def _exe_label(fname: str) -> str:
     return f"{d} {maj}.{mnr}" + (f" {beta}" if beta else "")
 
 
+def _exe_year(fname: str) -> int:
+    """Release year of a build in the pack, from its date prefix (0 if none)."""
+    m = re.match(r"(\d{4})-\d{2}-\d{2}_", fname)
+    return int(m.group(1)) if m else 0
+
+
 def _win_attrs(path: Path) -> int | None:
     """Windows file attribute mask, or None off Windows. RAR stores it in the
     file header, so a rebuild that ignores it can differ by a byte."""
@@ -200,6 +206,19 @@ def _release_system(rel: str) -> str:
         if hit:
             return hit
     return "Unknown"
+
+
+def _release_group(rel: str) -> str:
+    """The trailing `-GROUP` of a scene release name.
+
+    This is the sharpest predictor of the packing recipe there is, and by a
+    distance: a group is one person with one WinRAR install, so their releases
+    share a build and a thread count for years. Measured on the first 48
+    captures — EXiMiUS 22/23 on one recipe, ONEUP 8/8, BAHAMUT 7/7, PUSSYCAT
+    4/4. ONEUP and BAHAMUT even share a BUILD and differ only on -mt, which is
+    exactly the distinction a platform-level prior cannot make."""
+    m = re.search(r"-([A-Za-z0-9_.]+)$", rel or "")
+    return m.group(1).upper() if m else ""
 
 
 def _release_year(folder: Path, rel: str) -> str:
@@ -477,6 +496,9 @@ class RsrToolAPI:
         self._procs: set = set()
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
+        self._deadline = None          # per-release wall clock for the sweep
+        self._budget_hit = False
+        self._seeded = False           # recipe priors backfilled this process
 
     # ── plumbing ──────────────────────────────────────────────────────────
 
@@ -557,13 +579,18 @@ class RsrToolAPI:
             except Exception:
                 pass
 
-    def _run(self, cmd: list, timeout: int) -> bool:
+    def _run(self, cmd: list, timeout: int, heartbeat: str = "") -> bool:
         """Run a pack/extract command so that stop and skip can interrupt it.
 
         subprocess.run() is unkillable from another thread, so a skip pressed
         during a 900 s sweep step did nothing until that step finished. This
         polls instead, and terminates the child the moment either event is set.
-        Returns True only if the command ran to completion on its own."""
+        Returns True only if the command ran to completion on its own.
+
+        `heartbeat` names the step for the progress line. On a half-gigabyte
+        source a single rar.exe call runs for minutes with nothing on screen,
+        which is indistinguishable from a hang — so while one is running with a
+        name, the elapsed seconds are ticked out."""
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
@@ -572,15 +599,21 @@ class RsrToolAPI:
         with self._proc_lock:
             self._procs.add(p)
         try:
-            deadline = time.monotonic() + timeout
+            started = time.monotonic()
+            deadline = started + timeout
+            beat = 0.0
             while True:
                 try:
                     p.wait(timeout=0.25)
                     return True
                 except subprocess.TimeoutExpired:
                     pass
+                now = time.monotonic()
+                if heartbeat and now - beat > 1.0:
+                    beat = now
+                    self._progress(f"{heartbeat} · {now - started:,.0f}s")
                 if (self._stop.is_set() or self._skip.is_set()
-                        or time.monotonic() > deadline):
+                        or now > deadline):
                     try:
                         p.kill()
                         p.wait(timeout=10)
@@ -611,6 +644,9 @@ class RsrToolAPI:
             "write_srr": bool(cfg.get("write_srr", True)),
             "skip_done": bool(cfg.get("skip_done", True)),
             "dict_ladder": bool(cfg.get("dict_ladder", True)),
+            "budget_min": _num(cfg.get("budget_min"), 45, int),
+            "retry_walls": bool(cfg.get("retry_walls", False)),
+            "small_first": bool(cfg.get("small_first", True)),
         }
 
     def save_settings(self, s: dict) -> dict:
@@ -626,6 +662,10 @@ class RsrToolAPI:
             "write_srr": bool(s.get("write_srr", cur["write_srr"])),
             "skip_done": bool(s.get("skip_done", cur["skip_done"])),
             "dict_ladder": bool(s.get("dict_ladder", cur["dict_ladder"])),
+            "budget_min": max(0, min(1440, _num(s.get("budget_min"),
+                                                cur["budget_min"], int))),
+            "retry_walls": bool(s.get("retry_walls", cur["retry_walls"])),
+            "small_first": bool(s.get("small_first", cur["small_first"])),
         }
         try:
             self._config_path.write_text(json.dumps(out, indent=2), "utf-8")
@@ -717,10 +757,29 @@ class RsrToolAPI:
 
         store.mkdir(parents=True, exist_ok=True)
         folders = self._release_folders(src)
+        if s.get("small_first"):
+            # Learn cheaply, then spend. The cost of a sweep is dominated by
+            # recompressing the source, so a wrong guess on an 8 MB rom costs a
+            # second and the same wrong guess on a 512 MB rom costs a minute.
+            # Doing the small releases first means the big ones arrive with the
+            # group's recipe already known and land on combo #1 — the same total
+            # corpus, in a fraction of the time.
+            def _weight(f: Path) -> int:
+                try:
+                    return sum(p.stat().st_size for p in f.rglob("*")
+                               if p.is_file())
+                except OSError:
+                    return 0
+            self._progress("sizing release folders…")
+            folders.sort(key=_weight)
+            self._progress("")
+            self._log("Smallest releases first — priors learned on cheap "
+                      "releases make the expensive ones land on combo #1.",
+                      "dim")
         self._log(f"{len(folders)} release folder(s) under {src}", "info")
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
-        done = ok = failed = skipped = zips = 0
+        done = ok = failed = skipped = zips = parked = walls = 0
         for i, folder in enumerate(folders, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -730,6 +789,11 @@ class RsrToolAPI:
             # fires — otherwise a skip pressed late in one release could still
             # be set as the next one starts and silently skip that too.
             self._skip.clear()
+            # Same reasoning for the budget flag: _capture_release returns
+            # early on a ZIP or an archive-less folder without ever reaching
+            # the point where it resets this, so a stale True would relabel the
+            # NEXT release as parked.
+            self._budget_hit = False
             self._emit("row", {"name": rel, "status": "running"})
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
@@ -742,6 +806,15 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "already captured"})
                 skipped += 1
+                continue
+            wall = None if s.get("retry_walls") else self._known_wall(rel)
+            if wall:
+                self._log(f"  Already swept to exhaustion on "
+                          f"{(wall[0] or '')[:10]} against {wall[1]} build(s) — "
+                          "skipping (tick 'Retry known walls' to redo).", "dim")
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "known wall"})
+                walls += 1
                 continue
             try:
                 res = self._capture_release(folder, store, s, exes)
@@ -765,19 +838,37 @@ class RsrToolAPI:
                                    "recipe": "zip"})
                 zips += 1
                 continue
+            if self._budget_hit and not res.get("ok"):
+                # Not a wall and not a failure — an unfinished search. Kept
+                # apart so a later re-run (with better priors) can be pointed
+                # at exactly these, and so the failed count stays meaningful.
+                self._db_miss(rel, "parked", "time budget", len(exes))
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "parked — time budget"})
+                parked += 1
+                continue
             done += 1
             if res.get("ok"):
                 ok += 1
+                self._db_forget(rel)          # it worked; the miss is stale
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": res.get("recipe", "")})
             else:
                 failed += 1
+                err = res.get("error", "")
+                if err == "recipe not found":
+                    # Exhaustively searched. Remember it against the size of
+                    # the pack that failed, so a future scan re-tries only if
+                    # the pack has grown.
+                    self._db_miss(rel, "wall", err, len(exes))
                 self._emit("row", {"name": rel, "status": "error",
-                                   "recipe": res.get("error", "")})
+                                   "recipe": err})
 
         self._log("", "")
         self._log(f"Capture complete — {ok} verified, {failed} failed, "
                   f"{skipped} skipped"
+                  + (f", {walls} known wall(s) passed over" if walls else "")
+                  + (f", {parked} parked on the time budget" if parked else "")
                   + (f", {zips} ZIP release(s) out of scope" if zips else "")
                   + ".", "ok" if failed == 0 else "warn")
 
@@ -818,6 +909,14 @@ class RsrToolAPI:
         }
         embedded: dict[str, bytes] = {}      # path inside the .rsr → bytes
         all_ok = True
+        # One release must never be able to eat a whole run. The sweep is a
+        # product of builds x thread counts x dictionaries, and on a set whose
+        # answer is not in the pack at all it is the FULL product every time —
+        # 134 MB recompressed on each combo. Park it and move on; the priors
+        # learned from the rest of the corpus make a later retry much cheaper.
+        budget = max(0, _num(s.get("budget_min"), 0, int))
+        self._deadline = (time.monotonic() + budget * 60) if budget else None
+        self._budget_hit = False
         try:
             for si, st in enumerate(sets):
                 if self._stop.is_set() or self._skip.is_set():
@@ -848,6 +947,11 @@ class RsrToolAPI:
             if not (all_ok and verified):
                 self._log("  ✗ Not every set captured and verified — writing "
                           "NO .rsr, so a re-run still sees this release.", "err")
+                # Say WHICH kind of failure, because the caller records a wall
+                # (exhaustively searched, don't repeat) very differently from a
+                # verification miss (a real defect, always worth re-running).
+                if any(x.get("wall") for x in manifest["sets"]):
+                    return {"ok": False, "error": "recipe not found"}
                 return {"ok": False, "error": "one or more sets unverified"}
 
             # Sidecars: everything loose in the release folder that is not a
@@ -1012,8 +1116,20 @@ class RsrToolAPI:
         # needed), into our work dir — the scanned folder is never touched.
         srcdir = work / "src"
         srcdir.mkdir(exist_ok=True)
+        total_src = sum(f["size"] or 0 for f in meta)
+        # Say so BEFORE it happens. On a half-gigabyte source this step runs for
+        # minutes and used to print nothing between the file listing and the
+        # first sweep line, which reads exactly like a hang.
+        self._log(f"    extracting {total_src / (1 << 20):,.0f} MB of source(s) "
+                  f"from {len(vols)} volume(s)…", "dim")
+        self._progress(f"extracting {total_src / (1 << 20):,.0f} MB — "
+                       f"{st['stem']}")
+        t_x = time.monotonic()
         ok_x = self._run([str(exes[-1]), "x", "-y", "-o+", str(head),
-                          str(srcdir) + os.sep], timeout=3600)
+                          str(srcdir) + os.sep], timeout=3600,
+                         heartbeat=f"extracting {total_src / (1 << 20):,.0f} MB "
+                                   f"· {st['stem']}")
+        self._log(f"    extracted in {time.monotonic() - t_x:,.0f}s", "dim")
         if self._skip.is_set() or self._stop.is_set():
             return {"ok": False, "error": "skipped"}
         order = [f["name"] for f in meta]
@@ -1071,8 +1187,14 @@ class RsrToolAPI:
                           and _file_crc32(loose) == f["crc32"])
             if (f["size"] or 0) >= biggest or (cap and (f["size"] or 0) >= cap):
                 # Content: recorded in the manifest so the rebuild demands it,
-                # but its bytes stay out of the .rsr.
+                # but its bytes stay out of the .rsr. Hash it anyway — that
+                # hash is how a rebuild finds WHICH .rsr a loose rom belongs to,
+                # and the name never can (a rom is named for the game, a .rsr
+                # for the release).
                 f["source"] = "content"
+                self._progress(f"hashing {Path(f['name']).name} "
+                               f"({(f['size'] or 0) / (1 << 20):,.0f} MB)")
+                f["sha256"] = _file_sha256(sp)
                 content_only.append(f["name"])
                 continue
             f["source"] = "extra"
@@ -1099,6 +1221,10 @@ class RsrToolAPI:
                       + (" …" if len(content_only) > 4 else ""), "dim")
 
         # ── find the recipe ───────────────────────────────────────────────
+        rel = _release_name(folder)
+        grp = _release_group(rel)
+        year = _release_year(folder, rel)
+        year = int(year) if year.isdigit() else 0
         cands = self._dict_candidates(st["format"], dict_kb, s["dict_ladder"])
         recipe = None
         for di, dkb in enumerate(cands):
@@ -1109,15 +1235,27 @@ class RsrToolAPI:
                 self._log(f"    retrying with -md{dkb}KB "
                           f"(header dictionary didn't reproduce)", "dim")
             recipe = self._sweep_recipe(st["format"], exes, level, dkb, solid,
-                                        src_files, targets, work, s["max_mt"])
+                                        src_files, targets, work, s["max_mt"],
+                                        year, grp, self._deadline)
             if recipe:
                 break
+            if self._budget_hit:
+                break
         if not recipe:
+            if self._budget_hit:
+                return {"ok": False, "error": "time budget exceeded",
+                        "set": {"stem": st["stem"], "format": st["format"],
+                                "files": meta, "parked": True}}
             self._log("    ✗ no build × -mt reproduces these streams — the "
                       "exact build is outside the pack.", "err")
             return {"ok": False, "error": "recipe not found",
                     "set": {"stem": st["stem"], "format": st["format"],
                             "files": meta, "wall": True}}
+        # Learn it NOW rather than at _db_record time: a recipe that was found
+        # but whose replay later fails on a header detail is still the right
+        # build for the NEXT release by that group, and that is the whole value
+        # of the prior.
+        self._db_learn(st["format"], level, grp, recipe)
 
         self._log(f"    ✓ RECIPE: {recipe['version']} -mt{recipe['mt']} "
                   f"(-m{level} -md{recipe['dict_kb']}KB "
@@ -1220,10 +1358,25 @@ class RsrToolAPI:
         return out
 
     def _dict_candidates(self, fmt: str, primary: int, ladder: bool) -> list[int]:
+        """The -md values worth trying, header value first.
+
+        Only ever UPWARD. The dictionary recorded in the file header is the one
+        the compressor actually used, and WinRAR can only ever clamp the
+        requested -md DOWN (it shrinks the window to fit a small file, never
+        grows it past what was asked). So the -md on the original command line
+        was >= the header value, and every candidate below it is provably
+        unreachable.
+
+        The old ladder walked the whole pool in table order — for a RAR4 set
+        whose header already reads 4096 KB (the format maximum, so the ONLY
+        possible answer) that was six extra full sweeps of 232 builds x 17
+        thread counts, each one recompressing the entire source, all of them
+        incapable of matching. On Guitar_Rock_Tour…BAHAMUT — one 134 MB file —
+        that is the difference between one failed sweep and seven."""
         if not ladder:
             return [primary]
         pool = RAR5_DICTS if fmt == "RAR5" else RAR4_DICTS
-        return [primary] + [d for d in pool if d != primary]
+        return [primary] + sorted(d for d in pool if d > primary)
 
     # ── the sweep ─────────────────────────────────────────────────────────
 
@@ -1246,8 +1399,66 @@ class RsrToolAPI:
         return [str(ex), "a", f"-m{level}",
                 f"-md{letter}" if letter else f"-md{dict_kb}"]
 
+    @staticmethod
+    def _build_rank(name: str, year: int):
+        """Sort key for a build against the year the release was pred.
+
+        A release cannot have been packed by a build that did not exist yet, so
+        contemporary-or-older builds come first, nearest first; builds newer
+        than the release follow, also nearest first. Ordering only — nothing is
+        ever dropped, because the pre year comes from a folder prefix or a token
+        in the name and neither is worth a false wall."""
+        by = _exe_year(name)
+        if not year or not by:
+            return (2, 0, name)
+        if by <= year:
+            return (0, year - by, name)
+        return (1, by - year, name)
+
+    def _order_combos(self, exes, mts, fmt, level, grp, year):
+        """Every (build, -mt) pair — exhaustively, but in the order most likely
+        to hit first.
+
+        Two priors, both learned rather than assumed:
+
+        * what has already WON. A corpus is not a random sample of WinRAR
+          history; it is a handful of groups who each used one packer for years.
+          Across the first 45 captures here, 44 came from a single build
+          (3.60 2005-11-21) and -mt2 beat -mt8 three to one — so the static
+          MT_ORDER table, measured on a different corpus, was leading with the
+          wrong thread count on nearly every release.
+        * when the release happened, via _build_rank.
+
+        Nothing is skipped: this returns the identical set of combinations the
+        flat sweep did, so a wall found here is still a real wall. Only the
+        order changes, and the order is the entire cost when the answer is
+        found early."""
+        by_name = {e.name: e for e in exes}
+        order: list[tuple[Path, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for exe_name, mt in self._hot_recipes(fmt, level, grp):
+            ex = by_name.get(exe_name)
+            if ex is None:
+                continue
+            # mt == -1 is an imported prior: the BUILD is known but the thread
+            # count is not, so sweep that one build across every -mt before
+            # touching the other 231. Seventeen combos rather than 3,944.
+            for n in (mts if mt < 0 else [mt]):
+                if n in mts and (exe_name, n) not in seen:
+                    seen.add((exe_name, n))
+                    order.append((ex, n))
+        hot = len(order)
+        ranked = sorted(exes, key=lambda e: self._build_rank(e.name, year))
+        for mt in mts:
+            for ex in ranked:
+                if (ex.name, mt) not in seen:
+                    seen.add((ex.name, mt))
+                    order.append((ex, mt))
+        return order, hot
+
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
-                      targets, work, max_mt) -> dict | None:
+                      targets, work, max_mt, year=0, grp="",
+                      deadline=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -1257,7 +1468,11 @@ class RsrToolAPI:
         at any build or thread count. No family dedup either; fingerprinting
         one small file to skip builds is what manufactured false walls before,
         because a small file cannot discriminate builds that differ only on
-        larger input."""
+        larger input.
+
+        The sweep returns the moment a combo matches — it never runs to
+        completion once it has its answer. Ordering is therefore the whole
+        game, and _order_combos does that ordering."""
         mts = [n for n in (*MT_ORDER, *range(9, max_mt + 1)) if n <= max_mt]
         # RAR4 archives are most likely from RAR4-era builds — try those first,
         # but never DROP the RAR5 binaries (they reach -mt>16 via -ma4).
@@ -1271,36 +1486,69 @@ class RsrToolAPI:
                 self._log("    no RAR5-capable build in the pack.", "err")
                 return None
 
+        combos, hot = self._order_combos(exes, mts, fmt, level, grp, year)
+        if hot:
+            self._log(f"    {hot} known recipe(s)"
+                      + (f" for {grp}" if grp else "")
+                      + " — trying those first.", "dim")
+
         probe = work / "probe.rar"
         srcs = [str(p) for p in src_files]
         tried = 0
-        for mi, n in enumerate(mts, 1):
+        total = len(combos)
+        t0 = last = time.monotonic()
+        for ex, n in combos:
             if self._stop.is_set() or self._skip.is_set():
                 return None
-            for ex in exes:
-                if self._stop.is_set() or self._skip.is_set():
-                    return None
-                pre = self._pack_args(ex, fmt, level, dict_kb, n)
-                if pre is None:
-                    continue
-                tried += 1
-                if tried % 8 == 0:
-                    self._progress(f"sweep -mt{n} ({mi}/{len(mts)}) · "
-                                   f"{_exe_label(ex.name)} · {tried} combos")
-                for junk in work.glob("probe.*"):
-                    try:
-                        junk.unlink()
-                    except OSError:
-                        pass
-                cmd = pre + ["-s" if solid else "-s-", "-ds", f"-mt{n}",
-                             "-o+", "-ep", "-idcd", str(probe), *srcs]
-                if not self._run(cmd, timeout=900):
-                    continue
-                if not probe.is_file():
-                    continue
-                if self._streams_match(probe, targets):
-                    return {"exe": ex.name, "version": _exe_label(ex.name),
-                            "mt": n, "dict_kb": dict_kb, "tried": tried}
+            if deadline and time.monotonic() > deadline:
+                self._budget_hit = True
+                self._log(f"    ⏱ time budget reached after {tried} combo(s) — "
+                          "parking this release and moving on.", "warn")
+                return None
+            pre = self._pack_args(ex, fmt, level, dict_kb, n)
+            if pre is None:
+                continue
+            tried += 1
+            # Throttle on TIME, not on a combo count. Every-8-combos was fine
+            # when a combo was a fraction of a second, but one combo on a
+            # 512 MB source is minutes, so the display sat unchanged for the
+            # best part of half an hour and looked stopped.
+            now = time.monotonic()
+            if now - last > 0.5:
+                last = now
+                rate = tried / max(now - t0, 1e-6)
+                self._progress(
+                    f"sweep {tried}/{total} · -mt{n} · {_exe_label(ex.name)}"
+                    + (f" · {rate * 60:,.0f}/min" if rate < 8 else "")
+                    + (f" · {(deadline - now) / 60:,.0f} min left in budget"
+                       if deadline else ""))
+            for junk in work.glob("probe.*"):
+                try:
+                    junk.unlink()
+                except OSError:
+                    pass
+            cmd = pre + ["-s" if solid else "-s-", "-ds", f"-mt{n}",
+                         "-o+", "-ep", "-idcd", str(probe), *srcs]
+            t_one = time.monotonic()
+            ran = self._run(cmd, timeout=900,
+                            heartbeat=f"sweep {tried}/{total} · -mt{n} · "
+                                      f"{_exe_label(ex.name)}")
+            if tried == 1:
+                # Say up front what this release is going to cost. One combo
+                # tells you whether an exhaustive sweep is minutes or weeks,
+                # and that is worth knowing at combo 1 rather than hour 3.
+                per = time.monotonic() - t_one
+                self._log(f"    ~{per:,.1f}s per combo at this size — "
+                          f"{total:,} would take {total * per / 3600:,.1f}h"
+                          + (f"; budget allows about {int(max(deadline - t_one, 0) / max(per, 1e-6)):,}"
+                             if deadline else ""), "dim")
+            if not ran:
+                continue
+            if not probe.is_file():
+                continue
+            if self._streams_match(probe, targets):
+                return {"exe": ex.name, "version": _exe_label(ex.name),
+                        "mt": n, "dict_kb": dict_kb, "tried": tried}
         self._log(f"    swept {tried} combo(s) across {len(exes)} build(s) "
                   f"× -mt 0–{max_mt}.", "dim")
         return None
@@ -1353,7 +1601,10 @@ class RsrToolAPI:
                                [str(p) for p in src_files], cfile, fmt)
         if cmd is None:
             return None
-        if not self._run(cmd, timeout=3600):
+        mb = sum(p.stat().st_size for p in src_files if p.is_file()) / (1 << 20)
+        if not self._run(cmd, timeout=3600,
+                         heartbeat=f"replaying {recipe['version']} "
+                                   f"-mt{recipe['mt']} over {mb:,.0f} MB"):
             return None
         made = sorted(p for p in out.iterdir() if p.is_file())
         if not made:
@@ -1493,19 +1744,25 @@ class RsrToolAPI:
     def rebuild_start(self, cfg: dict) -> dict:
         if self._running:
             return {"ok": False, "error": "Already running"}
+        # Validate the STRING before it becomes a Path: Path("") is Path("."),
+        # whose str() is "." and therefore truthy, so an empty Output box used
+        # to sail through this check and write the rebuilt volumes into the
+        # working directory.
+        out_s = (cfg or {}).get("out", "").strip()
+        if not out_s:
+            return {"ok": False, "error": "Output folder required"}
         rsr = Path((cfg or {}).get("rsr", "").strip())
         content = Path((cfg or {}).get("content", "").strip())
-        out = Path((cfg or {}).get("out", "").strip())
+        out = Path(out_s)
         if not rsr.is_file():
             return {"ok": False, "error": ".rsr file not found"}
         if not content.is_dir():
             return {"ok": False, "error": "Content folder not found"}
-        if not str(out):
-            return {"ok": False, "error": "Output folder required"}
 
         def _bg():
             self._running = True
             self._stop.clear()
+            self._size_map_cache = {}      # the folder may have changed
             try:
                 self._rebuild_run(rsr, content, out)
             except Exception as e:
@@ -1518,6 +1775,192 @@ class RsrToolAPI:
 
         threading.Thread(target=_bg, daemon=True).start()
         return {"ok": True, "started": True}
+
+    # ── find the .rsr for a file, by hash ─────────────────────────────────
+
+    def find_rsr(self, path: str) -> dict:
+        """Which captured release is this file the content of?
+
+        By hash, never by name. A rom on disk is named for the game and a .rsr
+        for the release, so `Guitar Rock Tour.nds` and
+        `Guitar_Rock_Tour_EUR_MULTi6_NDS-BAHAMUT.rsr` share nothing to match on
+        — but the CRC32 in the RAR file header is exactly the content's hash,
+        and it is already indexed. size+CRC32 is the lookup (that pair IS what
+        the scene verifies with); a stored SHA-256 confirms it when the capture
+        was recent enough to have one."""
+        p = Path(path)
+        if not p.is_file():
+            return {"ok": False, "error": "not a file"}
+        return self._match_content(p)
+
+    def _match_content(self, p: Path) -> dict:
+        if not self._db_path.is_file():
+            return {"ok": False, "error": "no index yet"}
+        size = p.stat().st_size
+        crc = _file_crc32(p)
+        con = self._db()
+        try:
+            rows = con.execute(
+                "SELECT f.release, f.name, f.sha256, r.rsr_path, r.verified "
+                "FROM files f JOIN releases r ON r.name = f.release "
+                "WHERE f.size=? AND f.crc32=? AND f.source='content'",
+                (size, crc)).fetchall()
+        finally:
+            con.close()
+        if not rows:
+            return {"ok": False, "error": "no match",
+                    "crc32": f"{crc:08X}", "size": size}
+        if len(rows) > 1:
+            # Same rom in two releases (a P2P/scene dupe, or a re-pre). Settle
+            # it on SHA-256 where we have one, otherwise report the ambiguity
+            # rather than picking blind.
+            sha = _file_sha256(p)
+            exact = [r for r in rows if r[2] == sha]
+            if exact:
+                rows = exact
+        rel, name, sha256, rsr_path, verified = rows[0]
+        return {"ok": True, "release": rel, "packed_name": name,
+                "rsr": rsr_path, "verified": bool(verified),
+                "crc32": f"{crc:08X}", "size": size,
+                "ambiguous": [r[0] for r in rows[1:]] if len(rows) > 1 else []}
+
+    # ── batch rebuild ─────────────────────────────────────────────────────
+
+    def rebuild_batch_start(self, cfg: dict) -> dict:
+        """Point at a folder of loose content; every file that hashes to a
+        captured release is rebuilt into its own folder under the output."""
+        if self._running:
+            return {"ok": False, "error": "Already running"}
+        out_s = (cfg or {}).get("out", "").strip()      # see rebuild_start
+        if not out_s:
+            return {"ok": False, "error": "Output folder required"}
+        root = Path((cfg or {}).get("content", "").strip())
+        out = Path(out_s)
+        if not root.is_dir():
+            return {"ok": False, "error": "Content folder not found"}
+        if out.resolve() == root.resolve():
+            # Rebuilt volumes landing in the folder being scanned would be
+            # re-walked as candidates on the next run.
+            return {"ok": False,
+                    "error": "Output must not be the content folder"}
+        if not self._db_path.is_file():
+            return {"ok": False, "error": "No .rsr index yet — capture first"}
+
+        def _bg():
+            self._running = True
+            self._stop.clear()
+            self._size_map_cache = {}
+            try:
+                self._rebuild_batch_run(root, out)
+            except Exception as e:
+                self._log(f"Batch rebuild error: {e}", "err")
+                self._log(traceback.format_exc(), "dim")
+            finally:
+                self._running = False
+                self._progress("")
+                self._emit("scan_done", {})
+
+        threading.Thread(target=_bg, daemon=True).start()
+        return {"ok": True, "started": True}
+
+    # Files that are never release content — no point hashing a 2 KB nfo
+    # against an index of roms.
+    _NOT_CONTENT = {".nfo", ".sfv", ".diz", ".txt", ".jpg", ".jpeg", ".png",
+                    ".rsr", ".srr", ".srs", ".md5", ".sha1", ".log"}
+
+    def _content_sizes(self) -> set[int]:
+        """Every file size the index knows as content."""
+        con = self._db()
+        try:
+            return {int(r[0]) for r in con.execute(
+                "SELECT DISTINCT size FROM files WHERE source='content'")}
+        finally:
+            con.close()
+
+    def _rebuild_batch_run(self, root: Path, out: Path):
+        self._log("══ BATCH REBUILD ══", "info")
+        # Size first, hash second. A stat() is free and a CRC32 is a full read,
+        # so pointing this at a whole drive should not mean reading a whole
+        # drive: nothing can match unless its size matches a captured content
+        # file exactly, and that check throws out everything that isn't even a
+        # candidate before a single byte is read.
+        sizes = self._content_sizes()
+        looked = skipped_size = 0
+        cands = []
+        for p in sorted(root.rglob("*")):
+            if not p.is_file() or p.suffix.lower() in self._NOT_CONTENT:
+                continue
+            looked += 1
+            if p.stat().st_size in sizes:
+                cands.append(p)
+            else:
+                skipped_size += 1
+        self._log(f"  {looked} file(s) under {root}; {len(cands)} match a "
+                  f"captured content size, {skipped_size} cannot match at all.",
+                  "dim")
+        self._log("  matching by size + CRC32 against the .rsr index", "dim")
+
+        matched, done, failed, miss = {}, 0, 0, 0
+        for i, p in enumerate(cands, 1):
+            if self._stop.is_set():
+                self._log("Stopped.", "warn")
+                return
+            self._progress(f"hashing {i}/{len(cands)} · {p.name}")
+            hit = self._match_content(p)
+            if not hit.get("ok"):
+                miss += 1
+                self._emit("row", {"name": p.name, "status": "skipped",
+                                   "recipe": hit.get("error", "no match")})
+                continue
+            rel = hit["release"]
+            if rel in matched:
+                continue                      # one release, one rebuild
+            matched[rel] = (p, hit)
+        self._progress("")
+        self._log(f"  {len(matched)} release(s) matched, {miss} file(s) with no "
+                  "entry in the index.", "ok" if matched else "warn")
+
+        for i, (rel, (p, hit)) in enumerate(sorted(matched.items()), 1):
+            if self._stop.is_set():
+                self._log("Stopped.", "warn")
+                break
+            self._log("", "")
+            self._log(f"══ [{i}/{len(matched)}] {rel} ══", "info")
+            self._log(f"  matched {p.name}  CRC={hit['crc32']}  "
+                      f"{hit['size']:,} B", "dim")
+            if hit.get("ambiguous"):
+                self._log(f"  ⚠ that content also appears in: "
+                          f"{', '.join(hit['ambiguous'][:3])}", "warn")
+            rsr = Path(hit["rsr"])
+            if not rsr.is_file():
+                self._log(f"  ✗ indexed .rsr is missing from the store: {rsr}",
+                          "err")
+                self._emit("row", {"name": rel, "status": "error",
+                                   "recipe": ".rsr missing"})
+                failed += 1
+                continue
+            self._emit("row", {"name": rel, "status": "running"})
+            try:
+                # The file's own folder is the content root — a rebuild reads
+                # only the sources its manifest names, so a folder holding more
+                # than this release is fine.
+                res = self._rebuild_run(rsr, p.parent, out / rel)
+            except Exception as e:
+                self._log(f"  ERROR: {e}", "err")
+                self._log(traceback.format_exc(), "dim")
+                res = {"ok": False}
+            if res.get("ok"):
+                done += 1
+                self._emit("row", {"name": rel, "status": "done",
+                                   "recipe": "rebuilt"})
+            else:
+                failed += 1
+                self._emit("row", {"name": rel, "status": "error",
+                                   "recipe": "rebuild failed"})
+
+        self._log("", "")
+        self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "
+                  f"{miss} unmatched file(s).", "ok" if not failed else "warn")
 
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
         manifest, z = self.read_rsr(rsr)
@@ -1577,8 +2020,22 @@ class RsrToolAPI:
                     hits = list(content.rglob(base))
                     found = hits[0] if hits else None
                 if not found or not Path(found).is_file():
-                    self._log(f"    ✗ missing source: {base}", "err")
+                    # Name lookup failed — find it by CONTENT instead. The
+                    # packed name is a scene abbreviation (`tg-tg.nds`) and the
+                    # operator's copy is named for the game, so in batch mode
+                    # the names essentially never agree; matching the .rsr by
+                    # hash and then demanding a filename match would make the
+                    # hash lookup pointless.
+                    found = self._source_by_hash(content, f)
+                if not found or not Path(found).is_file():
+                    self._log(f"    ✗ missing source: {base} "
+                              f"({f['size']:,} B, CRC={f['crc32']:08X}) — no "
+                              "file of that name or that content in the "
+                              "content folder.", "err")
                     return False
+                if Path(found).name != base:
+                    self._log(f"    · {base} ← {Path(found).name} "
+                              "(matched on CRC32)", "dim")
                 shutil.copy2(found, dst)
             if f.get("crc32") is not None and _file_crc32(dst) != f["crc32"]:
                 self._log(f"    ✗ {base}: CRC does not match what was "
@@ -1642,6 +2099,38 @@ class RsrToolAPI:
 
         self._restore_extras(st, z, out)
         return True
+
+    def _source_by_hash(self, content: Path, f: dict) -> Path | None:
+        """The file in `content` whose bytes ARE this packed file, whatever it
+        happens to be called.
+
+        Size narrows it for free, so only genuine candidates are ever read. The
+        per-folder size map is cached because a multi-set release asks for this
+        once per set and re-walking a rom library each time would be silly."""
+        want_size = f.get("size")
+        want_crc = f.get("crc32")
+        if not want_size or want_crc is None:
+            return None
+        key = str(content)
+        cache = getattr(self, "_size_map_cache", None)
+        if cache is None:
+            cache = self._size_map_cache = {}
+        if key not in cache:
+            sizes: dict[int, list[Path]] = {}
+            for p in content.rglob("*"):
+                try:
+                    if p.is_file() and p.suffix.lower() not in self._NOT_CONTENT:
+                        sizes.setdefault(p.stat().st_size, []).append(p)
+                except OSError:
+                    continue
+            cache[key] = sizes
+        for p in cache[key].get(want_size, []):
+            try:
+                if _file_crc32(p) == want_crc:
+                    return p
+            except OSError:
+                continue
+        return None
 
     def _restore_sidecars(self, manifest, z, out: Path):
         """Put the .nfo / .sfv / proof back beside the rebuilt volumes, with the
@@ -1714,7 +2203,258 @@ class RsrToolAPI:
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_name ON files(name)")
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_crc ON files(crc32)")
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_rel ON files(release)")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_files_size ON files(size)")
+        # What has actually won, so the next sweep can lead with it. Keyed on
+        # the GROUP: the first cut of this keyed on `system`, which is "NDS"
+        # for every release in an NDS corpus and therefore discriminated
+        # nothing at all.
+        con.execute("""CREATE TABLE IF NOT EXISTS recipes(
+            fmt TEXT, level INT, grp TEXT, exe TEXT, mt INT,
+            hits INT DEFAULT 0, last_used TEXT,
+            PRIMARY KEY(fmt, level, grp, exe, mt))""")
+        cols = {r[1] for r in con.execute("PRAGMA table_info(recipes)")}
+        if "grp" not in cols:
+            # Built by an earlier version keyed on `system`. Those rows cannot
+            # be re-keyed (the group was never stored), but every one of them
+            # is re-derivable from `releases`, so drop and re-seed rather than
+            # carry a table that answers the wrong question.
+            con.execute("DROP TABLE recipes")
+            con.execute("""CREATE TABLE recipes(
+                fmt TEXT, level INT, grp TEXT, exe TEXT, mt INT,
+                hits INT DEFAULT 0, last_used TEXT,
+                PRIMARY KEY(fmt, level, grp, exe, mt))""")
+            self._seeded = False
+        # ...and what has already been proven unreachable, so a resumed scan
+        # does not re-grind it. A release that walls writes no .rsr, so
+        # skip_done cannot see it and every re-run pays the FULL sweep for it
+        # again — with a time budget attached, that is days across a corpus.
+        con.execute("""CREATE TABLE IF NOT EXISTS misses(
+            release TEXT PRIMARY KEY, kind TEXT, reason TEXT,
+            seen TEXT, combos INT, builds INT)""")
+        # Backfill the priors from captures made before this table existed —
+        # 45 releases already know the answer, and re-earning it one slow sweep
+        # at a time would be silly.
+        if not self._seeded:
+            self._seeded = True
+            try:
+                if not con.execute("SELECT 1 FROM recipes LIMIT 1").fetchone():
+                    seen: dict[tuple, list] = {}
+                    for name, fmt, lvl, exe, mt, created in con.execute(
+                            "SELECT name, format, level, recipe_exe, mt, created"
+                            " FROM releases WHERE recipe_exe<>'' AND mt>=0 "
+                            "AND level>=0"):
+                        k = (fmt, int(lvl), _release_group(name), exe, int(mt))
+                        row = seen.setdefault(k, [0, ""])
+                        row[0] += 1
+                        row[1] = max(row[1], created or "")
+                    con.executemany(
+                        "INSERT OR IGNORE INTO recipes(fmt, level, grp, exe, mt,"
+                        " hits, last_used) VALUES(?,?,?,?,?,?,?)",
+                        [(*k, v[0], v[1]) for k, v in seen.items()])
+                    con.commit()
+            except Exception:
+                pass
         return con
+
+    def _db_learn(self, fmt: str, level: int, grp: str, recipe: dict):
+        """Record a winning (build, -mt) so later releases try it first."""
+        try:
+            con = self._db()
+            try:
+                con.execute(
+                    "INSERT INTO recipes(fmt, level, grp, exe, mt, hits, "
+                    "last_used) VALUES(?,?,?,?,?,1,?) "
+                    "ON CONFLICT(fmt, level, grp, exe, mt) DO UPDATE SET "
+                    "hits = hits + 1, last_used = excluded.last_used",
+                    (fmt, int(level), grp or "", recipe["exe"],
+                     int(recipe["mt"]),
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                con.commit()
+            finally:
+                con.close()
+        except Exception as e:                      # never fail a capture on it
+            self._log(f"    (could not record recipe prior: {e})", "dim")
+
+    def _db_miss(self, rel: str, kind: str, reason: str, builds: int = 0):
+        """Record a release that produced no .rsr, and WHY.
+
+        'wall' means the sweep ran to exhaustion — retrying is pointless until
+        the build pack grows, so it is skipped by default. 'parked' means the
+        search was cut short by the budget and is always worth another go, so
+        it is recorded for reporting but never skipped."""
+        try:
+            con = self._db()
+            try:
+                con.execute(
+                    "INSERT INTO misses(release, kind, reason, seen, combos, "
+                    "builds) VALUES(?,?,?,?,0,?) ON CONFLICT(release) DO UPDATE "
+                    "SET kind=excluded.kind, reason=excluded.reason, "
+                    "seen=excluded.seen, builds=excluded.builds",
+                    (rel, kind, reason,
+                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     builds))
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    def import_srrdb_priors(self) -> dict:
+        """Seed the recipe priors from the legacy srrdb rebuild results.
+
+        Those runs measured, per release, which WinRAR build reproduced the
+        archive — thousands of them, for groups the .rsr scanner has never met.
+        `rar_version` is written by the same _exe_label() formatting used here
+        ('2005-11-21 3.60'), so it maps back to an exact exe with no guessing:
+        all 2,909 usable records resolve against the 232-build pack.
+
+        Two grades come out of it:
+          * the `sweep` records carry the exact exe AND -mt — a full prior;
+          * everything else carries the build only, imported with mt=-1, which
+            still collapses a 3,944-combo sweep to the 17 thread counts of one
+            known build.
+
+        Note the two tools can legitimately disagree on WHICH build (srrdb says
+        4.11 for EXiMiUS, our captures say 3.60) because RAR4 output is
+        identical across much of the 3.x/4.x family. Both reproduce the streams
+        byte-exact, so either is a fine thing to try first — the sweep verifies
+        by byte-compare regardless of where the suggestion came from."""
+        path = self._app_dir / "srrdb_results.json"
+        if not path.is_file():
+            return {"ok": False, "error": f"{path.name} not found"}
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except Exception as e:
+            return {"ok": False, "error": f"cannot read {path.name}: {e}"}
+
+        label2exe = {_exe_label(p.name): p.name for p in self._pack_exes()}
+        if not label2exe:
+            return {"ok": False, "error": "WinRAR build pack not found"}
+
+        exact: dict[tuple, int] = {}      # (grp, exe, mt) -> hits
+        build: dict[tuple, int] = {}      # (grp, exe)     -> hits
+        rows = skipped = 0
+        for r in data if isinstance(data, list) else []:
+            if not isinstance(r, dict) or not r.get("ok"):
+                continue
+            grp = (r.get("group") or "").upper()
+            if not grp:
+                continue
+            found = (r.get("sweep") or {}).get("found") or {}
+            exe = found.get("exe")
+            if exe and exe in {p.name for p in self._pack_exes()}:
+                exact[(grp, exe, int(found.get("mt", -1)))] = \
+                    exact.get((grp, exe, int(found.get("mt", -1))), 0) + 1
+                rows += 1
+                continue
+            exe = label2exe.get(r.get("rar_version") or "")
+            if not exe:
+                skipped += 1
+                continue
+            build[(grp, exe)] = build.get((grp, exe), 0) + 1
+            rows += 1
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        con = self._db()
+        try:
+            con.executemany(
+                "INSERT INTO recipes(fmt, level, grp, exe, mt, hits, last_used)"
+                " VALUES('',-1,?,?,?,?,?) ON CONFLICT(fmt, level, grp, exe, mt) "
+                "DO UPDATE SET hits=excluded.hits, last_used=excluded.last_used",
+                [(g, e, m, n, now) for (g, e, m), n in exact.items()])
+            con.executemany(
+                "INSERT INTO recipes(fmt, level, grp, exe, mt, hits, last_used)"
+                " VALUES('',-1,?,?,-1,?,?) ON CONFLICT(fmt, level, grp, exe, mt)"
+                " DO UPDATE SET hits=excluded.hits, last_used=excluded.last_used",
+                [(g, e, n, now) for (g, e), n in build.items()])
+            con.commit()
+            groups = con.execute("SELECT COUNT(DISTINCT grp) FROM recipes "
+                                 "WHERE grp<>''").fetchone()[0]
+        finally:
+            con.close()
+
+        self._log(f"Imported {rows:,} measured result(s) from "
+                  f"{path.name}: {len(exact)} exact (build + -mt), "
+                  f"{len(build)} build-only.", "ok")
+        self._log(f"  priors now cover {groups} group(s); "
+                  f"{skipped:,} record(s) had no usable build.", "dim")
+        return {"ok": True, "records": rows, "exact": len(exact),
+                "build_only": len(build), "groups": groups, "skipped": skipped}
+
+    def _db_forget(self, rel: str):
+        """Drop any recorded miss — this release just captured cleanly."""
+        try:
+            con = self._db()
+            try:
+                con.execute("DELETE FROM misses WHERE release=?", (rel,))
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    def _known_wall(self, rel: str) -> tuple | None:
+        """(seen, builds) if this release has already been swept to exhaustion
+        against a pack no larger than today's, else None."""
+        if not self._db_path.is_file():
+            return None
+        try:
+            con = self._db()
+            try:
+                r = con.execute("SELECT seen, builds FROM misses WHERE "
+                                "release=? AND kind='wall'", (rel,)).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            return None
+        if not r:
+            return None
+        # A bigger build pack than the one that failed is new evidence, so the
+        # old verdict no longer stands and the release is swept again.
+        if r[1] and len(self._pack_exes()) > r[1]:
+            return None
+        return r
+
+    def _hot_recipes(self, fmt: str, level: int, grp: str) -> list[tuple]:
+        """Known-good (exe, mt) pairs, best bet first.
+
+        Widening rings, sharpest first: this group at this compression level,
+        then this group at any level, then the corpus at this level, then the
+        format at large. The group rings are the ones that pay — a group is one
+        person with one WinRAR install — and the wider rings only exist so a
+        group never seen before still gets a sensible head start.
+
+        Everything returned is also in the exhaustive sweep that follows; this
+        only moves it earlier, never removes anything."""
+        if not self._db_path.is_file():
+            return []
+        out, seen = [], set()
+        rings = []
+        if grp:
+            rings += [("fmt=? AND level=? AND grp=?", (fmt, int(level), grp)),
+                      ("fmt=? AND grp=?", (fmt, grp)),
+                      # Imported srrdb priors: the group's build is known but
+                      # not its thread count or the archive shape it came from,
+                      # so they carry fmt='' / level=-1 / mt=-1 and are matched
+                      # on the group alone. A build that cannot write this
+                      # format is dropped later by _pack_args.
+                      ("grp=? AND mt=-1", (grp,))]
+        rings += [("fmt=? AND level=?", (fmt, int(level))), ("fmt=?", (fmt,))]
+        try:
+            con = self._db()
+            try:
+                for where, args in rings:
+                    for exe, mt in con.execute(
+                            f"SELECT exe, mt FROM recipes WHERE {where} "
+                            "ORDER BY hits DESC, last_used DESC LIMIT 24", args):
+                        if (exe, mt) not in seen:
+                            seen.add((exe, mt))
+                            out.append((exe, int(mt)))
+            finally:
+                con.close()
+        except Exception:
+            return out
+        return out
 
     def _db_record(self, manifest: dict, rsr_path: Path):
         rel = manifest["release"]

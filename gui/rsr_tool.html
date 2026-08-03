@@ -52,6 +52,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .btn-stop{border-color:var(--danger);color:var(--danger)}
 .btn-stop:hover{background:var(--danger);color:#fff}
 .btn-sm{padding:2px 8px;font-size:10px}
+.mode-tab.on{border-color:var(--acc2);color:var(--acc)}
 
 .chk-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer}
 .chk-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
@@ -183,8 +184,17 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             Also embed a legacy .srr</label>
           <label class="chk-row"><input type="checkbox" id="skip_done" checked>
             Skip releases already captured</label>
+          <div class="row">
+            <div class="lbl">Budget</div>
+            <input class="num" id="budget_min" type="number" min="0" max="1440" value="45">
+            <span class="hint">minutes per release, 0 = no limit</span>
+          </div>
           <label class="chk-row"><input type="checkbox" id="dict_ladder" checked>
-            Retry other dictionary sizes if the header's is wrong</label>
+            Retry larger dictionary sizes if the header's is wrong</label>
+          <label class="chk-row"><input type="checkbox" id="retry_walls">
+            Retry releases already swept to exhaustion</label>
+          <label class="chk-row"><input type="checkbox" id="small_first" checked>
+            Smallest releases first (learn recipes cheaply)</label>
           <div class="row" style="margin-top:2px">
             <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
             <button class="btn btn-sm" id="btn-skip" onclick="skipFile()" disabled
@@ -196,27 +206,57 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Rebuild -->
       <div class="panel">
-        <div class="phdr"><span class="dot"></span>Rebuild from .rsr</div>
+        <div class="phdr"><span class="dot"></span>Rebuild from .rsr
+          <span style="margin-left:auto;display:flex;gap:4px">
+            <button class="btn btn-sm mode-tab on" id="tab-batch"
+                    onclick="rbMode('batch')">Batch</button>
+            <button class="btn btn-sm mode-tab" id="tab-one"
+                    onclick="rbMode('one')">Single</button>
+          </span>
+        </div>
         <div class="pbody">
-          <div class="row">
-            <div class="lbl">.rsr file</div>
-            <input class="txt" id="rb-rsr" placeholder="captured .rsr">
-            <button class="btn btn-sm" onclick="pickRsr()">…</button>
+
+          <!-- Batch: point at content, the index finds the .rsr by hash -->
+          <div id="rb-batch">
+            <div class="row">
+              <div class="lbl">Content</div>
+              <input class="txt" id="rb-root" placeholder="folder of files to rebuild (searched recursively)">
+              <button class="btn btn-sm" onclick="pick('rb-root')">…</button>
+            </div>
+            <div class="row">
+              <div class="lbl">Output</div>
+              <input class="txt" id="rb-bout" placeholder="a folder per release is made here">
+              <button class="btn btn-sm" onclick="pick('rb-bout')">…</button>
+            </div>
+            <div class="row">
+              <button class="btn btn-go" id="btn-rebuild" onclick="startBatch()">Rebuild all</button>
+              <span class="hint">matched on size + CRC32, not on name</span>
+            </div>
           </div>
-          <div class="row">
-            <div class="lbl">Content</div>
-            <input class="txt" id="rb-content" placeholder="folder holding the release files">
-            <button class="btn btn-sm" onclick="pick('rb-content')">…</button>
+
+          <!-- Single: an explicit .rsr, for one-offs and testing -->
+          <div id="rb-one" style="display:none">
+            <div class="row">
+              <div class="lbl">.rsr file</div>
+              <input class="txt" id="rb-rsr" placeholder="captured .rsr">
+              <button class="btn btn-sm" onclick="pickRsr()">…</button>
+            </div>
+            <div class="row">
+              <div class="lbl">Content</div>
+              <input class="txt" id="rb-content" placeholder="folder holding the release files">
+              <button class="btn btn-sm" onclick="pick('rb-content')">…</button>
+            </div>
+            <div class="row">
+              <div class="lbl">Output</div>
+              <input class="txt" id="rb-out" placeholder="where to write the rar set">
+              <button class="btn btn-sm" onclick="pick('rb-out')">…</button>
+            </div>
+            <div class="row">
+              <button class="btn btn-go" id="btn-rebuild1" onclick="startRebuild()">Rebuild</button>
+              <span class="hint">extras come out of the .rsr automatically</span>
+            </div>
           </div>
-          <div class="row">
-            <div class="lbl">Output</div>
-            <input class="txt" id="rb-out" placeholder="where to write the rar set">
-            <button class="btn btn-sm" onclick="pick('rb-out')">…</button>
-          </div>
-          <div class="row">
-            <button class="btn btn-go" id="btn-rebuild" onclick="startRebuild()">Rebuild</button>
-            <span class="hint">extras come out of the .rsr automatically</span>
-          </div>
+
         </div>
       </div>
 
@@ -228,6 +268,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <input class="txt" id="db-q" placeholder="release, packed file name, or CRC32"
                    onkeydown="if(event.key==='Enter')dbSearch()">
             <button class="btn btn-sm" onclick="dbSearch()">Search</button>
+          </div>
+          <div class="row">
+            <button class="btn btn-sm" id="btn-import" onclick="importPriors()">Import srrdb priors</button>
+            <span class="hint">seed recipe hints from the legacy rebuild results</span>
           </div>
           <div class="db-list" id="db-list"></div>
         </div>
@@ -291,6 +335,9 @@ window.addEventListener('pywebviewready', async () => {
   $('write_srr').checked = s.write_srr;
   $('skip_done').checked = s.skip_done;
   $('dict_ladder').checked = s.dict_ladder;
+  $('budget_min').value = s.budget_min;
+  $('retry_walls').checked = s.retry_walls;
+  $('small_first').checked = s.small_first;
   refreshStats();
   dbSearch();
 });
@@ -305,6 +352,9 @@ function cfg() {
     write_srr: $('write_srr').checked,
     skip_done: $('skip_done').checked,
     dict_ladder: $('dict_ladder').checked,
+    budget_min: $('budget_min').value,
+    retry_walls: $('retry_walls').checked,
+    small_first: $('small_first').checked,
   };
 }
 
@@ -321,6 +371,7 @@ function save() { window.pywebview.api.save_settings(cfg()); }
 function setBusy(on) {
   $('btn-scan').disabled = on;
   $('btn-rebuild').disabled = on;
+  $('btn-rebuild1').disabled = on;
   $('btn-stop').disabled = !on;
   $('btn-skip').disabled = !on;
   const p = $('status-pill');
@@ -344,6 +395,34 @@ async function startRebuild() {
     out: $('rb-out').value.trim(),
   });
   if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
+}
+
+function rbMode(m) {
+  $('rb-batch').style.display = m === 'batch' ? '' : 'none';
+  $('rb-one').style.display   = m === 'one'   ? '' : 'none';
+  $('tab-batch').classList.toggle('on', m === 'batch');
+  $('tab-one').classList.toggle('on', m === 'one');
+}
+
+async function startBatch() {
+  if (!$('rb-root').value.trim()) { log('Pick a content folder first.', 'warn'); return; }
+  if (!$('rb-bout').value.trim()) { log('Pick an output folder first.', 'warn'); return; }
+  rows.clear(); $('queue').innerHTML = ''; $('queue-count').textContent = '';
+  setBusy(true);
+  const r = await window.pywebview.api.rebuild_batch_start({
+    content: $('rb-root').value.trim(),
+    out: $('rb-bout').value.trim(),
+  });
+  if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
+}
+
+async function importPriors() {
+  const b = $('btn-import');
+  b.disabled = true;
+  const r = await window.pywebview.api.import_srrdb_priors();
+  if (!r.ok) log('✗ ' + r.error, 'err');
+  b.disabled = false;
+  refreshStats();
 }
 
 function stopRun() { window.pywebview.api.stop(); }
