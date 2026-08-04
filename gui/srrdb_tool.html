@@ -374,7 +374,51 @@ window.addEventListener('pywebviewready', async () => {
 
   // Extras store — load configured folders + stats
   refreshExtras();
+
+  // Restore the folders from last time. Deliberately does NOT auto-scan the
+  // source: a big tree takes a while to enumerate and doing it unasked at
+  // startup would make the window look hung. One press of Rescan loads it.
+  try {
+    const s = await window.pywebview.api.get_settings();
+    for (const [id, v] of Object.entries(s || {})) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      if (el.type === 'checkbox') el.checked = !!v;
+      else if (v) el.value = v;
+    }
+    if (s && s['src-folder']) {
+      log(`Restored last folders — press Rescan to load the queue.`, 'dim');
+    }
+  } catch (e) {}
 });
+
+// Persist the folder boxes and the harmless toggles. `delete-source` is not
+// in the saved set — it deletes originals and is confirmation-guarded, so it
+// starts off every session by design.
+const _SAVE_IDS = ['src-folder', 'content-dir', 'dest-dir', 'do-sample',
+                   'extract-iso-m2ts', 'nonscene-sample', 'ignore-db-history',
+                   'fresh-prompt'];
+function saveSettings() {
+  const out = {};
+  for (const id of _SAVE_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    out[id] = el.type === 'checkbox' ? el.checked : el.value.trim();
+  }
+  try { window.pywebview.api.save_settings(out); } catch (e) {}
+}
+function _wireSaveHandlers() {
+  for (const id of _SAVE_IDS) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', saveSettings);
+  }
+}
+// This script runs inline, so DOMContentLoaded may already have fired by now —
+// waiting on it unconditionally would silently wire nothing.
+if (document.readyState === 'loading')
+  window.addEventListener('DOMContentLoaded', _wireSaveHandlers);
+else
+  _wireSaveHandlers();
 
 // Grey out the ISO M2TS option when "Create sample" is unchecked
 (function() {
@@ -535,6 +579,7 @@ async function browseSource() {
   const p = await window.pywebview.api.browse_folder();
   if (!p) return;
   document.getElementById('src-folder').value = p;
+  saveSettings();
   scanSource(p);
 }
 async function rescanSource() {
@@ -554,11 +599,13 @@ async function browseContent() {
   const p = await window.pywebview.api.browse_folder();
   if (!p) return;
   document.getElementById('content-dir').value = p;
+  saveSettings();
 }
 async function browseDest() {
   const p = await window.pywebview.api.browse_folder();
   if (!p) return;
   document.getElementById('dest-dir').value = p;
+  saveSettings();
 }
 
 // ── Source scanning ───────────────────────────────────────────────────────────

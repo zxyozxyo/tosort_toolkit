@@ -579,6 +579,43 @@ class SrrdbToolAPI:
 
         return {"ok": True, "done": done, "skipped": skipped, "failed": failed, "messages": messages}
 
+    # ── Settings ──────────────────────────────────────────────────────────────
+    #
+    # Folders only, plus the harmless toggles. Persisting them saves re-typing
+    # three paths on every restart, which is the whole point.
+    #
+    # `delete-source` is DELIBERATELY not persisted. It removes the operator's
+    # originals, and the GUI guards it behind a confirmation for that reason —
+    # restoring it silently pre-ticked at startup would re-arm a destructive
+    # option without the confirmation ever being shown. It starts off, every
+    # time, on purpose.
+
+    _SETTINGS_KEYS = ("src-folder", "content-dir", "dest-dir",
+                      "do-sample", "extract-iso-m2ts", "nonscene-sample",
+                      "ignore-db-history", "fresh-prompt")
+
+    @property
+    def _config_path(self) -> Path:
+        return Path(__file__).parent / "srrdb_tool.json"
+
+    def get_settings(self) -> dict:
+        try:
+            cfg = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            cfg = {}
+        return {k: cfg[k] for k in self._SETTINGS_KEYS if k in cfg}
+
+    def save_settings(self, s: dict) -> dict:
+        cur = self.get_settings()
+        for k in self._SETTINGS_KEYS:
+            if s and k in s:
+                cur[k] = s[k]
+        try:
+            self._config_path.write_text(json.dumps(cur, indent=2), "utf-8")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "settings": cur}
+
     # ── Browse ────────────────────────────────────────────────────────────────
 
     def browse_folder(self) -> str:
