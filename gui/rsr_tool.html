@@ -53,6 +53,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .btn-stop:hover{background:var(--danger);color:#fff}
 .btn-sm{padding:2px 8px;font-size:10px}
 .mode-tab.on{border-color:var(--acc2);color:var(--acc)}
+.btn.on{border-color:var(--warn);color:var(--warn);font-weight:600}
 
 .chk-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer}
 .chk-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
@@ -199,6 +200,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
             <button class="btn btn-sm" id="btn-skip" onclick="skipFile()" disabled
                     title="Abandon the release being captured right now and move to the next">Skip file</button>
+            <button class="btn btn-sm" id="btn-finish" onclick="finishThisOne()" disabled
+                    title="Lift the time budget for the release running right now — the next release gets the normal budget again">Finish this one</button>
             <button class="btn btn-stop" id="btn-stop" onclick="stopRun()" disabled>Stop</button>
           </div>
         </div>
@@ -374,6 +377,8 @@ function setBusy(on) {
   $('btn-rebuild1').disabled = on;
   $('btn-stop').disabled = !on;
   $('btn-skip').disabled = !on;
+  $('btn-finish').disabled = !on;
+  $('btn-finish').classList.remove('on');
   const p = $('status-pill');
   p.textContent = on ? 'running' : 'idle';
   p.className = 'pill' + (on ? ' running' : '');
@@ -427,6 +432,14 @@ async function importPriors() {
 
 function stopRun() { window.pywebview.api.stop(); }
 
+// Per-release budget override. Stays lit for the rest of this release so it is
+// obvious the limit is off; the backend clears it as the next release starts.
+async function finishThisOne() {
+  const r = await window.pywebview.api.extend_budget();
+  if (!r.ok) { log('✗ ' + r.error, 'err'); return; }
+  $('btn-finish').classList.add('on');
+}
+
 // Hard skip: the button stays live, since skipping several in a row is a
 // normal thing to want when a folder turns out to be full of duds.
 async function skipFile() {
@@ -472,6 +485,9 @@ function flash(btn, msg) {
 }
 
 function upsertRow(d) {
+  // A new release starting means the backend has just reset the per-release
+  // budget override, so the button must stop looking armed.
+  if (d.status === 'running') $('btn-finish').classList.remove('on');
   let el = rows.get(d.name);
   if (!el) {
     el = document.createElement('div');

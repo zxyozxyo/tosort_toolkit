@@ -499,6 +499,7 @@ class RsrToolAPI:
         self._deadline = None          # wall clock for the sweep, set per set
         self._budget_min = 0
         self._budget_hit = False
+        self._budget_override = False  # operator lifted it for THIS release
         self._seeded = False           # recipe priors backfilled this process
 
     # ── plumbing ──────────────────────────────────────────────────────────
@@ -567,6 +568,28 @@ class RsrToolAPI:
         self._skip.set()
         self._kill_procs()
         self._log("  ⏭ Skip requested — abandoning this release now.", "warn")
+        return {"ok": True}
+
+    def extend_budget(self) -> dict:
+        """Lift the time budget for the release being captured RIGHT NOW.
+
+        The counterpart to Skip, and it exists because the per-combo cost is
+        only knowable once a combo has run: the log says a release needs 3,944
+        combos and the budget covers 3,775, and the sensible answer is 'just
+        finish it' — for THIS release, not as a settings change. So the
+        override is per-release and is cleared as the next one starts; it can
+        never quietly disable the budget for a whole overnight run.
+
+        Deliberately does not touch the saved budget_min."""
+        if not self._running:
+            return {"ok": False, "error": "nothing running"}
+        if self._budget_override:
+            return {"ok": True, "already": True}
+        self._budget_override = True
+        self._deadline = None
+        self._log("  ⏱ Budget lifted for THIS release — the sweep will run to "
+                  "completion. The next release gets the normal budget again.",
+                  "warn")
         return {"ok": True}
 
     def _kill_procs(self):
@@ -803,6 +826,7 @@ class RsrToolAPI:
             # the point where it resets this, so a stale True would relabel the
             # NEXT release as parked.
             self._budget_hit = False
+            self._budget_override = False      # per-release only, never sticky
             self._emit("row", {"name": rel, "status": "running"})
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
@@ -1254,7 +1278,8 @@ class RsrToolAPI:
         cands = self._dict_candidates(st["format"], dict_kb, s["dict_ladder"])
         recipe = None
         budget = getattr(self, "_budget_min", 0)
-        self._deadline = (time.monotonic() + budget * 60) if budget else None
+        self._deadline = None if self._budget_override else (
+            (time.monotonic() + budget * 60) if budget else None)
         for di, dkb in enumerate(cands):
             if self._stop.is_set() or self._skip.is_set():
                 return {"ok": False,
@@ -1537,7 +1562,14 @@ class RsrToolAPI:
             # extract and the hashing and learns nothing, and the very first
             # combo is the group's best-known recipe, which is the one most
             # likely to just answer it.
-            if tried and deadline and time.monotonic() > deadline:
+            #
+            # The override is read from self on every pass, not captured with
+            # `deadline` at entry: the operator only learns what a release
+            # costs from the per-combo line printed AFTER combo 1, so the
+            # button has to be able to lift the limit while the sweep is
+            # already running.
+            if (tried and deadline and not self._budget_override
+                    and time.monotonic() > deadline):
                 self._budget_hit = True
                 self._log(f"    ⏱ time budget reached after {tried} combo(s) — "
                           "parking this release and moving on.", "warn")
@@ -1575,10 +1607,21 @@ class RsrToolAPI:
                 # tells you whether an exhaustive sweep is minutes or weeks,
                 # and that is worth knowing at combo 1 rather than hour 3.
                 per = time.monotonic() - t_one
-                self._log(f"    ~{per:,.1f}s per combo at this size — "
-                          f"{total:,} would take {total * per / 3600:,.1f}h"
-                          + (f"; budget allows about {int(max(deadline - t_one, 0) / max(per, 1e-6)):,}"
-                             if deadline else ""), "dim")
+                allows = (int(max(deadline - t_one, 0) / max(per, 1e-6))
+                          if deadline else None)
+                msg = (f"    ~{per:,.1f}s per combo at this size — "
+                       f"{total:,} would take {total * per / 3600:,.1f}h")
+                if allows is not None:
+                    msg += f"; budget allows about {allows:,}"
+                self._log(msg, "dim")
+                if allows is not None and allows < total:
+                    # Name the shortfall rather than making it a subtraction
+                    # the operator has to do in their head while it runs.
+                    self._log(f"    ⏱ budget covers {allows:,} of {total:,} "
+                              f"— {total - allows:,} short "
+                              f"(~{(total - allows) * per / 60:,.0f} min more). "
+                              "Press 'Finish this one' to lift it for this "
+                              "release.", "warn")
             if not ran:
                 continue
             if not probe.is_file():
