@@ -57,6 +57,15 @@ DB_NAME       = "rsr_index.db"
 RAR4_SIG      = b"Rar!\x1a\x07\x00"
 RAR5_SIG      = b"Rar!\x1a\x07\x01\x00"
 
+# Controls the log tells the operator to go and use. Quoted from here rather
+# than typed into each message, because they had already drifted: the log said
+# "tick 'Retry known walls'" for a checkbox actually labelled "Retry releases
+# already swept to exhaustion", which sends someone hunting for a control that
+# does not exist under that name. t_labels.py checks these against the HTML.
+UI_SKIP_DONE   = "Skip releases already captured"
+UI_RETRY_WALLS = "Retry releases already swept to exhaustion"
+UI_FINISH_ONE  = "Finish this one"
+
 # A replay that lands this close is a header-level difference worth storing as
 # a patch. Anything bigger means the recipe is wrong, not the headers, and we
 # refuse to pretend otherwise.
@@ -885,8 +894,8 @@ class RsrToolAPI:
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
             if s["skip_done"] and self._existing_rsr(store, folder, rel):
-                self._log("  Already captured — skipping "
-                          "(untick 'Skip captured' to redo).", "dim")
+                self._log(f"  Already captured — skipping "
+                          f"(untick '{UI_SKIP_DONE}' to redo).", "dim")
                 # Say WHY it was skipped in the row itself. A resumed run is
                 # mostly these, and "skipped" alone does not distinguish
                 # "captured on an earlier run" from "you pressed Skip".
@@ -898,7 +907,7 @@ class RsrToolAPI:
             if wall:
                 self._log(f"  Already swept to exhaustion on "
                           f"{(wall[0] or '')[:10]} against {wall[1]} build(s) — "
-                          "skipping (tick 'Retry known walls' to redo).", "dim")
+                          f"skipping (tick '{UI_RETRY_WALLS}' to redo).", "dim")
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "known wall"})
                 walls += 1
@@ -1764,8 +1773,8 @@ class RsrToolAPI:
                     self._log(f"    ⏱ budget covers {allows:,} of {total:,} "
                               f"— {total - allows:,} short "
                               f"(~{(total - allows) * per / 60:,.0f} min more). "
-                              "Press 'Finish this one' to lift it for this "
-                              "release.", "warn")
+                              f"Press '{UI_FINISH_ONE}' to lift it for this "
+                              f"release.", "warn")
             if not ran:
                 continue
             if not probe.is_file():
