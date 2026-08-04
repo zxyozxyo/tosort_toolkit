@@ -100,6 +100,9 @@ _COMPRESS_RE = re.compile(r"^Compressing\s+(.+?)\.\.\.\s*$")
 # __str__ drops the beta ("5.11" for both rar511.exe and rar511b1.exe), so we
 # capture the filename off the command line to distinguish beta vs final builds.
 _EXE_RE      = re.compile(r"(\d{4}-\d{2}-\d{2}_rar\d+(?:b\d)?\.exe)", re.I)
+# A version as rescene reports it: "2005-11-21 3.60". Used to tell a real
+# "Trying <version>." line from "Trying to rebuild compressed file X.".
+_VER_LABEL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d+\.\d+")
 
 import webview
 
@@ -2157,9 +2160,19 @@ class SrrdbToolAPI:
                 # so the version-wall cache can tell a genuine whole-pack miss
                 # from a deadline that struck before all versions were tried.
                 elif msg.startswith("Trying ") and msg.endswith("."):
+                    # ...but ONLY when what follows is actually a version.
+                    # rescene also logs "Trying to rebuild compressed file
+                    # cat-alnp.3ds.", which matched this prefix and was counted
+                    # as a version tested — one or two phantoms per release.
+                    # That inflates len(_versions_tried) in the `exhausted`
+                    # test below, so a hunt that stopped two versions short
+                    # could be cached as a permanent version WALL it never
+                    # earned. Every version rescene reports is _exe_label
+                    # formatted ("2005-11-21 3.60"), so require that shape.
+                    cand = msg[len("Trying "):-1].strip()
                     vt = getattr(_self, "_versions_tried", None)
-                    if vt is not None:
-                        vt.add(msg[len("Trying "):-1].strip())
+                    if vt is not None and _VER_LABEL_RE.match(cand):
+                        vt.add(cand)
                 # --- observational: record the winning (version, -mt) per
                 # stream. Read-side only — parses rescene's own log messages
                 # and touches no reconstruction state. rescene fires the rar
