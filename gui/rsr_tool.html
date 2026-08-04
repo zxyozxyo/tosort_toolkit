@@ -279,6 +279,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <button class="btn btn-sm" id="btn-import" onclick="importPriors()">Import srrdb priors</button>
             <span class="hint">seed recipe hints from the legacy rebuild results</span>
           </div>
+          <div class="row">
+            <button class="btn btn-sm" id="btn-reindex" onclick="reindexStore()">Reindex store</button>
+            <span class="hint">re-read the Store folder; index any .rsr the db is missing</span>
+          </div>
           <div class="db-list" id="db-list"></div>
         </div>
       </div>
@@ -449,6 +453,20 @@ async function importPriors() {
   if (!r.ok) log('✗ ' + r.error, 'err');
   b.disabled = false;
   refreshStats();
+}
+
+// The disk is the authority: any .rsr the db has not got a row for gets one.
+async function reindexStore() {
+  const b = $('btn-reindex');
+  b.disabled = true;
+  try {
+    const r = await window.pywebview.api.reindex_store($('store').value.trim());
+    if (!r.ok) log('✗ ' + r.error, 'err');
+  } finally {
+    b.disabled = false;
+  }
+  refreshStats();
+  dbSearch();
 }
 
 function stopRun() { window.pywebview.api.stop(); }

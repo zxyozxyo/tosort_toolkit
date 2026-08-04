@@ -2858,6 +2858,136 @@ class RsrToolAPI:
         finally:
             con.close()
 
+    def reindex_store(self, store: str) -> dict:
+        """Rebuild the index from what is actually on disk.
+
+        The index is derived data: every row in it is reproducible from the
+        manifest inside the .rsr it points at, so on any disagreement the DISK
+        wins. That matters because a capture writes its .rsr before it records
+        the row, and anything that interrupts the gap — a crash, a kill, or a
+        stale process whose INSERT no longer matched a migrated table — leaves
+        a perfectly good .rsr with no row. `skip_done` matches on the FILE, so
+        a re-run then skips the release and it stays invisible for good. This
+        heals all of that without recapturing anything.
+
+        Three repairs, in order of how much they touch:
+          * a .rsr with no row            -> indexed
+          * a row pointing somewhere else -> re-pointed (the store was moved,
+            or the release was re-filed, as the [NUKED] path fix did)
+          * a row whose .rsr is gone      -> dropped, but ONLY when its path
+            lies under the folder being reindexed. Reindexing one subtree must
+            not delete rows for releases stored elsewhere."""
+        path = (store or "").strip()
+        if not path:
+            return {"ok": False, "error": "no store folder given"}
+        root = Path(path)
+        if not root.is_dir():
+            return {"ok": False, "error": f"store folder not found: {root}"}
+
+        self._log(f"Reindexing {root} …", "info")
+        found = sorted(root.rglob("*.rsr"))          # .rsr.tmp is not matched
+        con = self._db()
+        try:
+            rows = {r[0]: r[1] or "" for r in
+                    con.execute("SELECT name, rsr_path FROM releases")}
+        finally:
+            con.close()
+        self._log(f"  {len(found):,} .rsr on disk · {len(rows):,} row(s) "
+                  f"in the index", "dim")
+
+        seen: dict[str, Path] = {}
+        added = moved = intact = bad = dupes = 0
+        for i, p in enumerate(found, 1):
+            if i % 25 == 0 or i == len(found):
+                self._progress(f"reindex {i}/{len(found)}")
+            try:
+                manifest, z = self.read_rsr(p)
+                z.close()
+            except Exception as e:
+                bad += 1
+                self._log(f"  ✗ unreadable, left alone: {p.name} — {e}", "err")
+                continue
+            # The manifest is the authority on the release name; the filename
+            # is only a convention and a rename would otherwise fork the row.
+            rel = manifest.get("release") or p.stem
+            if rel in seen:
+                # Two files claiming one release — exactly what re-filing a
+                # release leaves behind. Index the newer and say where the
+                # other is, rather than silently letting the walk order decide.
+                dupes += 1
+                other = seen[rel]
+                keep = max(p, other, key=lambda x: x.stat().st_mtime)
+                self._log(f"  ! {rel} is claimed by two .rsr — indexing the "
+                          f"newer one, {keep}", "warn")
+                self._log(f"      the other is still on disk: "
+                          f"{other if keep is p else p}", "dim")
+                if keep is other:
+                    continue
+            known = rows.get(rel)
+            if known is None:
+                added += 1
+                why = "not indexed"
+            elif Path(known) != p:
+                moved += 1
+                why = f"was {known}"
+            else:
+                intact += 1
+                seen[rel] = p
+                continue
+            try:
+                self._db_record(manifest, p)
+                self._db_forget(rel)       # it exists; any recorded miss is stale
+            except Exception as e:
+                bad += 1
+                self._log(f"  ✗ cannot index {p.name}: {e}", "err")
+                continue
+            seen[rel] = p
+            self._log(f"  + {rel} ({why})", "ok")
+        self._progress("")
+
+        stale = []
+        for name, rsr in rows.items():
+            if name in seen or not rsr:
+                continue
+            q = Path(rsr)
+            try:
+                inside = q.is_relative_to(root)
+            except ValueError:
+                inside = False
+            if inside and not q.is_file():
+                stale.append(name)
+        if stale:
+            con = self._db()
+            try:
+                con.executemany("DELETE FROM releases WHERE name=?",
+                                [(n,) for n in stale])
+                con.executemany("DELETE FROM files WHERE release=?",
+                                [(n,) for n in stale])
+                con.commit()
+            finally:
+                con.close()
+            for n in stale[:20]:
+                self._log(f"  − {n} (indexed, but the .rsr is gone)", "warn")
+            if len(stale) > 20:
+                self._log(f"    …and {len(stale) - 20} more", "dim")
+
+        parts = [f"{intact:,} already correct"]
+        if added:
+            parts.append(f"{added:,} indexed")
+        if moved:
+            parts.append(f"{moved:,} re-pointed")
+        if stale:
+            parts.append(f"{len(stale):,} stale row(s) dropped")
+        if dupes:
+            parts.append(f"{dupes:,} duplicate name(s)")
+        if bad:
+            parts.append(f"{bad:,} unreadable")
+        self._log("Reindex complete — " + ", ".join(parts) + ".",
+                  "ok" if not bad else "warn")
+        return {"ok": True, "found": len(found), "added": added, "moved": moved,
+                "intact": intact, "stale": len(stale), "dupes": dupes,
+                "bad": bad}
+
     def db_stats(self) -> dict:
         if not self._db_path.is_file():
             return {"ok": True, "releases": 0, "files": 0, "verified": 0}
