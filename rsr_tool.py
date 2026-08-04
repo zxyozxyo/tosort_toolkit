@@ -496,7 +496,8 @@ class RsrToolAPI:
         self._procs: set = set()
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
-        self._deadline = None          # per-release wall clock for the sweep
+        self._deadline = None          # wall clock for the sweep, set per set
+        self._budget_min = 0
         self._budget_hit = False
         self._seeded = False           # recipe priors backfilled this process
 
@@ -591,9 +592,17 @@ class RsrToolAPI:
         source a single rar.exe call runs for minutes with nothing on screen,
         which is indistinguishable from a hang — so while one is running with a
         name, the elapsed seconds are ticked out."""
+        # DEVNULL, not PIPE. Nothing here ever reads the child's output, and an
+        # undrained pipe is a deadlock: rar.exe prints a progress percentage
+        # while extracting, fills the few-KB OS pipe buffer, and blocks forever
+        # waiting for a reader that does not exist. The sweep never tripped it
+        # because those commands pass -idcd and emit almost nothing; a 24-volume
+        # 512 MB extract prints plenty, so it hung until the 3600 s timeout
+        # killed it — an hour per release, and it consumed the whole search
+        # budget before a single combo had been tried.
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
         except Exception:
             return False
         with self._proc_lock:
@@ -914,8 +923,14 @@ class RsrToolAPI:
         # answer is not in the pack at all it is the FULL product every time —
         # 134 MB recompressed on each combo. Park it and move on; the priors
         # learned from the rest of the corpus make a later retry much cheaper.
-        budget = max(0, _num(s.get("budget_min"), 0, int))
-        self._deadline = (time.monotonic() + budget * 60) if budget else None
+        #
+        # The clock starts at the SWEEP, not here. Reading and extracting the
+        # source is unavoidable work that has to happen whatever the budget is,
+        # so charging it to the search meant a slow extract could spend the
+        # whole allowance and park the release having tried ZERO combos — all
+        # of the cost, none of the benefit.
+        self._budget_min = max(0, _num(s.get("budget_min"), 0, int))
+        self._deadline = None
         self._budget_hit = False
         try:
             for si, st in enumerate(sets):
@@ -1134,10 +1149,21 @@ class RsrToolAPI:
             return {"ok": False, "error": "skipped"}
         order = [f["name"] for f in meta]
         src_files = [srcdir / n for n in order]
-        if not all(p.is_file() for p in src_files):
-            return {"ok": False,
-                    "error": "extraction incomplete"
-                             + ("" if ok_x else " (extract did not finish)")}
+        # "The file exists" is not "the file is complete". A killed extract
+        # leaves a partially written source behind, which passed the old
+        # is_file() test and then went on to sweep against TRUNCATED bytes —
+        # every combo mismatching, a wall reported for a release that was never
+        # actually tested. Check the size the header declares, and treat a
+        # non-clean exit as a failure in its own right.
+        short = [f["name"] for f, p in zip(meta, src_files)
+                 if not p.is_file() or p.stat().st_size != (f["size"] or 0)]
+        if short or not ok_x:
+            if self._skip.is_set() or self._stop.is_set():
+                return {"ok": False, "error": "skipped"}
+            detail = (f"{len(short)} file(s) wrong size: {', '.join(short[:3])}"
+                      if short else "extract did not finish")
+            self._log(f"    ✗ extraction incomplete — {detail}", "err")
+            return {"ok": False, "error": f"extraction incomplete ({detail})"}
 
         # The timestamp rar.exe just restored is the one that will be written
         # back into the header, at full 100 ns resolution. Record THAT rather
@@ -1227,6 +1253,8 @@ class RsrToolAPI:
         year = int(year) if year.isdigit() else 0
         cands = self._dict_candidates(st["format"], dict_kb, s["dict_ladder"])
         recipe = None
+        budget = getattr(self, "_budget_min", 0)
+        self._deadline = (time.monotonic() + budget * 60) if budget else None
         for di, dkb in enumerate(cands):
             if self._stop.is_set() or self._skip.is_set():
                 return {"ok": False,
@@ -1286,14 +1314,18 @@ class RsrToolAPI:
             self._log(f"    ✓ REPLAY + DELTA — {n} volume(s) needed a header "
                       f"patch ({sum(len(v) for v in deltas.values()):,} B "
                       "total); reconstruction is still byte-exact.", "ok")
+        elif verify == "failed":
+            self._log("    ✗ the replay could not be run — nothing captured.",
+                      "err")
         else:
-            self._log("    ⚠ replay did NOT reproduce the volumes and the "
-                      "residual is too large to store — captured as "
-                      "UNVERIFIED.", "warn")
+            self._log("    ⚠ replay ran, but the volumes differ by more than a "
+                      "header residual — captured as UNVERIFIED.", "warn")
 
         return {
             "ok": verify in ("exact", "delta"),
-            "error": "" if verify != "none" else "replay unverified",
+            "error": {"exact": "", "delta": "",
+                      "failed": "replay could not be run"}.get(
+                          verify, "replay unverified"),
             "set": {
                 "stem": st["stem"],
                 "format": st["format"],
@@ -1500,7 +1532,12 @@ class RsrToolAPI:
         for ex, n in combos:
             if self._stop.is_set() or self._skip.is_set():
                 return None
-            if deadline and time.monotonic() > deadline:
+            # `tried` guard: always try at least one combo. Parking a release
+            # having tested nothing is the worst of both worlds — it pays the
+            # extract and the hashing and learns nothing, and the very first
+            # combo is the group's best-known recipe, which is the one most
+            # likely to just answer it.
+            if tried and deadline and time.monotonic() > deadline:
                 self._budget_hit = True
                 self._log(f"    ⏱ time budget reached after {tried} combo(s) — "
                           "parking this release and moving on.", "warn")
@@ -1620,10 +1657,18 @@ class RsrToolAPI:
         produced = self._replay(recipe, src_files, work, comment, st["format"])
         volmeta, deltas = [], {}
         if not produced:
+            # Distinct from "the bytes differ": the replay command itself did
+            # not deliver. Reported identically, this cost an hour of hunting a
+            # phantom compression difference on Transformers_Prime, whose
+            # recipe was in fact perfect — rar.exe had deadlocked on an
+            # undrained stdout pipe and been killed at the timeout.
+            self._log("    ✗ the replay command produced no volumes at all "
+                      "(rar did not finish) — this is NOT a wrong recipe.",
+                      "err")
             for v in vols:
                 volmeta.append({"name": v.name, "size": v.stat().st_size,
                                 "sha256": _file_sha256(v), "delta": None})
-            return "none", volmeta, {}
+            return "failed", volmeta, {}
 
         if st["byte_split"]:
             # The originals are slices of one archive; compare the join.
