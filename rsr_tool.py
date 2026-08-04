@@ -890,7 +890,8 @@ class RsrToolAPI:
             self._budget_hit = False
             self._budget_override = False      # per-release only, never sticky
             self._sweep_pos = (0, "")
-            self._emit("row", {"name": rel, "status": "running"})
+            self._emit("row", {"name": rel, "status": "running",
+                               "kind": "running"})
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
             if s["skip_done"] and self._existing_rsr(store, folder, rel):
@@ -900,7 +901,8 @@ class RsrToolAPI:
                 # mostly these, and "skipped" alone does not distinguish
                 # "captured on an earlier run" from "you pressed Skip".
                 self._emit("row", {"name": rel, "status": "skipped",
-                                   "recipe": "already captured"})
+                                   "recipe": "already captured",
+                                   "kind": "captured-before"})
                 skipped += 1
                 continue
             wall = None if s.get("retry_walls") else self._known_wall(rel)
@@ -909,7 +911,8 @@ class RsrToolAPI:
                           f"{(wall[0] or '')[:10]} against {wall[1]} build(s) — "
                           f"skipping (tick '{UI_RETRY_WALLS}' to redo).", "dim")
                 self._emit("row", {"name": rel, "status": "skipped",
-                                   "recipe": "known wall"})
+                                   "recipe": "known wall",
+                                   "kind": "wall"})
                 walls += 1
                 continue
             try:
@@ -924,14 +927,15 @@ class RsrToolAPI:
                 # own rebuild has verified.
                 self._log("  ⏭ Skipped by request — nothing written.", "warn")
                 self._emit("row", {"name": rel, "status": "skipped",
-                                   "recipe": "skipped by hand"})
+                                   "recipe": "skipped by hand",
+                                   "kind": "skipped"})
                 skipped += 1
                 continue
             if res.get("error") == "zip release":
                 # Out of scope, not a failure. Counted apart so the summary's
                 # "failed" figure stays a number worth reading.
                 self._emit("row", {"name": rel, "status": "skipped",
-                                   "recipe": "zip"})
+                                   "recipe": "zip", "kind": "zip"})
                 zips += 1
                 continue
             if self._budget_hit and not res.get("ok"):
@@ -942,7 +946,8 @@ class RsrToolAPI:
                 self._db_miss(rel, "parked", "time budget", len(exes),
                               combos=pos, order_sig=sig)
                 self._emit("row", {"name": rel, "status": "skipped",
-                                   "recipe": "parked — time budget"})
+                                   "recipe": "parked — time budget",
+                                   "kind": "parked"})
                 parked += 1
                 continue
             done += 1
@@ -952,13 +957,15 @@ class RsrToolAPI:
                 meta += 1
                 self._db_forget(rel)
                 self._emit("row", {"name": rel, "status": "done",
-                                   "recipe": res.get("recipe", "metadata only")})
+                                   "recipe": res.get("recipe", "metadata only"),
+                                   "kind": "metadata"})
                 continue
             if res.get("ok"):
                 ok += 1
                 self._db_forget(rel)          # it worked; the miss is stale
                 self._emit("row", {"name": rel, "status": "done",
-                                   "recipe": res.get("recipe", "")})
+                                   "recipe": res.get("recipe", ""),
+                                   "kind": "ok"})
             else:
                 failed += 1
                 err = res.get("error", "")
@@ -968,7 +975,9 @@ class RsrToolAPI:
                     # the pack has grown.
                     self._db_miss(rel, "wall", err, len(exes))
                 self._emit("row", {"name": rel, "status": "error",
-                                   "recipe": err})
+                                   "recipe": err,
+                                   "kind": "wall" if err == "recipe not found"
+                                           else "error"})
 
         self._log("", "")
         self._log(f"Capture complete — {ok} verified, {failed} failed, "
@@ -2166,7 +2175,8 @@ class RsrToolAPI:
             if not hit.get("ok"):
                 miss += 1
                 self._emit("row", {"name": p.name, "status": "skipped",
-                                   "recipe": hit.get("error", "no match")})
+                                   "recipe": hit.get("error", "no match"),
+                                   "kind": "nomatch"})
                 continue
             rel = hit["release"]
             if rel in matched:
@@ -2192,10 +2202,11 @@ class RsrToolAPI:
                 self._log(f"  ✗ indexed .rsr is missing from the store: {rsr}",
                           "err")
                 self._emit("row", {"name": rel, "status": "error",
-                                   "recipe": ".rsr missing"})
+                                   "recipe": ".rsr missing", "kind": "error"})
                 failed += 1
                 continue
-            self._emit("row", {"name": rel, "status": "running"})
+            self._emit("row", {"name": rel, "status": "running",
+                               "kind": "running"})
             self._consumed = []
             try:
                 # The file's own folder is the content root — a rebuild reads
@@ -2211,11 +2222,11 @@ class RsrToolAPI:
                 if delete_content:
                     freed += self._delete_consumed(out)
                 self._emit("row", {"name": rel, "status": "done",
-                                   "recipe": "rebuilt"})
+                                   "recipe": "rebuilt", "kind": "ok"})
             else:
                 failed += 1
                 self._emit("row", {"name": rel, "status": "error",
-                                   "recipe": "rebuild failed"})
+                                   "recipe": "rebuild failed", "kind": "error"})
 
         self._log("", "")
         self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "

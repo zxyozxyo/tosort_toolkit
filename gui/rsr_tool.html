@@ -74,6 +74,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .qs-done{color:var(--acc)}
 .qs-error{color:var(--danger)}
 .qs-skipped{color:var(--text3)}
+.queue-hdr div{cursor:pointer;user-select:none}
+.queue-hdr div:hover{color:var(--text)}
+.queue-hdr .arrow{opacity:.85;font-weight:400}
+.sel{background:var(--bg0);border:1px solid var(--border);border-radius:4px;color:var(--text2);
+     font-family:var(--font);font-size:10px;padding:1px 4px;outline:none;margin-left:auto}
+.sel:focus{border-color:var(--acc)}
 
 .pill{display:inline-block;padding:1px 8px;border-radius:8px;font-size:9px;font-family:var(--mono);border:1px solid var(--border);color:var(--text2)}
 .pill.running{border-color:var(--warn);color:var(--warn)}
@@ -294,10 +300,24 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <div class="panel" style="flex:0 0 auto;max-height:34%;display:flex;flex-direction:column">
         <div class="phdr"><span class="dot"></span>Releases
-          <span id="queue-count" style="margin-left:auto;color:var(--text3)"></span>
+          <select class="sel" id="q-filter" onchange="renderQueue()"
+                  title="Show only releases of one kind">
+            <option value="">show: everything</option>
+            <option value="attention">needs attention (errors, walls, parked)</option>
+            <option value="error">errors only</option>
+            <option value="wall">known walls</option>
+            <option value="parked">parked on the time budget</option>
+            <option value="ok">captured</option>
+            <option value="skip">skipped</option>
+          </select>
+          <span id="queue-count" style="margin-left:8px;color:var(--text3)"></span>
         </div>
         <div class="pbody" style="flex:1;min-height:0;padding:6px">
-          <div class="queue-hdr"><div>Release</div><div>Recipe</div><div>Status</div></div>
+          <div class="queue-hdr">
+            <div onclick="sortQueue('name')" title="Sort by release name">Release<span class="arrow" id="qa-name"></span></div>
+            <div onclick="sortQueue('recipe')" title="Sort by recipe — groups every release that shared a build">Recipe<span class="arrow" id="qa-recipe"></span></div>
+            <div onclick="sortQueue('status')" title="Sort by outcome — errors and walls first, then parked, then the rest">Status<span class="arrow" id="qa-status"></span></div>
+          </div>
           <div class="queue" id="queue"></div>
         </div>
       </div>
@@ -331,7 +351,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
 <script>
 const $ = id => document.getElementById(id);
+// name -> {name, recipe, status, kind, seq, el}. The model is kept apart from
+// the DOM so the list can be re-ordered and filtered without the backend ever
+// having to resend it — a scan of 2,400 releases only ever sends each row.
 const rows = new Map();
+let qSeq = 0;
+let qSort = {key: 'seq', dir: 1};
 
 window.addEventListener('pywebviewready', async () => {
   const saved = localStorage.getItem('rv_theme');
@@ -393,7 +418,7 @@ function setBusy(on) {
 
 async function startScan() {
   if (!$('source').value.trim()) { log('Pick a folder of originals first.', 'warn'); return; }
-  rows.clear(); $('queue').innerHTML = ''; $('queue-count').textContent = '';
+  clearQueue();
   setBusy(true);
   const r = await window.pywebview.api.scan_start(cfg());
   if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
@@ -436,7 +461,7 @@ function confirmDeleteContent(el) {
 async function startBatch() {
   if (!$('rb-root').value.trim()) { log('Pick a content folder first.', 'warn'); return; }
   if (!$('rb-bout').value.trim()) { log('Pick an output folder first.', 'warn'); return; }
-  rows.clear(); $('queue').innerHTML = ''; $('queue-count').textContent = '';
+  clearQueue();
   setBusy(true);
   const r = await window.pywebview.api.rebuild_batch_start({
     content: $('rb-root').value.trim(),
@@ -523,31 +548,116 @@ function flash(btn, msg) {
   setTimeout(() => { btn.textContent = old; }, 1200);
 }
 
+// Sorting Status alphabetically would put 'done' above 'error', which is the
+// wrong way round for the only question anyone asks of this list: what needs
+// looking at? So one click groups by severity instead.
+const KIND_RANK = {error: 0, wall: 1, parked: 2, running: 3, nomatch: 4,
+                   zip: 5, skipped: 6, 'captured-before': 7, metadata: 8,
+                   ok: 9};
+const FILTERS = {
+  attention: k => k === 'error' || k === 'wall' || k === 'parked',
+  error: k => k === 'error',
+  wall: k => k === 'wall',
+  parked: k => k === 'parked',
+  ok: k => k === 'ok' || k === 'metadata',
+  skip: k => k === 'skipped' || k === 'captured-before' || k === 'zip'
+             || k === 'nomatch',
+};
+
+// A row sent by an older backend has no kind; fall back to its status so the
+// list still filters sensibly rather than dropping the row on the floor.
+function rowKind(d) {
+  if (d.kind) return d.kind;
+  return d.status === 'done' ? 'ok'
+       : d.status === 'error' ? 'error'
+       : d.status === 'running' ? 'running' : 'skipped';
+}
+
+function sortQueue(key) {
+  qSort = (qSort.key === key) ? {key: key, dir: -qSort.dir} : {key: key, dir: 1};
+  renderQueue();
+}
+
+function qCompare(a, b) {
+  const d = qSort.dir;
+  if (qSort.key === 'name') return d * a.name.localeCompare(b.name);
+  if (qSort.key === 'recipe') {
+    const c = (a.recipe || '').localeCompare(b.recipe || '');
+    return c ? d * c : a.seq - b.seq;
+  }
+  if (qSort.key === 'status') {
+    const ra = KIND_RANK[a.kind] === undefined ? 99 : KIND_RANK[a.kind];
+    const rb = KIND_RANK[b.kind] === undefined ? 99 : KIND_RANK[b.kind];
+    return ra === rb ? a.seq - b.seq : d * (ra - rb);
+  }
+  return d * (a.seq - b.seq);
+}
+
+function renderQueue() {
+  const want = FILTERS[$('q-filter').value] || null;
+  const all = Array.from(rows.values());
+  const shown = want ? all.filter(r => want(r.kind)) : all;
+  shown.sort(qCompare);
+  // appendChild MOVES an existing node, so re-ordering costs no new elements
+  // and the click handlers survive.
+  const frag = document.createDocumentFragment();
+  for (const r of shown) frag.appendChild(r.el);
+  const q = $('queue');
+  q.innerHTML = '';
+  q.appendChild(frag);
+  $('queue-count').textContent = want
+    ? shown.length + ' of ' + all.length + ' release(s)'
+    : all.length + ' release(s)';
+  for (const k of ['name', 'recipe', 'status']) {
+    $('qa-' + k).textContent =
+      qSort.key === k ? (qSort.dir > 0 ? ' ▲' : ' ▼') : '';
+  }
+}
+
+function clearQueue() {
+  rows.clear();
+  qSeq = 0;
+  $('queue').innerHTML = '';
+  $('queue-count').textContent = '';
+}
+
 function upsertRow(d) {
   // A new release starting means the backend has just reset the per-release
   // budget override, so the button must stop looking armed.
   if (d.status === 'running') $('btn-finish').classList.remove('on');
-  let el = rows.get(d.name);
-  if (!el) {
-    el = document.createElement('div');
+  let r = rows.get(d.name);
+  if (!r) {
+    const el = document.createElement('div');
     el.className = 'queue-row';
     el.innerHTML = '<div class="qr-name"></div><div class="qr-recipe"></div>'
                  + '<div class="qr-status"></div>';
     el.title = 'Click for capture details';
     el.onclick = () => showInfo(d.name);
-    $('queue').appendChild(el);
-    rows.set(d.name, el);
+    r = {name: d.name, recipe: '', status: '', kind: 'running',
+         seq: qSeq++, el: el};
+    rows.set(d.name, r);
+  }
+  r.status = d.status;
+  r.kind = rowKind(d);
+  if (d.recipe !== undefined) r.recipe = d.recipe || '';
+  r.el.children[0].textContent = r.name;
+  r.el.children[0].title = r.name;
+  r.el.children[1].textContent = r.recipe;
+  r.el.children[1].title = r.recipe;
+  r.el.children[2].textContent = r.status;
+  r.el.children[2].className = 'qr-status qs-' + r.status;
+
+  const plain = qSort.key === 'seq' && qSort.dir > 0 && !$('q-filter').value;
+  if (plain) {
+    // Untouched list: keep the cheap path, and keep following the run.
+    if (r.el.parentNode !== $('queue')) $('queue').appendChild(r.el);
     $('queue-count').textContent = rows.size + ' release(s)';
+    r.el.scrollIntoView({block: 'nearest'});
+  } else {
+    // Sorted or filtered by hand: put the row where it now belongs, and do
+    // NOT scroll — the operator is reading, not following.
+    renderQueue();
   }
-  el.children[0].textContent = d.name;
-  el.children[0].title = d.name;
-  if (d.recipe !== undefined) {
-    el.children[1].textContent = d.recipe || '';
-    el.children[1].title = d.recipe || '';
-  }
-  el.children[2].textContent = d.status;
-  el.children[2].className = 'qr-status qs-' + d.status;
-  el.scrollIntoView({block: 'nearest'});
 }
 
 window.rsrEvent = function (event, data) {
