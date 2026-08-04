@@ -418,17 +418,14 @@ function rbMode(m) {
 function confirmDeleteContent(el) {
   if (!el.checked) return;
   const ok = confirm(
-    'Delete unpacked source files after a successful rebuild?
-
-' +
-    'For each release that rebuilds AND passes hash verification, the loose ' +
-    'unpacked file it was built from will be permanently deleted.
-
-' +
-    'The rebuilt archives, NFO, SFV and proof are never touched.
-
-' +
-    'This cannot be undone.');
+    ['Delete unpacked source files after a successful rebuild?',
+     '',
+     'For each release that rebuilds AND passes hash verification, the loose '
+     + 'unpacked file it was built from will be permanently deleted.',
+     '',
+     'The rebuilt archives, NFO, SFV and proof are never touched.',
+     '',
+     'This cannot be undone.'].join('\n'));
   if (!ok) el.checked = false;
 }
 
