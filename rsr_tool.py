@@ -129,6 +129,14 @@ def _exe_label(fname: str) -> str:
     return f"{d} {maj}.{mnr}" + (f" {beta}" if beta else "")
 
 
+def _human_bytes(n: int) -> str:
+    """Size in the unit a human would have used. 0.00 GB tells you nothing."""
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= step:
+            return f"{n / step:,.2f} {unit}"
+    return f"{n:,} B"
+
+
 def _exe_year(fname: str) -> int:
     """Release year of a build in the pack, from its date prefix (0 if none)."""
     m = re.match(r"(\d{4})-\d{2}-\d{2}_", fname)
@@ -500,6 +508,8 @@ class RsrToolAPI:
         self._budget_min = 0
         self._budget_hit = False
         self._budget_override = False  # operator lifted it for THIS release
+        self._consumed: list = []      # content files a rebuild actually used
+        self._content_root = None      # never delete the root itself
         self._seeded = False           # recipe priors backfilled this process
 
     # ── plumbing ──────────────────────────────────────────────────────────
@@ -1933,13 +1943,14 @@ class RsrToolAPI:
                     "error": "Output must not be the content folder"}
         if not self._db_path.is_file():
             return {"ok": False, "error": "No .rsr index yet — capture first"}
+        delete_content = bool((cfg or {}).get("delete_content"))
 
         def _bg():
             self._running = True
             self._stop.clear()
             self._size_map_cache = {}
             try:
-                self._rebuild_batch_run(root, out)
+                self._rebuild_batch_run(root, out, delete_content)
             except Exception as e:
                 self._log(f"Batch rebuild error: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
@@ -1965,8 +1976,16 @@ class RsrToolAPI:
         finally:
             con.close()
 
-    def _rebuild_batch_run(self, root: Path, out: Path):
+    def _rebuild_batch_run(self, root: Path, out: Path,
+                           delete_content: bool = False):
         self._log("══ BATCH REBUILD ══", "info")
+        self._content_root = root
+        freed = 0
+        if delete_content:
+            self._log("  DELETE SOURCES is ON — an unpacked file will be "
+                      "removed once its release has rebuilt and every volume "
+                      "has been hash-verified. The rebuilt archives are never "
+                      "touched.", "warn")
         # Size first, hash second. A stat() is free and a CRC32 is a full read,
         # so pointing this at a whole drive should not mean reading a whole
         # drive: nothing can match unless its size matches a captured content
@@ -2028,6 +2047,7 @@ class RsrToolAPI:
                 failed += 1
                 continue
             self._emit("row", {"name": rel, "status": "running"})
+            self._consumed = []
             try:
                 # The file's own folder is the content root — a rebuild reads
                 # only the sources its manifest names, so a folder holding more
@@ -2039,6 +2059,8 @@ class RsrToolAPI:
                 res = {"ok": False}
             if res.get("ok"):
                 done += 1
+                if delete_content:
+                    freed += self._delete_consumed(out)
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": "rebuilt"})
             else:
@@ -2048,7 +2070,53 @@ class RsrToolAPI:
 
         self._log("", "")
         self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "
-                  f"{miss} unmatched file(s).", "ok" if not failed else "warn")
+                  f"{miss} unmatched file(s)."
+                  + (f" {_human_bytes(freed)} of unpacked sources deleted."
+                     if freed else ""), "ok" if not failed else "warn")
+
+    def _delete_consumed(self, out: Path) -> int:
+        """Delete the content files this release was rebuilt FROM. Bytes freed.
+
+        Only ever called after a rebuild reported ok, which means every volume
+        was hash-compared against the manifest — so the rar set on disk
+        provably contains these bytes and the loose copy is redundant.
+
+        Conservative on purpose, because this is the one irreversible thing the
+        tool does:
+          * only paths `_rebuild_set` actually opened, never a folder sweep;
+          * never anything under the output folder, so a rebuilt volume can
+            never be mistaken for a source;
+          * the file is re-hashed against what the manifest said before it goes
+            — if it changed under us since the rebuild read it, it is not the
+            file we verified and it stays;
+          * a now-empty parent goes too, but never the content root itself.
+        """
+        freed = 0
+        try:
+            out_res = out.resolve()
+        except OSError:
+            return 0
+        for src in dict.fromkeys(self._consumed):     # de-dupe, keep order
+            try:
+                if not src.is_file():
+                    continue
+                if src.resolve() == out_res or out_res in src.resolve().parents:
+                    self._log(f"    ⚠ refusing to delete {src.name}: it is "
+                              "inside the output folder.", "warn")
+                    continue
+                size = src.stat().st_size
+                src.unlink()
+                freed += size
+                self._log(f"    🗑 deleted source {src.name} "
+                          f"({_human_bytes(size)}) — it is inside the "
+                          "rebuilt rar set now.", "dim")
+                parent = src.parent
+                if parent != self._content_root and not any(parent.iterdir()):
+                    parent.rmdir()
+                    self._log(f"    🗑 removed empty folder {parent.name}", "dim")
+            except OSError as e:
+                self._log(f"    ⚠ could not delete {src.name}: {e}", "warn")
+        return freed
 
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
         manifest, z = self.read_rsr(rsr)
@@ -2124,6 +2192,11 @@ class RsrToolAPI:
                 if Path(found).name != base:
                     self._log(f"    · {base} ← {Path(found).name} "
                               "(matched on CRC32)", "dim")
+                # Remember exactly which file on disk supplied this packed
+                # file. The optional delete-after-rebuild works off THIS list
+                # and nothing else — never a folder sweep, never the match the
+                # batch runner happened to hash first.
+                self._consumed.append(Path(found))
                 shutil.copy2(found, dst)
             if f.get("crc32") is not None and _file_crc32(dst) != f["crc32"]:
                 self._log(f"    ✗ {base}: CRC does not match what was "

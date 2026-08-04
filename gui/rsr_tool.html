@@ -231,6 +231,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
               <input class="txt" id="rb-bout" placeholder="a folder per release is made here">
               <button class="btn btn-sm" onclick="pick('rb-bout')">…</button>
             </div>
+            <label class="chk-row"><input type="checkbox" id="delete_content"
+                     onchange="confirmDeleteContent(this)">
+              Delete the unpacked file once its release is rebuilt &amp; verified</label>
             <div class="row">
               <button class="btn btn-go" id="btn-rebuild" onclick="startBatch()">Rebuild all</button>
               <span class="hint">matched on size + CRC32, not on name</span>
@@ -409,6 +412,26 @@ function rbMode(m) {
   $('tab-one').classList.toggle('on', m === 'one');
 }
 
+// Irreversible, so it is confirmed at the moment of ticking rather than
+// buried in the run. Never persisted either — it starts off every session, so
+// a box ticked for one job can't quietly arm the next one.
+function confirmDeleteContent(el) {
+  if (!el.checked) return;
+  const ok = confirm(
+    'Delete unpacked source files after a successful rebuild?
+
+' +
+    'For each release that rebuilds AND passes hash verification, the loose ' +
+    'unpacked file it was built from will be permanently deleted.
+
+' +
+    'The rebuilt archives, NFO, SFV and proof are never touched.
+
+' +
+    'This cannot be undone.');
+  if (!ok) el.checked = false;
+}
+
 async function startBatch() {
   if (!$('rb-root').value.trim()) { log('Pick a content folder first.', 'warn'); return; }
   if (!$('rb-bout').value.trim()) { log('Pick an output folder first.', 'warn'); return; }
@@ -417,6 +440,7 @@ async function startBatch() {
   const r = await window.pywebview.api.rebuild_batch_start({
     content: $('rb-root').value.trim(),
     out: $('rb-bout').value.trim(),
+    delete_content: $('delete_content').checked,
   });
   if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
 }
