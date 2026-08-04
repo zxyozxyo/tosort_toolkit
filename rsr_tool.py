@@ -510,6 +510,7 @@ class RsrToolAPI:
         self._budget_override = False  # operator lifted it for THIS release
         self._consumed: list = []      # content files a rebuild actually used
         self._content_root = None      # never delete the root itself
+        self._sweep_pos = (0, "")      # how far a parked sweep got
         self._seeded = False           # recipe priors backfilled this process
 
     # ── plumbing ──────────────────────────────────────────────────────────
@@ -837,6 +838,7 @@ class RsrToolAPI:
             # NEXT release as parked.
             self._budget_hit = False
             self._budget_override = False      # per-release only, never sticky
+            self._sweep_pos = (0, "")
             self._emit("row", {"name": rel, "status": "running"})
             self._log("", "")
             self._log(f"══ [{i}/{len(folders)}] {rel} ══", "info")
@@ -885,7 +887,9 @@ class RsrToolAPI:
                 # Not a wall and not a failure — an unfinished search. Kept
                 # apart so a later re-run (with better priors) can be pointed
                 # at exactly these, and so the failed count stays meaningful.
-                self._db_miss(rel, "parked", "time budget", len(exes))
+                pos, sig = getattr(self, "_sweep_pos", (0, ""))
+                self._db_miss(rel, "parked", "time budget", len(exes),
+                              combos=pos, order_sig=sig)
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "parked — time budget"})
                 parked += 1
@@ -1299,7 +1303,7 @@ class RsrToolAPI:
                           f"(header dictionary didn't reproduce)", "dim")
             recipe = self._sweep_recipe(st["format"], exes, level, dkb, solid,
                                         src_files, targets, work, s["max_mt"],
-                                        year, grp, self._deadline)
+                                        year, grp, self._deadline, rel)
             if recipe:
                 break
             if self._budget_hit:
@@ -1525,7 +1529,7 @@ class RsrToolAPI:
 
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
-                      deadline=None) -> dict | None:
+                      deadline=None, rel="") -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -1559,6 +1563,16 @@ class RsrToolAPI:
                       + (f" for {grp}" if grp else "")
                       + " — trying those first.", "dim")
 
+        sig = self._order_sig(combos)
+        start, when = self._resume_point(rel, sig)
+        if start >= len(combos):
+            start = 0
+        if start:
+            self._log(f"    ▶ resuming after {start:,} combo(s) already tried"
+                      + (f" on {when}" if when else "")
+                      + f" — {len(combos) - start:,} left to check.", "ok")
+            combos = combos[start:]
+
         probe = work / "probe.rar"
         srcs = [str(p) for p in src_files]
         tried = 0
@@ -1581,8 +1595,13 @@ class RsrToolAPI:
             if (tried and deadline and not self._budget_override
                     and time.monotonic() > deadline):
                 self._budget_hit = True
-                self._log(f"    ⏱ time budget reached after {tried} combo(s) — "
-                          "parking this release and moving on.", "warn")
+                # Hand the position to _scan_run so the next run picks up here
+                # instead of re-grinding the same prefix forever.
+                self._sweep_pos = (start + tried, sig)
+                self._log(f"    ⏱ time budget reached after {tried} combo(s) "
+                          f"({start + tried:,} of {start + len(combos):,} "
+                          "overall) — parking this release; the next run "
+                          "resumes from here.", "warn")
                 return None
             pre = self._pack_args(ex, fmt, level, dict_kb, n)
             if pre is None:
@@ -1639,8 +1658,14 @@ class RsrToolAPI:
             if self._streams_match(probe, targets):
                 return {"exe": ex.name, "version": _exe_label(ex.name),
                         "mt": n, "dict_kb": dict_kb, "tried": tried}
-        self._log(f"    swept {tried} combo(s) across {len(exes)} build(s) "
-                  f"× -mt 0–{max_mt}.", "dim")
+        # Count the resumed prefix too: "swept 4 combo(s)" after picking up
+        # from 26 reads like a search that barely happened, when in fact the
+        # whole space is now covered — which is exactly what makes the wall
+        # that follows trustworthy.
+        self._log(f"    swept {start + tried:,} combo(s) across {len(exes)} "
+                  f"build(s) × -mt 0–{max_mt}"
+                  + (f" ({tried:,} this run, {start:,} carried over)"
+                     if start else "") + ".", "dim")
         return None
 
     @staticmethod
@@ -2392,6 +2417,12 @@ class RsrToolAPI:
         con.execute("""CREATE TABLE IF NOT EXISTS misses(
             release TEXT PRIMARY KEY, kind TEXT, reason TEXT,
             seen TEXT, combos INT, builds INT)""")
+        if "order_sig" not in {r[1] for r in con.execute(
+                "PRAGMA table_info(misses)")}:
+            # Which combo ORDER the recorded progress belongs to. Priors change
+            # as the corpus is learned, so a raw offset is only meaningful
+            # against the order it was measured in.
+            con.execute("ALTER TABLE misses ADD COLUMN order_sig TEXT")
         # Backfill the priors from captures made before this table existed —
         # 45 releases already know the answer, and re-earning it one slow sweep
         # at a time would be silly.
@@ -2436,7 +2467,8 @@ class RsrToolAPI:
         except Exception as e:                      # never fail a capture on it
             self._log(f"    (could not record recipe prior: {e})", "dim")
 
-    def _db_miss(self, rel: str, kind: str, reason: str, builds: int = 0):
+    def _db_miss(self, rel: str, kind: str, reason: str, builds: int = 0,
+                 combos: int = 0, order_sig: str = ""):
         """Record a release that produced no .rsr, and WHY.
 
         'wall' means the sweep ran to exhaustion — retrying is pointless until
@@ -2448,12 +2480,14 @@ class RsrToolAPI:
             try:
                 con.execute(
                     "INSERT INTO misses(release, kind, reason, seen, combos, "
-                    "builds) VALUES(?,?,?,?,0,?) ON CONFLICT(release) DO UPDATE "
+                    "builds, order_sig) VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(release) DO UPDATE "
                     "SET kind=excluded.kind, reason=excluded.reason, "
-                    "seen=excluded.seen, builds=excluded.builds",
+                    "seen=excluded.seen, builds=excluded.builds, "
+                    "combos=excluded.combos, order_sig=excluded.order_sig",
                     (rel, kind, reason,
                      datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                     builds))
+                     int(combos), builds, order_sig or ""))
                 con.commit()
             finally:
                 con.close()
@@ -2553,6 +2587,45 @@ class RsrToolAPI:
                 con.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _order_sig(combos) -> str:
+        """Fingerprint of a combo ORDER, so recorded progress is only reused
+        against the sequence it was actually measured in."""
+        h = hashlib.sha256()
+        for ex, n in combos:
+            h.update(f"{ex.name}:{n}\n".encode())
+        return h.hexdigest()[:16]
+
+    def _resume_point(self, rel: str, sig: str) -> tuple[int, str]:
+        """(combos already tried, when) for a release a budget cut short.
+
+        A parked release used to restart at combo 1, which meant that with a
+        fixed budget it could NEVER finish — every run re-ground the identical
+        prefix and parked in the same place. Resuming is only sound while the
+        order is unchanged, hence the signature: priors shift as the corpus is
+        learned, and an offset into a re-ordered list would skip combos that
+        were never tried. A mismatch simply starts over, which is the safe
+        direction to be wrong in."""
+        if not rel or not self._db_path.is_file():
+            return 0, ""
+        try:
+            con = self._db()
+            try:
+                r = con.execute(
+                    "SELECT combos, order_sig, seen FROM misses WHERE "
+                    "release=? AND kind='parked'", (rel,)).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            return 0, ""
+        if not r or not r[0]:
+            return 0, ""
+        if (r[1] or "") != sig:
+            self._log("    (previous run's progress was measured in a "
+                      "different combo order — starting over)", "dim")
+            return 0, ""
+        return int(r[0]), (r[2] or "")[:10]
 
     def _known_wall(self, rel: str) -> tuple | None:
         """(seen, builds) if this release has already been swept to exhaustion
