@@ -83,6 +83,8 @@ HOST_OS       = {0: "MS-DOS", 1: "OS/2", 2: "Windows", 3: "Unix",
 _R5_EXE       = re.compile(r"\d{4}-\d{2}-\d{2}_rar[5-9]\d\d(b\d)?\.exe$", re.I)
 _R4_EXE       = re.compile(r"\d{4}-\d{2}-\d{2}_rar[0-4]\d")
 _DATE_PREFIX  = re.compile(r"^\d{4}-\d{2}-\d{2}[-_]")
+# A bracketed status the archive puts BEFORE the date: "[NUKED] 2013-…".
+_TAG_PREFIX   = re.compile(r"^\[([^\]]{1,24})\]\s*")
 
 
 def _sha256(data: bytes) -> str:
@@ -137,6 +139,27 @@ def _human_bytes(n: int) -> str:
     return f"{n:,} B"
 
 
+# Files a release can consist ENTIRELY of and still be a real release: the
+# metadata-only fixes. Deliberately a whitelist — an unrecognised extension
+# means "an archive kind we don't handle yet", which must stay a warning rather
+# than be quietly filed as metadata.
+_SIDECAR_EXT = {".nfo", ".sfv", ".diz", ".txt", ".jpg", ".jpeg", ".png", ".gif",
+                ".m3u", ".srr", ".srs", ".md5", ".sha1", ".log", ".cue", ".par2"}
+
+_FIX_TAGS = ("DIRFIX", "NFOFIX", "PROOFFIX", "SFVFIX", "SAMPLEFIX",
+             "RARFIX", "SUBFIX", "SYNCFIX")
+
+
+def _fix_tag(rel: str) -> str:
+    """The scene FIX tag in a release name ('DIRFIX'), or ''.
+
+    Tokens only, so a game called `Dirfixer` is not mistaken for one."""
+    for t in re.split(r"[._\-]+", (rel or "").upper()):
+        if t in _FIX_TAGS:
+            return t
+    return ""
+
+
 def _exe_year(fname: str) -> int:
     """Release year of a build in the pack, from its date prefix (0 if none)."""
     m = re.match(r"(\d{4})-\d{2}-\d{2}_", fname)
@@ -183,10 +206,26 @@ def _zip_entry_size(sizes: dict, name: str) -> int:
     return int(sizes.get(name, 0) or 0)
 
 
+def _release_tag(name: str) -> str:
+    """A bracketed status the archive keeps in FRONT of the date — '[NUKED] '.
+
+    Kept as data rather than thrown away: whether a release was nuked is worth
+    recording, it just has no business being part of the release NAME."""
+    m = _TAG_PREFIX.match(name or "")
+    return m.group(1).upper() if m else ""
+
+
 def _release_name(folder: Path) -> str:
-    """Folder name with any dats.site date prefix stripped, so the store is
-    keyed by the ACTUAL release name (point 5 — browsable by hand)."""
-    return _DATE_PREFIX.sub("", folder.name)
+    """Folder name with any bracketed status AND dats.site date prefix
+    stripped, so the store is keyed by the ACTUAL release name (point 5 —
+    browsable by hand).
+
+    The tag has to come off FIRST. `[NUKED] 2013-12-01-Cookie_Shop…` kept both
+    the tag and the date, because the date rule is anchored and the tag pushed
+    the date off the front — so those releases were stored under
+    `NDS/Unknown/[NUKED] 2013-…` and, worse, `_release_year` found no year,
+    which silently disables the date-proximity build ordering in the sweep."""
+    return _DATE_PREFIX.sub("", _TAG_PREFIX.sub("", folder.name))
 
 
 # Scene platform tags, matched on the underscore/dot/dash separated TOKENS of a
@@ -234,7 +273,10 @@ def _release_year(folder: Path, rel: str) -> str:
     (authoritative — it is the scene pre date), else a 19xx/20xx token in the
     name, else 'Unknown'. Never guessed from file mtimes, which say when the
     files were copied, not when the release happened."""
-    m = re.match(r"^(\d{4})-\d{2}-\d{2}[-_]", folder.name)
+    # Match past any bracketed status, or "[NUKED] 2013-12-01-…" yields no
+    # year at all — which turns off the sweep's date-proximity ordering.
+    m = re.match(r"^(\d{4})-\d{2}-\d{2}[-_]",
+                 _TAG_PREFIX.sub("", folder.name))
     if m:
         return m.group(1)
     for t in re.split(r"[._\-]+", rel):
@@ -822,7 +864,7 @@ class RsrToolAPI:
         self._log(f"{len(folders)} release folder(s) under {src}", "info")
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
-        done = ok = failed = skipped = zips = parked = walls = 0
+        done = ok = failed = skipped = zips = parked = walls = meta = 0
         for i, folder in enumerate(folders, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -895,6 +937,14 @@ class RsrToolAPI:
                 parked += 1
                 continue
             done += 1
+            if res.get("metadata"):
+                # A complete release that simply has no archive. Counted apart
+                # so "verified" keeps meaning "a recipe was proved".
+                meta += 1
+                self._db_forget(rel)
+                self._emit("row", {"name": rel, "status": "done",
+                                   "recipe": res.get("recipe", "metadata only")})
+                continue
             if res.get("ok"):
                 ok += 1
                 self._db_forget(rel)          # it worked; the miss is stale
@@ -914,6 +964,7 @@ class RsrToolAPI:
         self._log("", "")
         self._log(f"Capture complete — {ok} verified, {failed} failed, "
                   f"{skipped} skipped"
+                  + (f", {meta} metadata-only release(s) carried" if meta else "")
                   + (f", {walls} known wall(s) passed over" if walls else "")
                   + (f", {parked} parked on the time budget" if parked else "")
                   + (f", {zips} ZIP release(s) out of scope" if zips else "")
@@ -935,6 +986,13 @@ class RsrToolAPI:
                 self._log("  ZIP release — not supported in v1 (needs preflate "
                           "to reproduce the deflate streams). Skipping.", "dim")
                 return {"ok": False, "error": "zip release"}
+            # A metadata-only fix (DIRFIX, NFOFIX, …) IS the release — it never
+            # had an archive, so reporting "no archive set found" calls a
+            # complete release a miss and buries it among the real ones. There
+            # is still something worth keeping: the nfo is the entire artefact.
+            files = [p for p in folder.rglob("*") if p.is_file()]
+            if files and all(p.suffix.lower() in _SIDECAR_EXT for p in files):
+                return self._capture_metadata(folder, store, s, rel, files)
             self._log("  No archive set found in this folder"
                       + (f" (contains: {', '.join(sorted(k for k in kinds if k)[:6])})"
                          if kinds else " — folder is empty") + ".", "warn")
@@ -951,6 +1009,7 @@ class RsrToolAPI:
             "release": rel,
             "system": _release_system(rel),
             "year": _release_year(folder, rel),
+            "tag": _release_tag(folder.name),
             "source_folder": str(folder),
             "sets": [],
         }
@@ -1052,6 +1111,62 @@ class RsrToolAPI:
             _rmtree(work)
 
     # ── release-folder sidecars ───────────────────────────────────────────
+
+    def _capture_metadata(self, folder: Path, store: Path, s: dict, rel: str,
+                          files: list) -> dict:
+        """Capture a release that is metadata only — a DIRFIX, NFOFIX and the
+        like, where the nfo IS the release and there never was an archive.
+
+        Writes a normal .rsr with no sets: nothing to reproduce, so nothing to
+        verify, but the files are carried and the release is recorded as
+        EXISTING rather than as a failed scan. A rebuild of one restores the
+        folder exactly, because sidecar restoration is already set-independent.
+        """
+        tag = _fix_tag(rel)
+        self._log(f"  Metadata-only release{f' ({tag})' if tag else ''} — "
+                  f"{len(files)} file(s), no archive. Capturing the files and "
+                  "recording it as complete.", "info")
+        manifest = {
+            "rsr_version": RSR_VERSION,
+            "magic": RSR_MAGIC,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
+            "host": {"platform": platform.platform(),
+                     "python": platform.python_version()},
+            "release": rel,
+            "system": _release_system(rel),
+            "year": _release_year(folder, rel),
+            "tag": _release_tag(folder.name),
+            "source_folder": str(folder),
+            "kind": "metadata",
+            "fix": tag,
+            "sets": [],
+        }
+        embedded: dict[str, bytes] = {}
+        manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
+                                                      manifest)
+        if not manifest["sidecars"]:
+            self._log("  Nothing could be carried (all files over the embed "
+                      "cap?) — not writing a .rsr.", "warn")
+            return {"ok": False, "error": "metadata release carried nothing"}
+
+        out_dir = self._store_dir(store, folder, rel)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rsr_path = out_dir / f"{rel}.rsr"
+        self._write_rsr(rsr_path, manifest, embedded)
+        for name, data in embedded.items():
+            if name.split("/")[0] not in ("extras", "sidecars"):
+                continue
+            dst = out_dir / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+        self._db_record(manifest, rsr_path)
+        self._db_forget(rel)
+        self._log(f"  ✓ {rsr_path.name} written "
+                  f"({rsr_path.stat().st_size:,} B) — METADATA ONLY", "ok")
+        return {"ok": True, "metadata": True,
+                "recipe": f"metadata only{f' ({tag})' if tag else ''}",
+                "error": ""}
 
     def _capture_sidecars(self, folder: Path, s: dict, embedded: dict,
                           manifest: dict) -> list[dict]:
@@ -2383,6 +2498,19 @@ class RsrToolAPI:
             verified INT, verify TEXT, recipe_exe TEXT, recipe_version TEXT,
             mt INT, level INT, dict_kb INT, solid INT, extras INT,
             total_bytes INT)""")
+        if "kind" not in {r[1] for r in con.execute(
+                "PRAGMA table_info(releases)")}:
+            # 'archive' (the normal case) or 'metadata' (a DIRFIX/NFOFIX and
+            # friends, which have no archive to reproduce). Without it a
+            # metadata release looks like an archive release that captured
+            # nothing — exactly the confusion this path exists to remove.
+            con.execute("ALTER TABLE releases ADD COLUMN kind TEXT "
+                        "DEFAULT 'archive'")
+        if "tag" not in {r[1] for r in con.execute(
+                "PRAGMA table_info(releases)")}:
+            # 'NUKED', 'PROPER', ... — stripped from the name so the store key
+            # is the real release, but kept because it is real information.
+            con.execute("ALTER TABLE releases ADD COLUMN tag TEXT DEFAULT ''")
         con.execute("""CREATE TABLE IF NOT EXISTS files(
             release TEXT, set_stem TEXT, name TEXT, size INT, packed_size INT,
             crc32 INT, sha256 TEXT, method INT, source TEXT)""")
@@ -2703,8 +2831,13 @@ class RsrToolAPI:
         try:
             con.execute("DELETE FROM releases WHERE name=?", (rel,))
             con.execute("DELETE FROM files WHERE release=?", (rel,))
+            # Named columns, not positional: a bare VALUES(...) list silently
+            # shifts every field the moment a column is added.
             con.execute(
-                "INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO releases(name, rsr_path, created, format, sets, "
+                "files, volumes, verified, verify, recipe_exe, recipe_version, "
+                "mt, level, dict_kb, solid, extras, total_bytes, kind, "
+                "tag) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rel, str(rsr_path), manifest.get("created_utc"),
                  sets[0].get("format") if sets else "",
                  len(sets), nfiles, nvols, verified,
@@ -2713,7 +2846,8 @@ class RsrToolAPI:
                  recipe.get("mt", -1), recipe.get("level", -1),
                  recipe.get("dict_kb", 0), int(recipe.get("solid", False)),
                  nextra,
-                 sum(v.get("size", 0) for s in sets for v in s.get("volumes", []))))
+                 sum(v.get("size", 0) for s in sets for v in s.get("volumes", [])),
+                 manifest.get("kind", "archive"), manifest.get("tag", "")))
             for s in sets:
                 for f in s.get("files", []):
                     con.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",
