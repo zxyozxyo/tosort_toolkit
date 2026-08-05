@@ -548,6 +548,33 @@ def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
     return blocks
 
 
+def recovery_record(head: Path) -> int:
+    """Bytes of recovery record in the set, or 0 — `rar a -rr` output.
+
+    An RR is a whole block of data the replay never asked for, so its absence
+    is not a header residual: diff_bytes refuses a length change outright and
+    the capture is refused as "differs by more than a header residual". Which
+    it does, by 46 KB of block that was never the compressor's fault."""
+    import rarfile
+    total = 0
+
+    def cb(h):
+        nonlocal total
+        t = getattr(h, "type", 0)
+        if t in (0x78, 0x7a) and str(getattr(h, "filename", "") or "") in (
+                "RR", "RR%", "Rr", "recovery"):
+            total += int(getattr(h, "add_size", 0) or 0)
+        elif t == 0x78:                       # old-style block, no name at all
+            total += int(getattr(h, "add_size", 0) or 0)
+
+    try:
+        rf = rarfile.RarFile(str(head), info_callback=cb)
+        rf.close()
+    except Exception:
+        return 0
+    return total
+
+
 def stream_digest(blocks: list[tuple[str, int, int]]) -> tuple[int, bytes]:
     """(total length, SHA-1) of a packed file's compressed bytes."""
     h = hashlib.sha1()
@@ -1577,9 +1604,22 @@ class RsrToolAPI:
         # splitter, not of RAR, and are restored from the volume records.
         vol_bytes = 0 if st["byte_split"] or len(vols) == 1 \
             else vols[0].stat().st_size
+        # A recovery record is a block the replay has to be TOLD to make. The
+        # percentage is not stored anywhere, but it is recoverable: the RR
+        # covers the rest of the archive, so its share of it is the -rr value
+        # that was asked for. _verify_replay corrects the guess if the volume
+        # lengths come out wrong.
+        rr_bytes = recovery_record(head)
+        rr_pct = 0
+        if rr_bytes:
+            arch = sum(v.stat().st_size for v in vols)
+            rr_pct = max(1, min(100, round(rr_bytes * 100
+                                           / max(arch - rr_bytes, 1))))
+            self._log(f"    recovery record: {rr_bytes:,} B (~{rr_pct}% of the "
+                      "archive) — the replay will ask for one too.", "dim")
         recipe.update({"level": level, "solid": solid,
                        "volume_bytes": vol_bytes, "naming": st["scheme"],
-                       "new_numbering": newnum,
+                       "new_numbering": newnum, "rr_pct": rr_pct,
                        "byte_split": st["byte_split"],
                        "comment": bool(comment)})
         verify, volmeta, deltas = self._verify_replay(
@@ -2037,6 +2077,8 @@ class RsrToolAPI:
             cmd.append(f"-v{recipe['volume_bytes']}b")
             if not recipe.get("new_numbering"):
                 cmd.append("-vn")          # .rar/.r00 rather than .partN.rar
+        if recipe.get("rr_pct"):
+            cmd.append(f"-rr{recipe['rr_pct']}p")
         if comment_file:
             cmd.append(f"-z{comment_file}")
         return cmd + [str(target), *srcs]
@@ -2075,6 +2117,24 @@ class RsrToolAPI:
         {path-in-rsr: patch bytes})."""
         produced = self._replay(recipe, src_files, work, comment, st["format"])
         volmeta, deltas = [], {}
+        # The -rr percentage was derived from the block size, which is rounded
+        # to whole sectors — so a set can sit between two percentages. If the
+        # lengths come out wrong, walk the neighbours rather than throwing away
+        # a recipe whose streams were all byte-exact.
+        if produced and recipe.get("rr_pct") and not st["byte_split"]:
+            want = sum(v.stat().st_size for v in vols)
+            if sum(p.stat().st_size for p in produced) != want:
+                for pct in (1, 2, 3, 4, 5, 10):
+                    if pct == recipe["rr_pct"]:
+                        continue
+                    alt = self._replay(dict(recipe, rr_pct=pct), src_files,
+                                       work, comment, st["format"])
+                    if alt and sum(p.stat().st_size for p in alt) == want:
+                        self._log(f"    recovery record is -rr{pct}p, not "
+                                  f"-rr{recipe['rr_pct']}p — corrected.", "dim")
+                        recipe["rr_pct"] = pct
+                        produced = alt
+                        break
         if not produced:
             # Distinct from "the bytes differ": the replay command itself did
             # not deliver. Reported identically, this cost an hour of hunting a
