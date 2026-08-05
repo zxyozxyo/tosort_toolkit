@@ -1673,12 +1673,66 @@ class RsrToolAPI:
                     order.append((ex, n))
         hot = len(order)
         ranked = sorted(exes, key=lambda e: self._build_rank(e.name, year))
+        mts = self._mt_order(mts)
+
+        # Then the tail, and its shape matters more than it looks: the tail is
+        # what a release costs when the priors miss, which is precisely the
+        # release that costs hours.
+        #
+        # Sweeping the whole pack at one thread count before trying a second
+        # thread count on ANY build spends the first 232 combos on builds that
+        # did not exist when the release was pred — 122 of them for a 2009
+        # release. Measured over 204 captures: 94% were packed by a build OLDER
+        # than themselves and 96% at -mt8 or -mt2, so contemporary builds at the
+        # two likely thread counts are worth far more than the entire pack at
+        # one. Same 3,944 combos, and the full product still follows as a
+        # backstop so nothing is dropped — but the mean position of the winning
+        # combo drops from 224 to 109 and the worst case from 1,987 to 827.
+        groups = [ranked]
+        if year:
+            older = [e for e in ranked
+                     if _exe_year(e.name) and _exe_year(e.name) <= year]
+            if older and len(older) < len(ranked):
+                rest = [e for e in ranked if e not in set(older)]
+                groups = [older, rest]
+        for group in groups:
+            for mt in mts[:2]:
+                for ex in group:
+                    if (ex.name, mt) not in seen:
+                        seen.add((ex.name, mt))
+                        order.append((ex, mt))
         for mt in mts:
             for ex in ranked:
                 if (ex.name, mt) not in seen:
                     seen.add((ex.name, mt))
                     order.append((ex, mt))
         return order, hot
+
+    def _mt_order(self, mts: list[int]) -> list[int]:
+        """Thread counts in the order they actually win HERE.
+
+        MT_ORDER is a static table measured on another corpus, and it disagrees
+        with this one: it puts -mt4 second, where these 204 captures give
+        -mt8 147 wins, -mt2 48, -mt0 6 and -mt4 only 3. Learning it from the
+        index costs one query and fixes the second-most-important dimension of
+        the sweep the same way the recipe priors fixed the first.
+
+        Anything unseen keeps its MT_ORDER place at the back, so a fresh index
+        behaves exactly as before."""
+        if not self._db_path.is_file():
+            return mts
+        try:
+            con = self._db()
+            try:
+                won = [int(m) for m, in con.execute(
+                    "SELECT mt FROM recipes WHERE mt>=0 GROUP BY mt "
+                    "ORDER BY SUM(hits) DESC, MAX(last_used) DESC")]
+            finally:
+                con.close()
+        except Exception:
+            return mts
+        lead = [m for m in won if m in mts]
+        return lead + [m for m in mts if m not in lead] if lead else mts
 
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
