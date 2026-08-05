@@ -1423,6 +1423,24 @@ class RsrToolAPI:
         year = _release_year(folder, rel)
         year = int(year) if year.isdigit() else 0
         cands = self._dict_candidates(st["format"], dict_kb, s["dict_ladder"])
+        # The sweep has to pack the way the original was packed, volumes and
+        # all. Not for the volume boundaries — those are a header property the
+        # replay fixes up — but because -v changes what rar DOES with a file it
+        # cannot compress. Writing one archive, rar compresses, sees the result
+        # grew, and rewrites the file as stored; writing volumes it is streaming
+        # to a file it may already have closed, so the expanded stream stays.
+        #
+        # Measured on El_Profesor_Layton (a jpg that grew by 525 B): every one
+        # of 2,585 real packs produced a STORED 1,416,837 B stream against a
+        # target of 1,417,362, so the release was unreproducible at any build ×
+        # any thread count. With -v5000000b, the same build that had already
+        # matched the other two files matched all three. Nine hours of sweep
+        # said "the exact build is outside the pack"; the build was combo #1.
+        #
+        # A byte-split set is one archive chopped up afterwards, so it takes no
+        # -v — the same rule the replay follows.
+        sweep_vol = 0 if st["byte_split"] or len(vols) == 1 \
+            else vols[0].stat().st_size
         recipe = None
         budget = getattr(self, "_budget_min", 0)
         self._deadline = None if self._budget_override else (
@@ -1436,7 +1454,9 @@ class RsrToolAPI:
                           f"(header dictionary didn't reproduce)", "dim")
             recipe = self._sweep_recipe(st["format"], exes, level, dkb, solid,
                                         src_files, targets, work, s["max_mt"],
-                                        year, grp, self._deadline, rel)
+                                        year, grp, self._deadline, rel,
+                                        vol_bytes=sweep_vol,
+                                        new_numbering=newnum)
             if recipe:
                 break
             if self._budget_hit:
@@ -1662,7 +1682,8 @@ class RsrToolAPI:
 
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
-                      deadline=None, rel="") -> dict | None:
+                      deadline=None, rel="", vol_bytes=0,
+                      new_numbering=True) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -1706,7 +1727,15 @@ class RsrToolAPI:
                       + f" — {len(combos) - start:,} left to check.", "ok")
             combos = combos[start:]
 
-        probe = work / "probe.rar"
+        # Its own directory: with -v a probe is 41 files, not one, and the head
+        # volume is only called probe.rar under old numbering.
+        probe_dir = work / "probe"
+        vol_args = []
+        if vol_bytes:
+            vol_args = [f"-v{vol_bytes}b"] + ([] if new_numbering else ["-vn"])
+            self._log(f"    packing in {vol_bytes:,} B volumes, as the original "
+                      "was — rar treats an incompressible file differently when "
+                      "it is streaming to volumes.", "dim")
         srcs = [str(p) for p in src_files]
         tried = 0
         total = len(combos)
@@ -1753,13 +1782,15 @@ class RsrToolAPI:
                     + (f" · {rate * 60:,.0f}/min" if rate < 8 else "")
                     + (f" · {(deadline - now) / 60:,.0f} min left in budget"
                        if deadline else ""))
-            for junk in work.glob("probe.*"):
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            for junk in probe_dir.iterdir():
                 try:
                     junk.unlink()
                 except OSError:
                     pass
             cmd = pre + ["-s" if solid else "-s-", "-ds", f"-mt{n}",
-                         "-o+", "-ep", "-idcd", str(probe), *srcs]
+                         "-o+", "-y", "-ep", "-idcd", *vol_args,
+                         str(probe_dir / "probe.rar"), *srcs]
             t_one = time.monotonic()
             ran = self._run(cmd, timeout=900,
                             heartbeat=f"sweep {tried}/{total} · -mt{n} · "
@@ -1786,9 +1817,10 @@ class RsrToolAPI:
                               f"release.", "warn")
             if not ran:
                 continue
-            if not probe.is_file():
+            head = self._probe_head(probe_dir)
+            if head is None:
                 continue
-            if self._streams_match(probe, targets):
+            if self._streams_match(head, targets):
                 return {"exe": ex.name, "version": _exe_label(ex.name),
                         "mt": n, "dict_kb": dict_kb, "tried": tried}
         # Count the resumed prefix too: "swept 4 combo(s)" after picking up
@@ -1800,6 +1832,27 @@ class RsrToolAPI:
                   + (f" ({tried:,} this run, {start:,} carried over)"
                      if start else "") + ".", "dim")
         return None
+
+    @staticmethod
+    def _probe_head(probe_dir: Path) -> Path | None:
+        """First volume of whatever the probe pack produced.
+
+        One archive is probe.rar; volumes are probe.rar + probe.r00… under old
+        numbering and probe.part01.rar… under new. Picking the head by volume
+        index rather than by name means the sweep does not have to care which,
+        and a probe that produced nothing at all reads as None instead of as a
+        mismatch."""
+        try:
+            made = [p for p in probe_dir.iterdir() if p.is_file()]
+        except OSError:
+            return None
+        if not made:
+            return None
+        vols = [p for p in made if _classify_volume(p.name)]
+        if vols:
+            return min(vols, key=lambda p: _classify_volume(p.name)[2])
+        single = probe_dir / "probe.rar"
+        return single if single.is_file() else None
 
     @staticmethod
     def _streams_match(probe: Path, targets: dict) -> bool:
