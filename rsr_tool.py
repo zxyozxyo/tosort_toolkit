@@ -1362,15 +1362,26 @@ class RsrToolAPI:
                 # were rather than one merged heap.
                 this, sib, base = pair_used
                 for f in manifest["sidecars"]:
-                    if base != this:
+                    if this != base:
                         f["folder"] = this.name
-                other = sib if base == this else this
-                extra = self._capture_sidecars(other, s, embedded, manifest)
+                extra = self._capture_sidecars(sib, s, embedded, manifest)
                 for f in extra:
-                    f["folder"] = other.name
+                    if sib != base:
+                        f["folder"] = sib.name
+                    # Two folders can hold same-named sidecars with different
+                    # bytes; _capture_sidecars keys on the name alone, so give
+                    # the partner's their own prefix rather than let one
+                    # silently win.
+                    key = f.get("stored")
+                    if key and key in {x.get("stored")
+                                       for x in manifest["sidecars"]}:
+                        newkey = f"sidecars/{sib.name}/{f['name']}"
+                        if embedded.get(key) is not None:
+                            embedded[newkey] = embedded[key]
+                        f["stored"] = newkey
                 manifest["sidecars"] += extra
-                self._log(f"  paired with {other.name}: "
-                          f"{len(extra)} sidecar(s) from there as well.", "dim")
+                self._log(f"  paired with {sib.name}: {len(extra)} sidecar(s) "
+                          "from there as well.", "dim")
 
             # Optional legacy .srr, embedded verbatim so a .rsr can always emit
             # one for the existing ecosystem without us re-deriving structure.
