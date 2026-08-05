@@ -175,6 +175,31 @@ def _exe_year(fname: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _exe_number(fname: str) -> int:
+    """'…_rar360b2.exe' → 360. 0 when the name says nothing."""
+    m = re.match(r"\d{4}-\d{2}-\d{2}_rar(\d{3})", fname)
+    return int(m.group(1)) if m else 0
+
+
+def _mt_label(exe: str, mt) -> str:
+    """'-mt8', or 'no -mt' for a build that has no such switch — reporting
+    '-mt0' for 3.00 would describe a command nobody could run."""
+    return f"-mt{mt}" if _supports_mt(exe or "") else "no -mt"
+
+
+def _supports_mt(fname: str) -> bool:
+    """Does this build understand -mt at all?
+
+    Multithreading arrived in WinRAR 3.60. Every earlier build rejects the
+    switch outright — which mattered far more than it sounds, because the sweep
+    put -mt on every command: 74 of the 232 builds in the pack, a third of it,
+    could never compress anything and failed in milliseconds while still being
+    counted as tried. They are also precisely the CONTEMPORARY builds for an
+    early release. Matchstick_USA_NDS-BAHAMUT walled twice against the full
+    3,944 combos and is reproduced byte-exact by 3.00 with no -mt at all."""
+    return _exe_number(fname) >= 360
+
+
 def _win_attrs(path: Path) -> int | None:
     """Windows file attribute mask, or None off Windows. RAR stores it in the
     file header, so a rebuild that ignores it can differ by a byte."""
@@ -1185,7 +1210,8 @@ class RsrToolAPI:
             self._log(f"  ✓ {rsr_path.name} written "
                       f"({rsr_path.stat().st_size:,} B) — VERIFIED", "ok")
             return {"ok": True,
-                    "recipe": f"{recipe.get('version', '?')} -mt{recipe.get('mt', '?')}",
+                    "recipe": f"{recipe.get('version', '?')} "
+                              f"{_mt_label(recipe.get('exe', ''), recipe.get('mt', '?'))}",
                     "error": ""}
         finally:
             _rmtree(work)
@@ -1539,7 +1565,8 @@ class RsrToolAPI:
         # of the prior.
         self._db_learn(st["format"], level, grp, recipe)
 
-        self._log(f"    ✓ RECIPE: {recipe['version']} -mt{recipe['mt']} "
+        self._log(f"    ✓ RECIPE: {recipe['version']} "
+                  f"{_mt_label(recipe['exe'], recipe['mt'])} "
                   f"(-m{level} -md{recipe['dict_kb']}KB "
                   f"{'-s' if solid else '-s-'}) — all {len(targets)} stream(s) "
                   "byte-exact.", "ok")
@@ -1668,22 +1695,34 @@ class RsrToolAPI:
 
     def _pack_args(self, ex: Path, fmt: str, level: int, dict_kb: int,
                    mt: int) -> list[str] | None:
-        """Command prefix for this (build, format, dict, thread count), or None
-        when the build cannot produce this archive at all."""
+        """The whole command up to the archive name, or None when this build
+        cannot produce this archive at all.
+
+        Includes -mt, rather than leaving the caller to append it: a build older
+        than 3.60 has no such switch, and appending one unconditionally is how a
+        third of the pack came to be untestable. Those builds are offered once,
+        at the mt=0 slot, instead of failing 17 times."""
         is_r5 = bool(_R5_EXE.search(ex.name))
         if fmt == "RAR5":
             if not is_r5:
                 return None                      # RAR4-era build can't write RAR5
-            return [str(ex), "a", f"-m{level}", "-ma5", f"-md{dict_kb}k"]
+            return [str(ex), "a", f"-m{level}", "-ma5", f"-md{dict_kb}k",
+                    f"-mt{mt}"]
         if is_r5:
             # A RAR5 binary still emits RAR4 with -ma4 — and it is the only
             # way a RAR4 archive can carry -mt above 16.
-            return [str(ex), "a", f"-m{level}", "-ma4", f"-md{dict_kb}k"]
+            return [str(ex), "a", f"-m{level}", "-ma4", f"-md{dict_kb}k",
+                    f"-mt{mt}"]
+        letter = DICT_LETTER.get(dict_kb)
+        pre = [str(ex), "a", f"-m{level}",
+               f"-md{letter}" if letter else f"-md{dict_kb}"]
+        if not _supports_mt(ex.name):
+            # Single-threaded by construction: one command, so try it once and
+            # let every other thread count fall through as a duplicate.
+            return pre if mt == 0 else None
         if mt > RAR4_MT_CAP:
             return None
-        letter = DICT_LETTER.get(dict_kb)
-        return [str(ex), "a", f"-m{level}",
-                f"-md{letter}" if letter else f"-md{dict_kb}"]
+        return pre + [f"-mt{mt}"]
 
     @staticmethod
     def _build_rank(name: str, year: int):
@@ -1904,7 +1943,7 @@ class RsrToolAPI:
                     junk.unlink()
                 except OSError:
                     pass
-            cmd = pre + ["-s" if solid else "-s-", "-ds", f"-mt{n}",
+            cmd = pre + ["-s" if solid else "-s-", "-ds",
                          "-o+", "-y", "-ep", "-idcd", *vol_args,
                          str(probe_dir / "probe.rar"), *srcs]
             t_one = time.monotonic()
@@ -1993,7 +2032,7 @@ class RsrToolAPI:
         if pre is None:
             return None
         cmd = pre + ["-s" if recipe["solid"] else "-s-", "-ds",
-                     f"-mt{recipe['mt']}", "-o+", "-ep", "-idcd", "-y"]
+                     "-o+", "-ep", "-idcd", "-y"]
         if recipe.get("volume_bytes"):
             cmd.append(f"-v{recipe['volume_bytes']}b")
             if not recipe.get("new_numbering"):
@@ -2484,7 +2523,8 @@ class RsrToolAPI:
                      work: Path) -> bool:
         recipe = st["recipe"]
         stem = st["stem"]
-        self._log(f"  {stem}: replaying {recipe['version']} -mt{recipe['mt']} "
+        self._log(f"  {stem}: replaying {recipe['version']} "
+                  f"{_mt_label(recipe.get('exe', ''), recipe['mt'])} "
                   f"(-m{recipe['level']} -md{recipe['dict_kb']}KB "
                   f"{'-s' if recipe['solid'] else '-s-'})", "info")
 
@@ -3319,7 +3359,8 @@ class RsrToolAPI:
                 "scheme": st.get("scheme", ""),
                 "solid": bool(rec.get("solid")),
                 "verify": st.get("verify", st.get("error", "—")),
-                "recipe": (f"{rec.get('version', '?')} -mt{rec.get('mt', '?')}"
+                "recipe": (f"{rec.get('version', '?')} "
+                           f"{_mt_label(rec.get('exe', ''), rec.get('mt', '?'))}"
                            if rec else "—"),
                 "exe": rec.get("exe", ""),
                 "settings": (f"-m{rec.get('level', '?')} "
