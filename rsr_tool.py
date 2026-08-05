@@ -975,6 +975,7 @@ class RsrToolAPI:
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
         done = ok = failed = skipped = zips = parked = walls = meta = 0
+        partial = 0
         for i, folder in enumerate(folders, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -1039,6 +1040,15 @@ class RsrToolAPI:
                                    "recipe": "zip", "kind": "zip"})
                 zips += 1
                 continue
+            if res.get("partial"):
+                # Same reasoning: a fix release is complete in itself, it just
+                # is not a set anyone can rebuild on its own.
+                self._db_forget(rel)
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "fix release — partial set",
+                                   "kind": "partial"})
+                partial += 1
+                continue
             if self._budget_hit and not res.get("ok"):
                 # Not a wall and not a failure — an unfinished search. Kept
                 # apart so a later re-run (with better priors) can be pointed
@@ -1093,6 +1103,8 @@ class RsrToolAPI:
                   + (f", {walls} known wall(s) passed over" if walls else "")
                   + (f", {parked} parked on the time budget" if parked else "")
                   + (f", {zips} ZIP release(s) out of scope" if zips else "")
+                  + (f", {partial} fix release(s) with only part of a set"
+                     if partial else "")
                   + ".", "ok" if failed == 0 else "warn")
 
     # ── one release ───────────────────────────────────────────────────────
@@ -1163,6 +1175,16 @@ class RsrToolAPI:
                             else "stopped"}
                 res = self._capture_set(st, si, folder, work / f"set{si}",
                                         s, exes, embedded)
+                if res.get("partial"):
+                    # Not a failure and not a wall: a fix release ships the
+                    # repaired volume alone, so there is nothing here that could
+                    # ever be reproduced from what is in this folder.
+                    self._log(f"  {st['stem']}: {res.get('error')} — a partial "
+                              "set on disk, not a damaged one: the rest of it "
+                              "lives in the release this one pairs with.",
+                              "dim")
+                    return {"ok": False, "error": res.get("error"),
+                            "partial": True}
                 if not res.get("ok"):
                     all_ok = False
                     self._log(f"  ✗ {st['stem']}: {res.get('error')}", "err")
@@ -1373,12 +1395,34 @@ class RsrToolAPI:
 
         newnum = new_numbering(vols[0])
         head = shadow_set(vols, work / "shadow", st["byte_split"], newnum)
-        rf = rarfile.RarFile(str(head))
+        # The end-of-archive block of the last volume says whether ANOTHER
+        # volume follows. A RARFIX release is exactly that: the one repaired
+        # volume, shipped on its own, with the rest of the set living in the
+        # release it fixes. Extracting it can only ever produce a truncated
+        # source, which is a complete release reported as a damaged one.
+        ends: list[int] = []
+
+        def _end_cb(h):
+            if getattr(h, "type", 0) == 0x7b:
+                ends.append(int(getattr(h, "flags", 0) or 0))
+
+        try:
+            rf = rarfile.RarFile(str(head), info_callback=_end_cb)
+        except Exception as e:
+            if "first volume" in str(e).lower():
+                # Started mid-set: the head volume is in another folder.
+                return {"ok": False, "partial": True,
+                        "error": "partial set: the first volume is missing"}
+            raise
         try:
             infos = [i for i in rf.infolist() if i.is_file()]
             comment = rf.comment
         finally:
             rf.close()
+        if ends and ends[-1] & 0x0001:
+            return {"ok": False, "partial": True,
+                    "error": "partial set: the archive continues into a "
+                             "volume that is not in this folder"}
         if not infos:
             return {"ok": False, "error": "no packed files"}
 
