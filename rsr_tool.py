@@ -33,6 +33,7 @@ import csv
 import json
 import time
 import zlib
+import struct
 import shutil
 import base64
 import sqlite3
@@ -572,6 +573,92 @@ def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
     rf = rarfile.RarFile(str(head), info_callback=cb)
     rf.close()
     return blocks
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ZIP
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A ZIP is easier than a RAR set in the one way that matters: we can build the
+# CONTAINER ourselves. Every header is stored verbatim and only the compressed
+# streams have to be reproduced, so there is no "one command must produce the
+# whole archive" constraint — no multi-command problem, no volume problem, and
+# header fidelity is exact by construction rather than by modelling flag bits,
+# extra fields and entry order (measured: 124 of 272 entries carry a 36-byte
+# extra field, and 28 of 60 archives are not in sorted order).
+ZIP_LEVELS = (9, 6, 5, 7, 8, 4, 3, 2, 1)
+ZIP_MEMS = (8, 9, 7, 6, 5, 4, 3, 2, 1)
+ZIP_STRATS = ((0, ""), (1, " filtered"), (3, " rle"), (2, " huffman"),
+              (4, " fixed"))
+
+
+def zip_entries(path: Path) -> list[dict] | None:
+    """Every entry, with the exact byte range its compressed data occupies."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(path)) as zf:
+            infos = zf.infolist()
+    except Exception:
+        return None
+    out = []
+    with open(path, "rb") as fh:
+        for zi in infos:
+            if zi.is_dir():
+                continue
+            if zi.flag_bits & 0x1:
+                return None                      # encrypted; out of scope
+            fh.seek(zi.header_offset)
+            lh = fh.read(30)
+            if lh[:4] != b"PK\x03\x04":
+                return None
+            n, m = struct.unpack("<HH", lh[26:30])
+            out.append({
+                "name": zi.filename,
+                "size": zi.file_size,
+                "packed_size": zi.compress_size,
+                "crc32": zi.CRC,
+                "method": zi.compress_type,
+                "data_offset": zi.header_offset + 30 + n + m,
+            })
+    return out
+
+
+def zip_skeleton(raw: bytes, ents: list[dict]) -> tuple[bytes, list]:
+    """The archive with every compressed stream cut out, plus where they were.
+
+    Headers, the central directory, the end record, any padding between
+    members — all of it is carried verbatim, which is why a rebuild does not
+    have to understand a single ZIP header field."""
+    holes = sorted((e["data_offset"], e["packed_size"]) for e in ents)
+    skel = bytearray()
+    pos = 0
+    for off, ln in holes:
+        skel += raw[pos:off]
+        pos = off + ln
+    skel += raw[pos:]
+    return bytes(skel), [list(h) for h in holes]
+
+
+def zip_assemble(skel: bytes, holes: list, streams: dict) -> bytes:
+    """Put the streams back into the skeleton, in file order."""
+    out = bytearray()
+    pos = 0
+    for off, ln in holes:
+        gap = off - (len(out))
+        out += skel[pos:pos + gap]
+        pos += gap
+        out += streams[off]
+    out += skel[pos:]
+    return bytes(out)
+
+
+def deflate_with(data: bytes, recipe: dict) -> bytes | None:
+    """Reproduce one entry's compressed stream from its recipe."""
+    if recipe.get("impl") == "zlib":
+        co = zlib.compressobj(int(recipe["level"]), zlib.DEFLATED, -15,
+                              int(recipe["mem"]), int(recipe.get("strategy", 0)))
+        return co.compress(data) + co.flush()
+    return None                                  # tool recipes: see _tool_stream
 
 
 def recovery_record(head: Path) -> int:
@@ -1210,9 +1297,8 @@ class RsrToolAPI:
             # find, it would hide real misses in thousands of expected ones.
             kinds = {p.suffix.lower() for p in folder.rglob("*") if p.is_file()}
             if ".zip" in kinds:
-                self._log("  ZIP release — not supported in v1 (needs preflate "
-                          "to reproduce the deflate streams). Skipping.", "dim")
-                return {"ok": False, "error": "zip release"}
+                zips = sorted(p for p in folder.rglob("*.zip") if p.is_file())
+                return self._capture_zip(folder, store, s, rel, zips)
             # A metadata-only fix (DIRFIX, NFOFIX, …) IS the release — it never
             # had an archive, so reporting "no archive set found" calls a
             # complete release a miss and buries it among the real ones. There
@@ -1426,6 +1512,247 @@ class RsrToolAPI:
 
     # ── release-folder sidecars ───────────────────────────────────────────
 
+    # ── ZIP ───────────────────────────────────────────────────────────────
+
+    def _tool_zips(self) -> list[tuple]:
+        """(label, argv builder, output name) for every non-zlib deflate on
+        this machine. Info-ZIP, 7-Zip and WinRAR each write their own, and the
+        corpus uses all three."""
+        out = []
+        zx = next((self._app_dir / "apps").rglob("zip.exe"), None)
+        if zx:
+            out += [(f"Info-ZIP -{l}",
+                     lambda w, n, l=l, zx=zx: [str(zx), f"-{l}", "-X", "o.zip", n],
+                     "o.zip") for l in range(1, 10)]
+        sv = self._app_dir / "apps" / "7z.exe"
+        if sv.is_file():
+            out += [(f"7z -mx{l}",
+                     lambda w, n, l=l, sv=sv: [str(sv), "a", "-tzip",
+                                               "-mm=Deflate", f"-mx{l}",
+                                               "s.zip", n], "s.zip")
+                    for l in (5, 9, 1, 3, 7)]
+        wr = Path(r"C:\Program Files\WinRAR\WinRAR.exe")
+        if wr.is_file():
+            out += [(f"WinRAR zip -m{l}",
+                     lambda w, n, l=l, wr=wr: [str(wr), "a", "-afzip", f"-m{l}",
+                                               "-ep", "-ibck", f"w{l}.zip", n],
+                     f"w{l}.zip") for l in (3, 5, 1)]
+        return out
+
+    def _tool_stream(self, plan, data: bytes, name: str, work: Path):
+        """Compress one file with an external zipper and hand back the raw
+        deflate stream it produced."""
+        label, argv, outname = plan
+        work.mkdir(parents=True, exist_ok=True)
+        for junk in work.iterdir():
+            try:
+                junk.unlink()
+            except OSError:
+                pass
+        safe = Path(name).name or "entry.bin"
+        (work / safe).write_bytes(data)
+        try:
+            subprocess.run(argv(work, safe), cwd=str(work),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=600,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            return None
+        made = work / outname
+        if not made.is_file():
+            return None
+        ents = zip_entries(made)
+        if not ents:
+            return None
+        e = next((x for x in ents if Path(x["name"]).name == safe), None)
+        if e is None:
+            return None
+        with open(made, "rb") as fh:
+            fh.seek(e["data_offset"])
+            return fh.read(e["packed_size"])
+
+    def _sweep_zip_entry(self, data: bytes, raw: bytes, name: str, work: Path,
+                         deadline=None) -> dict | None:
+        """Which deflate produced this stream.
+
+        zlib first and by likelihood — measured over 272 entries, -9 mem8 and
+        -9 mem9 alone account for 137 of the 188 that reproduced. memLevel is
+        swept because leaving it at 8 is what made the first survey call 55% of
+        the corpus unreproducible when the real figure was 14%."""
+        # Deflate emits complete blocks as it goes, so compressing a PREFIX of
+        # the input yields a prefix of the full output. That makes a cheap
+        # discriminator: run the 405 settings over the first megabyte, and only
+        # the handful whose output still agrees with the target pay for the
+        # whole file. On a 33 MB rom that is the difference between one sweep
+        # of minutes and one of hours.
+        probe = data[:1 << 20] if len(data) > (4 << 20) else None
+        for strat, sname in ZIP_STRATS:
+            for lvl in ZIP_LEVELS:
+                for mem in ZIP_MEMS:
+                    if self._stop.is_set() or self._skip.is_set():
+                        return None
+                    if probe is not None:
+                        co = zlib.compressobj(lvl, zlib.DEFLATED, -15, mem,
+                                              strat)
+                        head = co.compress(probe)
+                        if head and not raw.startswith(head):
+                            continue
+                    co = zlib.compressobj(lvl, zlib.DEFLATED, -15, mem, strat)
+                    if co.compress(data) + co.flush() == raw:
+                        return {"impl": "zlib", "level": lvl, "mem": mem,
+                                "strategy": strat,
+                                "label": f"zlib -{lvl} mem{mem}{sname}"}
+            if deadline and time.monotonic() > deadline:
+                break
+        for plan in self._tool_zips():
+            if self._stop.is_set() or self._skip.is_set():
+                return None
+            if self._tool_stream(plan, data, name, work) == raw:
+                return {"impl": "tool", "label": plan[0]}
+            if deadline and time.monotonic() > deadline:
+                break
+        return None
+
+    def _entry_stream(self, data: bytes, recipe: dict, name: str,
+                      work: Path) -> bytes | None:
+        if recipe.get("impl") == "zlib":
+            return deflate_with(data, recipe)
+        for plan in self._tool_zips():
+            if plan[0] == recipe.get("label"):
+                return self._tool_stream(plan, data, name, work)
+        return None
+
+    def _capture_zip(self, folder: Path, store: Path, s: dict, rel: str,
+                     zips: list[Path]) -> dict:
+        """Capture a ZIP release: headers verbatim, streams by recipe.
+
+        The same rule as everywhere else — the .rsr is written only after it
+        has been reassembled here and compared byte for byte with the original
+        archive."""
+        work = Path(tempfile.mkdtemp(prefix="rsr-zip-"))
+        manifest = {
+            "rsr_version": RSR_VERSION, "magic": RSR_MAGIC,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
+            "host": {"platform": platform.platform(),
+                     "python": platform.python_version()},
+            "release": rel, "system": _release_system(rel),
+            "year": _release_year(folder, rel), "tag": _release_tag(folder.name),
+            "kind": "zip", "source_folder": str(folder), "sets": [],
+        }
+        embedded: dict[str, bytes] = {}
+        cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+        budget = max(0, _num(s.get("budget_min"), 0, int))
+        try:
+            for zi_no, zp in enumerate(zips):
+                raw = zp.read_bytes()
+                ents = zip_entries(zp)
+                if not ents:
+                    self._log(f"  ✗ {zp.name}: cannot read (encrypted, or not "
+                              "a plain ZIP).", "err")
+                    return {"ok": False, "error": f"{zp.name}: unreadable zip"}
+                skel, holes = zip_skeleton(raw, ents)
+                self._log(f"  {zp.name}  ·  ZIP  ·  {len(ents)} entr(y/ies)  ·  "
+                          f"{len(skel):,} B of header carried verbatim", "dim")
+                deadline = (time.monotonic() + budget * 60) if budget else None
+                files = []
+                streams = {}
+                ok = True
+                # Same rule as a RAR set: the largest entry is content by
+                # definition, and so is anything at or over the embed cap. A
+                # size cap alone cannot do it — an 8 MB rom sits under any cap
+                # generous enough to hold a proof jpg, and embedding the rom
+                # made the first .rsr TWICE the size of the archive it
+                # describes.
+                biggest = max((e["size"] or 0) for e in ents)
+                for e in ents:
+                    with open(zp, "rb") as fh:
+                        fh.seek(e["data_offset"])
+                        rawe = fh.read(e["packed_size"])
+                    rec = dict(e)
+                    big = ((e["size"] or 0) >= biggest
+                           or (cap and (e["size"] or 0) >= cap))
+                    rec["source"] = "content" if big else "extra"
+                    if e["method"] == 0 and big:
+                        rec["recipe"] = {"impl": "stored", "label": "stored"}
+                    elif not big:
+                        # Small enough to carry the stream itself: exact by
+                        # definition, and cheaper than proving a recipe.
+                        key = f"zips/{zi_no}/{len(files)}.def"
+                        embedded[key] = rawe
+                        rec["stored"] = key
+                        rec["recipe"] = {"impl": "verbatim", "label": "carried"}
+                    else:
+                        data = zlib.decompress(rawe, -15)
+                        self._log(f"    sweeping {e['name']} "
+                                  f"({e['size']:,} → {e['packed_size']:,} B)…",
+                                  "dim")
+                        t = time.monotonic()
+                        r = self._sweep_zip_entry(data, rawe, e["name"],
+                                                  work / "tool", deadline)
+                        if not r:
+                            self._log(f"    ✗ {e['name']}: no deflate setting "
+                                      f"reproduces this stream.", "err")
+                            ok = False
+                            break
+                        self._log(f"    ✓ {e['name']}: {r['label']} "
+                                  f"({time.monotonic() - t:,.0f}s)", "ok")
+                        rec["recipe"] = r
+                    if not big and e["method"] != 0:
+                        pass
+                    files.append(rec)
+                    streams[e["data_offset"]] = rawe
+                if not ok:
+                    return {"ok": False,
+                            "error": f"{zp.name}: recipe not found"}
+
+                # Prove it: rebuild the archive from what we are about to store.
+                check = {}
+                for rec, e in zip(files, ents):
+                    if rec["recipe"]["impl"] == "verbatim":
+                        check[e["data_offset"]] = embedded[rec["stored"]]
+                    elif rec["recipe"]["impl"] == "stored":
+                        check[e["data_offset"]] = streams[e["data_offset"]]
+                    else:
+                        data = zlib.decompress(streams[e["data_offset"]], -15)
+                        got = self._entry_stream(data, rec["recipe"],
+                                                 e["name"], work / "tool")
+                        if got is None:
+                            return {"ok": False,
+                                    "error": f"{zp.name}: recipe will not replay"}
+                        check[e["data_offset"]] = got
+                rebuilt = zip_assemble(skel, holes, check)
+                if rebuilt != raw:
+                    self._log(f"  ✗ {zp.name}: reassembly does not match the "
+                              f"original ({len(rebuilt):,} vs {len(raw):,} B).",
+                              "err")
+                    return {"ok": False, "error": f"{zp.name}: reassembly differs"}
+                self._log(f"    ✓ reassembled byte-identical "
+                          f"({len(raw):,} B).", "ok")
+
+                skey = f"zips/{zi_no}/skeleton.bin"
+                embedded[skey] = skel
+                manifest["sets"].append({
+                    "stem": zp.stem, "format": "ZIP", "name": zp.name,
+                    "size": len(raw), "sha256": _sha256(raw),
+                    "skeleton": skey, "holes": holes, "files": files,
+                    "verify": "exact",
+                })
+
+            manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
+                                                          manifest)
+            out_dir = self._store_dir(store, folder, rel)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rsr_path = out_dir / f"{rel}.rsr"
+            self._write_rsr(rsr_path, manifest, embedded)
+            self._db_record(manifest, rsr_path)
+            self._db_forget(rel)
+            self._log(f"  ✓ {rsr_path.name} written "
+                      f"({rsr_path.stat().st_size:,} B) — VERIFIED", "ok")
+            return {"ok": True, "recipe": "zip", "error": ""}
+        finally:
+            _rmtree(work)
+
     def _capture_metadata(self, folder: Path, store: Path, s: dict, rel: str,
                           files: list) -> dict:
         """Capture a release that is metadata only — a DIRFIX, NFOFIX and the
@@ -1507,9 +1834,17 @@ class RsrToolAPI:
                        for st in manifest.get("sets", [])
                        for f in st.get("files", [])
                        if f.get("source") == "content"}
+        # An archive this capture already describes is not a sidecar either.
+        # _classify_volume only knows RAR naming, so a .zip release embedded
+        # its own archive verbatim and the .rsr came out at 198% of the size
+        # of the thing it was supposed to replace.
+        captured = {st.get("name") for st in manifest.get("sets", [])
+                    if st.get("name")}
         out: list[dict] = []
         for p in sorted(folder.rglob("*")):
             if not p.is_file() or _classify_volume(p.name):
+                continue
+            if p.name in captured:
                 continue
             rel = p.relative_to(folder).as_posix()
             size = p.stat().st_size
@@ -2809,6 +3144,47 @@ class RsrToolAPI:
                 self._log(f"    ⚠ could not delete {src.name}: {e}", "warn")
         return freed
 
+    def _rebuild_zip(self, st: dict, z, content: Path, out: Path,
+                     work: Path) -> bool:
+        """Re-deflate each entry, drop it back into the skeleton, compare."""
+        name = st.get("name") or f"{st.get('stem')}.zip"
+        self._log(f"  {name}: {len(st['files'])} entr(y/ies) into "
+                  f"{st['size']:,} B of archive", "dim")
+        skel = z.read(st["skeleton"])
+        streams = {}
+        for f in st["files"]:
+            rec = f.get("recipe") or {}
+            impl = rec.get("impl")
+            off = f["data_offset"]
+            if impl == "verbatim":
+                streams[off] = z.read(f["stored"])
+                continue
+            src = self._source_by_hash(content, f)
+            if src is None:
+                self._log(f"    ✗ missing source: {f['name']} "
+                          f"({f['size']:,} B, CRC {f['crc32']:08X})", "err")
+                return False
+            data = src.read_bytes()
+            if impl == "stored":
+                streams[off] = data
+                continue
+            got = self._entry_stream(data, rec, f["name"], work / "tool")
+            if got is None:
+                self._log(f"    ✗ {f['name']}: cannot replay {rec.get('label')}",
+                          "err")
+                return False
+            streams[off] = got
+        rebuilt = zip_assemble(skel, st["holes"], streams)
+        if _sha256(rebuilt) != st["sha256"]:
+            self._log(f"    ✗ {name}: rebuilt archive does not match "
+                      f"({len(rebuilt):,} vs {st['size']:,} B).", "err")
+            return False
+        dst = out / st.get("folder", "") / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(rebuilt)
+        self._log(f"    ✓ {name}  {len(rebuilt):,} B — hash-exact.", "ok")
+        return True
+
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
         manifest, z = self.read_rsr(rsr)
         try:
@@ -2824,6 +3200,9 @@ class RsrToolAPI:
                     if self._stop.is_set():
                         self._log("Stopped.", "warn")
                         break
+                    if st.get("format") == "ZIP":
+                        ok_all &= self._rebuild_zip(st, z, content, out, work)
+                        continue
                     if not st.get("recipe"):
                         self._log(f"  {st.get('stem')}: no recipe captured — "
                                   "cannot rebuild this set.", "err")
