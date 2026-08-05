@@ -623,11 +623,34 @@ def stream_digest(blocks: list[tuple[str, int, int]]) -> tuple[int, bytes]:
 #  Delta (residual header patch)
 # ══════════════════════════════════════════════════════════════════════════
 
+DELTA2_MAGIC = b"RSRD2\x00"
+
+
 def diff_bytes(produced: bytes, original: bytes) -> bytes | None:
     """A patch turning `produced` into `original`, or None if too big to be a
-    header residual. Format: repeated <u64 offset><u32 len><original bytes>."""
+    header residual. Format: repeated <u64 offset><u32 len><original bytes>.
+
+    A LENGTH change gets the second format instead. It used to be refused
+    outright, on the reasoning that a patch inserting bytes is not a header
+    fixup — true of a missing recovery record, false of the case that actually
+    turns up: a file header four bytes longer because the original carries the
+    Unicode-name flag (0x0200) for a plain ASCII name, which no switch makes
+    rar reproduce. The stream had already matched byte for byte, and the
+    capture was thrown away over four bytes of header."""
     if len(produced) != len(original):
-        return None
+        # Insertion or deletion: keep the common ends, carry the middle.
+        la, lb = len(produced), len(original)
+        p = 0
+        while p < min(la, lb) and produced[p] == original[p]:
+            p += 1
+        s = 0
+        while s < min(la, lb) - p and produced[la - 1 - s] == original[lb - 1 - s]:
+            s += 1
+        mid = original[p:lb - s]
+        if len(mid) > DELTA_MAX_BYTES:
+            return None
+        return (DELTA2_MAGIC + p.to_bytes(8, "little") + s.to_bytes(8, "little")
+                + len(mid).to_bytes(4, "little") + mid)
     out = bytearray()
     total = 0
     i, n = 0, len(original)
@@ -658,6 +681,14 @@ def diff_bytes(produced: bytes, original: bytes) -> bytes | None:
 
 
 def apply_delta(produced: bytes, patch: bytes) -> bytes:
+    if patch.startswith(DELTA2_MAGIC):
+        i = len(DELTA2_MAGIC)
+        p = int.from_bytes(patch[i:i + 8], "little")
+        s = int.from_bytes(patch[i + 8:i + 16], "little")
+        ln = int.from_bytes(patch[i + 16:i + 20], "little")
+        mid = patch[i + 20:i + 20 + ln]
+        tail = produced[len(produced) - s:] if s else b""
+        return produced[:p] + mid + tail
     buf = bytearray(produced)
     i = 0
     while i < len(patch):
@@ -1135,6 +1166,39 @@ class RsrToolAPI:
 
     # ── one release ───────────────────────────────────────────────────────
 
+    def _find_pair(self, folder: Path, st: dict):
+        """The folder holding the rest of this set, if it is in the scan.
+
+        A RARFIX ships the repaired volume and the release it repairs is
+        missing exactly that volume, so neither folder can be captured alone —
+        but together they are an ordinary complete set. Matching is on the
+        archive STEM (the fix carries the same one, by definition: it has to
+        drop into the same set) with strictly disjoint volumes, and the union
+        has to run unbroken from the head. Anything less is two copies of one
+        release rather than two halves of one, and is left alone.
+
+        Measured over 2,596 folders: 7 stems appear in two folders, 2 of them
+        complementary — both genuine RARFIX pairs, no false positives."""
+        want = st["stem"]
+        have = {Path(v).name for v in st["volumes"]}
+        for sib in sorted(folder.parent.iterdir()):
+            if not sib.is_dir() or sib == folder:
+                continue
+            for s2 in group_archive_sets(sib):
+                if s2["stem"] != want or s2["byte_split"]:
+                    continue
+                names = {Path(v).name for v in s2["volumes"]}
+                if names & have:
+                    continue                    # two copies, not two halves
+                union = sorted(
+                    [Path(v) for v in st["volumes"]] +
+                    [Path(v) for v in s2["volumes"]],
+                    key=lambda p: _classify_volume(p.name)[2])
+                idx = [_classify_volume(p.name)[2] for p in union]
+                if idx == list(range(-1, len(idx) - 1)):
+                    return sib, s2, union
+        return None
+
     def _capture_release(self, folder: Path, store: Path, s: dict,
                          exes: list[Path]) -> dict:
         rel = _release_name(folder)
@@ -1193,6 +1257,7 @@ class RsrToolAPI:
         self._deadline = None
         self._budget_hit = False
         set_errors: list[str] = []
+        pair_used = None            # (this folder, its partner, the base one)
         try:
             for si, st in enumerate(sets):
                 if self._stop.is_set() or self._skip.is_set():
@@ -1209,8 +1274,45 @@ class RsrToolAPI:
                               "set on disk, not a damaged one: the rest of it "
                               "lives in the release this one pairs with.",
                               "dim")
-                    return {"ok": False, "error": res.get("error"),
-                            "partial": True}
+                    pair = self._find_pair(folder, st)
+                    if not pair:
+                        self._log("    the other half is not in this scan "
+                                  "folder, so there is nothing to join it to.",
+                                  "dim")
+                        return {"ok": False, "error": res.get("error"),
+                                "partial": True}
+                    sib, _s2, union = pair
+                    # File the joined release under whichever folder holds more
+                    # of it, so both halves resolve to the same .rsr whichever
+                    # one the scan reaches first.
+                    base = folder if len(st["volumes"]) >= len(union) / 2 else sib
+                    base_rel = _release_name(base)
+                    done = self._existing_rsr(store, base, base_rel)
+                    if done and s.get("skip_done"):
+                        self._log(f"    already captured with its pair as "
+                                  f"{done.name}.", "dim")
+                        return {"ok": False, "error": "captured with its pair",
+                                "partial": True}
+                    self._log(f"    ✓ the rest of the set is in {sib.name} — "
+                              f"joining {len(union)} volume(s) and capturing as "
+                              f"one release.", "ok")
+                    pair_origin = {p.name: (folder if p.parent == folder else sib)
+                                   for p in union}
+                    pair_used = (folder, sib, base)
+                    manifest["release"] = base_rel
+                    manifest["system"] = _release_system(base_rel)
+                    manifest["year"] = _release_year(base, base_rel)
+                    manifest["tag"] = _release_tag(base.name)
+                    manifest["pair"] = sorted({folder.name, sib.name})
+                    manifest["source_folder"] = str(base)
+                    res = self._capture_set(dict(st, volumes=union), si, base,
+                                            work / f"set{si}pair", s, exes,
+                                            embedded)
+                    for v in res.get("set", {}).get("volumes", []):
+                        src = pair_origin.get(v.get("name"))
+                        if src is not None and src != base:
+                            v["folder"] = src.name
+                    pair_used = (folder, sib, base)
                 if not res.get("ok"):
                     all_ok = False
                     self._log(f"  ✗ {st['stem']}: {res.get('error')}", "err")
@@ -1253,6 +1355,22 @@ class RsrToolAPI:
             # produced a folder missing its own nfo. Kilobytes; carry them.
             manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
                                                           manifest)
+            if pair_used:
+                # Both folders have their own nfo and sfv — a fix release always
+                # ships its own. Carry the partner's too, tagged with the folder
+                # it belongs in, so a rebuild puts back BOTH folders as they
+                # were rather than one merged heap.
+                this, sib, base = pair_used
+                for f in manifest["sidecars"]:
+                    if base != this:
+                        f["folder"] = this.name
+                other = sib if base == this else this
+                extra = self._capture_sidecars(other, s, embedded, manifest)
+                for f in extra:
+                    f["folder"] = other.name
+                manifest["sidecars"] += extra
+                self._log(f"  paired with {other.name}: "
+                          f"{len(extra)} sidecar(s) from there as well.", "dim")
 
             # Optional legacy .srr, embedded verbatim so a .rsr can always emit
             # one for the existing ecosystem without us re-deriving structure.
@@ -1262,7 +1380,11 @@ class RsrToolAPI:
                     embedded["release.srr"] = srr
                     manifest["srr"] = "release.srr"
 
-            out_dir = self._store_dir(store, folder, rel)
+            # A joined pair is filed under the base release, not under
+            # whichever half the scan happened to reach first.
+            rel = manifest["release"]
+            home = pair_used[2] if pair_used else folder
+            out_dir = self._store_dir(store, home, rel)
             out_dir.mkdir(parents=True, exist_ok=True)
             rsr_path = out_dir / f"{rel}.rsr"
             self._write_rsr(rsr_path, manifest, embedded)
@@ -2796,8 +2918,11 @@ class RsrToolAPI:
                 if _sha256(chunk) != v["sha256"]:
                     self._log(f"    ✗ {v['name']}: hash mismatch.", "err")
                     return False
-                (out / v["name"]).write_bytes(chunk)
-                self._log(f"    ✓ {v['name']}  {v['size']:,} B", "dim")
+                dst = out / v.get("folder", "") / v["name"]
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(chunk)
+                self._log(f"    ✓ {v.get('folder', '')}{'/' if v.get('folder') else ''}"
+                          f"{v['name']}  {v['size']:,} B", "dim")
             self._restore_extras(st, z, out)
             return True
 
@@ -2813,7 +2938,9 @@ class RsrToolAPI:
                 self._log(f"    ✗ {v['name']}: hash mismatch after replay "
                           f"({self._mismatch_hint(data, v)}).", "err")
                 return False
-            (out / v["name"]).write_bytes(data)
+            dst = out / v.get("folder", "") / v["name"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
         self._log(f"    ✓ {len(vols)} volume(s) rebuilt, every one hash-exact.",
                   "ok")
 
@@ -2860,7 +2987,7 @@ class RsrToolAPI:
         for f in manifest.get("sidecars", []):
             if not f.get("stored"):
                 continue
-            dst = out / f["name"]
+            dst = out / f.get("folder", "") / f["name"]
             dst.parent.mkdir(parents=True, exist_ok=True)
             data = z.read(f["stored"])
             if f.get("sha256") and _sha256(data) != f["sha256"]:
