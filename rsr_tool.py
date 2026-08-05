@@ -444,6 +444,55 @@ def shadow_set(volumes: list[Path], work: Path, byte_split: bool,
 #  Packed streams
 # ══════════════════════════════════════════════════════════════════════════
 
+def _explain_error(reason: str) -> str:
+    """What a recorded failure actually means, in words.
+
+    The reason string is written for the log, where the surrounding lines
+    supply the context. In the detail popup there are no surrounding lines —
+    "one or more sets unverified" on its own tells the operator nothing they
+    did not already know from the red row. Matched on substrings because a
+    reason can carry a set stem and several sets can fail at once."""
+    r = (reason or "").lower()
+    if "extraction incomplete" in r:
+        return ("The sources could not be extracted whole — a file came out "
+                "shorter than its header declares, or rar exited badly. Almost "
+                "always a damaged or missing volume in the release folder; "
+                "check the .sfv before re-running.")
+    if "unverified" in r:
+        return ("A recipe WAS found — every compressed stream matched byte for "
+                "byte — but replaying the command produced volumes that differ "
+                "by more than a header residual, so the capture was refused "
+                "rather than written and trusted. This is the interesting kind "
+                "of failure: worth reporting, and always re-tried.")
+    if "replay could not be run" in r:
+        return ("The recipe was found, but the replay produced no volumes at "
+                "all. Usually rar was killed mid-write (a timeout on a very "
+                "large source) rather than anything wrong with the release — "
+                "a re-run on its own is often enough.")
+    if "cannot read packed blocks" in r or "no readable streams" in r:
+        return ("The archive could not be parsed far enough to find where each "
+                "file's compressed bytes live. Encrypted headers, or a "
+                "genuinely damaged head volume.")
+    if "no packed files" in r:
+        return ("The archive opened but contains no file blocks — an empty or "
+                "truncated head volume.")
+    if "nothing captured" in r:
+        return ("No set produced a result. If the folder holds an archive kind "
+                "this version does not handle, that is expected; otherwise the "
+                "set grouping is worth a look.")
+    if "no archive" in r:
+        return ("No archive set was recognised in the folder, and the files in "
+                "it are not all known sidecar kinds either — so it was not "
+                "filed as a metadata-only release.")
+    if "carried nothing" in r:
+        return "A metadata-only release whose files could not be read."
+    if "rsr missing" in r:
+        return ("The index points at a .rsr that is no longer on disk. Reindex "
+                "the store to clear it.")
+    return ("No explanation is recorded for this one — worth reporting, with "
+            "the log lines above it.")
+
+
 def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
     """{packed file name: [(volume, offset, length), …]} — where each file's
     COMPRESSED bytes physically live, in order, across the whole set.
@@ -974,6 +1023,12 @@ class RsrToolAPI:
                     # the pack that failed, so a future scan re-tries only if
                     # the pack has grown.
                     self._db_miss(rel, "wall", err, len(exes))
+                else:
+                    # Everything else is recorded too, not to suppress a
+                    # re-run — errors are always re-tried — but so the release
+                    # can still say what happened to it after the log has
+                    # scrolled away or the window has been closed.
+                    self._db_miss(rel, "error", err, len(exes))
                 self._emit("row", {"name": rel, "status": "error",
                                    "recipe": err,
                                    "kind": "wall" if err == "recipe not found"
@@ -1047,6 +1102,7 @@ class RsrToolAPI:
         self._budget_min = max(0, _num(s.get("budget_min"), 0, int))
         self._deadline = None
         self._budget_hit = False
+        set_errors: list[str] = []
         try:
             for si, st in enumerate(sets):
                 if self._stop.is_set() or self._skip.is_set():
@@ -1058,6 +1114,10 @@ class RsrToolAPI:
                 if not res.get("ok"):
                     all_ok = False
                     self._log(f"  ✗ {st['stem']}: {res.get('error')}", "err")
+                    # Keep the SET's reason. Rolled up to the release it becomes
+                    # "one or more sets unverified", which is the one thing the
+                    # operator already knows and none of what they need.
+                    set_errors.append(f"{st['stem']}: {res.get('error')}")
                 manifest["sets"].append(res.get("set", {"stem": st["stem"],
                                                         "error": res.get("error")}))
 
@@ -1082,7 +1142,9 @@ class RsrToolAPI:
                 # verification miss (a real defect, always worth re-running).
                 if any(x.get("wall") for x in manifest["sets"]):
                     return {"ok": False, "error": "recipe not found"}
-                return {"ok": False, "error": "one or more sets unverified"}
+                return {"ok": False,
+                        "error": "; ".join(set_errors) or
+                                 "one or more sets unverified"}
 
             # Sidecars: everything loose in the release folder that is not a
             # volume — .nfo, .sfv, proof jpg, file_id.diz, Proof/ and Sample/
@@ -3217,14 +3279,17 @@ class RsrToolAPI:
                             f"{builds} build(s) × every thread count, and "
                             f"nothing reproduced its streams. The build that "
                             f"packed it is not in the pack.")
-                else:
+                elif kind == "parked":
                     what = (f"Parked on {when} after {combos:,} of the "
                             f"{builds}-build sweep — the time budget ran out, "
                             f"not the search. The next run resumes from there.")
+                else:
+                    what = (f"Failed on {when} before a recipe could be "
+                            f"proved.\n\n{_explain_error(reason or '')}")
                 return {"ok": False, "known": True, "kind": kind,
                         "error": f"{key}\n\n{what}\n\nNo .rsr is written until "
                                  f"a recipe is proved, so there is nothing to "
-                                 f"show here yet. Reason recorded: "
+                                 f"show here yet. Recorded as: "
                                  f"{reason or kind}."}
             if not row:
                 return {"ok": False,
