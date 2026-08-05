@@ -685,7 +685,10 @@ async function showInfo(key) {
   if (!r.ok) {
     infoPath = '';
     $('mi-open').style.display = 'none';
-    $('mi-body').innerHTML = '<div class="hint">' + esc(r.error) + '</div>';
+    // A release the scanner KNOWS about but could not capture has a paragraph
+    // to say, not a one-liner — keep its line breaks.
+    $('mi-body').innerHTML = '<div class="hint" style="white-space:pre-wrap'
+      + (r.known ? ';line-height:1.7' : '') + '">' + esc(r.error) + '</div>';
     return;
   }
   const i = r.info;

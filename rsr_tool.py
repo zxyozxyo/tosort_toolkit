@@ -3094,8 +3094,31 @@ class RsrToolAPI:
             try:
                 row = con.execute("SELECT rsr_path FROM releases WHERE name=?",
                                   (key,)).fetchone()
+                miss = con.execute(
+                    "SELECT kind, reason, seen, combos, builds FROM misses "
+                    "WHERE release=?", (key,)).fetchone()
             finally:
                 con.close()
+            if not row and miss:
+                # Known, just not captured. "Not in the index" was technically
+                # true and practically useless: the scanner has a great deal to
+                # say about these — they are the releases worth reporting.
+                kind, reason, seen, combos, builds = miss
+                when = (seen or "")[:10]
+                if kind == "wall":
+                    what = (f"Swept to exhaustion on {when} against "
+                            f"{builds} build(s) × every thread count, and "
+                            f"nothing reproduced its streams. The build that "
+                            f"packed it is not in the pack.")
+                else:
+                    what = (f"Parked on {when} after {combos:,} of the "
+                            f"{builds}-build sweep — the time budget ran out, "
+                            f"not the search. The next run resumes from there.")
+                return {"ok": False, "known": True, "kind": kind,
+                        "error": f"{key}\n\n{what}\n\nNo .rsr is written until "
+                                 f"a recipe is proved, so there is nothing to "
+                                 f"show here yet. Reason recorded: "
+                                 f"{reason or kind}."}
             if not row:
                 return {"ok": False,
                         "error": f"'{key}' is not in the index — it may have "
