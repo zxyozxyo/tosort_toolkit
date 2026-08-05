@@ -181,6 +181,32 @@ def _exe_number(fname: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _method_groups(meta: list[dict]) -> list[tuple[int, int]]:
+    """[(compression level, how many consecutive files)] in archive order.
+
+    A set whose files carry different methods was not produced by one command.
+    Phantasy_Star_Zero-XPA is four files at three methods:
+
+        xdelta.exe -m5, xpa-ps0c.bat -m5, xpa-ps0u.crack -m0, xpa-ps0c.nfo -m3
+
+    -m3 is rar's DEFAULT, i.e. a command with no -m at all — the nfo was
+    appended afterwards. Packing everything at one level can never reproduce
+    that, at any build, thread count or dictionary, so the sweep searched a
+    space the answer was not in. Replayed as one command per group it matches
+    on combo 1.
+
+    Grouping is by RUN rather than by value: rar appends, so the order files
+    appear in the archive is the order the commands ran."""
+    out: list[list[int]] = []
+    for f in meta:
+        m = int(f.get("method", 0))
+        if out and out[-1][0] == m:
+            out[-1][1] += 1
+        else:
+            out.append([m, 1])
+    return [(lvl, n) for lvl, n in out]
+
+
 def _mt_label(exe: str, mt) -> str:
     """'-mt8', or 'no -mt' for a build that has no such switch — reporting
     '-mt0' for 3.00 would describe a command nobody could run."""
@@ -1600,6 +1626,17 @@ class RsrToolAPI:
         # -v — the same rule the replay follows.
         sweep_vol = 0 if st["byte_split"] or len(vols) == 1 \
             else vols[0].stat().st_size
+        # Files at different methods mean successive `rar a` calls. Appending
+        # is impossible once an archive is split, though — rar refuses to modify
+        # a volume set — so a mixed-method VOLUMED set is a shape we cannot
+        # replay, and saying so is better than sweeping a space with no answer.
+        mgroups = _method_groups(meta)
+        if len(mgroups) > 1 and sweep_vol:
+            self._log("    ⚠ files at different methods AND volumes — an "
+                      "archive cannot be appended to once it is split, so this "
+                      "shape cannot be replayed. Sweeping as one command.",
+                      "warn")
+            mgroups = [(level, len(meta))]
         recipe = None
         budget = getattr(self, "_budget_min", 0)
         self._deadline = None if self._budget_override else (
@@ -1615,7 +1652,7 @@ class RsrToolAPI:
                                         src_files, targets, work, s["max_mt"],
                                         year, grp, self._deadline, rel,
                                         vol_bytes=sweep_vol,
-                                        new_numbering=newnum)
+                                        new_numbering=newnum, groups=mgroups)
             if recipe:
                 break
             if self._budget_hit:
@@ -1666,6 +1703,11 @@ class RsrToolAPI:
                        "new_numbering": newnum, "rr_pct": rr_pct,
                        "byte_split": st["byte_split"],
                        "comment": bool(comment)})
+        if len(mgroups) > 1:
+            # Only when it means something. A single-group recipe replays
+            # through the identical code path with no `groups` key at all, so
+            # every .rsr written before today still rebuilds unchanged.
+            recipe["groups"] = [list(g) for g in mgroups]
         verify, volmeta, deltas = self._verify_replay(
             recipe, src_files, vols, work, comment, st, si)
         embedded.update(deltas)
@@ -1808,6 +1850,34 @@ class RsrToolAPI:
             return None
         return pre + [f"-mt{mt}"]
 
+    def _pack_cmds(self, ex: Path, fmt: str, dict_kb: int, mt: int, solid: bool,
+                   groups, srcs: list, target: Path, tail=(),
+                   vol_args=()) -> list[list[str]] | None:
+        """The command SEQUENCE that builds this archive — usually one command.
+
+        `groups` is [(level, count)] over `srcs` in archive order. One entry is
+        the ordinary case and produces exactly the command this used to build;
+        more than one means the archive was assembled by successive `rar a`
+        calls, which is the only way a set can hold files at different methods.
+
+        Volume switches and the recovery record go on the LAST command only:
+        -v cannot be combined with appending at all (rar refuses to modify a
+        volume set), and an RR is written when the archive is finished."""
+        cmds = []
+        at = 0
+        for gi, (level, count) in enumerate(groups):
+            pre = self._pack_args(ex, fmt, level, dict_kb, mt)
+            if pre is None:
+                return None
+            cmd = pre + ["-s" if solid else "-s-", "-ds", "-o+", "-y", "-ep",
+                         "-idcd"]
+            if gi == len(groups) - 1:
+                cmd += list(vol_args) + list(tail)
+            cmd += [str(target)] + [str(p) for p in srcs[at:at + count]]
+            cmds.append(cmd)
+            at += count
+        return cmds or None
+
     @staticmethod
     def _build_rank(name: str, year: int):
         """Sort key for a build against the year the release was pred.
@@ -1922,7 +1992,7 @@ class RsrToolAPI:
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
-                      new_numbering=True) -> dict | None:
+                      new_numbering=True, groups=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -1976,6 +2046,13 @@ class RsrToolAPI:
                       "was — rar treats an incompressible file differently when "
                       "it is streaming to volumes.", "dim")
         srcs = [str(p) for p in src_files]
+        groups = list(groups or [(level, len(src_files))])
+        if len(groups) > 1:
+            self._log("    this set holds files at "
+                      f"{len({g[0] for g in groups})} different methods "
+                      f"({' then '.join(f'-m{lv}x{n}' for lv, n in groups)}) — "
+                      "it was built by that many commands, and the sweep will "
+                      "replay them in order.", "dim")
         tried = 0
         total = len(combos)
         t0 = last = time.monotonic()
@@ -2004,8 +2081,9 @@ class RsrToolAPI:
                           "overall) — parking this release; the next run "
                           "resumes from here.", "warn")
                 return None
-            pre = self._pack_args(ex, fmt, level, dict_kb, n)
-            if pre is None:
+            cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
+                                   probe_dir / "probe.rar", vol_args=vol_args)
+            if cmds is None:
                 continue
             tried += 1
             # Throttle on TIME, not on a combo count. Every-8-combos was fine
@@ -2027,13 +2105,11 @@ class RsrToolAPI:
                     junk.unlink()
                 except OSError:
                     pass
-            cmd = pre + ["-s" if solid else "-s-", "-ds",
-                         "-o+", "-y", "-ep", "-idcd", *vol_args,
-                         str(probe_dir / "probe.rar"), *srcs]
             t_one = time.monotonic()
-            ran = self._run(cmd, timeout=900,
-                            heartbeat=f"sweep {tried}/{total} · -mt{n} · "
-                                      f"{_exe_label(ex.name)}")
+            ran = all(self._run(c, timeout=900,
+                                heartbeat=f"sweep {tried}/{total} · -mt{n} · "
+                                          f"{_exe_label(ex.name)}")
+                      for c in cmds)
             if tried == 1:
                 # Say up front what this release is going to cost. One combo
                 # tells you whether an exhaustive sweep is minutes or weeks,
@@ -2106,26 +2182,34 @@ class RsrToolAPI:
 
     # ── replay + verify ───────────────────────────────────────────────────
 
-    def _replay_cmd(self, recipe: dict, target: Path, srcs: list[str],
-                    comment_file: Path | None, fmt: str) -> list[str] | None:
+    def _replay_cmds(self, recipe: dict, target: Path, srcs: list[str],
+                     comment_file: Path | None, fmt: str) -> list[list[str]] | None:
+        """The command sequence that rebuilds this set — one entry, normally.
+
+        A recipe carrying `groups` was assembled by successive `rar a` calls,
+        so it replays as successive calls too. Everything that finishes the
+        archive — volumes, recovery record, comment — belongs to the last one."""
         ex = self._app_dir / "apps" / "winrar_pack-4.20" / recipe["exe"]
         if not ex.is_file():
             return None
-        pre = self._pack_args(ex, fmt, recipe["level"], recipe["dict_kb"],
-                              recipe["mt"])
-        if pre is None:
-            return None
-        cmd = pre + ["-s" if recipe["solid"] else "-s-", "-ds",
-                     "-o+", "-ep", "-idcd", "-y"]
+        groups = [tuple(g) for g in recipe.get("groups") or []]
+        if not groups:
+            groups = [(recipe["level"], len(srcs))]
+        if sum(n for _, n in groups) != len(srcs):
+            return None                    # recipe and sources disagree
+        vol_args = []
         if recipe.get("volume_bytes"):
-            cmd.append(f"-v{recipe['volume_bytes']}b")
+            vol_args = [f"-v{recipe['volume_bytes']}b"]
             if not recipe.get("new_numbering"):
-                cmd.append("-vn")          # .rar/.r00 rather than .partN.rar
+                vol_args.append("-vn")     # .rar/.r00 rather than .partN.rar
+        tail = []
         if recipe.get("rr_pct"):
-            cmd.append(f"-rr{recipe['rr_pct']}p")
+            tail.append(f"-rr{recipe['rr_pct']}p")
         if comment_file:
-            cmd.append(f"-z{comment_file}")
-        return cmd + [str(target), *srcs]
+            tail.append(f"-z{comment_file}")
+        return self._pack_cmds(ex, fmt, recipe["dict_kb"], recipe["mt"],
+                               recipe["solid"], groups, srcs, target,
+                               tail=tail, vol_args=vol_args)
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
                 fmt: str) -> list[Path] | None:
@@ -2139,15 +2223,17 @@ class RsrToolAPI:
         if comment:
             cfile = work / "comment.txt"
             cfile.write_text(comment, encoding="utf-8", errors="replace")
-        cmd = self._replay_cmd(recipe, out / "replay.rar",
-                               [str(p) for p in src_files], cfile, fmt)
-        if cmd is None:
+        cmds = self._replay_cmds(recipe, out / "replay.rar",
+                                 [str(p) for p in src_files], cfile, fmt)
+        if not cmds:
             return None
         mb = sum(p.stat().st_size for p in src_files if p.is_file()) / (1 << 20)
-        if not self._run(cmd, timeout=3600,
-                         heartbeat=f"replaying {recipe['version']} "
-                                   f"-mt{recipe['mt']} over {mb:,.0f} MB"):
-            return None
+        for c in cmds:
+            if not self._run(c, timeout=3600,
+                             heartbeat=f"replaying {recipe['version']} "
+                                       f"{_mt_label(recipe.get('exe', ''), recipe['mt'])}"
+                                       f" over {mb:,.0f} MB"):
+                return None
         made = sorted(p for p in out.iterdir() if p.is_file())
         if not made:
             return None
