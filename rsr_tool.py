@@ -2019,6 +2019,7 @@ class RsrToolAPI:
                 # made the first .rsr TWICE the size of the archive it
                 # describes.
                 biggest = max((e["size"] or 0) for e in ents)
+                prefer_pf = self._zip_prefers_preflate(_release_group(rel))
                 for e in ents:
                     with open(zp, "rb") as fh:
                         fh.seek(e["data_offset"])
@@ -2036,6 +2037,12 @@ class RsrToolAPI:
                         embedded[key] = rawe
                         rec["stored"] = key
                         rec["recipe"] = {"impl": "verbatim", "label": "carried"}
+                    elif prefer_pf:
+                        self._log(f"    {e['name']}: no setting has ever "
+                                  f"reproduced this group's streams — going "
+                                  f"straight to preflate.", "dim")
+                        ok = False
+                        break
                     else:
                         data = zlib.decompress(rawe, -15)
                         # Say what is about to happen and roughly what it
@@ -2103,6 +2110,9 @@ class RsrToolAPI:
                                 "error": f"{zp.name}: recipe not found"}
                     key = f"zips/{zi_no}/preflate.bin"
                     embedded[key] = skel
+                    self._db_learn_zip(_release_group(rel),
+                                       {"impl": "preflate",
+                                        "label": self.PREFLATE_LABEL})
                     self._log(f"    ✓ preflate reconstructs this archive "
                               f"byte-exact — carrying {len(skel):,} B of "
                               f"reconstruction data instead of a recipe.", "ok")
@@ -4084,6 +4094,37 @@ class RsrToolAPI:
             self._log(f"  Seeded {n} deflate prior(s) from the store.", "dim")
         return n
 
+    PREFLATE_LABEL = "preflate"
+
+    def _zip_prefers_preflate(self, grp: str) -> bool:
+        """Has this group needed preflate before?
+
+        A group zips the way it zips. If no setting has ever reproduced its
+        streams, the next release will not be different — and finding that out
+        costs a full grid every time: 33 s on Bobs_Game, and the prefix probe
+        cannot even help below 4 MB, where all 405 settings compress in full.
+        Across three hundred releases that is hours spent reaching a foregone
+        conclusion."""
+        if not grp or not self._db_path.is_file():
+            return False
+        try:
+            con = self._db()
+            try:
+                r = con.execute(
+                    "SELECT hits FROM zip_recipes WHERE grp=? AND label=?",
+                    (grp, self.PREFLATE_LABEL)).fetchone()
+                other = con.execute(
+                    "SELECT COUNT(*) FROM zip_recipes WHERE grp=? AND label<>?",
+                    (grp, self.PREFLATE_LABEL)).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            return False
+        # Only when preflate is the ONLY thing that has ever worked for them.
+        # A group with a real recipe keeps using it — a recipe is smaller and
+        # needs nothing installed at rebuild.
+        return bool(r) and not (other and other[0])
+
     def _zip_hot(self, grp: str) -> list[dict]:
         """Deflates worth trying before the grid: this group's first, then
         whatever has won anywhere. Widening rings, exactly as for RAR."""
@@ -4098,7 +4139,8 @@ class RsrToolAPI:
                         continue
                     for label, impl, lvl, mem, strat in con.execute(
                             "SELECT label, impl, level, mem, strategy FROM "
-                            "zip_recipes" + where +
+                            "zip_recipes" + (where or " WHERE 1=1") +
+                            " AND impl<>'preflate'" +
                             " ORDER BY hits DESC, last_used DESC LIMIT 12",
                             args):
                         if label in seen:
