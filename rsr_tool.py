@@ -182,6 +182,23 @@ def _exe_number(fname: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _no_window() -> dict:
+    """Spawn a console child without flashing a window at the operator.
+
+    One rar.exe running for four minutes is barely noticeable. A ZIP sweep is
+    seventeen zipper invocations PER ENTRY, each a console app that pops a
+    window for a few milliseconds — a strobe over the screen for as long as the
+    scan runs. CREATE_NO_WINDOW alone is not always enough for a process
+    started from a GUI parent, so the hidden-window STARTUPINFO goes with it."""
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0                              # SW_HIDE
+    return {"startupinfo": si,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def _method_groups(meta: list[dict]) -> list[tuple[int, int]]:
     """[(compression level, how many consecutive files)] in archive order.
 
@@ -932,7 +949,7 @@ class RsrToolAPI:
         # budget before a single combo had been tried.
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
+                                 stderr=subprocess.DEVNULL, **_no_window())
         except Exception:
             return False
         with self._proc_lock:
@@ -1554,8 +1571,7 @@ class RsrToolAPI:
         try:
             subprocess.run(argv(work, safe), cwd=str(work),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=600,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           timeout=600, **_no_window())
         except Exception:
             return None
         made = work / outname
@@ -1586,17 +1602,29 @@ class RsrToolAPI:
         # whole file. On a 33 MB rom that is the difference between one sweep
         # of minutes and one of hours.
         probe = data[:1 << 20] if len(data) > (4 << 20) else None
+        total = len(ZIP_STRATS) * len(ZIP_LEVELS) * len(ZIP_MEMS)
+        tried = full = 0
+        t0 = last = time.monotonic()
+        short = Path(name).name
         for strat, sname in ZIP_STRATS:
             for lvl in ZIP_LEVELS:
                 for mem in ZIP_MEMS:
                     if self._stop.is_set() or self._skip.is_set():
                         return None
+                    tried += 1
+                    now = time.monotonic()
+                    if now - last > 0.5:
+                        last = now
+                        self._progress(f"zlib {tried}/{total} · -{lvl} mem{mem}"
+                                       f"{sname} · {full} full check(s) · "
+                                       f"{short}")
                     if probe is not None:
                         co = zlib.compressobj(lvl, zlib.DEFLATED, -15, mem,
                                               strat)
                         head = co.compress(probe)
                         if head and not raw.startswith(head):
                             continue
+                    full += 1
                     co = zlib.compressobj(lvl, zlib.DEFLATED, -15, mem, strat)
                     if co.compress(data) + co.flush() == raw:
                         return {"impl": "zlib", "level": lvl, "mem": mem,
@@ -1604,13 +1632,50 @@ class RsrToolAPI:
                                 "label": f"zlib -{lvl} mem{mem}{sname}"}
             if deadline and time.monotonic() > deadline:
                 break
-        for plan in self._tool_zips():
+        self._log(f"      zlib: {total} setting(s) swept, {full} needed the "
+                  f"whole file ({time.monotonic() - t0:,.0f}s) — no match.",
+                  "dim")
+
+        # The same pruning for the external zippers, which is where the time
+        # actually goes: each one recompresses the entire rom.
+        #
+        # A tool's output for a 1 MB prefix is only MOSTLY a prefix of the full
+        # stream — 7-Zip optimises block boundaries over a lookahead, so the
+        # tail of a truncated run diverges. Trimming a fixed margin off the end
+        # is not good enough: measured across 17 settings, agreement ran from
+        # 92% to 99.9% of the probe output, and a 32 KB trim wrongly pruned
+        # Info-ZIP -2 and WinRAR -m1 — both of which would have been real
+        # answers for some other release.
+        #
+        # So compare a fixed slice from the START instead, never more than half
+        # the probe output. A wrong setting diverges within the first few
+        # hundred bytes, so 64 KB discriminates just as well while sitting far
+        # inside the region that provably agrees.
+        plans = self._tool_zips()
+        pre_raw = None
+        if probe is not None:
+            pre_raw = probe
+        for i, plan in enumerate(plans, 1):
             if self._stop.is_set() or self._skip.is_set():
                 return None
+            self._progress(f"{plan[0]} · {i}/{len(plans)} · {short}")
+            if pre_raw is not None:
+                head = self._tool_stream(plan, pre_raw, name, work)
+                if head is None:
+                    continue
+                n = min(65536, len(head) // 2)
+                if n and not raw.startswith(head[:n]):
+                    continue
+                self._log(f"      {plan[0]}: survives the prefix probe — "
+                          f"checking the whole file.", "dim")
             if self._tool_stream(plan, data, name, work) == raw:
                 return {"impl": "tool", "label": plan[0]}
             if deadline and time.monotonic() > deadline:
+                self._log("      ⏱ time budget reached while sweeping "
+                          "zippers.", "warn")
                 break
+        self._log(f"      {len(plans)} zipper setting(s) swept too "
+                  f"({time.monotonic() - t0:,.0f}s total).", "dim")
         return None
 
     def _entry_stream(self, data: bytes, recipe: dict, name: str,
@@ -1684,15 +1749,23 @@ class RsrToolAPI:
                         rec["recipe"] = {"impl": "verbatim", "label": "carried"}
                     else:
                         data = zlib.decompress(rawe, -15)
+                        # Say what is about to happen and roughly what it
+                        # costs. A ZIP sweep is one long silence per rom
+                        # otherwise, which reads exactly like a hang.
                         self._log(f"    sweeping {e['name']} "
-                                  f"({e['size']:,} → {e['packed_size']:,} B)…",
-                                  "dim")
+                                  f"({e['size']:,} → {e['packed_size']:,} B) — "
+                                  f"405 zlib setting(s) then "
+                                  f"{len(self._tool_zips())} zipper(s), "
+                                  f"pruned by a 1 MB prefix probe…", "dim")
+                        self._progress(f"sweeping {Path(e['name']).name} "
+                                       f"({e['size'] / (1 << 20):,.0f} MB)")
                         t = time.monotonic()
                         r = self._sweep_zip_entry(data, rawe, e["name"],
                                                   work / "tool", deadline)
                         if not r:
                             self._log(f"    ✗ {e['name']}: no deflate setting "
-                                      f"reproduces this stream.", "err")
+                                      f"reproduces this stream "
+                                      f"({time.monotonic() - t:,.0f}s).", "err")
                             ok = False
                             break
                         self._log(f"    ✓ {e['name']}: {r['label']} "
