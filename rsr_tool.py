@@ -1801,6 +1801,9 @@ class RsrToolAPI:
         # of minutes and one of hours.
         # What this group has used before, first. A scene group zips the way it
         # zips, so this is normally a single attempt instead of 405.
+        if not getattr(self, "_zip_seeded", False):
+            self._zip_seeded = True
+            self._seed_zip_priors()
         hot = self._zip_hot(grp)
         if hot:
             self._log(f"      {len(hot)} known deflate(s)"
@@ -3868,6 +3871,46 @@ class RsrToolAPI:
                 con.close()
         except Exception as e:
             self._log(f"      (could not record zip prior: {e})", "dim")
+
+    def _seed_zip_priors(self) -> int:
+        """Backfill the ZIP priors from captures already in the store.
+
+        Learning happens when a stream is proved, so with "skip captured" on
+        — which is the normal way to run — an established store teaches the
+        table nothing: every release it could learn from is skipped before the
+        sweep. The recipes are already sitting in those manifests, so read them
+        once instead of waiting for the corpus to be captured a second time."""
+        if not self._db_path.is_file():
+            return 0
+        try:
+            con = self._db()
+            try:
+                if con.execute("SELECT 1 FROM zip_recipes LIMIT 1").fetchone():
+                    return 0
+                rows = con.execute(
+                    "SELECT name, rsr_path FROM releases WHERE kind='zip'"
+                ).fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return 0
+        n = 0
+        for name, path in rows:
+            try:
+                manifest, z = self.read_rsr(Path(path))
+                z.close()
+            except Exception:
+                continue
+            grp = _release_group(name)
+            for st in manifest.get("sets", []):
+                for f in st.get("files", []):
+                    r = f.get("recipe") or {}
+                    if r.get("impl") in ("zlib", "tool"):
+                        self._db_learn_zip(grp, r)
+                        n += 1
+        if n:
+            self._log(f"  Seeded {n} deflate prior(s) from the store.", "dim")
+        return n
 
     def _zip_hot(self, grp: str) -> list[dict]:
         """Deflates worth trying before the grid: this group's first, then
