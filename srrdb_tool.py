@@ -144,12 +144,28 @@ CONTENT_HASH_EXTS = MEDIA_EXTS | {
     ".wbfs", ".gcm", ".gcz", ".cso", ".wud", ".wux", ".nsz", ".xcz",
 }
 
+def _no_window_kw() -> dict:
+    """Spawn a console child without flashing a window — the sweep starts one
+    rar.exe per candidate, so without this it strobes for the whole run."""
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return {"startupinfo": si,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 # Metadata files placed in the output folder before/besides reconstruction
 META_EXTS = {".srr", ".nfo", ".sfv", ".nzb", ".jpg", ".jpeg", ".png", ".diz", ".txt"}
 
 # Max wall-clock time for a single release's reconstruction before it is
 # aborted so the batch can continue. Generous — only fires on a genuine stall.
 _RECON_TIMEOUT_S = 1800  # 30 minutes
+# ...but a large release legitimately needs longer: its recipe sweep now packs
+# full sources, and 5 of 15 failures in the last batch were this timeout rather
+# than a wall. Scaled by the biggest source, so small releases are unaffected.
+_RECON_TIMEOUT_PER_GB_S = 2400
 
 # Single-file thread-count near-miss rescue: rescene greedily locks the first
 # -mt whose test piece passes, then does one full compress; if the size is a
@@ -191,6 +207,13 @@ _MT_COMMON = (1, 2, 4, 6, 8, 12, 16, 24, 32, 0)
 _XVER_ERA_DAYS = 3 * 365          # ± ~3 years around the game's locked build
 _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 
+# What a PARTIAL run already tried is only reusable while the sweep still means
+# the same thing. Keyed on the pack alone, the truncated-source lists from
+# before 2026-08-06 would have told a re-run that all 58 versions were done —
+# so the fixed sweep would have skipped every one of them and failed instantly,
+# which is precisely the trap the wall cache is generation-guarded against.
+_SWEEP_GEN = 2
+
 # Version-wall cache: a release whose main content file matches NO pack version
 # (rescene tried every one, none reproduced it) is a pure version wall — only a
 # bigger WinRAR pack can ever fix it, and re-grinding all 232 versions wastes
@@ -198,7 +221,17 @@ _XVER_MAX_BUILDS = 48             # hard backstop when dates can't be parsed
 # re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
 # _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
 # auto-invalidates the cache so every wall gets one fresh attempt.
-_WALL_CACHE_GEN = 5   # 2026-08-02: gen 4's sweep could exhaust its candidates
+_WALL_CACHE_GEN = 6   # 2026-08-06: gen 5 truncated any source over 48 MB for
+                      # the whole sweep, INCLUDING the thread-count dimension.
+                      # Multithreaded RAR derives its per-thread chunk
+                      # boundaries from the total input size, so a cut source
+                      # cannot reproduce a multithreaded stream at any build —
+                      # 25 of 25 releases over the threshold failed, against 221
+                      # successes all under it. Every one of those verdicts was
+                      # measured in a space the answer was not in, so none of
+                      # them are evidence of anything. (gen 5: see below.)
+                      #
+                      # gen 5 — 2026-08-02: gen 4's sweep could exhaust its candidates
                       # for reasons that were NOT the archive's fault (a
                       # calibration probe that picked a build unable to run the
                       # recipe; single-file sets refused outright; a confirm pass
@@ -226,11 +259,27 @@ _WALL_CACHE_GEN = 5   # 2026-08-02: gen 4's sweep could exhaust its candidates
 # that volume's slice of the COMPRESSED stream — hard, byte-level evidence that
 # needs no copy of the original RARs.
 _RECIPE_SWEEP_BUDGET_S = 900      # 15 min ceiling; a hit normally lands in <60 s
-# Sources bigger than this are TRUNCATED for the sweep: only enough input to
-# produce the first volume's compressed slice is needed, and that prefix is
-# byte-identical to the full file's (verified across 8/12/16/24/33 MB cuts). Keeps
-# the sweep seconds-cheap on multi-GB releases instead of minutes per candidate.
+# Sources bigger than this MAY be truncated for the sweep — but only for the
+# single-threaded pass.
+#
+# The original reasoning was that a compressed stream's prefix depends only on
+# the input prefix, so cutting the tail leaves volume one byte-identical. That
+# is true at -mt1 and FALSE above it: multithreaded RAR splits the input into
+# per-thread chunks whose boundaries are computed from the TOTAL input size, so
+# truncating moves every boundary. Measured against one SRR's expected slice
+# CRC (9d532f85): full -mt8 reproduced it exactly, full -mt1 gave b4c3a8e6 —
+# while TRUNCATED -mt8 and -mt1 both gave a37eefcb. Not merely wrong: identical,
+# because the cut collapses the thread-count dimension the sweep is searching.
+#
+# So above this size the sweep could never find a multithreaded recipe, and
+# every release over it failed — 25 of 25 in the last batch, against 221
+# successes all under it.
 _RECIPE_TRUNC_MIN = 48 * 1024 * 1024
+# Packing a 268 MB source whole costs perhaps 30 s a candidate instead of 3, so
+# the budget scales with the source. The group prior normally lands in the first
+# few candidates, which is what makes this affordable at all; the outer
+# _RECON_TIMEOUT_S still caps the release as a whole.
+_RECIPE_SWEEP_BUDGET_FULL_S = 2700
 
 # Release-date version cap: a scene group can't pack with a WinRAR newer than the
 # release date — so on the main version hunt, drop far-future builds and try those
@@ -3753,6 +3802,13 @@ class SrrdbToolAPI:
             if cmd_files is None:
                 self._sweep_skipped = True
                 return None
+            # If anything was cut, the staged set can only speak for -mt1: above
+            # that the cut moves every thread-chunk boundary, so the sweep would
+            # be searching a space the answer is not in. Run the cheap pass at
+            # -mt1 only, then re-stage WHOLE and sweep the thread counts for
+            # real.
+            was_cut = any(os.path.getsize(f) != os.path.getsize(srcs[n])
+                          for n, f in zip(s["order"], cmd_files))
             n_crc = sum(len(c[1]) for c in checks)
             if not n_crc:
                 self._log("  Recipe sweep: the staged set produced no checkable "
@@ -3762,6 +3818,19 @@ class SrrdbToolAPI:
             for m in (self._mt_freq_rank() + list(_MT_COMMON)):
                 if m not in mts:
                     mts.append(m)
+            phases = [(cmd_files, checks, mts)]
+            if was_cut:
+                whole_files, whole_checks = self._stage_sweep_sources(
+                    work, s, srcs, into=work / "whole", whole=True)
+                phases = [(cmd_files, checks, [1]),
+                          (whole_files, whole_checks,
+                           [m for m in mts if m != 1])]
+                self._log(
+                    "  Recipe sweep: the source was truncated to keep this "
+                    "cheap, which is only sound single-threaded — sweeping "
+                    "-mt1 on the cut, then the rest on the WHOLE file "
+                    "(slower per candidate; the group's known builds go "
+                    "first).", "dim")
             self._log(
                 f"  Recipe sweep: packing all {len(cmd_files)} file(s) together "
                 f"(-m{level} {md} {'-s' if solid else '-s-'}) across "
@@ -3791,13 +3860,41 @@ class SrrdbToolAPI:
                         shutil.copy2(str(p), str(link))
                 full_files.append(str(link))
             full_checks = self._full_checks(s)
-            truncated = any(
-                os.path.getsize(f) != os.path.getsize(srcs[n])
-                for n, f in zip(s["order"], cmd_files))
             probe = work / "probe.rar"
-            deadline = time.time() + _RECIPE_SWEEP_BUDGET_S
+            deadline = time.time() + (_RECIPE_SWEEP_BUDGET_FULL_S if was_cut
+                                      else _RECIPE_SWEEP_BUDGET_S)
             tried = 0
-            for mt in mts:
+            for ph_files, ph_checks, ph_mts in phases:
+              if ph_files is None or not ph_mts:
+                continue
+              truncated = any(
+                  os.path.getsize(f) != os.path.getsize(srcs[n])
+                  for n, f in zip(s["order"], ph_files))
+              # Only worth stopping early when the source is big enough for it
+              # to matter; a small set compresses fully in less time than the
+              # polling costs.
+              # A whole-source phase checks EVERY volume's slice, which is the
+              # entire stream — 65% of the source on One_Piece — so stopping
+              # early saves nothing. But the discriminating power is all in the
+              # first slice: a wrong build diverges in volume one and never
+              # recovers. So sweep on the first slice per file, stop as soon as
+              # that much output exists, and prove the survivor properly.
+              ph_stop, sweep_checks = 0, ph_checks
+              if not truncated and any(
+                      os.path.getsize(f) > _RECIPE_TRUNC_MIN for f in ph_files):
+                  fast = [(n, c[:1], None) for n, c, _e in ph_checks if c]
+                  if fast:
+                      sweep_checks = fast
+                      ph_stop = self._needed_bytes(fast)
+              if was_cut:
+                  self._log(f"  Recipe sweep: {'cut' if truncated else 'WHOLE'} "
+                            f"source(s), -mt {ph_mts}"
+                            + (f" — judging each candidate on the first "
+                               f"{ph_stop / (1 << 20):,.1f} MB of output "
+                               f"instead of compressing all of it, then "
+                               f"proving the survivor in full" if ph_stop
+                               else "") + " …", "dim")
+              for mt in ph_mts:
                 for fn in reps:
                     if self._stop.is_set() or self._skip.is_set():
                         return None
@@ -3807,10 +3904,14 @@ class SrrdbToolAPI:
                         return None
                     tried += 1
                     if not self._sweep_compress(Path(rar_dir) / fn, level, md,
-                                                solid, mt, cmd_files, probe):
+                                                solid, mt, ph_files, probe,
+                                                stop_after=ph_stop):
                         continue
-                    if self._sweep_matches(probe, checks, RarStream):
-                        if truncated and not self._confirm_recipe(
+                    hit_ok = (self._sweep_matches_partial(probe, sweep_checks)
+                              if ph_stop else
+                              self._sweep_matches(probe, sweep_checks, RarStream))
+                    if hit_ok:
+                        if (truncated or ph_stop) and not self._confirm_recipe(
                                 Path(rar_dir) / fn, level, md, solid, mt,
                                 full_files, full_checks, work / "confirm.rar",
                                 RarStream):
@@ -3908,7 +4009,8 @@ class SrrdbToolAPI:
         return cmd_files, checks
 
     def _stage_sweep_sources(self, work: Path, s: dict, srcs: dict,
-                             scale: float = 1.0, into: Path = None):
+                             scale: float = 1.0, into: Path = None,
+                             whole: bool = False):
         """Copy the set's sources into `work` in ARCHIVE ORDER, truncating the
         first oversized split file, and return (command file list, checks).
 
@@ -3936,7 +4038,11 @@ class SrrdbToolAPI:
             blocks = s["files"][name]["blocks"]
             total_packed = sum(b[0] for b in blocks)
             need = size
-            if cut_at is None and size > _RECIPE_TRUNC_MIN and len(blocks) >= 2:
+            if whole:
+                # Every thread count above 1 needs the real input length: the
+                # chunk boundaries are computed from it.
+                need = size
+            elif cut_at is None and size > _RECIPE_TRUNC_MIN and len(blocks) >= 2:
                 ratio = max(1.0, size / max(1, total_packed))
                 need = min(size, int(blocks[0][0] * ratio * 1.4 * scale)
                            + int(s["dict"]) + (1 << 20))
@@ -3982,7 +4088,8 @@ class SrrdbToolAPI:
               "g": 4096}
 
     def _sweep_compress(self, exe: Path, level: int, md: str, solid: bool,
-                        mt: int, files: list, out: Path) -> bool:
+                        mt: int, files: list, out: Path,
+                        stop_after: int = 0) -> bool:
         """One `rar a` of the whole set at (exe, -mt). False when the build can't
         run the recipe at all (pre-mt RAR 2.x rejects -mt, RAR3/4 reject -mt>16,
         old builds reject a 4 MB dictionary) — those fail in milliseconds, which
@@ -4008,6 +4115,43 @@ class SrrdbToolAPI:
                 stale.unlink(missing_ok=True)
         except Exception:
             pass
+        if stop_after:
+            # The verdict needs the first `stop_after` bytes of output and
+            # nothing else, so stop there instead of compressing the rest of a
+            # quarter-gigabyte source to produce evidence no one reads. The
+            # INPUT still has to be whole — the thread-chunk boundaries come
+            # from its total length — but the OUTPUT can be cut short.
+            want = stop_after + (1 << 18)          # slack for headers
+            try:
+                proc = subprocess.Popen(args + files, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        **_no_window_kw())
+            except OSError:
+                return False
+            try:
+                end = time.time() + 900
+                while proc.poll() is None:
+                    if self._stop.is_set() or self._skip.is_set():
+                        proc.kill()
+                        return False
+                    try:
+                        if out.is_file() and out.stat().st_size >= want:
+                            proc.kill()
+                            proc.wait(timeout=30)
+                            return True
+                    except OSError:
+                        pass
+                    if time.time() > end:
+                        proc.kill()
+                        return False
+                    time.sleep(0.05)
+            finally:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            return out.is_file()
         try:
             r = subprocess.run(args + files, capture_output=True, timeout=900)
         except (subprocess.TimeoutExpired, OSError):
@@ -4042,6 +4186,94 @@ class SrrdbToolAPI:
         if not self._sweep_compress(exe, level, md, solid, mt, full_files, probe):
             return False
         return self._sweep_matches(probe, full_checks, RarStream)
+
+    # 'Rar!' + 0x1a 0x07 0x00, spelled without escapes.
+    RAR4_MARKER = bytes([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00])
+
+    @staticmethod
+    def _needed_bytes(checks: list) -> int:
+        """How much COMPRESSED output the checks actually look at.
+
+        Every check is a CRC over a slice of one packed stream, and the first
+        volume's slice is normally the only one there is. So a candidate does
+        not have to compress a 268 MB source to be judged — it has to produce
+        this many bytes, which for these releases is ~5 MB. Everything after
+        that is work done to answer a question nobody asked."""
+        n = 0
+        for _name, crcs, exact in checks:
+            if exact:
+                n = max(n, int(exact))
+            for off, ln, _crc in crcs:
+                n = max(n, int(off) + int(ln))
+        return n
+
+    @staticmethod
+    def _rar4_streams(probe: Path) -> dict:
+        """{packed name: (data offset, packed size)} by walking RAR4 headers.
+
+        A run killed early leaves a valid header chain but no end block, and
+        RarStream will not open it — so the slice is read straight out of the
+        file instead. Anything unexpected returns {} and the caller falls back
+        to a complete run."""
+        out = {}
+        try:
+            data = probe.read_bytes() if probe.stat().st_size < (1 << 20) else None
+            with open(probe, "rb") as fh:
+                head = fh.read(7)
+                if head[:7] != SrrdbToolAPI.RAR4_MARKER:
+                    return {}
+                pos = 7
+                size = probe.stat().st_size
+                while pos + 11 <= size:
+                    fh.seek(pos)
+                    hdr = fh.read(32)
+                    if len(hdr) < 11:
+                        break
+                    btype = hdr[2]
+                    flags = int.from_bytes(hdr[3:5], "little")
+                    hsize = int.from_bytes(hdr[5:7], "little")
+                    if hsize < 7:
+                        break
+                    add = (int.from_bytes(hdr[7:11], "little")
+                           if flags & 0x8000 else 0)
+                    if btype == 0x74:                     # file header
+                        fh.seek(pos)
+                        full = fh.read(hsize)
+                        if len(full) < 32:
+                            break
+                        nlen = int.from_bytes(full[26:28], "little")
+                        name = full[32:32 + nlen].split(bytes(1))[0]
+                        out[name.decode("latin-1", "replace")] = (pos + hsize,
+                                                                  add)
+                    pos += hsize + add
+        except Exception:
+            return {}
+        return out
+
+    def _sweep_matches_partial(self, probe: Path, checks: list) -> bool:
+        """The same verdict as _sweep_matches, from a possibly-unfinished
+        archive: read each slice at its raw offset rather than asking rescene to
+        open a file that has no end block yet."""
+        streams = self._rar4_streams(probe)
+        if not streams:
+            return False
+        size = probe.stat().st_size
+        with open(probe, "rb") as fh:
+            for name, crcs, exact in checks:
+                key = next((k for k in streams
+                            if k.lower() == str(name).lower()), None)
+                if key is None:
+                    return False
+                start, packed = streams[key]
+                if exact is not None and packed and packed != exact:
+                    return False
+                for off, ln, crc in crcs:
+                    if start + off + ln > size:
+                        return False      # not enough written yet
+                    fh.seek(start + off)
+                    if zlib.crc32(fh.read(ln)) & 0xFFFFFFFF != crc:
+                        return False
+        return True
 
     def _sweep_matches(self, probe: Path, checks: list, RarStream) -> bool:
         """True when the probe archive reproduces every verifiable stream: exact
@@ -4604,7 +4836,20 @@ class SrrdbToolAPI:
         # incompressible embedded jpg) must not hang the batch forever. Generous
         # so it only ever fires on a genuine stall.
         self._live_procs = []
-        self._recon_deadline = time.time() + _RECON_TIMEOUT_S
+        big = 0
+        try:
+            cd = Path(content_dir) if content_dir else None
+            if cd and cd.is_dir():
+                big = max((f.stat().st_size for f in cd.rglob("*")
+                           if f.is_file()), default=0)
+        except Exception:
+            big = 0
+        extra = int(_RECON_TIMEOUT_PER_GB_S * (big / (1 << 30)))
+        self._recon_deadline = time.time() + _RECON_TIMEOUT_S + extra
+        if extra:
+            self._log(f"  Reconstruction deadline: {(_RECON_TIMEOUT_S + extra) // 60} "
+                      f"min for a {big / (1 << 20):,.0f} MB source (the recipe "
+                      f"sweep packs it whole).", "dim")
 
         # Heartbeat so large files don't look frozen; also enforces the deadline
         done_flag = threading.Event()
@@ -5589,7 +5834,8 @@ class SrrdbToolAPI:
                 return set()
             for r in self._load_results():
                 if (r.get("release") == release and not r.get("ok")
-                        and r.get("tried_pack_sig") == cur):
+                        and r.get("tried_pack_sig") == cur
+                        and r.get("sweep_gen") == _SWEEP_GEN):
                     return set(r.get("versions_tried") or [])
         except Exception:
             pass
@@ -5692,6 +5938,8 @@ class SrrdbToolAPI:
                 # isn't a proven version miss over its searched set.
                 "wall":        wall,
                 "wall_gen":    _WALL_CACHE_GEN if wall else None,
+                # Which sweep produced versions_tried (see _prior_versions_tried).
+                "sweep_gen":   _SWEEP_GEN,
                 "pack_sig":    self._pack_signature() if wall else None,
                 # A capped wall only tried the in-range subset, so it's skipped on
                 # re-run ONLY while the date-cap is still on (see _wall_cache_hit).
