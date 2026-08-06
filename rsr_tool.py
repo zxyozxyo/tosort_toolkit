@@ -182,6 +182,50 @@ def _exe_number(fname: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def sfv_expected(folder: Path) -> dict[str, int]:
+    """{filename: crc32} from every .sfv in the release folder.
+
+    The scene ships the checksums with the release. Nothing here ever read
+    them, which meant a damaged volume looked exactly like a recipe we could
+    not find — the sweep would grind the whole space and report a wall for a
+    set that was never reproducible by anyone."""
+    want: dict[str, int] = {}
+    for sfv in sorted(folder.rglob("*.sfv")):
+        try:
+            text = sfv.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            name, _, crc = line.rpartition(" ")
+            name, crc = name.strip(), crc.strip()
+            if not name or len(crc) != 8:
+                continue
+            try:
+                want[name.lower()] = int(crc, 16)
+            except ValueError:
+                continue
+    return want
+
+
+def sfv_check(folder: Path, paths) -> list[dict]:
+    """Which of these files disagree with the .sfv. Files it does not mention
+    are not reported — silence there means unknown, not good."""
+    want = sfv_expected(folder)
+    bad = []
+    for p in paths:
+        exp = want.get(p.name.lower())
+        if exp is None or not p.is_file():
+            continue
+        got = _file_crc32(p)
+        if got != exp:
+            bad.append({"name": p.name, "expected": exp, "actual": got,
+                        "size": p.stat().st_size})
+    return bad
+
+
 def _no_window() -> dict:
     """Spawn a console child without flashing a window at the operator.
 
@@ -522,6 +566,15 @@ def _explain_error(reason: str) -> str:
     did not already know from the red row. Matched on substrings because a
     reason can carry a set stem and several sets can fail at once."""
     r = (reason or "").lower()
+    if "damaged volume" in r or "sfv" in r:
+        return ("One or more volumes do not match the CRC32 in the release's "
+                "own .sfv, so the bytes on disk are not the bytes that were "
+                "released. Nothing can reproduce damage — no build at any "
+                "setting ever produced them — so this is not a recipe we "
+                "failed to find. Re-download the release, or find its RARFIX: "
+                "if a fix release is in the same scan folder, the good volume "
+                "is taken from there automatically and the REPAIRED set is "
+                "captured instead.")
     if "extraction incomplete" in r:
         return ("The sources could not be extracted whole — a file came out "
                 "shorter than its header declares, or rar exited badly. Almost "
@@ -1136,7 +1189,7 @@ class RsrToolAPI:
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
         done = ok = failed = skipped = zips = parked = walls = meta = 0
-        partial = 0
+        partial = broken = 0
         for i, folder in enumerate(folders, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -1200,6 +1253,17 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "zip", "kind": "zip"})
                 zips += 1
+                continue
+            if res.get("damaged"):
+                # Not a wall and not our failure: the bytes on disk are not
+                # what the release shipped. Recorded so it can say so later,
+                # and counted apart so "failed" keeps meaning our problem.
+                self._db_miss(rel, "damaged", res.get("error", "sfv mismatch"),
+                              len(exes))
+                self._emit("row", {"name": rel, "status": "error",
+                                   "recipe": "damaged — fails its .sfv",
+                                   "kind": "damaged"})
+                broken += 1
                 continue
             if res.get("partial"):
                 # Same reasoning: a fix release is complete in itself, it just
@@ -1266,11 +1330,13 @@ class RsrToolAPI:
                   + (f", {zips} ZIP release(s) out of scope" if zips else "")
                   + (f", {partial} fix release(s) with only part of a set"
                      if partial else "")
+                  + (f", {broken} DAMAGED (fail their own .sfv)"
+                     if broken else "")
                   + ".", "ok" if failed == 0 else "warn")
 
     # ── one release ───────────────────────────────────────────────────────
 
-    def _find_pair(self, folder: Path, st: dict):
+    def _find_pair(self, folder: Path, st: dict, ignore=()):
         """The folder holding the rest of this set, if it is in the scan.
 
         A RARFIX ships the repaired volume and the release it repairs is
@@ -1284,20 +1350,30 @@ class RsrToolAPI:
         Measured over 2,596 folders: 7 stems appear in two folders, 2 of them
         complementary — both genuine RARFIX pairs, no false positives."""
         want = st["stem"]
-        have = {Path(v).name for v in st["volumes"]}
+        # A volume this folder holds but which FAILS its .sfv counts as absent:
+        # a fix release that supplies a good copy of exactly that volume is the
+        # other half of the set, not a duplicate of it.
+        skip = {n.lower() for n in ignore}
+        mine = [Path(v) for v in st["volumes"]
+                if Path(v).name.lower() not in skip]
+        have = {p.name for p in mine}
         for sib in sorted(folder.parent.iterdir()):
             if not sib.is_dir() or sib == folder:
                 continue
             for s2 in group_archive_sets(sib):
                 if s2["stem"] != want or s2["byte_split"]:
                     continue
-                names = {Path(v).name for v in s2["volumes"]}
+                theirs = [Path(v) for v in s2["volumes"]]
+                names = {p.name for p in theirs}
                 if names & have:
                     continue                    # two copies, not two halves
-                union = sorted(
-                    [Path(v) for v in st["volumes"]] +
-                    [Path(v) for v in s2["volumes"]],
-                    key=lambda p: _classify_volume(p.name)[2])
+                if skip and not any(p.name.lower() in skip for p in theirs):
+                    # Replacing damaged volumes: the partner has to actually
+                    # carry a replacement for one of them, or it is just some
+                    # other release that happens to share a stem.
+                    continue
+                union = sorted(mine + theirs,
+                               key=lambda p: _classify_volume(p.name)[2])
                 idx = [_classify_volume(p.name)[2] for p in union]
                 if idx == list(range(-1, len(idx) - 1)):
                     return sib, s2, union
@@ -1327,6 +1403,51 @@ class RsrToolAPI:
                       + (f" (contains: {', '.join(sorted(k for k in kinds if k)[:6])})"
                          if kinds else " — folder is empty") + ".", "warn")
             return {"ok": False, "error": "no archive"}
+
+        # Pre-flight against the .sfv the release ships with. A volume that
+        # fails its own checksum is DAMAGE, and damage has no recipe: no build
+        # at no thread count ever produced those bytes, so sweeping for one is
+        # hours spent proving that corruption is not reproducible. This is also
+        # the honest answer to "what about the original set the RARFIX fixes" —
+        # that set is not a release we failed to capture, it is a broken copy of
+        # one, and the correct bytes are in the fix.
+        vol_paths = [Path(v) for st in sets for v in st["volumes"]]
+        broken_keep: list = []          # (path, sfv record) kept verbatim
+        pair_seed = None                # (this folder, partner, joined volumes)
+        damaged = sfv_check(folder, vol_paths)
+        if damaged:
+            names = ", ".join(d["name"] for d in damaged[:4])
+            self._log(f"  ✗ {len(damaged)} volume(s) fail the .sfv: {names}"
+                      + (" …" if len(damaged) > 4 else ""), "err")
+            for d in damaged[:4]:
+                self._log(f"      {d['name']}: sfv says {d['expected']:08X}, "
+                          f"the file is {d['actual']:08X} "
+                          f"({d['size']:,} B)", "dim")
+            bad_names = [d["name"] for d in damaged]
+            pair = pair_st = None
+            for st in sets:
+                pair = self._find_pair(folder, st, ignore=bad_names)
+                if pair:
+                    pair_st = st
+                    break
+            if not pair:
+                self._log("    A damaged volume has no recipe — nothing could "
+                          "reproduce these bytes. Looking for a fix release "
+                          "found nothing either.", "warn")
+                return {"ok": False, "damaged": True,
+                        "error": f"damaged volume(s) per the .sfv: {names}"}
+            sib, _s2, union = pair
+            self._log(f"    ✓ {sib.name} supplies a good copy — capturing the "
+                      f"REPAIRED set, and carrying the bad volume(s) as they "
+                      f"were.", "ok")
+            # Swap the good volumes in. The broken ones are kept aside and
+            # carried verbatim: a rebuild then restores BOTH folders exactly as
+            # they sat on disk, bad file included, for anyone who wants the
+            # release as it was actually distributed rather than as it should
+            # have been.
+            pair_st["volumes"] = union
+            broken_keep = [(folder / d["name"], d) for d in damaged]
+            pair_seed = (folder, sib, union)
 
         work = Path(tempfile.mkdtemp(prefix="rsr-"))
         manifest = {
@@ -1361,6 +1482,15 @@ class RsrToolAPI:
         self._budget_hit = False
         set_errors: list[str] = []
         pair_used = None            # (this folder, its partner, the base one)
+        if pair_seed:
+            this, sib, union = pair_seed
+            base = this if len(union) > 1 else sib
+            pair_used = (this, sib, base)
+            manifest["pair"] = sorted({this.name, sib.name})
+            pair_origin = {p.name: (this if p.parent == this else sib)
+                           for p in union}
+        else:
+            pair_origin = {}
         try:
             for si, st in enumerate(sets):
                 if self._stop.is_set() or self._skip.is_set():
@@ -1423,6 +1553,11 @@ class RsrToolAPI:
                     # "one or more sets unverified", which is the one thing the
                     # operator already knows and none of what they need.
                     set_errors.append(f"{st['stem']}: {res.get('error')}")
+                if pair_origin:
+                    for v in res.get("set", {}).get("volumes", []):
+                        src = pair_origin.get(v.get("name"))
+                        if src is not None and src != pair_used[2]:
+                            v["folder"] = src.name
                 manifest["sets"].append(res.get("set", {"stem": st["stem"],
                                                         "error": res.get("error")}))
 
@@ -1458,6 +1593,46 @@ class RsrToolAPI:
             # produced a folder missing its own nfo. Kilobytes; carry them.
             manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
                                                           manifest)
+            if broken_keep:
+                # The damaged volume, kept as it was. It is not part of any
+                # recipe — nothing can reproduce it — so it is carried
+                # verbatim, and only when it fits the embed cap: a 50 MB bad
+                # volume is not worth doubling the .rsr for, and saying so is
+                # better than quietly dropping it.
+                cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+                # Same folder rule as the volumes and sidecars: the base folder
+                # of a pair rebuilds at the root, the partner into its own
+                # subfolder. Tagging this one unconditionally put the bad volume
+                # in a subfolder while its own siblings went to the root.
+                home = pair_used[2] if pair_used else folder
+                fld = "" if folder == home else folder.name
+                kept = []
+                for path, rec in broken_keep:
+                    if not path.is_file():
+                        continue
+                    if cap and path.stat().st_size > cap:
+                        self._log(f"  ⚠ {path.name} is damaged and too big to "
+                                  f"carry ({path.stat().st_size:,} B > the "
+                                  f"{cap:,} B embed cap) — recorded, not "
+                                  f"stored.", "warn")
+                        kept.append({"name": path.name, "folder": fld,
+                                     "size": path.stat().st_size,
+                                     "crc32": rec["actual"],
+                                     "sfv_crc32": rec["expected"],
+                                     "stored": None})
+                        continue
+                    data = path.read_bytes()
+                    key = f"damaged/{folder.name}/{path.name}"
+                    embedded[key] = data
+                    kept.append({"name": path.name, "folder": fld,
+                                 "size": len(data), "crc32": rec["actual"],
+                                 "sfv_crc32": rec["expected"],
+                                 "sha256": _sha256(data), "stored": key})
+                    self._log(f"  carried the damaged {path.name} verbatim "
+                              f"({len(data):,} B) — a rebuild restores the "
+                              f"folder exactly as it was, bad volume and all.",
+                              "dim")
+                manifest["damaged"] = kept
             if pair_used:
                 # Both folders have their own nfo and sfv — a fix release always
                 # ships its own. Carry the partner's too, tagged with the folder
@@ -3283,6 +3458,7 @@ class RsrToolAPI:
                         continue
                     ok_all &= self._rebuild_set(st, manifest, z, content, out, work)
                 self._restore_sidecars(manifest, z, out)
+                self._restore_damaged(manifest, z, out)
             finally:
                 _rmtree(work)
             self._log("", "")
@@ -3441,6 +3617,32 @@ class RsrToolAPI:
             except OSError:
                 continue
         return None
+
+    def _restore_damaged(self, manifest, z, out: Path):
+        """Put back the volume that failed its .sfv, byte for byte.
+
+        The repaired set is the useful thing, but the release as DISTRIBUTED
+        had the bad file in it. Anyone who wants the folder as it actually was
+        gets it; the good copy lives in the fix folder, so there is no clash."""
+        n = 0
+        for f in manifest.get("damaged", []):
+            if not f.get("stored"):
+                self._log(f"    ! {f['name']} was damaged and not carried "
+                          f"(too big) — the rebuilt folder has the GOOD copy "
+                          f"only.", "warn")
+                continue
+            data = z.read(f["stored"])
+            if f.get("sha256") and _sha256(data) != f["sha256"]:
+                self._log(f"    ✗ damaged {f['name']}: stored bytes do not "
+                          "match the captured hash.", "err")
+                continue
+            dst = out / f.get("folder", "") / f["name"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+            n += 1
+        if n:
+            self._log(f"    ✓ {n} damaged volume(s) restored as they were "
+                      f"(they fail the .sfv on purpose).", "ok")
 
     def _restore_sidecars(self, manifest, z, out: Path):
         """Put the .nfo / .sfv / proof back beside the rebuilt volumes, with the
@@ -4099,6 +4301,9 @@ class RsrToolAPI:
                             f"{builds} build(s) × every thread count, and "
                             f"nothing reproduced its streams. The build that "
                             f"packed it is not in the pack.")
+                elif kind == "damaged":
+                    what = (f"Checked against its own .sfv on {when} and found "
+                            f"damaged.\n\n{_explain_error(reason or '')}")
                 elif kind == "parked":
                     what = (f"Parked on {when} after {combos:,} of the "
                             f"{builds}-build sweep — the time budget ran out, "
