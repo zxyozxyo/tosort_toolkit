@@ -301,14 +301,37 @@ def _win_attrs(path: Path) -> int | None:
         return None
 
 
+# Every file attribute Windows lets you set directly. RAR copies the source
+# file's attribute DWORD into EVERY file header — and for a split file that is
+# every volume — so reproducing an archive means reproducing the attributes.
+_SETTABLE_ATTRS = (0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000
+                   | 0x20000)
+
+
 def _set_win_attrs(path: Path, attrs: int | None):
+    """Put the file into the attribute state the archive was packed from.
+
+    This used to mask with 0x26 — archive, hidden, system — on the reasoning
+    that those are "the flags RAR actually round-trips" and that READONLY would
+    block our own cleanup. Both halves were wrong.
+
+    RAR round-trips the whole DWORD. LiTE's releases were packed from files
+    carrying 0x2020 (ARCHIVE | NOT_CONTENT_INDEXED); the mask dropped 0x2000,
+    so a rebuild packed a 0x0020 file and every volume header differed from the
+    original by those bits. Capture never noticed because IT extracts its
+    sources with rar, which restores the full attributes — so the release
+    verified at capture and then failed to rebuild, which is the worst possible
+    place to disagree. Measured on Star_Wars_The_Clone_Wars-LiTE: with the mask,
+    volume one differs; with the real attributes, it matches.
+
+    READONLY is safe to set: _rmtree already clears it, which is precisely why
+    that helper exists."""
     if os.name != "nt" or not attrs:
         return
     try:
         import ctypes
-        # Only the flags RAR actually round-trips; never set READONLY, which
-        # would then block our own cleanup of the work directory.
-        ctypes.windll.kernel32.SetFileAttributesW(str(path), int(attrs) & 0x26)
+        ctypes.windll.kernel32.SetFileAttributesW(
+            str(path), int(attrs) & _SETTABLE_ATTRS)
     except Exception:
         pass
 
@@ -3533,7 +3556,14 @@ class RsrToolAPI:
                     os.utime(dst, (ts, ts))
             except Exception:
                 pass
-            _set_win_attrs(dst, f.get("win_attrs"))
+            # Prefer what the ARCHIVE recorded over what the loose copy in the
+            # release folder happened to have — the archive's value is the one
+            # that has to come back out in the header. Only for a Windows-host
+            # archive: elsewhere that field is a Unix mode, not a DWORD.
+            attrs = f.get("win_attrs")
+            if str(f.get("host_os", "")).lower().startswith("win") and f.get("attrs"):
+                attrs = f["attrs"]
+            _set_win_attrs(dst, attrs)
             srcs.append(dst)
 
         comment = None
