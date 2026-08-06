@@ -1786,7 +1786,7 @@ class RsrToolAPI:
             return fh.read(e["packed_size"])
 
     def _sweep_zip_entry(self, data: bytes, raw: bytes, name: str, work: Path,
-                         deadline=None) -> dict | None:
+                         deadline=None, grp: str = "") -> dict | None:
         """Which deflate produced this stream.
 
         zlib first and by likelihood — measured over 272 entries, -9 mem8 and
@@ -1799,6 +1799,21 @@ class RsrToolAPI:
         # the handful whose output still agrees with the target pay for the
         # whole file. On a 33 MB rom that is the difference between one sweep
         # of minutes and one of hours.
+        # What this group has used before, first. A scene group zips the way it
+        # zips, so this is normally a single attempt instead of 405.
+        hot = self._zip_hot(grp)
+        if hot:
+            self._log(f"      {len(hot)} known deflate(s)"
+                      + (f" for {grp}" if grp else "") + " — trying those "
+                      "first.", "dim")
+        for r in hot:
+            if self._stop.is_set() or self._skip.is_set():
+                return None
+            got = (deflate_with(data, r) if r.get("impl") == "zlib"
+                   else self._entry_stream(data, r, name, work))
+            if got == raw:
+                return dict(r)
+
         probe = data[:1 << 20] if len(data) > (4 << 20) else None
         total = len(ZIP_STRATS) * len(ZIP_LEVELS) * len(ZIP_MEMS)
         tried = full = 0
@@ -1959,7 +1974,8 @@ class RsrToolAPI:
                                        f"({e['size'] / (1 << 20):,.0f} MB)")
                         t = time.monotonic()
                         r = self._sweep_zip_entry(data, rawe, e["name"],
-                                                  work / "tool", deadline)
+                                                  work / "tool", deadline,
+                                                  grp=_release_group(rel))
                         if not r:
                             self._log(f"    ✗ {e['name']}: no deflate setting "
                                       f"reproduces this stream "
@@ -1968,6 +1984,10 @@ class RsrToolAPI:
                             break
                         self._log(f"    ✓ {e['name']}: {r['label']} "
                                   f"({time.monotonic() - t:,.0f}s)", "ok")
+                        # Learn it now, not at write time: a recipe that proved
+                        # itself here is the right lead for this group's next
+                        # release even if a later entry in THIS one fails.
+                        self._db_learn_zip(_release_group(rel), r)
                         rec["recipe"] = r
                     if not big and e["method"] != 0:
                         pass
@@ -3759,6 +3779,14 @@ class RsrToolAPI:
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_crc ON files(crc32)")
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_rel ON files(release)")
         con.execute("CREATE INDEX IF NOT EXISTS ix_files_size ON files(size)")
+        # The same idea for ZIP: which deflate reproduced a group's streams.
+        # A ZIP sweep is 405 zlib settings plus seventeen zippers, all on the
+        # rom — the most expensive entry in the release — so knowing that this
+        # group zips with "zlib -9 mem8" turns that into one attempt.
+        con.execute("""CREATE TABLE IF NOT EXISTS zip_recipes(
+            grp TEXT, label TEXT, impl TEXT, level INT, mem INT, strategy INT,
+            hits INT DEFAULT 0, last_used TEXT,
+            PRIMARY KEY(grp, label))""")
         # What has actually won, so the next sweep can lead with it. Keyed on
         # the GROUP: the first cut of this keyed on `system`, which is "NDS"
         # for every release in an NDS corpus and therefore discriminated
@@ -3816,6 +3844,58 @@ class RsrToolAPI:
             except Exception:
                 pass
         return con
+
+    def _db_learn_zip(self, grp: str, recipe: dict):
+        """Record a deflate that reproduced a stream, so the group's next
+        release leads with it."""
+        if not recipe or recipe.get("impl") in (None, "stored", "verbatim"):
+            return
+        try:
+            con = self._db()
+            try:
+                con.execute(
+                    "INSERT INTO zip_recipes(grp, label, impl, level, mem, "
+                    "strategy, hits, last_used) VALUES(?,?,?,?,?,?,1,?) "
+                    "ON CONFLICT(grp, label) DO UPDATE SET hits = hits + 1, "
+                    "last_used = excluded.last_used",
+                    (grp or "", recipe.get("label", ""), recipe.get("impl", ""),
+                     int(recipe.get("level", -1) or -1),
+                     int(recipe.get("mem", -1) or -1),
+                     int(recipe.get("strategy", 0) or 0),
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                con.commit()
+            finally:
+                con.close()
+        except Exception as e:
+            self._log(f"      (could not record zip prior: {e})", "dim")
+
+    def _zip_hot(self, grp: str) -> list[dict]:
+        """Deflates worth trying before the grid: this group's first, then
+        whatever has won anywhere. Widening rings, exactly as for RAR."""
+        if not self._db_path.is_file():
+            return []
+        out, seen = [], set()
+        try:
+            con = self._db()
+            try:
+                for where, args in ((" WHERE grp=?", (grp,)), ("", ())):
+                    if where and not grp:
+                        continue
+                    for label, impl, lvl, mem, strat in con.execute(
+                            "SELECT label, impl, level, mem, strategy FROM "
+                            "zip_recipes" + where +
+                            " ORDER BY hits DESC, last_used DESC LIMIT 12",
+                            args):
+                        if label in seen:
+                            continue
+                        seen.add(label)
+                        out.append({"impl": impl, "level": lvl, "mem": mem,
+                                    "strategy": strat, "label": label})
+            finally:
+                con.close()
+        except Exception:
+            return out
+        return out
 
     def _db_learn(self, fmt: str, level: int, grp: str, recipe: dict):
         """Record a winning (build, -mt) so later releases try it first."""
