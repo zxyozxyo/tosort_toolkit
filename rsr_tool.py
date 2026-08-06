@@ -1928,8 +1928,17 @@ class RsrToolAPI:
         out = work / "a.pcf"
         if out.exists():
             out.unlink()
-        if not self._run([str(exe), "-cn", f"-o{out}", str(zp)], timeout=3600,
-                         heartbeat=f"preflate {zp.name}"):
+        # -t+z -d0: ZIP streams only, and do not recurse.
+        #
+        # Left to itself precomp also unpacks GZip, PNG and JPG — including
+        # streams it finds INSIDE the decompressed rom — so the content stops
+        # being a contiguous run of bytes in the output and cannot be cut back
+        # out. Astrology-iND failed exactly there: 6 recompressed streams where
+        # the archive holds 4, the extras being a GZip and a JPG inside the
+        # data. Restricted to ZIP with no recursion it is 4 of 4 and the rom is
+        # contiguous again.
+        if not self._run([str(exe), "-cn", "-t+z", "-d0", f"-o{out}", str(zp)],
+                         timeout=3600, heartbeat=f"preflate {zp.name}"):
             return None
         return out.read_bytes() if out.is_file() else None
 
@@ -2083,19 +2092,27 @@ class RsrToolAPI:
                     pcf = self._pcf_of(zp, work / "pf")
                     if pcf is None:
                         return {"ok": False,
-                                "error": f"{zp.name}: recipe not found"}
+                                "error": f"{zp.name}: no deflate setting "
+                                         f"reproduces it and preflate could "
+                                         f"not run"}
+                    # Cut EVERY entry's payload out, not just the content.
+                    # Contact-WTFE is 19 similar jpgs: cutting only the largest
+                    # left a 2.5 MB skeleton for a 2.28 MB archive — bigger
+                    # than the thing it describes. The small ones are carried
+                    # as extras exactly as they are in a recipe capture, so
+                    # what remains is only preflate's reconstruction data.
                     payloads = []
                     with zipfile.ZipFile(zp) as zf:
                         for e in ents:
-                            if (e["size"] or 0) >= biggest or (
-                                    cap and (e["size"] or 0) >= cap):
-                                payloads.append((e["name"], zf.read(e["name"])))
+                            payloads.append((e["name"], zf.read(e["name"])))
                     cut = self._pcf_cut(pcf, payloads)
                     if cut is None:
-                        self._log("    ✗ preflate ran, but the content could "
-                                  "not be separated from its output.", "err")
+                        self._log("    ✗ preflate ran, but the content is not "
+                                  "a contiguous run in its output — it cannot "
+                                  "be cut back out.", "err")
                         return {"ok": False,
-                                "error": f"{zp.name}: recipe not found"}
+                                "error": f"{zp.name}: preflate output could "
+                                         f"not be separated from the content"}
                     skel, holes = cut
                     # Prove it here, exactly as a recipe is proved: put the
                     # content back, restore, and byte-compare.
@@ -2107,7 +2124,8 @@ class RsrToolAPI:
                         self._log("    ✗ preflate did not restore this archive "
                                   "byte-exact — refusing it.", "err")
                         return {"ok": False,
-                                "error": f"{zp.name}: recipe not found"}
+                                "error": f"{zp.name}: preflate did not restore "
+                                         f"it byte-exact"}
                     key = f"zips/{zi_no}/preflate.bin"
                     embedded[key] = skel
                     self._db_learn_zip(_release_group(rel),
@@ -2117,13 +2135,36 @@ class RsrToolAPI:
                               f"byte-exact — carrying {len(skel):,} B of "
                               f"reconstruction data instead of a recipe.", "ok")
                     files = []
+                    by_name2 = dict(payloads)
                     for e in ents:
                         rec = dict(e)
                         big = ((e["size"] or 0) >= biggest
                                or (cap and (e["size"] or 0) >= cap))
                         rec["source"] = "content" if big else "extra"
                         rec["recipe"] = {"impl": "preflate", "label": "preflate"}
+                        if not big:
+                            k = f"zips/{zi_no}/pf/{len(files)}.bin"
+                            embedded[k] = by_name2[e["name"]]
+                            rec["stored"] = k
                         files.append(rec)
+                    total = len(skel) + sum(
+                        len(v) for k, v in embedded.items()
+                        if k.startswith(f"zips/{zi_no}/"))
+                    if total >= len(raw):
+                        # A release of nineteen similar jpgs has no small
+                        # extras to carry cheaply — Contact-WTFE is exactly
+                        # that. Promoting them to content was tried and is
+                        # worse: it makes the .rsr a 59% copy of the archive
+                        # AND demands all nineteen files back at rebuild. An
+                        # honest refusal is the better answer; this shape is
+                        # not what the format is for.
+                        self._log(f"    ✗ preflate would carry {total:,} B for "
+                                  f"a {len(raw):,} B archive — refusing, since "
+                                  f"that is no better than keeping the "
+                                  f"archive.", "err")
+                        return {"ok": False,
+                                "error": f"{zp.name}: preflate data is larger "
+                                         f"than the archive"}
                     manifest["sets"].append({
                         "stem": zp.stem, "format": "ZIP", "name": zp.name,
                         "size": len(raw), "sha256": _sha256(raw),
@@ -3634,6 +3675,14 @@ class RsrToolAPI:
             if f is None:
                 self._log(f"    ✗ {nm}: not described in the manifest.", "err")
                 return False
+            if f.get("stored"):
+                data = z.read(f["stored"])
+                if len(data) != ln:
+                    self._log(f"    ✗ {nm}: carried {len(data):,} B, expected "
+                              f"{ln:,}.", "err")
+                    return False
+                streams[off] = data
+                continue
             src = self._source_by_hash(content, f)
             if src is None:
                 self._log(f"    ✗ missing source: {nm} ({f['size']:,} B, "
