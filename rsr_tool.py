@@ -1903,6 +1903,79 @@ class RsrToolAPI:
                 return self._tool_stream(plan, data, name, work)
         return None
 
+    # ── preflate fallback ─────────────────────────────────────────────────
+
+    def _precomp_exe(self) -> Path | None:
+        p = (self._app_dir / "apps" / "zip_pack" / "precomp" / "windows"
+             / "precomp.exe")
+        return p if p.is_file() else None
+
+    def _pcf_of(self, zp: Path, work: Path) -> bytes | None:
+        """precomp -cn of an archive: every deflate stream turned back into its
+        source bytes, plus the data needed to re-deflate it EXACTLY.
+
+        This is the answer to a stream no build-and-setting sweep can match.
+        preflate derives the parameters from the stream itself instead of
+        guessing which zipper wrote it, which is the whole difference: measured
+        on Dragon_Dance-Caravan, 3 of 3 streams recompressed and the archive
+        restored byte-identical, where 405 zlib settings and 17 zippers had all
+        failed. -cn because the payload has to stay findable — a compressed
+        .pcf would be a blob we could not cut the content out of."""
+        exe = self._precomp_exe()
+        if exe is None:
+            return None
+        work.mkdir(parents=True, exist_ok=True)
+        out = work / "a.pcf"
+        if out.exists():
+            out.unlink()
+        if not self._run([str(exe), "-cn", f"-o{out}", str(zp)], timeout=3600,
+                         heartbeat=f"preflate {zp.name}"):
+            return None
+        return out.read_bytes() if out.is_file() else None
+
+    def _pcf_restore(self, pcf: bytes, work: Path) -> bytes | None:
+        """precomp -r: the .pcf back to the archive it came from."""
+        exe = self._precomp_exe()
+        if exe is None:
+            return None
+        work.mkdir(parents=True, exist_ok=True)
+        src = work / "r.pcf"
+        dst = work / "r.zip"
+        for q in (src, dst):
+            if q.exists():
+                q.unlink()
+        src.write_bytes(pcf)
+        if not self._run([str(exe), "-r", f"-o{dst}", str(src)], timeout=3600,
+                         heartbeat="preflate restore"):
+            return None
+        return dst.read_bytes() if dst.is_file() else None
+
+    @staticmethod
+    def _pcf_cut(pcf: bytes, payloads: list) -> tuple | None:
+        """Take the content payloads back out of the .pcf.
+
+        Same trick as the ZIP skeleton: what is left is headers and preflate's
+        reconstruction data — 86 KB against 34 MB of rom on Dragon_Dance — and
+        the content is supplied again at rebuild."""
+        holes = []
+        for name, data in payloads:
+            if not data:
+                return None
+            i = pcf.find(data[:1 << 16])
+            if i < 0 or pcf[i:i + len(data)] != data:
+                return None
+            holes.append([i, len(data), name])
+        holes.sort()
+        skel = bytearray()
+        pos = 0
+        for off, ln, _n in holes:
+            if off < pos:
+                return None                      # overlapping payloads
+            skel += pcf[pos:off]
+            pos = off + ln
+        skel += pcf[pos:]
+        return bytes(skel), holes
+
     def _capture_zip(self, folder: Path, store: Path, s: dict, rel: str,
                      zips: list[Path]) -> dict:
         """Capture a ZIP release: headers verbatim, streams by recipe.
@@ -1985,6 +2058,7 @@ class RsrToolAPI:
                                       f"({time.monotonic() - t:,.0f}s).", "err")
                             ok = False
                             break
+
                         self._log(f"    ✓ {e['name']}: {r['label']} "
                                   f"({time.monotonic() - t:,.0f}s)", "ok")
                         # Learn it now, not at write time: a recipe that proved
@@ -1997,8 +2071,58 @@ class RsrToolAPI:
                     files.append(rec)
                     streams[e["data_offset"]] = rawe
                 if not ok:
-                    return {"ok": False,
-                            "error": f"{zp.name}: recipe not found"}
+                    # No setting reproduces the stream — so stop guessing which
+                    # zipper wrote it and read the parameters out of the stream.
+                    pcf = self._pcf_of(zp, work / "pf")
+                    if pcf is None:
+                        return {"ok": False,
+                                "error": f"{zp.name}: recipe not found"}
+                    payloads = []
+                    with zipfile.ZipFile(zp) as zf:
+                        for e in ents:
+                            if (e["size"] or 0) >= biggest or (
+                                    cap and (e["size"] or 0) >= cap):
+                                payloads.append((e["name"], zf.read(e["name"])))
+                    cut = self._pcf_cut(pcf, payloads)
+                    if cut is None:
+                        self._log("    ✗ preflate ran, but the content could "
+                                  "not be separated from its output.", "err")
+                        return {"ok": False,
+                                "error": f"{zp.name}: recipe not found"}
+                    skel, holes = cut
+                    # Prove it here, exactly as a recipe is proved: put the
+                    # content back, restore, and byte-compare.
+                    by_name = dict(payloads)
+                    back = zip_assemble(skel, [[h[0], h[1]] for h in holes],
+                                        {h[0]: by_name[h[2]] for h in holes})
+                    restored = self._pcf_restore(back, work / "pf")
+                    if restored != raw:
+                        self._log("    ✗ preflate did not restore this archive "
+                                  "byte-exact — refusing it.", "err")
+                        return {"ok": False,
+                                "error": f"{zp.name}: recipe not found"}
+                    key = f"zips/{zi_no}/preflate.bin"
+                    embedded[key] = skel
+                    self._log(f"    ✓ preflate reconstructs this archive "
+                              f"byte-exact — carrying {len(skel):,} B of "
+                              f"reconstruction data instead of a recipe.", "ok")
+                    files = []
+                    for e in ents:
+                        rec = dict(e)
+                        big = ((e["size"] or 0) >= biggest
+                               or (cap and (e["size"] or 0) >= cap))
+                        rec["source"] = "content" if big else "extra"
+                        rec["recipe"] = {"impl": "preflate", "label": "preflate"}
+                        files.append(rec)
+                    manifest["sets"].append({
+                        "stem": zp.stem, "format": "ZIP", "name": zp.name,
+                        "size": len(raw), "sha256": _sha256(raw),
+                        "method": "preflate", "skeleton": key,
+                        "holes": [[h[0], h[1]] for h in holes],
+                        "hole_names": [h[2] for h in holes],
+                        "files": files, "verify": "exact",
+                    })
+                    continue
 
                 # Prove it: rebuild the archive from what we are about to store.
                 check = {}
@@ -3442,6 +3566,8 @@ class RsrToolAPI:
                      work: Path) -> bool:
         """Re-deflate each entry, drop it back into the skeleton, compare."""
         name = st.get("name") or f"{st.get('stem')}.zip"
+        if st.get("method") == "preflate":
+            return self._rebuild_preflate(st, z, content, out, work, name)
         self._log(f"  {name}: {len(st['files'])} entr(y/ies) into "
                   f"{st['size']:,} B of archive", "dim")
         skel = z.read(st["skeleton"])
@@ -3477,6 +3603,52 @@ class RsrToolAPI:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(rebuilt)
         self._log(f"    ✓ {name}  {len(rebuilt):,} B — hash-exact.", "ok")
+        return True
+
+    def _rebuild_preflate(self, st: dict, z, content: Path, out: Path,
+                          work: Path, name: str) -> bool:
+        """Put the content back into preflate's output and let it re-deflate.
+
+        No recipe to replay: preflate recorded how the original encoder behaved,
+        so the archive comes back byte-exact without anyone knowing which zipper
+        made it."""
+        if self._precomp_exe() is None:
+            self._log("    ✗ this release needs preflate "
+                      "(apps/zip_pack/precomp) and it is not here.", "err")
+            return False
+        holes = [list(h) for h in st.get("holes", [])]
+        names = list(st.get("hole_names", []))
+        streams = {}
+        for (off, ln), nm in zip(holes, names):
+            f = next((x for x in st["files"] if x["name"] == nm), None)
+            if f is None:
+                self._log(f"    ✗ {nm}: not described in the manifest.", "err")
+                return False
+            src = self._source_by_hash(content, f)
+            if src is None:
+                self._log(f"    ✗ missing source: {nm} ({f['size']:,} B, "
+                          f"CRC {f['crc32']:08X})", "err")
+                return False
+            data = src.read_bytes()
+            if len(data) != ln:
+                self._log(f"    ✗ {nm}: {len(data):,} B, expected {ln:,}.",
+                          "err")
+                return False
+            streams[off] = data
+        pcf = zip_assemble(z.read(st["skeleton"]), holes, streams)
+        rebuilt = self._pcf_restore(pcf, work / "pf")
+        if rebuilt is None:
+            self._log("    ✗ preflate could not restore this archive.", "err")
+            return False
+        if _sha256(rebuilt) != st["sha256"]:
+            self._log(f"    ✗ {name}: restored archive does not match "
+                      f"({len(rebuilt):,} vs {st['size']:,} B).", "err")
+            return False
+        dst = out / st.get("folder", "") / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(rebuilt)
+        self._log(f"    ✓ {name}  {len(rebuilt):,} B — restored by preflate, "
+                  f"hash-exact.", "ok")
         return True
 
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
