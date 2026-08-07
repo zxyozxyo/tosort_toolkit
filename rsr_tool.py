@@ -754,6 +754,42 @@ def deflate_with(data: bytes, recipe: dict) -> bytes | None:
     return None                                  # tool recipes: see _tool_stream
 
 
+def end_block_sig(vol: Path) -> tuple | None:
+    """(flags, header size) of a volume's end-of-archive block, or None.
+
+    A matching compressed stream does NOT identify the build. Stored data is
+    identical across every build, and RAR4 compression output is identical
+    across much of the 3.x/4.x family — so the sweep matches a stream and then
+    picks the first build that produced it, which may write its ARCHIVE
+    differently from the one that made the original.
+
+    Der_Schatz_der_Delfine-DNB is the clean example: our 4.10 writes an end
+    block of 20 bytes with flags 0x0f (the volume-number field present), the
+    original has 18 bytes and 0x07. Two bytes, at the end of every volume,
+    shifting everything after them — a whole volume mismatching on a recipe
+    whose stream was perfect.
+
+    This is free to check: it reads the last few hundred bytes of a file we
+    already have."""
+    try:
+        size = vol.stat().st_size
+        with open(vol, "rb") as fh:
+            fh.seek(max(0, size - 4096))
+            tail = fh.read(4096)
+    except OSError:
+        return None
+    # Walk backwards for the last 0x7b block header: crc(2) type(1) flags(2)
+    # size(2), and the block must end exactly at the file end.
+    for i in range(len(tail) - 7, -1, -1):
+        if tail[i + 2] != 0x7B:
+            continue
+        flags = int.from_bytes(tail[i + 3:i + 5], "little")
+        hsize = int.from_bytes(tail[i + 5:i + 7], "little")
+        if 7 <= hsize <= 64 and (len(tail) - i) == hsize:
+            return flags, hsize
+    return None
+
+
 def recovery_record(head: Path) -> int:
     """Bytes of recovery record in the set, or 0 — `rar a -rr` output.
 
@@ -2567,6 +2603,9 @@ class RsrToolAPI:
         # is impossible once an archive is split, though — rar refuses to modify
         # a volume set — so a mixed-method VOLUMED set is a shape we cannot
         # replay, and saying so is better than sweeping a space with no answer.
+        # What the ORIGINAL's first volume ends with. Read before the sweep,
+        # because it is one of the sweep's match conditions.
+        want_end = end_block_sig(vols[0])
         mgroups = _method_groups(meta)
         if len(mgroups) > 1 and sweep_vol:
             self._log("    ⚠ files at different methods AND volumes — an "
@@ -2589,7 +2628,8 @@ class RsrToolAPI:
                                         src_files, targets, work, s["max_mt"],
                                         year, grp, self._deadline, rel,
                                         vol_bytes=sweep_vol,
-                                        new_numbering=newnum, groups=mgroups)
+                                        new_numbering=newnum, groups=mgroups,
+                                        end_sig=want_end)
             if recipe:
                 break
             if self._budget_hit:
@@ -2929,7 +2969,7 @@ class RsrToolAPI:
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
-                      new_numbering=True, groups=None) -> dict | None:
+                      new_numbering=True, groups=None, end_sig=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -3071,6 +3111,12 @@ class RsrToolAPI:
                 continue
             head = self._probe_head(probe_dir)
             if head is None:
+                continue
+            # The archive has to match too, not just the streams it carries.
+            # Same cost either way — this reads a few hundred bytes of a file
+            # already on disk — and it is the only thing that tells two builds
+            # apart when their compressed output is identical.
+            if end_sig is not None and end_block_sig(head) != end_sig:
                 continue
             if self._streams_match(head, targets):
                 return {"exe": ex.name, "version": _exe_label(ex.name),
