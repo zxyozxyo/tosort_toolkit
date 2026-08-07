@@ -875,6 +875,69 @@ def end_block_sig(vol: Path) -> tuple | None:
     return None
 
 
+def _rar4_file_headers(vol: Path, limit: int = 8) -> list[dict]:
+    """The first few RAR4 file blocks of a volume: flags, header size, name.
+
+    Only the head of the file is read — a file header sits at the front of its
+    own block, so the first one is a few dozen bytes in."""
+    try:
+        with open(vol, "rb") as fh:
+            raw = fh.read(1 << 16)
+    except OSError:
+        return []
+    if raw[:7] != RAR4_SIG:
+        return []
+    out, pos = [], 7
+    while pos + 32 <= len(raw) and len(out) < limit:
+        typ = raw[pos + 2]
+        flags = int.from_bytes(raw[pos + 3:pos + 5], "little")
+        size = int.from_bytes(raw[pos + 5:pos + 7], "little")
+        if size < 7:
+            break
+        add = 0
+        if flags & 0x8000 and pos + 11 <= len(raw):
+            add = int.from_bytes(raw[pos + 7:pos + 11], "little")
+        if typ == 0x74:
+            nlen = int.from_bytes(raw[pos + 26:pos + 28], "little")
+            name = raw[pos + 32:pos + 32 + nlen]
+            out.append({"flags": flags, "size": size,
+                        "name": name.split(b"\0")[0].decode("latin-1", "replace")})
+        pos += size + add
+    return out
+
+
+def header_exttime(vol: Path) -> bool | None:
+    """Whether a volume's first file header carries the high-precision
+    timestamp (LHD_EXTTIME, 0x1000), or None if there is no file header.
+
+    The same lesson as end_block_sig, one block earlier. RAR4 gained the field
+    in 3.20: measured across the pack, every build up to 3.11 writes a 54-byte
+    header for a plain name and every build from 3.20 writes 59. The compressed
+    stream is identical either side of that line, so the sweep matched a stream
+    at 3.11 and replayed an archive five bytes short in every file header —
+    reported as "replay unverified", with nothing to suggest the build was
+    simply too old. Balls_Of_Fury-Micronauts is exactly that."""
+    heads = _rar4_file_headers(vol, limit=1)
+    return bool(heads[0]["flags"] & 0x1000) if heads else None
+
+
+def unicode_named_ascii(vol: Path) -> list[str]:
+    """Files whose header carries the Unicode-name flag for a plain ASCII name.
+
+    No build reproduces this — measured across all 232 in the pack, none sets
+    0x0200 for an ASCII name — so it is a property of the host that packed the
+    release, not of the packer we can choose. In a FLAT archive it costs four
+    bytes in one header and diff_bytes already patches it. In a VOLUMED set it
+    pushes four bytes of data out of every volume, moving every split point, so
+    no patch can express it and no sweep can find it. Say so instead of
+    spending three hours proving it again."""
+    out = []
+    for h in _rar4_file_headers(vol):
+        if h["flags"] & 0x0200 and h["name"].isascii():
+            out.append(h["name"])
+    return out
+
+
 def recovery_record(head: Path) -> int:
     """Bytes of recovery record in the set, or 0 — `rar a -rr` output.
 
@@ -925,9 +988,93 @@ def stream_digest(blocks: list[tuple[str, int, int]]) -> tuple[int, bytes]:
 # ══════════════════════════════════════════════════════════════════════════
 
 DELTA2_MAGIC = b"RSRD2\x00"
+DELTA3_MAGIC = b"RSRD3\x00"
+
+
+def _common_run(a: bytes, b: bytes, ai: int, bi: int) -> int:
+    """How many bytes a[ai:] and b[bi:] share, compared in strides."""
+    n = min(len(a) - ai, len(b) - bi)
+    k, step = 0, 1 << 16
+    while k < n:
+        want = min(step, n - k)
+        if a[ai + k:ai + k + want] != b[bi + k:bi + k + want]:
+            for t in range(want):
+                if a[ai + k + t] != b[bi + k + t]:
+                    return k + t
+            return k + want
+        k += want
+    return n
+
+
+def _delta3(produced: bytes, original: bytes, max_ops: int = 64) -> bytes | None:
+    """A copy/insert script: <u32 ops>, then per op <u64 at><u32 del><u32 ins>.
+
+    diff_bytes handles one edit region, or one length change with matching
+    ends. Balls_Of_Fury-Micronauts needs two: rar's authenticity block (`-av`,
+    242 bytes of RSA signature nobody can regenerate) sits before the end
+    block, AND the main header's PosAV field points at it, six bytes at offset
+    seven. Either alone is a header residual. Together they defeat a single
+    prefix/suffix split, and a perfect recipe was thrown away over 248 bytes.
+
+    Resyncs by looking for the next 64 bytes of `produced` inside `original`,
+    stepping the anchor forward so a substitution re-aligns as readily as an
+    insertion."""
+    la, lb = len(produced), len(original)
+    ladder = list(range(0, 65)) + [128, 256, 512, 1024, 2048, 4096]
+    window, anchor = 1 << 20, 64
+    ops: list[tuple[int, int, bytes]] = []
+    total = i = j = 0
+    while True:
+        k = _common_run(produced, original, i, j)
+        i, j = i + k, j + k
+        if i >= la or j >= lb:
+            break
+        hit = None
+        for dp in ladder:
+            if i + dp + anchor > la:
+                break
+            y = original.find(produced[i + dp:i + dp + anchor], j, j + window)
+            if y >= 0:
+                hit = (dp, y)
+                break
+        if hit is None:
+            break                                # no resync: fall through
+        dp, y = hit
+        ops.append((i, dp, original[j:y]))
+        total += y - j
+        i, j = i + dp, y
+        if total > DELTA_MAX_BYTES or len(ops) >= max_ops:
+            return None
+    if i < la or j < lb:
+        ops.append((i, la - i, original[j:]))
+        total += lb - j
+    if total > DELTA_MAX_BYTES or not ops:
+        return None
+    out = bytearray(DELTA3_MAGIC + len(ops).to_bytes(4, "little"))
+    for at, dl, ins in ops:
+        out += (at.to_bytes(8, "little") + dl.to_bytes(4, "little")
+                + len(ins).to_bytes(4, "little") + ins)
+    return bytes(out)
 
 
 def diff_bytes(produced: bytes, original: bytes) -> bytes | None:
+    """The smallest patch turning `produced` into `original`, or None.
+
+    The simple forms are tried first because they are nearly free and cover
+    almost everything. They are not always the best answer, though, and "fits
+    under the cap" is not "small": Donkey_Kong_Jungle_Climber's last volume
+    took a 870 KB middle when a copy/insert script expresses the same
+    difference in 110 bytes. Anything fat gets a second opinion."""
+    cand = _diff_simple(produced, original)
+    if cand is not None and len(cand) <= 4096:
+        return cand
+    alt = _delta3(produced, original)
+    if alt is None:
+        return cand
+    return alt if cand is None or len(alt) < len(cand) else cand
+
+
+def _diff_simple(produced: bytes, original: bytes) -> bytes | None:
     """A patch turning `produced` into `original`, or None if too big to be a
     header residual. Format: repeated <u64 offset><u32 len><original bytes>.
 
@@ -981,7 +1128,61 @@ def diff_bytes(produced: bytes, original: bytes) -> bytes | None:
     return bytes(out)
 
 
+def diff_shape(produced: bytes, original: bytes) -> str:
+    """Where two volumes stop agreeing, in one line.
+
+    "replay unverified" only ever said the difference was too big to store as a
+    patch. Whether the streams part at byte zero — a wrong build, wrong
+    settings — or hold for thirty megabytes and then diverge is the entire
+    question, and it costs one comparison pass to answer instead of a probe
+    that has to guess which build the sweep chose."""
+    la, lb = len(produced), len(original)
+    n = min(la, lb)
+    step = 1 << 20
+    first = n
+    for off in range(0, n, step):
+        a, b = produced[off:off + step], original[off:off + step]
+        if a != b:
+            first = off + next(i for i in range(len(a)) if a[i] != b[i])
+            break
+    tail = 0
+    limit = n - first
+    while tail < limit:
+        want = min(step, limit - tail)
+        a = produced[la - tail - want:la - tail]
+        b = original[lb - tail - want:lb - tail]
+        if a != b:
+            k = 0
+            while k < want and a[want - 1 - k] == b[want - 1 - k]:
+                k += 1
+            tail += k
+            break
+        tail += want
+    if first >= n and la == lb:
+        return "identical"
+    span = max(0, (lb - tail) - first)
+    return (f"agrees for the first {first:,} B, differs over the next "
+            f"{span:,} B, and the last {tail:,} B match"
+            + (f" ({lb - la:+,} B of length)" if la != lb else ""))
+
+
 def apply_delta(produced: bytes, patch: bytes) -> bytes:
+    if patch.startswith(DELTA3_MAGIC):
+        out = bytearray()
+        i = len(DELTA3_MAGIC)
+        n = int.from_bytes(patch[i:i + 4], "little")
+        i += 4
+        pos = 0
+        for _ in range(n):
+            at = int.from_bytes(patch[i:i + 8], "little")
+            dl = int.from_bytes(patch[i + 8:i + 12], "little")
+            il = int.from_bytes(patch[i + 12:i + 16], "little")
+            i += 16
+            out += produced[pos:at] + patch[i:i + il]
+            i += il
+            pos = at + dl
+        out += produced[pos:]
+        return bytes(out)
     if patch.startswith(DELTA2_MAGIC):
         i = len(DELTA2_MAGIC)
         p = int.from_bytes(patch[i:i + 8], "little")
@@ -2721,6 +2922,16 @@ class RsrToolAPI:
         # What the ORIGINAL's first volume ends with. Read before the sweep,
         # because it is one of the sweep's match conditions.
         want_end = end_block_sig(vols[0])
+        want_ext = header_exttime(vols[0]) if st["format"] == "RAR4" else None
+        # Four bytes of header no build in the pack writes. Worth saying out
+        # loud, because in a volumed set it moves every split point and the
+        # replay comes back different in every volume for no reason the recipe
+        # can show — but it is a DELTA, not a wall, so do not refuse it.
+        uni = unicode_named_ascii(vols[0])
+        if uni:
+            self._log(f"    {uni[0]} carries the Unicode-name flag for a plain "
+                      f"ASCII name — four bytes no build reproduces, so expect "
+                      f"a header patch here.", "dim")
         mgroups = _method_groups(meta)
         if len(mgroups) > 1 and sweep_vol:
             self._log("    ⚠ files at different methods AND volumes — an "
@@ -2744,7 +2955,7 @@ class RsrToolAPI:
                                         year, grp, self._deadline, rel,
                                         vol_bytes=sweep_vol,
                                         new_numbering=newnum, groups=mgroups,
-                                        end_sig=want_end)
+                                        end_sig=want_end, hdr_ext=want_ext)
             if recipe:
                 break
             if self._budget_hit:
@@ -3084,7 +3295,8 @@ class RsrToolAPI:
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
-                      new_numbering=True, groups=None, end_sig=None) -> dict | None:
+                      new_numbering=True, groups=None, end_sig=None,
+                      hdr_ext=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -3232,6 +3444,8 @@ class RsrToolAPI:
             # already on disk — and it is the only thing that tells two builds
             # apart when their compressed output is identical.
             if end_sig is not None and end_block_sig(head) != end_sig:
+                continue
+            if hdr_ext is not None and header_exttime(head) != hdr_ext:
                 continue
             if self._streams_match(head, targets):
                 return {"exe": ex.name, "version": _exe_label(ex.name),
@@ -3383,6 +3597,8 @@ class RsrToolAPI:
             got = b"".join(p.read_bytes() for p in produced)
             same = got == joined
             patch = None if same else diff_bytes(got, joined)
+            if not same and patch is None:
+                self._log(f"      the join {diff_shape(got, joined)}.", "dim")
             for v in vols:
                 raw = v.read_bytes()
                 volmeta.append({"name": v.name, "size": len(raw),
@@ -3415,6 +3631,7 @@ class RsrToolAPI:
             if got != orig:
                 patch = diff_bytes(got, orig)
                 if patch is None:
+                    self._log(f"      {v.name} {diff_shape(got, orig)}.", "dim")
                     volmeta.append(rec)
                     return "none", volmeta, {}
                 key = f"deltas/{si}_{idx:04d}.bin"
