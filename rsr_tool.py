@@ -2002,14 +2002,23 @@ class RsrToolAPI:
         Same trick as the ZIP skeleton: what is left is headers and preflate's
         reconstruction data — 86 KB against 34 MB of rom on Dragon_Dance — and
         the content is supplied again at rebuild."""
+        # Search FORWARD from the last match, in archive order. A plain find()
+        # per entry breaks the moment two entries hold the same bytes — the
+        # 2005 LGC trainers ship bunzip2.exe and bzip2.exe byte-identical, so
+        # both resolved to the same offset and the holes overlapped, which read
+        # as "the content is not a contiguous run" when it was there twice.
         holes = []
+        cur = 0
         for name, data in payloads:
             if not data:
                 return None
-            i = pcf.find(data[:1 << 16])
-            if i < 0 or pcf[i:i + len(data)] != data:
+            i = pcf.find(data[:1 << 16], cur)
+            while i >= 0 and pcf[i:i + len(data)] != data:
+                i = pcf.find(data[:1 << 16], i + 1)
+            if i < 0:
                 return None
             holes.append([i, len(data), name])
+            cur = i + len(data)
         holes.sort()
         skel = bytearray()
         pos = 0
