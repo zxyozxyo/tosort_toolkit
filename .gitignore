@@ -92,3 +92,6 @@ rclone.exe
 _filelist_.lst
 _prep_*.lst
 _fp_*.lst
+
+# precomp scratch files: it writes these beside the working directory
+~temp*.dat
