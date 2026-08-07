@@ -686,8 +686,25 @@ ZIP_STRATS = ((0, ""), (1, " filtered"), (3, " rle"), (2, " huffman"),
 
 
 def zip_entries(path: Path) -> list[dict] | None:
-    """Every entry, with the exact byte range its compressed data occupies."""
-    import zipfile
+    """Every entry, with the exact byte range its compressed data occupies.
+
+    The central directory is the fast path, not the truth. The NUKED
+    Urusei_Yatsura-SCZ carries one archive's members under a different
+    archive's central directory: it lists five entries, the file holds three,
+    and every offset in it points into the middle of a compressed stream. The
+    members themselves are intact and decompress with the right CRC, so when
+    the directory does not line up, read the local headers instead. A skeleton
+    capture never needs the directory to be true — it is carried verbatim, and
+    the rebuild reproduces the archive byte-exact including the lie."""
+    ents = _zip_entries_central(path)
+    if ents == "encrypted":
+        return None
+    return ents or _zip_entries_scan(path)
+
+
+def _zip_entries_central(path: Path) -> list[dict] | str | None:
+    """Entries as the central directory describes them, or None if it does
+    not agree with the local headers."""
     try:
         with zipfile.ZipFile(str(path)) as zf:
             infos = zf.infolist()
@@ -699,7 +716,7 @@ def zip_entries(path: Path) -> list[dict] | None:
             if zi.is_dir():
                 continue
             if zi.flag_bits & 0x1:
-                return None                      # encrypted; out of scope
+                return "encrypted"               # out of scope
             fh.seek(zi.header_offset)
             lh = fh.read(30)
             if lh[:4] != b"PK\x03\x04":
@@ -714,6 +731,63 @@ def zip_entries(path: Path) -> list[dict] | None:
                 "data_offset": zi.header_offset + 30 + n + m,
             })
     return out
+
+
+def _zip_entries_scan(path: Path) -> list[dict] | None:
+    """Walk the local headers in file order, keeping only members that prove
+    themselves.
+
+    PK\\x03\\x04 turns up inside compressed data by chance often enough that a
+    candidate does not count until it decompresses to the length and the CRC
+    its own header claims. Anything left over between members — a stale stream,
+    padding, a whole obsolete central directory — is not our problem: the
+    skeleton carries every byte we did not cut out."""
+    raw = path.read_bytes()
+    out = []
+    i = raw.find(b"PK\x03\x04")
+    while i >= 0:
+        head = raw[i + 4:i + 30]
+        if len(head) < 26:
+            break
+        _v, flag, meth, _t, _d, crc, cs, us, nl, el = struct.unpack(
+            "<HHHHHIIIHH", head)
+        if flag & 0x1:
+            return None                          # encrypted; out of scope
+        off = i + 30 + nl + el
+        blob = raw[off:off + cs]
+        ok = bool(nl) and meth in (0, 8) and not flag & 0x8 and len(blob) == cs
+        if ok:
+            try:
+                plain = zlib.decompress(blob, -15) if meth else blob
+            except zlib.error:
+                ok = False
+            else:
+                ok = len(plain) == us and zlib.crc32(plain) == crc
+        if not ok:
+            i = raw.find(b"PK\x03\x04", i + 1)
+            continue
+        name = raw[i + 30:i + 30 + nl]
+        out.append({
+            "name": name.decode("utf-8" if flag & 0x800 else "cp437", "replace"),
+            "size": us,
+            "packed_size": cs,
+            "crc32": crc,
+            "method": meth,
+            "data_offset": off,
+        })
+        i = raw.find(b"PK\x03\x04", off + cs)
+    return out or None
+
+
+def zip_payload(raw: bytes, ent: dict) -> bytes:
+    """One entry's expanded bytes, taken from where its local header says they
+    are.
+
+    Deliberately not ZipFile.read(): that goes through the central directory,
+    which is not always describing this file, and it cannot tell two entries of
+    the same name apart."""
+    blob = raw[ent["data_offset"]:ent["data_offset"] + ent["packed_size"]]
+    return zlib.decompress(blob, -15) if ent["method"] else blob
 
 
 def zip_skeleton(raw: bytes, ents: list[dict]) -> tuple[bytes, list]:
@@ -2056,8 +2130,9 @@ class RsrToolAPI:
                 raw = zp.read_bytes()
                 ents = zip_entries(zp)
                 if not ents:
-                    self._log(f"  ✗ {zp.name}: cannot read (encrypted, or not "
-                              "a plain ZIP).", "err")
+                    self._log(f"  ✗ {zp.name}: cannot read — encrypted, or no "
+                              "member survives a CRC check from either the "
+                              "central directory or the local headers.", "err")
                     return {"ok": False, "error": f"{zp.name}: unreadable zip"}
                 skel, holes = zip_skeleton(raw, ents)
                 self._log(f"  {zp.name}  ·  ZIP  ·  {len(ents)} entr(y/ies)  ·  "
@@ -2146,10 +2221,7 @@ class RsrToolAPI:
                     # than the thing it describes. The small ones are carried
                     # as extras exactly as they are in a recipe capture, so
                     # what remains is only preflate's reconstruction data.
-                    payloads = []
-                    with zipfile.ZipFile(zp) as zf:
-                        for e in ents:
-                            payloads.append((e["name"], zf.read(e["name"])))
+                    payloads = [(e["name"], zip_payload(raw, e)) for e in ents]
                     cut = self._pcf_cut(pcf, payloads)
                     if cut is None:
                         self._log("    ✗ preflate ran, but the content is not "
@@ -2172,6 +2244,16 @@ class RsrToolAPI:
                                 "error": f"{zp.name}: preflate did not restore "
                                          f"it byte-exact"}
                     key = f"zips/{zi_no}/preflate.bin"
+                    # The sweep pass embedded each extra's ORIGINAL compressed
+                    # stream before it gave up. preflate wants the expanded
+                    # bytes instead, so those are dead weight now — and left in
+                    # place they were counted a second time in the size test
+                    # below, which is what refused both Ensata emulator
+                    # releases for carrying nearly a megabyte they would never
+                    # have carried.
+                    for k in [k for k in embedded
+                              if k.startswith(f"zips/{zi_no}/")]:
+                        del embedded[k]
                     embedded[key] = skel
                     self._db_learn_zip(_release_group(rel),
                                        {"impl": "preflate",
@@ -2180,8 +2262,7 @@ class RsrToolAPI:
                               f"byte-exact — carrying {len(skel):,} B of "
                               f"reconstruction data instead of a recipe.", "ok")
                     files = []
-                    by_name2 = dict(payloads)
-                    for e in ents:
+                    for idx, e in enumerate(ents):
                         rec = dict(e)
                         big = ((e["size"] or 0) >= biggest
                                or (cap and (e["size"] or 0) >= cap))
@@ -2189,12 +2270,21 @@ class RsrToolAPI:
                         rec["recipe"] = {"impl": "preflate", "label": "preflate"}
                         if not big:
                             k = f"zips/{zi_no}/pf/{len(files)}.bin"
-                            embedded[k] = by_name2[e["name"]]
+                            # By position, not by name: two entries of the same
+                            # name are legal in a ZIP and a dict silently keeps
+                            # one of them.
+                            embedded[k] = payloads[idx][1]
                             rec["stored"] = k
                         files.append(rec)
-                    total = len(skel) + sum(
-                        len(v) for k, v in embedded.items()
-                        if k.startswith(f"zips/{zi_no}/"))
+                    # Measure what the .rsr will actually cost, not what the
+                    # payloads weigh loose: the container deflates everything
+                    # it carries that is not already-compressed extras. Ensata
+                    # is 1.9 MB of dlls and chm files expanded, 1.0 MB once
+                    # written — comfortably under the 1.58 MB archive it
+                    # replaces, where the raw total said give up.
+                    total = sum(len(zlib.compress(v, 9))
+                                for k, v in embedded.items()
+                                if k.startswith(f"zips/{zi_no}/"))
                     if total >= len(raw):
                         # A release of nineteen similar jpgs has no small
                         # extras to carry cheaply — Contact-WTFE is exactly
@@ -2203,13 +2293,18 @@ class RsrToolAPI:
                         # AND demands all nineteen files back at rebuild. An
                         # honest refusal is the better answer; this shape is
                         # not what the format is for.
-                        self._log(f"    ✗ preflate would carry {total:,} B for "
-                                  f"a {len(raw):,} B archive — refusing, since "
-                                  f"that is no better than keeping the "
-                                  f"archive.", "err")
+                        self._log(f"    ✗ preflate would carry {total:,} B "
+                                  f"written for a {len(raw):,} B archive — "
+                                  f"refusing, since that is no better than "
+                                  f"keeping the archive.", "err")
                         return {"ok": False,
                                 "error": f"{zp.name}: preflate data is larger "
                                          f"than the archive"}
+                    n_extra = sum(1 for f in files if f["source"] == "extra")
+                    self._log(f"    {n_extra} extra(s) carried alongside it: "
+                              f"{total:,} B written against a "
+                              f"{len(raw):,} B archive "
+                              f"({total / len(raw) * 100:.0f}%).", "dim")
                     manifest["sets"].append({
                         "stem": zp.stem, "format": "ZIP", "name": zp.name,
                         "size": len(raw), "sha256": _sha256(raw),
