@@ -5762,6 +5762,35 @@ class SrrdbToolAPI:
                 year = ym.group(1)
         return group, platform, year
 
+    def _rsr_priors(self, group: str, year=None) -> list:
+        """Builds the .rsr scanner has PROVED for this group.
+
+        The two tools search the same space from opposite ends, and the scanner
+        has the stronger evidence: a .rsr is only written after its own replay
+        was byte-compared against the original archive, so every recipe in that
+        index is a build that demonstrably reproduced a release. 2,158 of them
+        across 40 groups at the time of writing — LiTE at 4.10, BAHAMUT and
+        EXiMiUS at 3.60 — which is exactly what a rebuild wants to try first.
+
+        Both tools spell a build the same way ("2005-11-21 3.60"), so the
+        labels drop straight in."""
+        db = Path(__file__).parent / "rsr_index.db"
+        if not group or not db.is_file():
+            return []
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = con.execute(
+                    "SELECT recipe_version, COUNT(*) FROM releases "
+                    "WHERE recipe_version<>'' AND name LIKE ? "
+                    "GROUP BY recipe_version ORDER BY 2 DESC",
+                    (f"%-{group}",)).fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return []
+        return [v for v, _n in rows if v]
+
     def _preferred_rar_versions(self, release: str, queue_path: str) -> list:
         """Known-good RAR versions from past successes of the SAME group —
         same year first, then the group's other years. rescene will try these
@@ -5780,7 +5809,13 @@ class SrrdbToolAPI:
                             and (not want_year or r.get("year") == year)
                             and r["rar_version"] not in prefs):
                         prefs.append(r["rar_version"])
-            return prefs[:4]
+            # Then what the .rsr scanner has proved for the same group. Its
+            # verdicts are byte-verified rebuilds, so they belong ahead of the
+            # date-ordered sweep even when this tool has never met the group.
+            for v in self._rsr_priors(group, year):
+                if v not in prefs:
+                    prefs.append(v)
+            return prefs[:6]
         except Exception:
             return []
 

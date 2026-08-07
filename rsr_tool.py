@@ -4374,6 +4374,16 @@ class RsrToolAPI:
                   f"{len(build)} build-only.", "ok")
         self._log(f"  priors now cover {groups} group(s); "
                   f"{skipped:,} record(s) had no usable build.", "dim")
+        try:
+            cfg = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            cfg = {}
+        cfg["priors_imported_mtime"] = int(path.stat().st_mtime)
+        cfg["priors_imported_records"] = rows
+        try:
+            self._config_path.write_text(json.dumps(cfg, indent=2), "utf-8")
+        except Exception:
+            pass
         return {"ok": True, "records": rows, "exact": len(exact),
                 "build_only": len(build), "groups": groups, "skipped": skipped}
 
@@ -4660,6 +4670,32 @@ class RsrToolAPI:
         return {"ok": True, "found": len(found), "added": added, "moved": moved,
                 "intact": intact, "stale": len(stale), "dupes": dupes,
                 "bad": bad}
+
+    def priors_status(self) -> dict:
+        """Is there anything new in srrdb_results.json to import?
+
+        A reminder every N starts would nag when nothing has changed and stay
+        silent when everything has. The file's own timestamp answers the real
+        question: the srrdb tool rewrites it after every batch, so if it is
+        newer than the last import there ARE new measured rebuilds waiting,
+        and if it is not there is nothing to do."""
+        path = self._app_dir / "srrdb_results.json"
+        if not path.is_file():
+            return {"ok": True, "stale": False}
+        try:
+            cfg = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            cfg = {}
+        done = int(cfg.get("priors_imported_mtime") or 0)
+        mtime = int(path.stat().st_mtime)
+        try:
+            n = len(json.loads(path.read_text("utf-8")))
+        except Exception:
+            n = 0
+        return {"ok": True, "stale": mtime > done, "never": not done,
+                "records": n,
+                "since": int(cfg.get("priors_imported_records") or 0),
+                "when": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")}
 
     def db_stats(self) -> dict:
         if not self._db_path.is_file():
