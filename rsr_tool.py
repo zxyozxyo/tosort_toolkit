@@ -494,6 +494,17 @@ def group_archive_sets(base: Path) -> list[dict]:
         stem, scheme, idx = cls
         families.setdefault((str(p.parent), stem, scheme), []).append((idx, p))
 
+    # A file whose name says nothing and whose first bytes say RAR. SCZ shipped
+    # the Unou_no_Tatsujin repack as SCZ-TSMMr.zip holding a RAR archive, so
+    # the release routed to the ZIP path and died there as "unreadable zip" —
+    # correctly, since it is not a zip. The marker decides format everywhere
+    # else in here; let it decide membership too.
+    for p in sorted(base.rglob("*")):
+        if not p.is_file() or _classify_volume(p.name):
+            continue
+        if _rar_format(p):
+            families[(str(p.parent), p.stem, "lone")] = [(0, p)]
+
     sets = []
     for (parent, stem, scheme), vols in families.items():
         vols.sort()
