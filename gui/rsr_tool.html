@@ -74,6 +74,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .qs-done{color:var(--acc)}
 .qs-error{color:var(--danger)}
 .qs-skipped{color:var(--text3)}
+/* Parked is unfinished work, not a pass — it has to read differently from the
+   grey of "skipped" at a glance, and differently from a red error. */
+.qs-parked{color:var(--warn);font-weight:600}
 .queue-hdr div{cursor:pointer;user-select:none}
 .queue-hdr div:hover{color:var(--text)}
 .queue-hdr .arrow{opacity:.85;font-weight:400}
@@ -571,6 +574,7 @@ function rowKind(d) {
   if (d.kind) return d.kind;
   return d.status === 'done' ? 'ok'
        : d.status === 'error' ? 'error'
+       : d.status === 'parked' ? 'parked'
        : d.status === 'running' ? 'running' : 'skipped';
 }
 

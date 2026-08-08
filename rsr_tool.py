@@ -226,6 +226,35 @@ def sfv_check(folder: Path, paths) -> list[dict]:
     return bad
 
 
+def volume_gap(folder: Path, vols: list) -> str:
+    """A hole in a volume sequence that the release's own .sfv also has, or "".
+
+    Street_Football-EXiMiUS ships .rar and .r01 through .r04 — no .r00 — and
+    every one of the five matches its .sfv exactly. So nothing is wrong with
+    the copy: a volume was never released, which is presumably why the release
+    was nuked. rar cannot extract past the hole, and "extraction incomplete"
+    reads as a bad download and invites a pointless re-fetch. Say which volume
+    the release itself never had."""
+    idx = [_classify_volume(p.name) for p in vols]
+    nums = sorted(c[2] for c in idx if c)
+    if not nums:
+        return ""
+    have = set(nums)
+    gaps = [n for n in range(min(nums), max(nums) + 1) if n not in have]
+    if not gaps:
+        return ""                                # contiguous; nothing missing
+    stem = next((c[0] for c in idx if c), "")
+    want = sfv_expected(folder)
+    named = [f"{stem}.r{n:02d}" for n in gaps]
+    listed = [n for n in named if n.lower() in want]
+    if listed:
+        return (f"{', '.join(listed)} is in the .sfv but not on disk — that "
+                f"volume is missing from your copy")
+    return (f"the set jumps straight past {', '.join(named)}, and the "
+            f"release's own .sfv does not list it either — a volume was never "
+            f"released, so this archive cannot be extracted by anyone")
+
+
 def _no_window() -> dict:
     """Spawn a console child without flashing a window at the operator.
 
@@ -788,6 +817,38 @@ def _zip_entries_scan(path: Path) -> list[dict] | None:
         })
         i = raw.find(b"PK\x03\x04", off + cs)
     return out or None
+
+
+def zip_truncated(path: Path) -> str:
+    """Why a ZIP looks cut short, or "" if it does not.
+
+    "cannot read" sends you looking for a parser bug when the answer is that
+    the file is not all there. Baby_Pals-SirVG is 14,950,400 bytes — a round
+    14,600 KB, the shape of an interrupted transfer — holding one member whose
+    own header says its data ends at 37,880,850. Nothing can read that, and no
+    amount of re-parsing will change it."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            raw = fh.read(1 << 16)
+    except OSError:
+        return ""
+    if raw[:4] != b"PK\x03\x04":
+        return ""
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - (1 << 16)))
+        if b"PK\x05\x06" in fh.read(1 << 16):
+            return ""                            # has an end record; not cut
+    nl, el = struct.unpack("<HH", raw[26:30])
+    cs, = struct.unpack("<I", raw[18:22])
+    name = raw[30:30 + nl].decode("latin-1", "replace")
+    end = 30 + nl + el + cs
+    if end > size:
+        return (f"the file is {size:,} B with no end-of-directory record, and "
+                f"its first member {name} declares data ending at {end:,} B — "
+                f"the archive is truncated, not unreadable")
+    return ("there is no end-of-directory record — the archive is truncated or "
+            "was never finished")
 
 
 def zip_payload(raw: bytes, ent: dict) -> bytes:
@@ -1626,7 +1687,11 @@ class RsrToolAPI:
                 pos, sig = getattr(self, "_sweep_pos", (0, ""))
                 self._db_miss(rel, "parked", "time budget", len(exes),
                               combos=pos, order_sig=sig)
-                self._emit("row", {"name": rel, "status": "skipped",
+                # Its own status word, not "skipped". A parked release was
+                # searched and ran out of time; a skipped one was never looked
+                # at. Reading the same grey "skipped" for both hides the
+                # unfinished work in among the two thousand deliberate passes.
+                self._emit("row", {"name": rel, "status": "parked",
                                    "recipe": "parked — time budget",
                                    "kind": "parked"})
                 parked += 1
@@ -2342,6 +2407,11 @@ class RsrToolAPI:
                 raw = zp.read_bytes()
                 ents = zip_entries(zp)
                 if not ents:
+                    cut = zip_truncated(zp)
+                    if cut:
+                        self._log(f"  ✗ {zp.name}: {cut}.", "err")
+                        return {"ok": False,
+                                "error": f"{zp.name}: truncated zip"}
                     self._log(f"  ✗ {zp.name}: cannot read — encrypted, or no "
                               "member survives a CRC check from either the "
                               "central directory or the local headers.", "err")
@@ -2807,8 +2877,34 @@ class RsrToolAPI:
                 return {"ok": False, "error": "skipped"}
             detail = (f"{len(short)} file(s) wrong size: {', '.join(short[:3])}"
                       if short else "extract did not finish")
+            # Before blaming the download: a hole in the volume numbering that
+            # the release's own .sfv shares is not our problem and never was.
+            gap = volume_gap(folder, vols)
+            if gap:
+                self._log(f"    ✗ {gap}.", "err")
+                return {"ok": False, "error": f"incomplete release: {gap}"}
             self._log(f"    ✗ extraction incomplete — {detail}", "err")
             return {"ok": False, "error": f"extraction incomplete ({detail})"}
+
+        # rar wrote the sources; something else took one away. A release
+        # carrying a tool — NINTENDO_DS_BETA_DUMPER-IND ships
+        # nds-dumper-beta.exe — gets quarantined between the extract and the
+        # first read, and the capture died on a raw errno 13 that named a
+        # temp path and nothing else. Say what happened and whose it is.
+        locked = []
+        for p in src_files:
+            try:
+                with open(p, "rb") as fh:
+                    fh.read(1)
+            except OSError as e:
+                locked.append(f"{p.name} ({e.strerror or e.errno})")
+        if locked:
+            self._log(f"    ✗ extracted but then unreadable: "
+                      f"{', '.join(locked[:3])}. Antivirus quarantining a "
+                      f"packed tool is the usual cause — exclude the temp "
+                      f"folder to capture this one.", "err")
+            return {"ok": False,
+                    "error": f"source locked after extraction: {locked[0]}"}
 
         # The timestamp rar.exe just restored is the one that will be written
         # back into the header, at full 100 ns resolution. Record THAT rather
