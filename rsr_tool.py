@@ -1452,6 +1452,10 @@ class RsrToolAPI:
             cfg = {}
         return {
             "source": cfg.get("source", ""),
+            # Extra roots scanned in the same run. `source` stays the first one
+            # so a settings file written before today still loads, and so a
+            # single folder needs no list at all.
+            "sources": [str(p) for p in (cfg.get("sources") or []) if str(p).strip()],
             "store": cfg.get("store", str(self._app_dir / "rsr_store")),
             "max_mt": _num(cfg.get("max_mt"), 16, int),
             "embed_extras": bool(cfg.get("embed_extras", True)),
@@ -1469,6 +1473,8 @@ class RsrToolAPI:
         s = s or {}
         out = {
             "source": (s.get("source") or cur["source"]).strip(),
+            "sources": ([str(p).strip() for p in s["sources"] if str(p).strip()]
+                        if isinstance(s.get("sources"), list) else cur["sources"]),
             "store": (s.get("store") or cur["store"]).strip(),
             "max_mt": max(0, min(32, _num(s.get("max_mt"), cur["max_mt"], int))),
             "embed_extras": bool(s.get("embed_extras", cur["embed_extras"])),
@@ -1488,6 +1494,48 @@ class RsrToolAPI:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "settings": out}
 
+    def store_status(self, path: str = "") -> dict:
+        """Whether `path` is where the .rsr files this index knows about live.
+
+        The Store box is one stray keystroke or one mis-click in a folder
+        picker away from pointing somewhere else, and nothing about a run would
+        look wrong: captures succeed, the index records them, and the corpus is
+        quietly in two places. The index already knows the answer — every row
+        carries the path its .rsr was written to — so ask it rather than
+        remembering a setting that is itself the thing in doubt."""
+        want = str(path or self.get_settings()["store"]).strip()
+        try:
+            con = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            try:
+                rows = [r[0] for r in con.execute(
+                    "SELECT rsr_path FROM releases WHERE rsr_path IS NOT NULL "
+                    "AND rsr_path <> ''").fetchall()]
+            finally:
+                con.close()
+        except Exception:
+            return {"ok": True, "differs": False, "count": 0, "expected": ""}
+        if not rows:
+            return {"ok": True, "differs": False, "count": 0, "expected": ""}
+        # The store root is the common ancestor of every .rsr in it: the layout
+        # below it is SYSTEM/YEAR/RELEASE, so a few hundred rows converge on it.
+        try:
+            root = Path(os.path.commonpath([str(Path(r).parent) for r in rows]))
+        except ValueError:
+            return {"ok": True, "differs": False, "count": len(rows),
+                    "expected": ""}
+        # Walk up out of SYSTEM/YEAR/RELEASE if every row shares those levels.
+        here = Path(want) if want else None
+        same = False
+        if here is not None:
+            try:
+                same = here.resolve() == root.resolve() \
+                    or root.resolve().is_relative_to(here.resolve()) \
+                    or here.resolve().is_relative_to(root.resolve())
+            except OSError:
+                same = str(here) == str(root)
+        return {"ok": True, "differs": not same, "count": len(rows),
+                "expected": str(root), "chosen": want}
+
     # ── the WinRAR build pack ─────────────────────────────────────────────
 
     def _pack_exes(self) -> list[Path]:
@@ -1503,8 +1551,24 @@ class RsrToolAPI:
             return {"ok": False, "error": "Already running"}
         self.save_settings(cfg or {})
         s = self.get_settings()
-        src = Path(s["source"])
-        if not src.is_dir():
+        wanted = [s["source"]] + list(s["sources"])
+        roots, seen = [], set()
+        for w in wanted:
+            w = str(w or "").strip()
+            if not w:
+                continue
+            p = Path(w)
+            key = str(p.resolve()).lower() if p.exists() else w.lower()
+            if key not in seen:
+                seen.add(key)
+                roots.append(p)
+        missing = [str(p) for p in roots if not p.is_dir()]
+        if missing:
+            return {"ok": False,
+                    "error": f"Folder not found: {missing[0]}"
+                             + (f" (and {len(missing) - 1} more)"
+                                if len(missing) > 1 else "")}
+        if not roots:
             return {"ok": False, "error": "Source folder not found"}
 
         def _bg():
@@ -1512,7 +1576,7 @@ class RsrToolAPI:
             self._stop.clear()
             self._skip.clear()
             try:
-                self._scan_run(src, Path(s["store"]), s)
+                self._scan_run(roots, Path(s["store"]), s)
             except Exception as e:
                 self._log(f"Scan error: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
@@ -1558,7 +1622,7 @@ class RsrToolAPI:
                 return cand
         return None
 
-    def _scan_run(self, src: Path, store: Path, s: dict):
+    def _scan_run(self, roots, store: Path, s: dict):
         exes = self._pack_exes()
         if not exes:
             self._log("WinRAR pack not found (apps/winrar_pack-4.20/*.exe) — "
@@ -1571,7 +1635,26 @@ class RsrToolAPI:
             return
 
         store.mkdir(parents=True, exist_ok=True)
-        folders = self._release_folders(src)
+        if isinstance(roots, (str, Path)):
+            roots = [Path(roots)]
+        # One list across every root, de-duplicated: nested or repeated roots
+        # would otherwise capture the same release twice in one run.
+        folders, seen = [], set()
+        for root in roots:
+            for f in self._release_folders(Path(root)):
+                key = str(f.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    folders.append(f)
+        # The store the index says it has been using. A run that quietly writes
+        # somewhere else splits the corpus in two and nothing about it looks
+        # wrong until a rebuild cannot find its .rsr.
+        st = self.store_status(str(store))
+        if st.get("differs") and st.get("count"):
+            self._log(f"⚠ Store is {store}, but the {st['count']:,} release(s) "
+                      f"already indexed live under {st['expected']}. Captures "
+                      f"from this run will go somewhere else — stop now if that "
+                      f"was not deliberate.", "warn")
         if s.get("small_first"):
             # Learn cheaply, then spend. The cost of a sweep is dominated by
             # recompressing the source, so a wrong guess on an 8 MB rom costs a
@@ -1591,7 +1674,14 @@ class RsrToolAPI:
             self._log("Smallest releases first — priors learned on cheap "
                       "releases make the expensive ones land on combo #1.",
                       "dim")
-        self._log(f"{len(folders)} release folder(s) under {src}", "info")
+        if len(roots) > 1:
+            self._log(f"{len(folders)} release folder(s) across "
+                      f"{len(roots)} folders:", "info")
+            for root in roots:
+                self._log(f"    {root}", "dim")
+        else:
+            self._log(f"{len(folders)} release folder(s) under {roots[0]}",
+                      "info")
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
         done = ok = failed = skipped = zips = parked = walls = meta = 0

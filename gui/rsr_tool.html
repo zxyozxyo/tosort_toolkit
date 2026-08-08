@@ -74,6 +74,17 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .qs-done{color:var(--acc)}
 .qs-error{color:var(--danger)}
 .qs-skipped{color:var(--text3)}
+/* Extra scan roots. Each row is one folder with a remove button, so what the
+   run will cover is visible without opening settings. */
+.src-list{display:flex;flex-direction:column;gap:2px;margin:0 0 2px 62px}
+.src-row{align-items:center;background:var(--bg0);border:1px solid var(--border);
+         border-radius:4px;color:var(--text2);display:flex;font-family:var(--mono);
+         font-size:10px;gap:6px;padding:2px 4px}
+.src-row span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.src-row button{background:none;border:none;color:var(--text3);cursor:pointer;
+                font-size:12px;line-height:1;padding:0 2px}
+.src-row button:hover{color:var(--danger)}
+.warn-line{color:var(--warn);font-size:10px;margin:0 0 2px 62px;display:none}
 /* Parked is unfinished work, not a pass — it has to read differently from the
    grey of "skipped" at a glance, and differently from a red error. */
 .qs-parked{color:var(--warn);font-weight:600}
@@ -171,13 +182,18 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <div class="row">
             <div class="lbl">Originals</div>
             <input class="txt" id="source" placeholder="folder of releases, or one release">
-            <button class="btn btn-sm" onclick="pick('source')">…</button>
+            <button class="btn btn-sm" onclick="pick('source')" title="Browse for a folder">…</button>
+            <button class="btn btn-sm" onclick="addSource()"
+                    title="Scan this folder as well as the one above — added folders are listed below">+</button>
           </div>
+          <div class="src-list" id="src-list"></div>
           <div class="row">
             <div class="lbl">Store</div>
-            <input class="txt" id="store" placeholder="where the .rsr files go">
+            <input class="txt" id="store" placeholder="where the .rsr files go"
+                   onchange="checkStore()">
             <button class="btn btn-sm" onclick="pick('store')">…</button>
           </div>
+          <div class="warn-line" id="store-warn"></div>
           <div class="row">
             <div class="lbl">Max -mt</div>
             <input class="num" id="max_mt" type="number" min="0" max="32" value="16">
@@ -366,7 +382,10 @@ window.addEventListener('pywebviewready', async () => {
   if (saved) document.documentElement.setAttribute('data-theme', saved);
   const s = await window.pywebview.api.get_settings();
   $('source').value = s.source || '';
+  extraSources = (s.sources || []).slice();
+  renderSources();
   $('store').value = s.store || '';
+  checkStore();
   $('max_mt').value = s.max_mt;
   $('embed_max_mb').value = s.embed_max_mb;
   $('embed_extras').checked = s.embed_extras;
@@ -381,9 +400,84 @@ window.addEventListener('pywebviewready', async () => {
   checkPriors();
 });
 
+let extraSources = [];
+
+// Every folder the run will cover, in order, with the box at the top first.
+function allSources() {
+  const first = $('source').value.trim();
+  const seen = new Set();
+  const out = [];
+  for (const p of [first].concat(extraSources)) {
+    const k = p.trim().toLowerCase();
+    if (p.trim() && !seen.has(k)) { seen.add(k); out.push(p.trim()); }
+  }
+  return out;
+}
+
+function renderSources() {
+  const box = $('src-list');
+  box.innerHTML = '';
+  extraSources.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'src-row';
+    const s = document.createElement('span');
+    s.textContent = p;
+    s.title = p;
+    const b = document.createElement('button');
+    b.textContent = '✕';
+    b.title = 'Stop scanning this folder';
+    b.onclick = () => { extraSources.splice(i, 1); renderSources(); save(); };
+    row.appendChild(s);
+    row.appendChild(b);
+    box.appendChild(row);
+  });
+  box.style.display = extraSources.length ? '' : 'none';
+}
+
+// The box at the top stays the first folder; + moves whatever is in it into
+// the list and clears it, so picking three folders is three clicks of the same
+// two controls rather than a different flow.
+async function addSource() {
+  let p = $('source').value.trim();
+  if (!p) {
+    p = await window.pywebview.api.browse_folder();
+    if (!p) return;
+    $('source').value = p;
+    save();
+    return;
+  }
+  const k = p.toLowerCase();
+  if (!extraSources.some(q => q.toLowerCase() === k)) extraSources.push(p);
+  $('source').value = '';
+  const next = await window.pywebview.api.browse_folder();
+  if (next) $('source').value = next;
+  renderSources();
+  save();
+}
+
+// Ask the index where the .rsr it knows about actually are. A mistyped or
+// mis-picked Store still captures happily and still records rows; the corpus
+// just ends up in two places, and nothing says so until a rebuild cannot find
+// its .rsr.
+async function checkStore() {
+  const el = $('store-warn');
+  try {
+    const r = await window.pywebview.api.store_status($('store').value.trim());
+    if (r && r.differs && r.count) {
+      el.textContent = '⚠ ' + r.count.toLocaleString() + ' indexed release(s) '
+        + 'are under ' + r.expected + ' — this is a different folder.';
+      el.style.display = '';
+      return true;
+    }
+  } catch (e) { /* index may not exist yet */ }
+  el.style.display = 'none';
+  return false;
+}
+
 function cfg() {
   return {
-    source: $('source').value.trim(),
+    source: allSources()[0] || $('source').value.trim(),
+    sources: allSources().slice(1),
     store: $('store').value.trim(),
     max_mt: $('max_mt').value,
     embed_max_mb: $('embed_max_mb').value,
@@ -421,7 +515,28 @@ function setBusy(on) {
 }
 
 async function startScan() {
-  if (!$('source').value.trim()) { log('Pick a folder of originals first.', 'warn'); return; }
+  const srcs = allSources();
+  if (!srcs.length) { log('Pick a folder of originals first.', 'warn'); return; }
+  // Confirmed here rather than only warned in the log: by the time a warning
+  // has scrolled past, the run has already written .rsr files to the wrong
+  // place, and moving them afterwards means reindexing the store.
+  const r = await window.pywebview.api.store_status($('store').value.trim());
+  if (r && r.differs && r.count) {
+    const ok = confirm(
+      ['The Store folder is not where your .rsr files are.',
+       '',
+       'Chosen:  ' + ($('store').value.trim() || '(empty)'),
+       'Indexed: ' + r.expected + '  (' + r.count.toLocaleString()
+         + ' release(s))',
+       '',
+       'Capturing into a different folder splits the corpus in two. Nothing '
+       + 'will look wrong during the run — a rebuild simply will not find '
+       + 'these .rsr later.',
+       '',
+       'Scan anyway?'].join('\n'));
+    if (!ok) return;
+  }
+  if (srcs.length > 1) log(srcs.length + ' folders will be scanned.', 'dim');
   clearQueue();
   setBusy(true);
   const r = await window.pywebview.api.scan_start(cfg());
