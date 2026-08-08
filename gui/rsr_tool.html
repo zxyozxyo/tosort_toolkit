@@ -520,13 +520,13 @@ async function startScan() {
   // Confirmed here rather than only warned in the log: by the time a warning
   // has scrolled past, the run has already written .rsr files to the wrong
   // place, and moving them afterwards means reindexing the store.
-  const r = await window.pywebview.api.store_status($('store').value.trim());
-  if (r && r.differs && r.count) {
+  const st = await window.pywebview.api.store_status($('store').value.trim());
+  if (st && st.differs && st.count) {
     const ok = confirm(
       ['The Store folder is not where your .rsr files are.',
        '',
        'Chosen:  ' + ($('store').value.trim() || '(empty)'),
-       'Indexed: ' + r.expected + '  (' + r.count.toLocaleString()
+       'Indexed: ' + st.expected + '  (' + st.count.toLocaleString()
          + ' release(s))',
        '',
        'Capturing into a different folder splits the corpus in two. Nothing '
