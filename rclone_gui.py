@@ -22,6 +22,9 @@ class RCloneAPI:
         self._running = False
         self._fixdat_names: set = set()
         self._fixdat_path: str = ""
+        self._letters: set = set()   # empty = no letter filter (upload everything)
+        self._files_from_path: str = ""
+        self._load_letters()
 
     def set_window(self, w):
         self._window = w
@@ -147,6 +150,45 @@ class RCloneAPI:
             "active": bool(self._fixdat_names),
             "count": len(self._fixdat_names),
             "path": self._fixdat_path,
+        }
+
+    # ── Letter filter ─────────────────────────────────────────────────────────
+    #
+    # An IA item is capped at 1TB, so a set like REDUMP AUDIO CD has to go up
+    # in chunks. Rather than copying files into "0 - C" / "D - G" staging
+    # folders by hand, point the uploader at the whole set and tick the
+    # letters this run should carry. The groups are the same ones the Folder
+    # Packer names its batches after (letter_filter.GROUPS).
+
+    def _load_letters(self):
+        try:
+            import letter_filter
+            p = Path(__file__).parent / "rclone_ia.json"
+            cfg = json.loads(p.read_text()) if p.exists() else {}
+            self._letters = letter_filter.normalise_letters(cfg.get("letters", []))
+        except Exception:
+            self._letters = set()
+
+    def set_letters(self, letters: list) -> dict:
+        import letter_filter
+        self._letters = letter_filter.normalise_letters(letters)
+        try:
+            cfg_path = Path(__file__).parent / "rclone_ia.json"
+            cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+            cfg["letters"] = sorted(self._letters)
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+        return self.get_letter_status()
+
+    def get_letter_status(self) -> dict:
+        import letter_filter
+        return {
+            "active": bool(self._letters),
+            "letters": sorted(self._letters),
+            "groups": letter_filter.GROUPS,
+            "summary": letter_filter.describe(self._letters),
         }
 
     def write_rclone_conf(self, access_key: str, secret_key: str, derive: bool = False) -> dict:
@@ -310,18 +352,36 @@ class RCloneAPI:
                 else:
                     cmd += ["--internetarchive-item-metadata", f"{k}={v}"]
 
-        # Apply fixdat filter — add --exclude for each incomplete file found in source
-        if self._fixdat_names:
-            try:
-                excluded_count = 0
-                for entry in Path(src).iterdir():
-                    if entry.is_file() and entry.stem in self._fixdat_names:
-                        cmd += ["--exclude", entry.name]
-                        excluded_count += 1
-                if excluded_count:
-                    self._log(f"  Fixdat filter: {excluded_count} incomplete file(s) will be skipped", "warn")
-            except Exception:
-                pass
+        # Apply the fixdat and letter filters. Both are expressed as ONE
+        # --files-from list of exactly the files that should go up, rather
+        # than a --exclude per unwanted file: a full ROM set can push the
+        # unwanted list into the thousands, which blows past the Windows
+        # command-line length limit, and a list file states the intent
+        # (upload precisely these) instead of leaving it implied.
+        if self._fixdat_names or self._letters:
+            keep, dropped_fix, dropped_letter = self._build_file_list(src)
+            if not keep:
+                self._log("ERROR: Every file was excluded by the fixdat/letter filter — "
+                          "nothing to upload.", "err")
+                self._running = False
+                self._emit("status", {"state": "error"})
+                return
+            if self._letters:
+                import letter_filter
+                self._log(f"  Letter filter: {letter_filter.describe(self._letters)}"
+                          + (f" — {dropped_letter} file(s) outside range skipped"
+                             if dropped_letter else ""), "warn" if dropped_letter else "dim")
+            if dropped_fix:
+                self._log(f"  Fixdat filter: {dropped_fix} incomplete file(s) will be skipped", "warn")
+            self._log(f"  Uploading {len(keep)} file(s) of this folder", "info")
+            list_path = self._write_files_from(keep)
+            if not list_path:
+                # Without the list file the filters cannot be honoured, and
+                # running anyway would upload the very files being held back.
+                self._running = False
+                self._emit("status", {"state": "error"})
+                return
+            cmd += ["--files-from", list_path]
 
         cmd += [src, f"archive:{identifier}"]
 
@@ -423,6 +483,49 @@ class RCloneAPI:
         finally:
             self._running = False
             self._proc = None
+            if self._files_from_path:
+                try:
+                    os.unlink(self._files_from_path)
+                except Exception:
+                    pass
+                self._files_from_path = ""
+
+    def _build_file_list(self, src: str):
+        """
+        Walk `src` and split it into (keep, dropped_by_fixdat,
+        dropped_by_letter). Paths in `keep` are relative to src with forward
+        slashes — the form rclone's --files-from expects, and the same form
+        get_folder_files reports so the GUI queue and the actual transfer are
+        talking about the same names.
+        """
+        import letter_filter
+        base = Path(src)
+        keep, dropped_fix, dropped_letter = [], 0, 0
+        for root, dirs, files in os.walk(src):
+            for f in sorted(files):
+                fp = Path(root) / f
+                if self._fixdat_names and fp.stem in self._fixdat_names:
+                    dropped_fix += 1
+                    continue
+                if not letter_filter.letter_allows(fp.name, self._letters):
+                    dropped_letter += 1
+                    continue
+                keep.append(str(fp.relative_to(base)).replace("\\", "/"))
+        return keep, dropped_fix, dropped_letter
+
+    def _write_files_from(self, rel_paths: list) -> str:
+        """Write the include list to a temp file; returns its path ("" on failure)."""
+        try:
+            import tempfile
+            fd, path = tempfile.mkstemp(prefix="ia_files_from_", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(rel_paths) + "\n")
+            self._files_from_path = path
+            return path
+        except Exception as e:
+            self._log(f"ERROR: could not write the filter file list ({e}) — "
+                      f"upload aborted rather than uploading unfiltered.", "err")
+            return ""
 
     def _parse_line(self, line: str):
         """Parse stats lines for progress panel, and per-file transfer
@@ -569,6 +672,7 @@ class RCloneAPI:
         no hashing, no network calls — so it stays fast even on very
         large folders.
         """
+        import letter_filter
         result = []
         try:
             base = Path(folder)
@@ -581,7 +685,12 @@ class RCloneAPI:
                         size = 0
                     rel = str(fp.relative_to(base)).replace("\\", "/")
                     excluded = fp.stem in self._fixdat_names if self._fixdat_names else False
-                    result.append({"name": fp.name, "rel": rel, "path": str(fp), "size": size, "excluded": excluded})
+                    result.append({
+                        "name": fp.name, "rel": rel, "path": str(fp), "size": size,
+                        "letter": letter_filter.get_letter_group(fp.name),
+                        "excluded": excluded,
+                        "out_of_range": not letter_filter.letter_allows(fp.name, self._letters),
+                    })
         except Exception:
             pass
         return result

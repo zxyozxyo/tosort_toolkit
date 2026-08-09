@@ -27,7 +27,9 @@ class IAUploaderAPI:
         self._upload_stats = {}  # file_key -> {bytes_done, total, speed, status}
         self._fixdat_names: set = set()
         self._fixdat_path: str = ""
+        self._letters: set = set()   # empty = no letter filter (upload everything)
         self._auto_load_fixdat()
+        self._auto_load_letters()
 
     def set_window(self, window):
         self._window = window
@@ -123,6 +125,38 @@ class IAUploaderAPI:
             "active": bool(self._fixdat_names),
             "count": len(self._fixdat_names),
             "path": self._fixdat_path,
+        }
+
+    # ── Letter filter ─────────────────────────────────────────────────────────
+    #
+    # An IA item is capped at 1TB, so a set like REDUMP AUDIO CD has to go up
+    # in chunks. Rather than copying files into "0 - C" / "D - G" staging
+    # folders by hand, point the uploader at the whole set and tick the
+    # letters this run should carry. The groups are the same ones the Folder
+    # Packer names its batches after (letter_filter.GROUPS).
+
+    def _auto_load_letters(self):
+        try:
+            import letter_filter
+            self._letters = letter_filter.normalise_letters(
+                self._load_uploader_settings().get("letters", [])
+            )
+        except Exception:
+            self._letters = set()
+
+    def set_letters(self, letters: list) -> dict:
+        import letter_filter
+        self._letters = letter_filter.normalise_letters(letters)
+        self._save_uploader_setting("letters", sorted(self._letters))
+        return self.get_letter_status()
+
+    def get_letter_status(self) -> dict:
+        import letter_filter
+        return {
+            "active": bool(self._letters),
+            "letters": sorted(self._letters),
+            "groups": letter_filter.GROUPS,
+            "summary": letter_filter.describe(self._letters),
         }
 
     def _emit(self, event: str, data: dict):
@@ -274,6 +308,24 @@ class IAUploaderAPI:
             self._running = False
             self._emit("uploadStatus", {"state": "error"})
             return
+
+        # Apply letter filter — the GUI already filters what it adds to the
+        # list, but re-check here so a selection changed after the list was
+        # built can never smuggle an out-of-range letter into the item.
+        if self._letters:
+            import letter_filter
+            kept = [fp for fp in file_paths
+                    if letter_filter.letter_allows(fp.name, self._letters)]
+            dropped = len(file_paths) - len(kept)
+            self._log(f"  Letter filter: {letter_filter.describe(self._letters)}"
+                      + (f" — {dropped} file(s) outside range excluded" if dropped else ""),
+                      "warn" if dropped else "dim")
+            file_paths = kept
+            if not file_paths:
+                self._log("ERROR: All files excluded by the letter filter — nothing to upload.", "err")
+                self._running = False
+                self._emit("uploadStatus", {"state": "error"})
+                return
 
         # Apply fixdat filter — skip any file whose stem matches a game entry
         if self._fixdat_names:
@@ -741,7 +793,14 @@ class IAUploaderAPI:
             return []
 
     def get_folder_files(self, folder: str) -> list:
-        """Return list of {name, path, size, rel, excluded} for all files in folder."""
+        """
+        Return {name, path, size, rel, letter, excluded, out_of_range} for
+        every file in folder. `excluded` means the fixdat says the file is
+        incomplete; `out_of_range` means the file's first-letter group is not
+        one of the ticked letters. Both are reported separately so the GUI can
+        say WHY a file isn't in the list.
+        """
+        import letter_filter
         result = []
         try:
             for root, dirs, files in os.walk(folder):
@@ -753,7 +812,9 @@ class IAUploaderAPI:
                         "path": str(fp),
                         "size": fp.stat().st_size,
                         "rel": str(fp.relative_to(folder)),
+                        "letter": letter_filter.get_letter_group(fp.name),
                         "excluded": excluded,
+                        "out_of_range": not letter_filter.letter_allows(fp.name, self._letters),
                     })
         except Exception:
             pass

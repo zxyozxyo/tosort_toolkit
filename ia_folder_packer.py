@@ -100,18 +100,10 @@ def find_folders_at_depth(root: Path, depth: int) -> list:
     return [f for f in current_level if any(p.is_file() for p in f.rglob('*'))]
 
 
-def get_letter_group(filename: str) -> str:
-    """Return letter group for a filename (used by LETTER mode)."""
-    name = Path(filename).stem.strip()
-    if not name:
-        return 'MISC'
-    first = name[0].upper()
-    if first.isalpha():
-        return first
-    elif first.isdigit():
-        return '0-9'
-    else:
-        return 'MISC'
+# Letter grouping lives in letter_filter.py so the two IA uploaders can
+# offer "upload only these letters" using exactly the same groups this
+# mode names its batches after.
+from letter_filter import get_letter_group  # noqa: E402  (re-exported for LETTER mode)
 
 
 class IAFolderPackerAPI:

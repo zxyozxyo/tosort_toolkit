@@ -77,7 +77,7 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
 .file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
 .file-sz{color:var(--text3);min-width:55px;text-align:right;flex-shrink:0}
 .file-st{width:50px;text-align:right;flex-shrink:0;font-size:10px}
-.file-st.queued{color:var(--text3)}.file-st.uploading{color:var(--info)}.file-st.done{color:var(--acc)}.file-st.already{color:var(--warn)}.file-st.error{color:var(--danger)}
+.file-st.queued{color:var(--text3)}.file-st.uploading{color:var(--info)}.file-st.done{color:var(--acc)}.file-st.already{color:var(--warn)}.file-st.error{color:var(--danger)}.file-st.excluded,.file-st.outrange{color:var(--text3)}
 .file-empty{color:var(--text3);font-size:10px;padding:6px;text-align:center}
 .file-list-hdr span:hover{color:var(--acc)}
 </style>
@@ -173,6 +173,28 @@ body{background:var(--bg0);color:var(--text);font-family:var(--font);font-size:1
         <button class="btn" onclick="fetchMeta()">Fetch</button>
       </div>
       <div class="hint">Identifier rules: 5-100 chars, letters/numbers/dots/hyphens/underscores, must be unique on IA.</div>
+    </div>
+  </div>
+
+  <!-- Letter Filter -->
+  <div class="panel">
+    <div class="panel-hdr" onclick="togglePanel('letters')">
+      <div class="dot" id="letters-dot"></div>Letter Filter
+      <span id="letters-sum" style="font-size:9px;color:var(--text3);margin-left:6px;font-weight:400"></span>
+      <span class="chevron" id="chev-letters">▾</span>
+    </div>
+    <div class="panel-body" id="body-letters">
+      <div class="row" style="gap:6px">
+        <button class="btn" onclick="setAllLetters(true)">All</button>
+        <button class="btn" onclick="setAllLetters(false)">None</button>
+        <button class="btn" onclick="scanSourceFiles()">Re-scan source</button>
+      </div>
+      <div id="letter-grid" style="display:flex;flex-wrap:wrap;gap:3px;padding:4px 2px"></div>
+      <div id="letters-status" class="hint">
+        Tick letters to upload only part of an oversized set (IA caps an item at 1TB).
+        Nothing ticked = upload everything. 0-9 = filenames starting with a digit,
+        MISC = anything else (#, brackets, symbols).
+      </div>
     </div>
   </div>
 
@@ -374,6 +396,8 @@ window.addEventListener('pywebviewready', async () => {
   // Restore fixdat filter state
   const fixdatStatus = await window.pywebview.api.get_fixdat_status();
   if (fixdatStatus.active) updateFixdatUI(fixdatStatus);
+  // Restore letter filter state
+  await initLetters();
 
   // Auto-populate the file queue if a source folder was restored from
   // a previous session, so the list isn't empty until Start/Scan is
@@ -383,6 +407,77 @@ window.addEventListener('pywebviewready', async () => {
   // Pre-load profiles so the list is populated the moment the panel is expanded
   loadProfiles();
 });
+
+// ── Letter filter ─────────────────────────────────────────────────────────────
+// Lets an oversized set (REDUMP AUDIO CD and friends) go up a slice at a time
+// without staging copies on disk: tick the letters this run should carry. The
+// backend turns the same selection into rclone's --files-from list, with the
+// fixdat exclusions applied on top, so the queue below and the actual transfer
+// always agree on what goes up.
+let letterGroups = [];
+let selectedLetters = new Set();
+
+async function initLetters() {
+  const st = await window.pywebview.api.get_letter_status();
+  letterGroups = st.groups || [];
+  selectedLetters = new Set(st.letters || []);
+  renderLetterGrid();
+  updateLettersUI(st);
+}
+
+function renderLetterGrid() {
+  const grid = document.getElementById('letter-grid');
+  grid.innerHTML = '';
+  for (const g of letterGroups) {
+    const lab = document.createElement('label');
+    lab.className = 'opt';
+    lab.style.cssText = 'min-width:34px;justify-content:center';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selectedLetters.has(g);
+    cb.onchange = () => {
+      if (cb.checked) selectedLetters.add(g); else selectedLetters.delete(g);
+      saveLetters();
+    };
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(' ' + g));
+    grid.appendChild(lab);
+  }
+}
+
+async function saveLetters() {
+  const st = await window.pywebview.api.set_letters([...selectedLetters]);
+  updateLettersUI(st);
+  // Keep the visible queue honest about what the next run will send
+  if (typeof lastScannedSrc !== 'undefined' && lastScannedSrc) scanSourceFiles();
+}
+
+function setAllLetters(on) {
+  selectedLetters = on ? new Set(letterGroups) : new Set();
+  renderLetterGrid();
+  saveLetters();
+}
+
+function updateLettersUI(st) {
+  const dot = document.getElementById('letters-dot');
+  const sum = document.getElementById('letters-sum');
+  const status = document.getElementById('letters-status');
+  // A full tick-everything selection comes back from the backend as "not
+  // active" — it filters nothing, so it shouldn't look like a live filter.
+  selectedLetters = new Set(st.letters || []);
+  renderLetterGrid();
+  if (st.active) {
+    dot.style.background = 'var(--warn)';
+    sum.textContent = st.summary;
+    status.textContent = `Only files starting with ${st.summary} will be uploaded.`;
+    status.style.color = 'var(--warn)';
+  } else {
+    dot.style.background = '';
+    sum.textContent = '';
+    status.textContent = 'No letter filter — every file will be uploaded.';
+    status.style.color = '';
+  }
+}
 
 // ── Fixdat filter ─────────────────────────────────────────────────────────────
 async function browseFixdat() {
@@ -502,14 +597,18 @@ async function scanSourceFiles() {
   if (!src) { addLog('Set a source folder first.', 'warn'); return; }
   addLog('Scanning source folder...', 'dim');
   const files = await window.pywebview.api.get_folder_files(src);
-  let excluded = 0;
+  let excluded = 0, outOfRange = 0;
   fileList = files.map(f => {
     if (f.excluded) { excluded++; return { name: f.rel, path: f.path, size: f.size, status: 'excluded' }; }
+    if (f.out_of_range) { outOfRange++; return { name: f.rel, path: f.path, size: f.size, status: 'outrange' }; }
     return { name: f.rel, path: f.path, size: f.size, status: 'queued' };
   });
   lastScannedSrc = src;
   renderFiles();
-  addLog(`Found ${files.length} file(s)${excluded ? ` — ${excluded} excluded by fixdat` : ''}`, files.length ? 'ok' : 'warn');
+  addLog(`Found ${files.length} file(s)`
+         + (excluded ? ` — ${excluded} excluded by fixdat` : '')
+         + (outOfRange ? ` — ${outOfRange} outside the ticked letters` : ''),
+         files.length ? 'ok' : 'warn');
 }
 
 function updateFilesSummary() {
@@ -520,7 +619,11 @@ function updateFilesSummary() {
   // remote files are genuinely finished, but an errored file still
   // needs uploading (rclone just hasn't succeeded with it yet), so it
   // stays counted as remaining rather than being treated as resolved
-  const remaining = fileList.filter(f => f.status !== 'done' && f.status !== 'already');
+  // Files held back by the fixdat or letter filter aren't "remaining" —
+  // they're not going up at all this run, so counting them would overstate
+  // both the file count and the bytes still to transfer
+  const SETTLED = new Set(['done', 'already', 'excluded', 'outrange']);
+  const remaining = fileList.filter(f => !SETTLED.has(f.status));
   const remainingSize = remaining.reduce((a, f) => a + (f.size || 0), 0);
   if (remaining.length === fileList.length) {
     // Nothing processed yet — just show the total, no need for a
@@ -535,7 +638,7 @@ function updateFilesSummary() {
 // one end, finished (done/already) toward the other, so "sort by
 // error" and "sort by uploaded" are both just this same Status column,
 // clicked once for one direction and twice for the other
-const STATUS_ORDER = { error: 0, uploading: 1, queued: 2, excluded: 3, done: 4, already: 5 };
+const STATUS_ORDER = { error: 0, uploading: 1, queued: 2, excluded: 3, outrange: 3, done: 4, already: 5 };
 
 function sortFiles(key) {
   if (sortKey === key) {
@@ -586,8 +689,9 @@ function renderFiles() {
     d.dataset.fname = f.name;
     const stClass = f.status || 'queued';
     const stText = stClass === 'done' ? '✓' : stClass === 'already' ? '✓ existing' : stClass === 'error' ? '✗'
-                 : stClass === 'excluded' ? '✗ fixdat' : stClass === 'uploading' ? (f.pct != null ? f.pct + '%' : '…') : '—';
-    const dimmed = stClass === 'excluded' ? ' style="opacity:0.4"' : '';
+                 : stClass === 'excluded' ? '✗ fixdat' : stClass === 'outrange' ? '✗ letter'
+                 : stClass === 'uploading' ? (f.pct != null ? f.pct + '%' : '…') : '—';
+    const dimmed = (stClass === 'excluded' || stClass === 'outrange') ? ' style="opacity:0.4"' : '';
     d.innerHTML = `<span class="file-name" title="${f.path}"${dimmed}>${f.name}</span>`
       + `<span class="file-sz">${fmtSz(f.size)}</span>`
       + `<span class="file-st ${stClass}" id="fst-${i}">${stText}</span>`;
