@@ -1,6 +1,6 @@
 # ToSort Toolkit
 
-A PyWebView desktop application for cleaning and managing ROM and scene release collections. Includes tools for RomVault integration, DAT file management, Internet Archive uploading, and scene RAR reconstruction.
+A PyWebView desktop application for cleaning and managing ROM and scene release collections. Includes tools for RomVault integration, DAT file management, Internet Archive uploading, and scene RAR reconstruction — including **RSR**, a capture-time format that guarantees byte-exact reconstruction rather than merely making it possible.
 
 ---
 
@@ -45,7 +45,11 @@ tosort_toolkit/
 ├── rclone_gui.py            # RClone uploader backend
 ├── scene_recreator.py       # Scene ZIP recreator/repair tool
 ├── srrdb_tool.py            # srrdb.com scene RAR rebuilder
+├── rsr_tool.py              # RSR capture/rebuild — Reproducible Scene Release
 ├── misc_tools.py            # Miscellaneous utilities backend
+├── letter_filter.py         # Shared A–Z / 0-9 / MISC grouping (packer + both uploaders)
+├── upload_profiles.py       # Shared upload profile store for both IA uploaders
+├── rescene_guard.py         # Gives each tool window its own private pyReScene copy
 ├── gui/                     # HTML frontends
 │   ├── home.html            # Launcher hub (main entry page)
 │   ├── index.html           # ToSort pipeline
@@ -55,6 +59,7 @@ tosort_toolkit/
 │   ├── rclone_gui.html      # RClone IA uploader
 │   ├── scene_recreator.html # Scene ZIP recreator
 │   ├── srrdb_tool.html      # srrdb scene RAR rebuilder
+│   ├── rsr_tool.html        # RSR capture/rebuild
 │   └── misc_tools.html      # Miscellaneous utilities
 ├── apps/                    # Drop tool binaries here (gitignored)
 │   ├── rar.exe
@@ -63,7 +68,8 @@ tosort_toolkit/
 │   ├── UnRAR.exe
 │   ├── chdman.exe
 │   ├── xdms.exe
-│   └── winrar_pack-4.20/    # Legacy WinRAR installers for compressed scene RARs
+│   ├── winrar_pack-4.20/    # Legacy WinRAR installers for compressed scene RARs
+│   └── zip_pack/precomp/windows/precomp.exe   # preflate fallback for ZIP capture
 └── rclone/                  # Drop rclone files here (gitignored)
     ├── rclone.exe
     └── rclone.conf          # Auto-created when saving credentials
@@ -84,11 +90,14 @@ Place binaries in the `apps/` subfolder (created manually). All scripts search `
 | `7zr.exe` | Minimal 7z (.7z only, cannot create RAR) | 7-zip.org |
 | `chdman.exe` | CHD file handling | MAME project |
 | `xdms.exe` | Amiga DMS extraction | Various Amiga sources |
+| `zip_pack/precomp/windows/precomp.exe` | preflate fallback for RSR ZIP capture | schnaader/precomp-cpp |
 
 **Notes:**
 - For RAR output in the IA pre-processors, `rar.exe` is preferred.
 - `7zr.exe` alone cannot create RAR archives — use `7z.exe` or `rar.exe`.
 - The `apps/winrar_pack-4.20/` subfolder contains WinRAR setup packages for legacy RAR versions. These are only required for reconstructing compressed scene RARs (rare for video releases). Standard uncompressed scene RARs do not need them — pyReScene handles those natively.
+- **WinRAR 7.x is deliberately excluded** from the extracted pack: 7.00 removed RAR4 creation entirely (`Unknown option: ma4`), so 6.24 is the last RAR4-capable build. Versions 5.00–6.24 *are* useful — post-2013 scene releases were made with modern WinRAR in RAR4 mode, and the tools inject `-ma4`.
+- `precomp.exe` is only needed for RSR's ZIP capture, and only as a fallback when no deflate setting reproduces a stream. RAR capture never touches it.
 
 ---
 
@@ -116,13 +125,18 @@ apps/                         # All tool binaries
 rclone/                       # rclone.exe and rclone.conf
 settings.json                 # Auto-saved pipeline settings
 ia_credentials.json           # IA S3 keys for Python uploader
-ia_uploader.json              # IA uploader saved settings (fixdat path etc.)
+ia_uploader.json              # IA uploader saved settings (fixdat path, letter filter etc.)
 ia_folder_packer.json         # Folder packer saved settings
-rclone_ia.json                # RClone uploader saved settings (fixdat path etc.)
+rclone_ia.json                # RClone uploader saved settings (fixdat path, letter filter etc.)
+ia_upload_profiles.json       # Saved upload profiles, shared by both IA uploaders
 scene_recreator.json          # Scene recreator saved settings
 srrdb_tool.json               # srrdb rebuilder saved settings
+srrdb_results.json/.csv/.xlsx # srrdb results DB — wall cache, tried builds, locked recipes
 srrdb_extras.db               # srrdb local extras store — CRC index of your extras folders (auto-generated)
 srr_cache/                    # srrdb persistent SRR download cache
+rsr_tool.json                 # RSR scanner saved settings
+rsr_index.db                  # RSR index — captures, misses, recipe priors (auto-generated)
+rsr_store/                    # Captured .rsr files and their extras (your data)
 reference_fingerprint_db.json # Scene recreator fingerprint DB (auto-generated, can be large)
 excluded_references.txt       # Scene recreator exclusion list (local)
 tosort_settings_export.json
@@ -190,8 +204,23 @@ Upload collections directly to archive.org using the IA S3 API.
 - Live thread count adjustment
 - Spaces in identifiers are automatically converted to underscores
 
+- Upload profiles — save and recall a whole set of fields; the profile store is shared with the RClone uploader
+
 **Fixdat Filter**
 Load a RomVault fixdat XML to exclude incomplete ROM sets from the upload queue. Files listed in the fixdat (incomplete) are skipped; files not listed (complete sets) upload normally. The fixdat path is saved between sessions (`ia_uploader.json`). Excluded files are shown greyed out in the file list before uploading.
+
+**Letter Filter**
+An IA item is capped at 1 TB, so an oversized set (REDUMP AUDIO CD and friends) has to go up in chunks. Rather than hand-copying files into `0 - C` / `D - G` staging folders, point the uploader at the whole set and tick the letters this run should carry.
+
+- Tick boxes for `A`–`Z`, `0-9` (filenames starting with a digit) and `MISC` (`#`, brackets, symbols), plus All / None
+- Nothing ticked = upload everything, exactly as before
+- Only matching files are added by **+ Folder**; hand-picked files outside the range are refused with a log line
+- **Re-apply to list** re-filters a queue built under a different selection, leaving already-uploaded rows alone
+- The upload thread re-checks the filter itself, so a selection changed mid-session can't smuggle an out-of-range file into the item
+- Stacks with the fixdat filter — letter first, fixdat on top, so nothing incomplete ever slips through
+- Selection persists between sessions (`ia_uploader.json`)
+
+The groups are the same ones the Folder Packer names its batches after (`letter_filter.py` is shared by all three tools), so a letter means the same thing everywhere.
 
 **IA Pre-processor (within IA Uploader)**
 Groups loose archives into letter-named RAR/ZIP files before upload — ideal for large TOSEC sets.
@@ -205,15 +234,18 @@ Groups loose archives into letter-named RAR/ZIP files before upload — ideal fo
 
 ### IA Folder Packer (ia_folder_packer.html)
 
-Packs each leaf folder containing archives into a single archive.
+One tool, three selectable packing strategies for preparing folders of archives for upload. All three share the same source/destination/format/copy-or-move options, the same archiver discovery, and a preview that shows what a run would produce before it does it.
 
-Finds the deepest folder containing archives and packs it as one file, preserving relative structure.
+**LEAF** — finds the deepest folder that directly contains archives and packs each one as a single file, named after the folder, preserving relative structure.
 
-**Example:**
 ```
 TOSEC/Commodore/C64/Games/[D64]/  →  [D64].rar
 TOSEC/Commodore/[D64]/            →  [D64].rar
 ```
+
+**LETTER** — groups loose archives by first character (`A`–`Z`, `0-9`, `MISC`) and splits each group into batches not exceeding a size limit, named `A.rar`, `A_2.rar`, `A_3.rar`. This is the original IA Prepper behaviour, and it uses the same grouping as the uploaders' Letter Filter.
+
+**DEPTH** — treats every folder at a fixed number of levels below the source root as one packing unit (everything beneath it is included, whether or not it directly contains archives) and size-splits it the same way LETTER does, named `FOLDERNAME.rar`, `FOLDERNAME_2.rar`.
 
 - Copy mode: output mirrors structure under destination, originals untouched
 - Move mode: archives created alongside source folder, originals deleted
@@ -240,7 +272,12 @@ Standalone rclone wrapper for IA uploads.
 - Spaces in identifiers are automatically converted to underscores
 
 **Fixdat Filter**
-Same RomVault fixdat filtering as the IA Uploader. Loads a fixdat XML and passes matching filenames to rclone as `--exclude` flags so they are skipped server-side. The fixdat path is saved between sessions (`rclone_ia.json`).
+Same RomVault fixdat filtering as the IA Uploader. Loads a fixdat XML; matching files are held back from the transfer. The fixdat path is saved between sessions (`rclone_ia.json`).
+
+**Letter Filter**
+Same letter selection as the IA Uploader (see above) — tick the letters this run should carry so an oversized set can be split across several IA items without staging copies on disk.
+
+Both filters are expressed to rclone as **one `--files-from` list** of exactly the files that should go up, rather than a `--exclude` per unwanted file. A full ROM set can push the unwanted list into the thousands, which would blow past the Windows command-line length limit; a list file also states the intent (upload precisely these) instead of leaving it implied, and covers subfolders rather than just the top level. If that list can't be written the upload aborts rather than running unfiltered. Held-back files appear in the queue dimmed and marked `✗ fixdat` or `✗ letter`.
 
 **Speed:** rclone typically achieves significantly higher throughput than the Python uploader due to more efficient connection handling.
 
@@ -367,12 +404,78 @@ Game scene RARs (3DS, NDS, etc.) are usually **compressed**, which makes the reb
 
 **Genuine walls** (reported clearly, never silently failed): RAR5 releases (pyReScene 0.7 limit), solid-compressed archives whose exact settings can't be reproduced, and a packed extra that differs from the SRR copy when no matching file exists on srrdb or in your extras store.
 
+#### Results DB — what a re-run reuses
+
+Every processed release is recorded (`srrdb_results.json`, also exported as CSV/XLSX). A re-run reuses three things from it, so a second pass doesn't repeat the first:
+
+- **Version-wall cache** — a release proven to match *no* build in the pack is a pure version wall; only a bigger pack can ever fix it, so it's skipped instantly instead of re-grinding every build. The record is tagged with the pack signature and a cache generation, so **adding WinRAR versions, or a change to the hunt logic, automatically re-opens every wall** for one fresh attempt. A wall recorded under the release-date cap is marked as such and re-opens by itself when the cap is turned off — the cap's subset is never a permanent exclusion.
+- **Recipe-sweep verdict** — cached for a hit and for a clean exhaustion. A sweep cut short by the budget or by Stop is deliberately *not* cached, since it proved nothing.
+- **Builds a timed-out run already tested** — these are pushed to the **back** of the order on the retry, so a second pass explores new builds instead of grinding the same head of the list into the same timeout. A deadline-truncated run is never recorded as a wall.
+
+Two options control this. **Ignore stored DB history** discards all three and searches from scratch — thorough, but it also throws away the resume list, so a release that only ever times out will restart at the same builds every run. **Ask first (30s pause)** offers the choice per release instead and auto-continues if unanswered, so an unattended batch is unaffected.
+
+Locked recipes are stored per stream as `[file, version, mt]` — the byte-exact packing settings, and the accumulating dataset the RSR format grew out of. The RSR tool can import them as priors.
+
 #### Notes
 
 - **No Rar.exe required** for the vast majority of scene releases. Standard uncompressed video scene RARs are reconstructed natively by pyReScene in pure Python.
 - **Compressed RARs** (mostly game releases): require the exact original Rar.exe version. Use the **Setup RAR versions** button to extract correctly named executables from installers in `apps/winrar_pack-4.20/`. See the rescue stack above.
 - **RAR5 releases** (WinRAR 5+) cannot be reconstructed by pyReScene 0.7 — detected and skipped upfront.
 - SRR downloads are cached persistently in `srr_cache/` — re-running any release (even after a restart) skips the download and never re-hits the rate-limited host.
+
+---
+
+### RSR — Reproducible Scene Release (rsr_tool.html)
+
+A capture-time format that **guarantees** byte-exact archive reconstruction, where a `.srr` can only make it *possible*.
+
+The difference is where the brute force happens. pyReScene reassembles an archive block by block at *rebuild* time, having to infer the WinRAR build and thread count from evidence the SRR never recorded. RSR captures while the **original archives are still on disk**, so it can find the exact recipe, run it, and byte-compare the result against the real thing before writing anything:
+
+```
+reconstruction = replay the original `rar a` command
+```
+
+That one decision is why RSR handles what the rebuilder cannot:
+
+| | |
+|---|---|
+| **RAR5** | pyReScene 0.7 can't write it; `rar.exe` always could |
+| **Solid archives** | one command packs the whole solid set — no member surgery |
+| **`.001`/`.002`** | a volume naming scheme, not a structural problem |
+| **ZIP releases** | captured too — a third of a typical NDS corpus |
+
+Anything the replay still gets wrong (header-level: timestamps, attributes, host-OS byte) is stored as a per-volume delta, so a verified `.rsr` is verified in the literal sense: it was run, and the bytes matched. Nothing is ever written to the folder being scanned, and **no `.rsr` is written until a recipe is proved** — there is no such thing as a partial capture.
+
+#### Capture
+
+Point it at a folder of releases (or one release) and a **Store** folder. Several source folders can be scanned in one run. Captures are filed as `SYSTEM/YEAR/RELEASE`.
+
+- **Max -mt** — thread counts swept 0–N. Sweep order is measured rather than assumed (mt8 dominates, then mt1/mt3/mt4) and runs outermost, so common counts cover the whole build pack before a rare one is tried anywhere
+- **Embed cap** — packed files under this size are embedded so archive-only extras can be rebuilt; larger ones count as content
+- **Also embed a legacy `.srr`** — for compatibility with existing tooling
+- **Budget** — minutes per release, 0 for no limit
+- **Retry larger dictionary sizes if the header's is wrong**
+- **Smallest releases first** — learns recipes cheaply before spending time on the big ones
+- **Skip releases already captured** / **Retry releases already swept to exhaustion**
+- Live **Skip file**, **Finish this one** (lifts the budget for the release running right now, next release gets the normal budget again) and **Stop**
+
+Outcomes are named rather than lumped together: captured, known wall, damaged, partial, parked, metadata-only, ZIP. A release that ran out of budget is distinguished from one that was searched exhaustively, so only the second gets remembered as a wall — and that wall re-opens automatically once the build pack grows.
+
+#### ZIP capture
+
+ZIP releases are captured through the same prove-it-then-write discipline. The tool learns which deflate implementation a group zips with and seeds those priors from the store rather than relearning them each run. When no deflate setting reproduces a stream, it falls back to **preflate** (via `precomp.exe`), which derives the parameters from the stream itself. Groups only preflate can crack skip the settings grid entirely.
+
+#### Rebuild
+
+Two modes: **Batch** (rebuild everything under a root, optionally deleting content as it goes) and **Single** (one `.rsr` + its content folder → output folder).
+
+#### Database
+
+`rsr_index.db` indexes every capture, miss and recipe prior.
+
+- **Search** by release, packed file name, or CRC32
+- **Import srrdb priors** — seed recipe hints from the legacy rebuild results, so the two tools' evidence flows both ways
+- **Reindex store** — re-read the Store folder and index any `.rsr` the DB is missing (also notices a Store that has moved)
 
 ---
 
