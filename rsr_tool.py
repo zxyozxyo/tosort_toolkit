@@ -97,6 +97,15 @@ _DATE_PREFIX  = re.compile(r"^\d{4}-\d{2}-\d{2}[-_]")
 _TAG_PREFIX   = re.compile(r"^\[([^\]]{1,24})\]\s*")
 
 
+# A loose file that IS the set's content is normally not a sidecar — it is the
+# rom sitting unpacked beside its own rars, and carrying it would put back the
+# very bytes the capture just took out. That reasoning is about big files. On a
+# patch or trainer release the largest zip member is the nfo, so the nfo is the
+# content, and the rule then dropped the loose nfo that every such release also
+# ships beside its zip: the rebuild came out without it. Below this size the
+# bytes are too cheap to reason about, so carry them.
+LOOSE_CONTENT_MIN = 1 << 20
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -1590,14 +1599,41 @@ class RsrToolAPI:
 
     @staticmethod
     def _release_folders(src: Path) -> list[Path]:
-        """A source may be one release folder, or a parent full of them.
+        """A source may be one release folder, or a parent full of them — or,
+        as a year-per-folder library is, a parent of parents.
 
-        Archives sitting loose in `src` mean `src` IS the release; otherwise
-        every subfolder is one."""
-        if any(_classify_volume(p.name) for p in src.iterdir() if p.is_file()):
-            return [src]
-        subs = [p for p in sorted(src.iterdir()) if p.is_dir()]
-        return subs or [src]
+        Archives sitting loose in `src` mean `src` IS the release. Otherwise
+        its subfolders are examined the same way, because stopping after one
+        level is what turned `NDS/NDS Scene 2005/<release>` into a single
+        "NDS Scene 2005" release holding all 91 zips of the year: one .rsr
+        that can only ever be rebuilt from one folder, and 91 real releases
+        whose content it then shadowed in the index.
+
+        A container is told from a release by its LOOSE files, not by its
+        depth: a scene release folder always carries at least the nfo beside
+        whatever it packs, and a year folder carries nothing at all. Depth is
+        capped so a wrong root cannot turn into a full-disk walk."""
+
+        def walk(d: Path, depth: int) -> list[Path]:
+            try:
+                kids = sorted(d.iterdir())
+            except OSError:
+                return [d]
+            if any(_classify_volume(p.name) for p in kids if p.is_file()):
+                return [d]
+            subs = [p for p in kids if p.is_dir()]
+            # Any loose file at all makes this a release — an nfo-only or
+            # sfv-only folder is still a release and must not be descended
+            # past. No loose files and no subfolders is an empty folder, which
+            # the caller reports as such.
+            if not subs or any(p.is_file() for p in kids) or depth <= 0:
+                return [d]
+            found = []
+            for sub in subs:
+                found.extend(walk(sub, depth - 1))
+            return found
+
+        return walk(src, 4) or [src]
 
     @staticmethod
     def _store_dir(store: Path, folder: Path, rel: str) -> Path:
@@ -2529,6 +2565,21 @@ class RsrToolAPI:
                     big = ((e["size"] or 0) >= biggest
                            or (cap and (e["size"] or 0) >= cap))
                     rec["source"] = "content" if big else "extra"
+                    # A rom is matched back to its release on size+CRC32, and a
+                    # collision is settled on SHA-256. A RAR capture records
+                    # one per file and a ZIP capture recorded none, so on the
+                    # ZIP side there was nothing to settle WITH — and the
+                    # tie-break treated "no sha" as "not this one", which is
+                    # how a zip release lost its own rom to a later re-pre.
+                    plain = None
+                    if big:
+                        try:
+                            plain = (rawe if e["method"] == 0
+                                     else zlib.decompress(rawe, -15))
+                        except zlib.error:
+                            plain = None
+                        if plain is not None:
+                            rec["sha256"] = _sha256(plain)
                     if e["method"] == 0 and big:
                         rec["recipe"] = {"impl": "stored", "label": "stored"}
                     elif not big:
@@ -2545,7 +2596,8 @@ class RsrToolAPI:
                         ok = False
                         break
                     else:
-                        data = zlib.decompress(rawe, -15)
+                        data = (plain if plain is not None
+                                else zlib.decompress(rawe, -15))
                         # Say what is about to happen and roughly what it
                         # costs. A ZIP sweep is one long silence per rom
                         # otherwise, which reads exactly like a hang.
@@ -2605,9 +2657,15 @@ class RsrToolAPI:
                     skel, holes = cut
                     # Prove it here, exactly as a recipe is proved: put the
                     # content back, restore, and byte-compare.
-                    by_name = dict(payloads)
+                    # By position, not by name. `holes` is built by scanning
+                    # forward through the .pcf in payload order and then
+                    # sorted by offset, so hole i is payload i — whereas a
+                    # name-keyed dict hands two same-named entries the same
+                    # bytes, which the byte-compare below then rejects as a
+                    # preflate failure it never was.
                     back = zip_assemble(skel, [[h[0], h[1]] for h in holes],
-                                        {h[0]: by_name[h[2]] for h in holes})
+                                        {h[0]: payloads[i][1]
+                                         for i, h in enumerate(holes)})
                     restored = self._pcf_restore(back, work / "pf")
                     if restored != raw:
                         self._log("    ✗ preflate did not restore this archive "
@@ -2640,6 +2698,8 @@ class RsrToolAPI:
                                or (cap and (e["size"] or 0) >= cap))
                         rec["source"] = "content" if big else "extra"
                         rec["recipe"] = {"impl": "preflate", "label": "preflate"}
+                        if big:
+                            rec["sha256"] = _sha256(payloads[idx][1])
                         if not big:
                             k = f"zips/{zi_no}/pf/{len(files)}.bin"
                             # By position, not by name: two entries of the same
@@ -2829,7 +2889,7 @@ class RsrToolAPI:
                 continue
             rel = p.relative_to(folder).as_posix()
             size = p.stat().st_size
-            if (size, _file_crc32(p)) in content_ids:
+            if (size, _file_crc32(p)) in content_ids and size >= LOOSE_CONTENT_MIN:
                 self._log(f"    (skipping loose {rel} — it is the set's "
                           "content, supplied at rebuild)", "dim")
                 continue
@@ -3948,7 +4008,15 @@ class RsrToolAPI:
             return {"ok": False, "error": "not a file"}
         return self._match_content(p)
 
-    def _match_content(self, p: Path) -> dict:
+    def _match_all(self, p: Path) -> dict:
+        """EVERY captured release this file is the content of.
+
+        One rom is routinely the content of several real releases at once: the
+        original pre, a PROPER or a RARFIX of it, a second group dumping the
+        same cart, and years later a numbered re-release of the whole library.
+        None of them is the "right" one — they are all releases, they are all
+        rebuildable from this one file, and a rebuilder that keeps only one of
+        them silently drops the rest on the floor."""
         if not self._db_path.is_file():
             return {"ok": False, "error": "no index yet"}
         size = p.stat().st_size
@@ -3958,7 +4026,8 @@ class RsrToolAPI:
             rows = con.execute(
                 "SELECT f.release, f.name, f.sha256, r.rsr_path, r.verified "
                 "FROM files f JOIN releases r ON r.name = f.release "
-                "WHERE f.size=? AND f.crc32=? AND f.source='content'",
+                "WHERE f.size=? AND f.crc32=? AND f.source='content' "
+                "ORDER BY f.release",
                 (size, crc)).fetchall()
         finally:
             con.close()
@@ -3966,18 +4035,37 @@ class RsrToolAPI:
             return {"ok": False, "error": "no match",
                     "crc32": f"{crc:08X}", "size": size}
         if len(rows) > 1:
-            # Same rom in two releases (a P2P/scene dupe, or a re-pre). Settle
-            # it on SHA-256 where we have one, otherwise report the ambiguity
-            # rather than picking blind.
+            # SHA-256 settles a genuine size+CRC32 collision — but only against
+            # a release that HAS one. A ZIP capture records no sha for its
+            # entries, so keeping the rows that compare equal threw away every
+            # ZIP candidate and handed the rom to whichever RAR release shared
+            # it: 8 of 8 2005 zip releases rebuilt as somebody else's re-pre,
+            # and the tool called it a clean run. A missing sha is unknown, not
+            # wrong; only a sha that is present AND different rules a release
+            # out.
             sha = _file_sha256(p)
-            exact = [r for r in rows if r[2] == sha]
-            if exact:
-                rows = exact
-        rel, name, sha256, rsr_path, verified = rows[0]
-        return {"ok": True, "release": rel, "packed_name": name,
-                "rsr": rsr_path, "verified": bool(verified),
-                "crc32": f"{crc:08X}", "size": size,
-                "ambiguous": [r[0] for r in rows[1:]] if len(rows) > 1 else []}
+            keep = [r for r in rows if not r[2] or r[2] == sha]
+            if keep:
+                rows = keep
+            # Confirmed first, unknown after — the caller that still wants one
+            # answer should get the best-evidenced one.
+            rows.sort(key=lambda r: 0 if r[2] == sha else 1)
+        hits = [{"release": r[0], "packed_name": r[1], "rsr": r[3],
+                 "verified": bool(r[4])} for r in rows]
+        return {"ok": True, "crc32": f"{crc:08X}", "size": size,
+                "releases": hits}
+
+    def _match_content(self, p: Path) -> dict:
+        """The single best release for this file — the shape the UI wants."""
+        res = self._match_all(p)
+        if not res.get("ok"):
+            return res
+        hits = res["releases"]
+        return {"ok": True, "release": hits[0]["release"],
+                "packed_name": hits[0]["packed_name"],
+                "rsr": hits[0]["rsr"], "verified": hits[0]["verified"],
+                "crc32": res["crc32"], "size": res["size"],
+                "ambiguous": [h["release"] for h in hits[1:]]}
 
     # ── batch rebuild ─────────────────────────────────────────────────────
 
@@ -4019,11 +4107,6 @@ class RsrToolAPI:
         threading.Thread(target=_bg, daemon=True).start()
         return {"ok": True, "started": True}
 
-    # Files that are never release content — no point hashing a 2 KB nfo
-    # against an index of roms.
-    _NOT_CONTENT = {".nfo", ".sfv", ".diz", ".txt", ".jpg", ".jpeg", ".png",
-                    ".rsr", ".srr", ".srs", ".md5", ".sha1", ".log"}
-
     def _content_sizes(self) -> set[int]:
         """Every file size the index knows as content."""
         con = self._db()
@@ -4051,8 +4134,13 @@ class RsrToolAPI:
         sizes = self._content_sizes()
         looked = skipped_size = 0
         cands = []
+        # Nothing is excluded by extension. Skipping the usual sidecar types
+        # here looked free and cost 51 releases: on a patch or trainer release
+        # the largest zip member is the nfo, so the nfo IS the content, and a
+        # scan that refuses to look at .nfo files can never match one. The
+        # size test is the real filter and it is already free.
         for p in sorted(root.rglob("*")):
-            if not p.is_file() or p.suffix.lower() in self._NOT_CONTENT:
+            if not p.is_file() or p.suffix.lower() == ".rsr":
                 continue
             looked += 1
             if p.stat().st_size in sizes:
@@ -4065,25 +4153,52 @@ class RsrToolAPI:
         self._log("  matching by size + CRC32 against the .rsr index", "dim")
 
         matched, done, failed, miss = {}, 0, 0, 0
+        shared = 0
         for i, p in enumerate(cands, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
                 return
             self._progress(f"hashing {i}/{len(cands)} · {p.name}")
-            hit = self._match_content(p)
+            hit = self._match_all(p)
             if not hit.get("ok"):
                 miss += 1
                 self._emit("row", {"name": p.name, "status": "skipped",
                                    "recipe": hit.get("error", "no match"),
                                    "kind": "nomatch"})
                 continue
-            rel = hit["release"]
-            if rel in matched:
-                continue                      # one release, one rebuild
-            matched[rel] = (p, hit)
+            # EVERY release this rom belongs to, not just the best-evidenced
+            # one. Building only the winner is what made the older zip
+            # releases look unrebuildable: their rom is also in a later
+            # re-pre, that re-pre won, and the zip release produced no
+            # archive, no nfo and no extras — no output at all, which reads
+            # from the outside like a failed rebuild rather than a release
+            # that was never attempted.
+            if len(hit["releases"]) > 1:
+                shared += 1
+            for h in hit["releases"]:
+                rel = h["release"]
+                if rel in matched:
+                    continue                  # one release, one rebuild
+                matched[rel] = (p, dict(h, crc32=hit["crc32"],
+                                        size=hit["size"],
+                                        others=[o["release"]
+                                                for o in hit["releases"]
+                                                if o["release"] != rel]))
         self._progress("")
         self._log(f"  {len(matched)} release(s) matched, {miss} file(s) with no "
                   "entry in the index.", "ok" if matched else "warn")
+        if shared:
+            self._log(f"  {shared} of those rom(s) are the content of more "
+                      f"than one release — every one of them is queued.", "dim")
+
+        # Which releases still need each source file. DELETE SOURCES must not
+        # remove a rom the moment the first of its releases is built, or the
+        # other four have nothing left to rebuild from.
+        claims: dict = {}
+        for rel, (p, _h) in matched.items():
+            claims.setdefault(p, set()).add(rel)
+        consumed_by: dict = {}
+        failed_rels: set = set()
 
         for i, (rel, (p, hit)) in enumerate(sorted(matched.items()), 1):
             if self._stop.is_set():
@@ -4093,9 +4208,12 @@ class RsrToolAPI:
             self._log(f"══ [{i}/{len(matched)}] {rel} ══", "info")
             self._log(f"  matched {p.name}  CRC={hit['crc32']}  "
                       f"{hit['size']:,} B", "dim")
-            if hit.get("ambiguous"):
-                self._log(f"  ⚠ that content also appears in: "
-                          f"{', '.join(hit['ambiguous'][:3])}", "warn")
+            if hit.get("others"):
+                self._log(f"  that content is also the release content of: "
+                          f"{', '.join(hit['others'][:3])}"
+                          + (f" (+{len(hit['others']) - 3} more)"
+                             if len(hit["others"]) > 3 else "")
+                          + " — those are queued too.", "dim")
             rsr = Path(hit["rsr"])
             if not rsr.is_file():
                 self._log(f"  ✗ indexed .rsr is missing from the store: {rsr}",
@@ -4119,13 +4237,33 @@ class RsrToolAPI:
             if res.get("ok"):
                 done += 1
                 if delete_content:
-                    freed += self._delete_consumed(out)
+                    for c in self._consumed:
+                        consumed_by.setdefault(c, set()).add(rel)
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": "rebuilt", "kind": "ok"})
             else:
                 failed += 1
+                failed_rels.add(rel)
                 self._emit("row", {"name": rel, "status": "error",
                                    "recipe": "rebuild failed", "kind": "error"})
+
+        if delete_content and consumed_by:
+            # A source goes only once every release that claimed it has been
+            # built and hash-verified. Anything still owed to a release that
+            # failed, or that the run never reached, stays where it is.
+            held = 0
+            keep = []
+            for srcp, built in consumed_by.items():
+                owed = claims.get(srcp, set())
+                if owed - built:
+                    held += 1
+                    continue
+                keep.append(srcp)
+            self._consumed = keep
+            freed += self._delete_consumed(out)
+            if held:
+                self._log(f"    {held} source(s) kept — another release still "
+                          f"needs them.", "dim")
 
         self._log("", "")
         self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "
@@ -4199,6 +4337,11 @@ class RsrToolAPI:
                 self._log(f"    ✗ missing source: {f['name']} "
                           f"({f['size']:,} B, CRC {f['crc32']:08X})", "err")
                 return False
+            # Delete-after-rebuild works off this list and nothing else, so a
+            # path that resolves a source and forgets it is a source that can
+            # never be deleted. Only the RAR path recorded them, which quietly
+            # made the option a no-op for every ZIP release.
+            self._consumed.append(src)
             data = src.read_bytes()
             if impl == "stored":
                 streams[off] = data
@@ -4234,8 +4377,22 @@ class RsrToolAPI:
         holes = [list(h) for h in st.get("holes", [])]
         names = list(st.get("hole_names", []))
         streams = {}
+        # Two entries of the SAME name are legal in a ZIP, and capture stores
+        # their payloads by POSITION for exactly that reason. Resolving them
+        # back by name alone took the first record every time, so the second
+        # occurrence replayed the first one's bytes: a same-length pair sailed
+        # past the length check and only failed at the final hash, with nothing
+        # in the log to say why. Consume occurrences in order instead, which
+        # needs nothing new in the manifest and so works on already-captured
+        # .rsr files.
+        used: dict = {}
         for (off, ln), nm in zip(holes, names):
-            f = next((x for x in st["files"] if x["name"] == nm), None)
+            seen_n = used.get(nm, 0)
+            f = next((x for i, x in enumerate(st["files"])
+                      if x["name"] == nm
+                      and sum(1 for y in st["files"][:i] if y["name"] == nm)
+                      == seen_n), None)
+            used[nm] = seen_n + 1
             if f is None:
                 self._log(f"    ✗ {nm}: not described in the manifest.", "err")
                 return False
@@ -4252,6 +4409,7 @@ class RsrToolAPI:
                 self._log(f"    ✗ missing source: {nm} ({f['size']:,} B, "
                           f"CRC {f['crc32']:08X})", "err")
                 return False
+            self._consumed.append(src)          # see _rebuild_zip
             data = src.read_bytes()
             if len(data) != ln:
                 self._log(f"    ✗ {nm}: {len(data):,} B, expected {ln:,}.",
@@ -4453,7 +4611,7 @@ class RsrToolAPI:
             sizes: dict[int, list[Path]] = {}
             for p in content.rglob("*"):
                 try:
-                    if p.is_file() and p.suffix.lower() not in self._NOT_CONTENT:
+                    if p.is_file():
                         sizes.setdefault(p.stat().st_size, []).append(p)
                 except OSError:
                     continue
