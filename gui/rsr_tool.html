@@ -259,6 +259,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <label class="chk-row"><input type="checkbox" id="delete_content"
                      onchange="confirmDeleteContent(this)">
               Delete the unpacked file once its release is rebuilt &amp; verified</label>
+            <label class="chk-row"><input type="checkbox" id="metadata_releases" checked>
+              Also write the nfo-only releases (dirfix / nfofix) &mdash; they have
+              no content to match on</label>
             <div class="row">
               <button class="btn btn-go" id="btn-rebuild" onclick="startBatch()">Rebuild all</button>
               <span class="hint">matched on size + CRC32, not on name</span>
@@ -586,6 +589,7 @@ async function startBatch() {
     content: $('rb-root').value.trim(),
     out: $('rb-bout').value.trim(),
     delete_content: $('delete_content').checked,
+    metadata_releases: $('metadata_releases').checked,
   });
   if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
 }

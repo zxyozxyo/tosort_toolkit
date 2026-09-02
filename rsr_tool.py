@@ -4089,13 +4089,16 @@ class RsrToolAPI:
         if not self._db_path.is_file():
             return {"ok": False, "error": "No .rsr index yet — capture first"}
         delete_content = bool((cfg or {}).get("delete_content"))
+        # Default ON: without it these releases are simply unreachable from
+        # this screen, and a set is not complete without them.
+        with_meta = bool((cfg or {}).get("metadata_releases", True))
 
         def _bg():
             self._running = True
             self._stop.clear()
             self._size_map_cache = {}
             try:
-                self._rebuild_batch_run(root, out, delete_content)
+                self._rebuild_batch_run(root, out, delete_content, with_meta)
             except Exception as e:
                 self._log(f"Batch rebuild error: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
@@ -4117,7 +4120,8 @@ class RsrToolAPI:
             con.close()
 
     def _rebuild_batch_run(self, root: Path, out: Path,
-                           delete_content: bool = False):
+                           delete_content: bool = False,
+                           with_meta: bool = True):
         self._log("══ BATCH REBUILD ══", "info")
         self._content_root = root
         freed = 0
@@ -4265,11 +4269,72 @@ class RsrToolAPI:
                 self._log(f"    {held} source(s) kept — another release still "
                           f"needs them.", "dim")
 
+        if with_meta:
+            done += self._rebuild_metadata(matched, out)
+
         self._log("", "")
         self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "
                   f"{miss} unmatched file(s)."
                   + (f" {_human_bytes(freed)} of unpacked sources deleted."
                      if freed else ""), "ok" if not failed else "warn")
+
+    def _rebuild_metadata(self, matched: dict, out: Path) -> int:
+        """Write the releases that are nothing but an nfo.
+
+        A DIRFIX or NFOFIX release has no archive and therefore no content
+        file, and this screen finds its work by hashing loose content and
+        asking the index whose it is. There is nothing to hash for these, so
+        nothing could ever match, so they were never even attempted — they
+        captured fine and then quietly never came out again. They are not
+        matched, they are enumerated.
+
+        Scoped to the systems this run actually built, so pointing at a folder
+        of NDS roms does not also write out every GBA nfo in the store. A
+        release whose name carries no platform token is written whatever the
+        run built — 'Unknown' means we could not attribute it, not that it
+        belongs to some other system, and excluding it would strand it for
+        good. When the run built nothing there is nothing to scope by, so
+        everything is written."""
+        systems = {_release_system(rel) for rel in matched}
+        con = self._db()
+        try:
+            rows = con.execute(
+                "SELECT name, rsr_path FROM releases WHERE kind='metadata'"
+            ).fetchall()
+        finally:
+            con.close()
+        todo = [(n, rp) for n, rp in rows
+                if not systems
+                or _release_system(n) in systems
+                or _release_system(n) == "Unknown"]
+        if not todo:
+            return 0
+        self._log("", "")
+        self._log(f"══ {len(todo)} nfo-only release(s) ══", "info")
+        self._log("  no content to match on, so these are written straight "
+                  "from the store.", "dim")
+        n = 0
+        for rel, rp in sorted(todo):
+            if self._stop.is_set():
+                self._log("Stopped.", "warn")
+                break
+            dest = out / rel
+            rsr = Path(rp)
+            if not rsr.is_file():
+                self._log(f"  ✗ {rel}: .rsr missing from the store.", "err")
+                continue
+            self._consumed = []
+            try:
+                res = self._rebuild_run(rsr, dest, dest)
+            except Exception as e:
+                self._log(f"  ✗ {rel}: {e}", "err")
+                continue
+            if res.get("ok"):
+                n += 1
+                self._emit("row", {"name": rel, "status": "done",
+                                   "recipe": "nfo only", "kind": "ok"})
+        self._log(f"  ✓ {n} of {len(todo)} written.", "ok" if n else "warn")
+        return n
 
     def _delete_consumed(self, out: Path) -> int:
         """Delete the content files this release was rebuilt FROM. Bytes freed.
