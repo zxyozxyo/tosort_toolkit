@@ -1607,7 +1607,8 @@ class RsrToolAPI:
             except Exception:
                 pass
 
-    def _run(self, cmd: list, timeout: int, heartbeat: str = "") -> bool:
+    def _run(self, cmd: list, timeout: int, heartbeat: str = "",
+             cwd=None) -> bool:
         """Run a pack/extract command so that stop and skip can interrupt it.
 
         subprocess.run() is unkillable from another thread, so a skip pressed
@@ -1629,7 +1630,9 @@ class RsrToolAPI:
         # budget before a single combo had been tried.
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, **_no_window())
+                                 stderr=subprocess.DEVNULL,
+                                 cwd=(str(cwd) if cwd else None),
+                                 **_no_window())
         except Exception:
             return False
         with self._proc_lock:
@@ -3555,6 +3558,15 @@ class RsrToolAPI:
             return {"ok": False, "error": "skipped"}
         order = [f["name"] for f in meta]
         src_files = [srcdir / n for n in order]
+        # Does this archive keep directories in its packed names? The `x`
+        # above already extracted them that way, so the sources are laid out
+        # correctly on disk; it is the PACK side that has to stop passing -ep.
+        keep_paths = any(("/" in n or "\\" in n) for n in order)
+        if keep_paths:
+            deep = next(n for n in order if "/" in n or "\\" in n)
+            self._log(f"    packed names carry directories ({deep[:56]}) — "
+                      f"packing from the source root without -ep so the names "
+                      f"match.", "dim")
         # "The file exists" is not "the file is complete". A killed extract
         # leaves a partially written source behind, which passed the old
         # is_file() test and then went on to sweep against TRUNCATED bytes —
@@ -3743,7 +3755,8 @@ class RsrToolAPI:
                                         vol_bytes=sweep_vol,
                                         new_numbering=newnum, groups=mgroups,
                                         end_sig=want_end, hdr_ext=want_ext,
-                                        rung=di, rungs=len(cands))
+                                        rung=di, rungs=len(cands),
+                                        base=srcdir if keep_paths else None)
             if recipe:
                 break
             if self._budget_hit:
@@ -3793,6 +3806,7 @@ class RsrToolAPI:
                        "volume_bytes": vol_bytes, "naming": st["scheme"],
                        "new_numbering": newnum, "rr_pct": rr_pct,
                        "byte_split": st["byte_split"],
+                       "keep_paths": keep_paths,
                        "locked": arch_locked,
                        "comment": bool(comment)})
         if len(mgroups) > 1:
@@ -3801,7 +3815,8 @@ class RsrToolAPI:
             # every .rsr written before today still rebuilds unchanged.
             recipe["groups"] = [list(g) for g in mgroups]
         verify, volmeta, deltas = self._verify_replay(
-            recipe, src_files, vols, work, comment, st, si)
+            recipe, src_files, vols, work, comment, st, si,
+            base=srcdir if keep_paths else None)
         embedded.update(deltas)
         recipe["verify"] = verify
 
@@ -3944,7 +3959,7 @@ class RsrToolAPI:
 
     def _pack_cmds(self, ex: Path, fmt: str, dict_kb: int, mt: int, solid: bool,
                    groups, srcs: list, target: Path, tail=(),
-                   vol_args=()) -> list[list[str]] | None:
+                   vol_args=(), base=None) -> list[list[str]] | None:
         """The command SEQUENCE that builds this archive — usually one command.
 
         `groups` is [(level, count)] over `srcs` in archive order. One entry is
@@ -3954,18 +3969,42 @@ class RsrToolAPI:
 
         Volume switches and the recovery record go on the LAST command only:
         -v cannot be combined with appending at all (rar refuses to modify a
-        volume set), and an RR is written when the archive is finished."""
+        volume set), and an RR is written when the archive is finished.
+
+        `base` is the source root for an archive that STORES PATHS. Plenty do:
+        the PUSSYCAT header-fix collections pack
+        `Tangled_EUR_NDS-RobotKillers/B6TPv00.ups`, EXPERiENCE packs
+        `Ensata v1.4d/dlls/StrRes_eng.dll`, and XPA managed to pre two
+        releases straight off the FTP and one off somebody's desktop
+        (`home/glftpd/site/private/...`, `Documents and Settings/.../Desktop`).
+        `-ep` throws all of that away, so the sweep packed flat names, the
+        stream lookup — which is keyed on the name the ARCHIVE uses — never
+        matched, and the release walled after an exhaustive search that had
+        never once run the right command. Given a base, the sources are named
+        relative to it and `-ep` is dropped; the caller runs the command with
+        that base as its working directory, which is what makes rar store the
+        same names the original does."""
         cmds = []
         at = 0
         for gi, (level, count) in enumerate(groups):
             pre = self._pack_args(ex, fmt, level, dict_kb, mt)
             if pre is None:
                 return None
-            cmd = pre + ["-s" if solid else "-s-", "-ds", "-o+", "-y", "-ep",
-                         "-idcd"]
+            cmd = pre + ["-s" if solid else "-s-", "-ds", "-o+", "-y", "-idcd"]
+            if not base:
+                cmd.append("-ep")
             if gi == len(groups) - 1:
                 cmd += list(vol_args) + list(tail)
-            cmd += [str(target)] + [str(p) for p in srcs[at:at + count]]
+            names = []
+            for q in srcs[at:at + count]:
+                if base:
+                    try:
+                        names.append(os.path.relpath(str(q), str(base)))
+                        continue
+                    except ValueError:
+                        pass
+                names.append(str(q))
+            cmd += [str(target)] + names
             cmds.append(cmd)
             at += count
         return cmds or None
@@ -4085,7 +4124,8 @@ class RsrToolAPI:
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
                       new_numbering=True, groups=None, end_sig=None,
-                      hdr_ext=None, rung=0, rungs=1) -> dict | None:
+                      hdr_ext=None, rung=0, rungs=1,
+                      base=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -4175,7 +4215,8 @@ class RsrToolAPI:
                           "resumes from here.", "warn")
                 return None
             cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
-                                   probe_dir / "probe.rar", vol_args=vol_args)
+                                   probe_dir / "probe.rar", vol_args=vol_args,
+                                   base=base)
             if cmds is None:
                 continue
             tried += 1
@@ -4201,7 +4242,8 @@ class RsrToolAPI:
             t_one = time.monotonic()
             ran = all(self._run(c, timeout=900,
                                 heartbeat=f"sweep {tried}/{total} · -mt{n} · "
-                                          f"{_exe_label(ex.name)}")
+                                          f"{_exe_label(ex.name)}",
+                                cwd=base)
                       for c in cmds)
             if tried == 1 and not rung:
                 # Say up front what this release is going to cost. One combo
@@ -4296,7 +4338,8 @@ class RsrToolAPI:
     # ── replay + verify ───────────────────────────────────────────────────
 
     def _replay_cmds(self, recipe: dict, target: Path, srcs: list[str],
-                     comment_file: Path | None, fmt: str) -> list[list[str]] | None:
+                     comment_file: Path | None, fmt: str,
+                     base=None) -> list[list[str]] | None:
         """The command sequence that rebuilds this set — one entry, normally.
 
         A recipe carrying `groups` was assembled by successive `rar a` calls,
@@ -4326,10 +4369,10 @@ class RsrToolAPI:
             tail.append("-k")
         return self._pack_cmds(ex, fmt, recipe["dict_kb"], recipe["mt"],
                                recipe["solid"], groups, srcs, target,
-                               tail=tail, vol_args=vol_args)
+                               tail=tail, vol_args=vol_args, base=base)
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
-                fmt: str) -> list[Path] | None:
+                fmt: str, base=None) -> list[Path] | None:
         """Run the original command again and return the volumes it produced,
         in order."""
         out = work / "replay"
@@ -4347,7 +4390,8 @@ class RsrToolAPI:
             cfile.write_text(comment, encoding="utf-8", errors="replace",
                              newline="")
         cmds = self._replay_cmds(recipe, out / "replay.rar",
-                                 [str(p) for p in src_files], cfile, fmt)
+                                 [str(p) for p in src_files], cfile, fmt,
+                                 base=base)
         if not cmds:
             return None
         mb = sum(p.stat().st_size for p in src_files if p.is_file()) / (1 << 20)
@@ -4355,7 +4399,8 @@ class RsrToolAPI:
             if not self._run(c, timeout=3600,
                              heartbeat=f"replaying {recipe['version']} "
                                        f"{_mt_label(recipe.get('exe', ''), recipe['mt'])}"
-                                       f" over {mb:,.0f} MB"):
+                                       f" over {mb:,.0f} MB",
+                             cwd=base):
                 return None
         made = sorted(p for p in out.iterdir() if p.is_file())
         if not made:
@@ -4364,11 +4409,13 @@ class RsrToolAPI:
         ordered.sort(key=lambda p: _classify_volume(p.name)[2])
         return ordered or made
 
-    def _verify_replay(self, recipe, src_files, vols, work, comment, st, si=0):
+    def _verify_replay(self, recipe, src_files, vols, work, comment, st, si=0,
+                       base=None):
         """The whole point of capture-time: don't claim the recipe works, run
         it and compare. Returns ('exact'|'delta'|'none', volume records,
         {path-in-rsr: patch bytes})."""
-        produced = self._replay(recipe, src_files, work, comment, st["format"])
+        produced = self._replay(recipe, src_files, work, comment,
+                                st["format"], base=base)
         volmeta, deltas = [], {}
         # The -rr percentage was derived from the block size, which is rounded
         # to whole sectors — so a set can sit between two percentages. If the
@@ -5166,9 +5213,16 @@ class RsrToolAPI:
         srcdir = setwork / "src"
         srcdir.mkdir(parents=True, exist_ok=True)
         srcs = []
+        # An archive that stores directories has to be staged under them, or
+        # the replay packs the right bytes under the wrong names. The capture
+        # recorded which shape this is; anything captured before that flag
+        # existed is flat, as it always was.
+        keep_paths = bool(recipe.get("keep_paths"))
         for f in sorted(st["files"], key=lambda x: x["order"]):
             base = Path(f["name"]).name
-            dst = srcdir / base
+            rel_name = f["name"].replace("\\", "/") if keep_paths else base
+            dst = srcdir / rel_name
+            dst.parent.mkdir(parents=True, exist_ok=True)
             if f.get("stored"):
                 dst.write_bytes(z.read(f["stored"]))
             else:
@@ -5227,7 +5281,9 @@ class RsrToolAPI:
         comment = None
         if st.get("comment_b64"):
             comment = base64.b64decode(st["comment_b64"]).decode("utf-8", "replace")
-        produced = self._replay(recipe, srcs, setwork, comment, st["format"])
+        produced = self._replay(recipe, srcs, setwork, comment,
+                                st["format"],
+                                base=srcdir if keep_paths else None)
         if not produced:
             self._log("    ✗ replay produced nothing.", "err")
             return False
