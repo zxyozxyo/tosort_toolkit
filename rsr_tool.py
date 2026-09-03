@@ -173,6 +173,10 @@ _SIDECAR_EXT = {".nfo", ".sfv", ".diz", ".txt", ".jpg", ".jpeg", ".png", ".gif",
 _FOREIGN_ARCHIVE_EXT = {".lzh", ".lha", ".lzx", ".arj", ".ace", ".7z", ".zoo",
                         ".arc", ".cab", ".tar", ".gz", ".bz2", ".xz", ".sit"}
 
+# Guards the window in which _open_rar() swaps rarfile's comment decompressor
+# out and back; two captures in one process must not interleave there.
+_RAR_COMMENT_LOCK = threading.RLock()
+
 _FIX_TAGS = ("DIRFIX", "NFOFIX", "PROOFFIX", "SFVFIX", "SAMPLEFIX",
              "RARFIX", "SUBFIX", "SYNCFIX")
 
@@ -580,6 +584,45 @@ def group_archive_sets(base: Path) -> list[dict]:
     return sets
 
 
+# RAR4 main archive header flags (the byte pair at offset 10).
+MHD_LOCK = 0x0004
+MHD_SOLID = 0x0008
+
+
+def main_flags(head: Path) -> int:
+    """The RAR4 main archive header flags, or 0.
+
+    Two of these bits are switches nothing else can tell you about, because
+    they say something about the ARCHIVE and every other probe in here reads
+    FILE headers:
+
+      * MHD_SOLID — an archive packed with -s. With more than one file the
+        file headers give it away too, since every file after the first
+        carries its own solid bit. With ONE file they do not: `rar a -s` sets
+        this flag and leaves the single file header looking exactly like -s-.
+        Micronauts pack one .nds per archive, so the capture read "-s-", and
+        every replay came out with the wrong main header.
+
+      * MHD_LOCK — an archive packed with -k. Nothing in a file header
+        records it at all.
+
+    Between them they were the whole of the Lego_Batman and Nancy_Drew
+    "replay unverified": the recovery record matched to the byte, the stream
+    matched, nine of eleven volumes already had identical data offsets, and
+    the two flags moved everything. With -s -k the set reproduces 11/11
+    byte-identical."""
+    if _rar_format(head) != "RAR4":
+        return 0
+    try:
+        with open(head, "rb") as f:
+            data = f.read(12)
+    except OSError:
+        return 0
+    if len(data) < 12 or data[9] != 0x73:      # main header block type
+        return 0
+    return int.from_bytes(data[10:12], "little")
+
+
 def new_numbering(head: Path) -> bool:
     """Whether the archive was written with `.partN.rar` numbering.
 
@@ -695,6 +738,47 @@ def _explain_error(reason: str) -> str:
             "the log lines above it.")
 
 
+def _open_rar(head, info_callback=None):
+    """rarfile.RarFile, except that a FILE comment can never stop the parse.
+
+    rarfile decompresses a RAR3 per-file comment while parsing, and RAR3
+    comment decompression is one of the things it shells out to an external
+    unrar for. There is no unrar on this machine and there does not need to
+    be — the build pack ships rar.exe, the packer, and every extract this tool
+    does goes through that. So Micronauts' Lego_Batman and Nancy_Drew, which
+    carry a file comment, came out of a scan as
+
+        ERROR: Cannot find working tool
+        rarfile.RarCannotExec: Cannot find working tool
+
+    and a forty-line Python traceback, with no row, no recorded miss and no
+    hint that the release was fine and the parser was not. (The pair had an
+    older `replay unverified` against them from a run that got further, which
+    is what made this look like a compression problem for so long.)
+
+    Nothing in here ever reads a file comment. The ARCHIVE comment is a
+    separate field, is captured from `rf.comment`, and on these two is None
+    anyway. So when — and only when — the tool is what is missing, re-open
+    with the comment decompressor stubbed and carry on with the block offsets
+    and sizes that were the only thing wanted."""
+    import rarfile
+    try:
+        return rarfile.RarFile(str(head), info_callback=info_callback)
+    except rarfile.RarCannotExec:
+        with _RAR_COMMENT_LOCK:
+            orig = rarfile.rar3_decompress
+            rarfile.rar3_decompress = lambda *a, **kw: b""
+            try:
+                rf = rarfile.RarFile(str(head), info_callback=info_callback)
+            finally:
+                rarfile.rar3_decompress = orig
+        # The stub blanked the ARCHIVE comment too, and that one matters: it is
+        # packed back with -z and it occupies real bytes in the first volume.
+        # Flag it so the caller can go and fetch it properly.
+        rf._rsr_comment_stubbed = True
+        return rf
+
+
 def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
     """{packed file name: [(volume, offset, length), …]} — where each file's
     COMPRESSED bytes physically live, in order, across the whole set.
@@ -720,7 +804,7 @@ def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
         blocks.setdefault(h.filename, []).append(
             (str(h.volume_file), int(h.data_offset), int(h.add_size)))
 
-    rf = rarfile.RarFile(str(head), info_callback=cb)
+    rf = _open_rar(head, cb)
     rf.close()
     return blocks
 
@@ -1036,7 +1120,7 @@ def recovery_record(head: Path) -> int:
             total += int(getattr(h, "add_size", 0) or 0)
 
     try:
-        rf = rarfile.RarFile(str(head), info_callback=cb)
+        rf = _open_rar(head, cb)
         rf.close()
     except Exception:
         return 0
@@ -1554,6 +1638,45 @@ class RsrToolAPI:
                 "expected": str(root), "chosen": want}
 
     # ── the WinRAR build pack ─────────────────────────────────────────────
+
+    def _comment_via_rar(self, head: Path) -> str:
+        """The archive comment, read with rar.exe instead of rarfile.
+
+        rarfile needs an unrar binary to decompress a RAR3 comment and there
+        is none here; the build pack is rar.exe, the packer. But `rar cw`
+        writes the comment out, and the packer does that perfectly well — so
+        the one thing the stub in _open_rar() costs us is recoverable from the
+        232 executables already sitting in the pack.
+
+        This is not cosmetic. Micronauts' Lego_Batman carries WinRAR's own
+        default comment, 56 bytes of it, and it occupies 97 bytes of the first
+        volume. Without it the replay's first volume is 97 bytes short, every
+        following byte shifts, and eleven volumes that are otherwise correct
+        down to the recovery record come back as "replay unverified"."""
+        exes = self._pack_exes()
+        if not exes:
+            return ""
+        work = Path(tempfile.mkdtemp(prefix="rsr-cmt-"))
+        try:
+            out = work / "comment.txt"
+            for exe in reversed(exes[-4:]):        # newest first
+                try:
+                    subprocess.run([str(exe), "cw", str(head), str(out)],
+                                   capture_output=True, timeout=120,
+                                   cwd=str(work), **_no_window())
+                except Exception:
+                    continue
+                if out.is_file() and out.stat().st_size:
+                    raw = out.read_bytes()
+                    for enc in ("utf-8", "cp437", "latin-1"):
+                        try:
+                            return raw.decode(enc)
+                        except UnicodeDecodeError:
+                            continue
+                    return raw.decode("utf-8", "replace")
+            return ""
+        finally:
+            _rmtree(work)
 
     def _pack_exes(self) -> list[Path]:
         pack = self._app_dir / "apps" / "winrar_pack-4.20"
@@ -3075,7 +3198,7 @@ class RsrToolAPI:
                 ends.append(int(getattr(h, "flags", 0) or 0))
 
         try:
-            rf = rarfile.RarFile(str(head), info_callback=_end_cb)
+            rf = _open_rar(head, _end_cb)
         except Exception as e:
             if "first volume" in str(e).lower():
                 # Started mid-set: the head volume is in another folder.
@@ -3085,8 +3208,15 @@ class RsrToolAPI:
         try:
             infos = [i for i in rf.infolist() if i.is_file()]
             comment = rf.comment
+            stubbed = getattr(rf, "_rsr_comment_stubbed", False)
         finally:
             rf.close()
+        if stubbed and not comment:
+            comment = self._comment_via_rar(head)
+            if comment:
+                self._log(f"    archive comment recovered with rar.exe "
+                          f"({len(comment)} chars) — rarfile could not read it "
+                          f"without an unrar binary.", "dim")
         if ends and ends[-1] & 0x0001:
             return {"ok": False, "partial": True,
                     "error": "partial set: the archive continues into a "
@@ -3095,7 +3225,16 @@ class RsrToolAPI:
             return {"ok": False, "error": "no packed files"}
 
         meta = self._read_files(infos, st["format"])
-        solid = any(f["solid"] for f in meta)
+        mflags = main_flags(head)
+        # The main header is the authority on both of these; see main_flags().
+        solid = any(f["solid"] for f in meta) or bool(mflags & MHD_SOLID)
+        # NOT `locked` — that name is taken further down by the list of
+        # source files antivirus grabbed after extraction, and a truthy empty
+        # list quietly swallowed this flag once already.
+        arch_locked = bool(mflags & MHD_LOCK)
+        if arch_locked:
+            self._log("    archive is LOCKED (-k) — the replay will lock too.",
+                      "dim")
         comp = next((f for f in meta if f["method"] != 0), meta[0])
         level = comp["method"]
         dict_kb = comp["dict_kb"]
@@ -3385,6 +3524,7 @@ class RsrToolAPI:
                        "volume_bytes": vol_bytes, "naming": st["scheme"],
                        "new_numbering": newnum, "rr_pct": rr_pct,
                        "byte_split": st["byte_split"],
+                       "locked": arch_locked,
                        "comment": bool(comment)})
         if len(mgroups) > 1:
             # Only when it means something. A single-group recipe replays
@@ -3911,6 +4051,10 @@ class RsrToolAPI:
             tail.append(f"-rr{recipe['rr_pct']}p")
         if comment_file:
             tail.append(f"-z{comment_file}")
+        if recipe.get("locked"):
+            # Tail, so it lands on the last command only — rar cannot append
+            # to an archive it has already locked.
+            tail.append("-k")
         return self._pack_cmds(ex, fmt, recipe["dict_kb"], recipe["mt"],
                                recipe["solid"], groups, srcs, target,
                                tail=tail, vol_args=vol_args)
@@ -3926,7 +4070,13 @@ class RsrToolAPI:
         cfile = None
         if comment:
             cfile = work / "comment.txt"
-            cfile.write_text(comment, encoding="utf-8", errors="replace")
+            # newline="" or Python translates the line endings on the way
+            # out, and a comment that already holds CRLF — WinRAR's own
+            # default one does — goes to disk as CR CR LF. Two extra bytes a
+            # line is enough to move every byte of a 50 MB eleven-volume set
+            # and lose the whole thing as "replay unverified".
+            cfile.write_text(comment, encoding="utf-8", errors="replace",
+                             newline="")
         cmds = self._replay_cmds(recipe, out / "replay.rar",
                                  [str(p) for p in src_files], cfile, fmt)
         if not cmds:
