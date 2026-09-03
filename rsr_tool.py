@@ -170,7 +170,10 @@ _SIDECAR_EXT = {".nfo", ".sfv", ".diz", ".txt", ".jpg", ".jpeg", ".png", ".gif",
 # release is complete and correctly stored and simply cannot be described by a
 # format that replays rar.exe, while a folder of loose files has lost the
 # archive it came in.
-_FOREIGN_ARCHIVE_EXT = {".lzh", ".lha", ".lzx", ".arj", ".ace", ".7z", ".zoo",
+# .lha/.lzh are NOT here — the scanner reads those now. .lzx stays: it is
+# Amiga LZX, a different format that merely looks related, and the corpus holds
+# exactly one (TB1SS.LZX, whose first bytes are "LZX" then a NUL).
+_FOREIGN_ARCHIVE_EXT = {".lzx", ".arj", ".ace", ".7z", ".zoo",
                         ".arc", ".cab", ".tar", ".gz", ".bz2", ".xz", ".sit"}
 
 # Guards the window in which _open_rar() swaps rarfile's comment decompressor
@@ -807,6 +810,123 @@ def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
     rf = _open_rar(head, cb)
     rf.close()
     return blocks
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LHA / LZH
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The 1996 PSX DOX scene packed in LHA, not RAR or ZIP: 329 releases of the
+# corpus, the single largest thing the scanner could not read. The container
+# yields to exactly the same skeleton trick as ZIP — headers carried verbatim,
+# member data cut out — so nothing here has to model an LHA header field.
+#
+# What it does NOT yield is the compression. `-lh5-` is LZSS over an 8 KB
+# window with per-block static Huffman, and reproducing a given encoder's
+# output bit for bit means reimplementing that encoder's match finder. There
+# is no lha binary on this machine and no preflate equivalent for LZH, so an
+# `-lh5-` stream can only be carried, never derived. Measured over all 329:
+# deflating an `-lh5-` stream returns 100.1% of it, so carrying every stream
+# makes a .rsr the size of the archive — which is the one shape this format
+# exists to avoid.
+#
+# `-lh0-` is stored, and a stored member IS its file. Where the biggest member
+# is `-lh0-` the content can be supplied loose at rebuild exactly as it is for
+# RAR and ZIP, and the capture is a real one. That is what this path does, and
+# it declines the rest honestly rather than writing a copy of the archive.
+
+LHA_METHODS = (b"-lh0-", b"-lh1-", b"-lh2-", b"-lh3-", b"-lh4-", b"-lh5-",
+               b"-lh6-", b"-lh7-", b"-lzs-", b"-lz4-", b"-lz5-", b"-pm0-",
+               b"-pm2-")
+LHA_STORED = ("-lh0-", "-lz4-", "-pm0-")
+
+
+def _u16(b: bytes, o: int) -> int:
+    return int.from_bytes(b[o:o + 2], "little")
+
+
+def lha_members(raw: bytes) -> list[dict] | None:
+    """Every member of an LHA/LZH archive with the exact byte range its data
+    occupies, or None if this is not one.
+
+    Header levels 0, 1 and 2 all appear in the corpus (0 and 1 dominate, 2,005
+    and 1,331 members). Level 1 is the one with a trap: its size field is a
+    SKIP size covering the extended headers as well as the data, and the size
+    of the first extended header is the last word of the BASE header — at
+    `i + hs`, not after it. Reading it two bytes later reads compressed data as
+    a header length, which walks off the end of the file; that alone accounted
+    for 210 of 330 archives looking corrupt when they are all fine."""
+    out: list[dict] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        if n - i < 22 or raw[i] == 0:
+            break                              # 0 byte terminates the archive
+        meth = raw[i + 2:i + 7]
+        if meth not in LHA_METHODS:
+            return None if not out else out
+        csize, osize = struct.unpack("<II", raw[i + 7:i + 15])
+        lvl = raw[i + 20]
+        try:
+            if lvl in (0, 1):
+                hs = raw[i]
+                nl = raw[i + 21]
+                name = raw[i + 22:i + 22 + nl]
+                crc = _u16(raw, i + 22 + nl)
+                if lvl == 0:
+                    data, dsize = i + 2 + hs, csize
+                else:
+                    # Level 1: walk the extended-header chain. Each header
+                    # ends with the size of the next one; a size of 0 ends
+                    # the chain and the data starts there.
+                    esz = _u16(raw, i + hs)    # NOT i + hs + 2
+                    j, ext = i + 2 + hs, 0
+                    while esz:
+                        ext += esz
+                        if j + esz > n:
+                            return out or None
+                        nxt = _u16(raw, j + esz - 2)
+                        j += esz
+                        esz = nxt
+                    data, dsize = j, csize - ext
+            elif lvl == 2:
+                hs = _u16(raw, i)
+                crc = _u16(raw, i + 21)
+                name = b""
+                data, dsize = i + hs, csize
+            else:
+                return out or None
+        except (IndexError, struct.error):
+            return out or None
+        if dsize < 0 or data + dsize > n:
+            return out or None
+        out.append({
+            "name": name.decode("cp437", "replace").replace("\\", "/"),
+            "method": meth.decode("ascii"),
+            "level": lvl,
+            "data_offset": data,
+            "packed_size": dsize,
+            "size": osize,
+            "crc16": crc,
+        })
+        i = data + dsize
+    return out or None
+
+
+def lha_skeleton(raw: bytes, ents: list[dict]) -> tuple[bytes, list]:
+    """The archive with every member's data cut out, plus where it was.
+
+    Byte-for-byte the same idea as zip_skeleton: headers, the terminating 0
+    and any padding are all carried, so a rebuild never has to write an LHA
+    header field of its own."""
+    holes = sorted((e["data_offset"], e["packed_size"]) for e in ents)
+    skel = bytearray()
+    pos = 0
+    for off, ln in holes:
+        skel += raw[pos:off]
+        pos = off + ln
+    skel += raw[pos:]
+    return bytes(skel), [list(h) for h in holes]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2059,6 +2179,11 @@ class RsrToolAPI:
             if ".zip" in kinds:
                 zips = sorted(p for p in folder.rglob("*.zip") if p.is_file())
                 return self._capture_zip(folder, store, s, rel, zips)
+            if kinds & {".lha", ".lzh"}:
+                lhas = sorted(q for q in folder.rglob("*")
+                              if q.is_file()
+                              and q.suffix.lower() in (".lha", ".lzh"))
+                return self._capture_lha(folder, store, s, rel, lhas)
             # A metadata-only fix (DIRFIX, NFOFIX, …) IS the release — it never
             # had an archive, so reporting "no archive set found" calls a
             # complete release a miss and buries it among the real ones. There
@@ -2079,9 +2204,9 @@ class RsrToolAPI:
                 # archives when it is nothing but archive. Nothing here is
                 # broken and nothing is missing; the format is simply outside
                 # what this tool packs.
-                self._log(f"  {', '.join(foreign)} archive — outside the RAR "
-                          f"and ZIP formats this tool reproduces. Not a miss: "
-                          f"there is no recipe to look for.", "warn")
+                self._log(f"  {', '.join(foreign)} archive — outside the "
+                          f"RAR, ZIP and LHA formats this tool reads. Not a "
+                          f"miss: there is no recipe to look for.", "warn")
                 return {"ok": False,
                         "error": f"unsupported archive format "
                                  f"({', '.join(foreign)})"}
@@ -2732,6 +2857,150 @@ class RsrToolAPI:
             pos = off + ln
         skel += pcf[pos:]
         return bytes(skel), holes
+
+    def _capture_lha(self, folder: Path, store: Path, s: dict, rel: str,
+                     archives: list[Path]) -> dict:
+        """Capture an LHA/LZH release: headers verbatim, stored members loose.
+
+        The same contract as everywhere else — the .rsr is written only after
+        it has been reassembled here and compared byte for byte with the
+        original archive.
+
+        The honest limit is stated in the LHA section above: an `-lh5-` stream
+        can only be carried, never derived. So a capture comes out at one of
+        two grades, and the manifest records which:
+
+          * `skeleton` — the content member is stored, so it is supplied loose
+            at rebuild exactly as a rom is, and the .rsr is a real recipe
+            (~65% of the archive across the 42 that qualify);
+          * `carried` — the content member is compressed, so every stream is
+            carried and the .rsr weighs about what the archive does. It is a
+            verified container rather than a recipe. Worth keeping, because a
+            complete indexed corpus that rebuilds is worth more than the
+            bytes — but labelled, so nothing downstream reads it as a recipe.
+        """
+        manifest = {
+            "rsr_version": RSR_VERSION, "magic": RSR_MAGIC,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
+            "host": {"platform": platform.platform(),
+                     "python": platform.python_version()},
+            "release": rel, "system": _release_system(rel),
+            "year": _release_year(folder, rel), "tag": _release_tag(folder.name),
+            "kind": "lha", "source_folder": str(folder), "sets": [],
+        }
+        embedded: dict[str, bytes] = {}
+        cap_b = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+        for ai, ap in enumerate(archives):
+            raw = ap.read_bytes()
+            ents = lha_members(raw)
+            if not ents:
+                self._log(f"  ✗ {ap.name}: not a readable LHA archive.", "err")
+                return {"ok": False, "error": f"{ap.name}: unreadable LHA"}
+            skel, holes = lha_skeleton(raw, ents)
+            meths = ", ".join(sorted({e["method"] for e in ents}))
+            self._log(f"  {ap.name}  ·  LHA  ·  {len(ents)} member(s)  ·  "
+                      f"{meths}  ·  {len(skel):,} B of header carried verbatim",
+                      "dim")
+            biggest = max((e["size"] or 0) for e in ents)
+            big_e = max(ents, key=lambda e: e["size"] or 0)
+            # The grade of this set. A stored content member can be handed
+            # back loose at rebuild and the capture is a recipe; a compressed
+            # one cannot be, so everything has to be carried.
+            derivable = big_e["method"] in LHA_STORED
+            if not derivable:
+                self._log(f"    the content member ({big_e['name']}) is "
+                          f"{big_e['method']} — an LZH stream cannot be "
+                          f"derived, so every member is carried and this is a "
+                          f"container rather than a recipe.", "dim")
+            files = []
+            for idx, e in enumerate(ents):
+                blob = raw[e["data_offset"]:
+                           e["data_offset"] + e["packed_size"]]
+                rec = dict(e)
+                big = ((e["size"] or 0) >= biggest
+                       or (cap_b and (e["size"] or 0) >= cap_b))
+                stored = e["method"] in LHA_STORED
+                loose = big and stored and derivable
+                rec["source"] = "content" if loose else "extra"
+                # A stored member IS its file, so its CRC32 is computable
+                # and the index gets a real one. A compressed member's is not,
+                # without an LZH decoder — it is carried verbatim and never
+                # looked up by hash, so NULL is the honest value.
+                rec["crc32"] = zlib.crc32(blob) if stored else None
+                if loose:
+                    # It can be matched back by hash and handed in loose at
+                    # rebuild, same as a rom.
+                    rec["sha256"] = _sha256(blob)
+                    rec["recipe"] = {"impl": "stored", "label": "stored"}
+                else:
+                    key = f"lha/{ai}/{idx}.bin"
+                    embedded[key] = blob
+                    rec["stored"] = key
+                    rec["recipe"] = {"impl": "verbatim", "label": "carried"}
+                files.append(rec)
+
+            # Prove it before anything is written: put every member back and
+            # compare with the archive on disk.
+            streams = {}
+            for rec, e in zip(files, ents):
+                off = e["data_offset"]
+                streams[off] = (embedded[rec["stored"]] if rec.get("stored")
+                                else raw[off:off + e["packed_size"]])
+            if zip_assemble(skel, holes, streams) != raw:
+                self._log(f"  ✗ {ap.name}: reassembly did not reproduce the "
+                          f"archive byte-exact — refusing it.", "err")
+                return {"ok": False,
+                        "error": f"{ap.name}: reassembly not byte-exact"}
+
+            key = f"lha/{ai}/skeleton.bin"
+            embedded[key] = skel
+            total = sum(len(zlib.compress(v, 9)) for k, v in embedded.items()
+                        if k.startswith(f"lha/{ai}/"))
+            # A container should weigh about what the archive does.
+            # Meaningfully MORE is not a container, it is a bug — so this is a
+            # sanity guard now, not a size policy.
+            if total > len(raw) * 1.15:
+                self._log(f"    ✗ the .rsr would be {total:,} B for a "
+                          f"{len(raw):,} B archive — larger than the thing it "
+                          f"describes, which should not happen. Refusing.",
+                          "err")
+                return {"ok": False,
+                        "error": f"{ap.name}: capture larger than the archive"}
+            n_extra = sum(1 for f in files if f["source"] == "extra")
+            pct = total / max(len(raw), 1) * 100
+            if derivable:
+                self._log(f"    RECIPE — {n_extra} member(s) carried, content "
+                          f"supplied at rebuild: {total:,} B against a "
+                          f"{len(raw):,} B archive ({pct:.0f}%).", "ok")
+            else:
+                self._log(f"    CONTAINER — all {n_extra} member(s) carried: "
+                          f"{total:,} B against a {len(raw):,} B archive "
+                          f"({pct:.0f}%). Verified and rebuildable, but not a "
+                          f"recipe.", "dim")
+            manifest["sets"].append({
+                "stem": ap.stem, "format": "LHA", "name": ap.name,
+                "size": len(raw), "sha256": _sha256(raw),
+                "method": "skeleton" if derivable else "carried",
+                "skeleton": key,
+                "holes": [[h[0], h[1]] for h in holes],
+                "hole_names": [e["name"] for e in
+                               sorted(ents, key=lambda x: x["data_offset"])],
+                "files": files, "verify": "exact",
+            })
+
+        if not manifest["sets"]:
+            return {"ok": False, "error": "no LHA archive captured"}
+        manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
+                                                      manifest)
+        out_dir = self._store_dir(store, folder, rel)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rsr_path = out_dir / f"{rel}.rsr"
+        self._write_rsr(rsr_path, manifest, embedded)
+        self._db_record(manifest, rsr_path)
+        self._log(f"  ✓ {rsr_path.name} written "
+                  f"({rsr_path.stat().st_size:,} B) — VERIFIED", "ok")
+        return {"ok": True, "recipe": "LHA skeleton"}
 
     def _capture_zip(self, folder: Path, store: Path, s: dict, rel: str,
                      zips: list[Path]) -> dict:
@@ -4793,6 +5062,55 @@ class RsrToolAPI:
                   f"hash-exact.", "ok")
         return True
 
+    def _rebuild_lha(self, st: dict, z, content: Path, out: Path) -> bool:
+        """Put an LHA archive back together from the skeleton and its members.
+
+        Simpler than the ZIP rebuild for the one reason that makes LHA worth
+        so little as a recipe: nothing is derived. Every compressed member was
+        carried, and the only thing asked of the caller is the stored content
+        member, matched back by hash exactly as a rom is."""
+        name = st["name"]
+        holes = [list(h) for h in st.get("holes", [])]
+        names = list(st.get("hole_names", []))
+        streams = {}
+        used: dict = {}
+        for (off, ln), nm in zip(holes, names):
+            seen_n = used.get(nm, 0)
+            f = next((x for i, x in enumerate(st["files"])
+                      if x["name"] == nm
+                      and sum(1 for y in st["files"][:i] if y["name"] == nm)
+                      == seen_n), None)
+            used[nm] = seen_n + 1
+            if f is None:
+                self._log(f"    ✗ {nm}: not described in the manifest.", "err")
+                return False
+            if f.get("stored"):
+                data = z.read(f["stored"])
+            else:
+                src = self._source_by_hash(content, f)
+                if src is None:
+                    self._log(f"    ✗ missing source: {nm} "
+                              f"({f['size']:,} B)", "err")
+                    return False
+                self._consumed.append(src)
+                data = src.read_bytes()
+            if len(data) != ln:
+                self._log(f"    ✗ {nm}: {len(data):,} B, expected {ln:,}.",
+                          "err")
+                return False
+            streams[off] = data
+        rebuilt = zip_assemble(z.read(st["skeleton"]), holes, streams)
+        if _sha256(rebuilt) != st["sha256"]:
+            self._log(f"    ✗ {name}: rebuilt archive does not match "
+                      f"({len(rebuilt):,} vs {st['size']:,} B).", "err")
+            return False
+        dst = out / st.get("folder", "") / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(rebuilt)
+        self._log(f"    ✓ {name}  {len(rebuilt):,} B — rebuilt from the "
+                  f"skeleton, hash-exact.", "ok")
+        return True
+
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
         manifest, z = self.read_rsr(rsr)
         try:
@@ -4810,6 +5128,9 @@ class RsrToolAPI:
                         break
                     if st.get("format") == "ZIP":
                         ok_all &= self._rebuild_zip(st, z, content, out, work)
+                        continue
+                    if st.get("format") == "LHA":
+                        ok_all &= self._rebuild_lha(st, z, content, out)
                         continue
                     if not st.get("recipe"):
                         self._log(f"  {st.get('stem')}: no recipe captured — "
