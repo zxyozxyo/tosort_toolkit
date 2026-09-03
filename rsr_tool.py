@@ -3334,7 +3334,8 @@ class RsrToolAPI:
                                         year, grp, self._deadline, rel,
                                         vol_bytes=sweep_vol,
                                         new_numbering=newnum, groups=mgroups,
-                                        end_sig=want_end, hdr_ext=want_ext)
+                                        end_sig=want_end, hdr_ext=want_ext,
+                                        rung=di, rungs=len(cands))
             if recipe:
                 break
             if self._budget_hit:
@@ -3675,7 +3676,7 @@ class RsrToolAPI:
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
                       new_numbering=True, groups=None, end_sig=None,
-                      hdr_ext=None) -> dict | None:
+                      hdr_ext=None, rung=0, rungs=1) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -3793,24 +3794,36 @@ class RsrToolAPI:
                                 heartbeat=f"sweep {tried}/{total} · -mt{n} · "
                                           f"{_exe_label(ex.name)}")
                       for c in cmds)
-            if tried == 1:
+            if tried == 1 and not rung:
                 # Say up front what this release is going to cost. One combo
                 # tells you whether an exhaustive sweep is minutes or weeks,
                 # and that is worth knowing at combo 1 rather than hour 3.
+                #
+                # Counting ONE rung of the dictionary ladder was the reason
+                # this number kept being wrong by a factor of three: a header
+                # that says -md1024KB and does not reproduce sends the whole
+                # sweep round again at 2048 and again at 4096, so the estimate
+                # promised "0.1h, budget allows 8,723 of 3,944" three separate
+                # times while the release quietly spent 12 minutes and parked.
+                # Quote the ladder, and quote it once instead of once a rung.
                 per = time.monotonic() - t_one
+                worst = total * max(rungs, 1)
                 allows = (int(max(deadline - t_one, 0) / max(per, 1e-6))
                           if deadline else None)
                 msg = (f"    ~{per:,.1f}s per combo at this size — "
-                       f"{total:,} would take {total * per / 3600:,.1f}h")
+                       f"{worst:,} would take {worst * per / 3600:,.1f}h")
+                if rungs > 1:
+                    msg += (f" ({total:,} per dictionary × {rungs} on the "
+                            f"ladder)")
                 if allows is not None:
                     msg += f"; budget allows about {allows:,}"
                 self._log(msg, "dim")
-                if allows is not None and allows < total:
+                if allows is not None and allows < worst:
                     # Name the shortfall rather than making it a subtraction
                     # the operator has to do in their head while it runs.
-                    self._log(f"    ⏱ budget covers {allows:,} of {total:,} "
-                              f"— {total - allows:,} short "
-                              f"(~{(total - allows) * per / 60:,.0f} min more). "
+                    self._log(f"    ⏱ budget covers {allows:,} of {worst:,} "
+                              f"— {worst - allows:,} short "
+                              f"(~{(worst - allows) * per / 60:,.0f} min more). "
                               f"Press '{UI_FINISH_ONE}' to lift it for this "
                               f"release.", "warn")
             if not ran:
