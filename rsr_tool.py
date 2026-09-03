@@ -2474,32 +2474,87 @@ class RsrToolAPI:
 
     @staticmethod
     def _pcf_cut(pcf: bytes, payloads: list) -> tuple | None:
-        """Take the content payloads back out of the .pcf.
+        """Take the entry payloads back out of the .pcf.
 
         Same trick as the ZIP skeleton: what is left is headers and preflate's
         reconstruction data — 86 KB against 34 MB of rom on Dragon_Dance — and
-        the content is supplied again at rebuild."""
-        # Search FORWARD from the last match, in archive order. A plain find()
-        # per entry breaks the moment two entries hold the same bytes — the
-        # 2005 LGC trainers ship bunzip2.exe and bzip2.exe byte-identical, so
-        # both resolved to the same offset and the holes overlapped, which read
-        # as "the content is not a contiguous run" when it was there twice.
-        holes = []
-        cur = 0
-        for name, data in payloads:
-            if not data:
+        the content is supplied again at rebuild.
+
+        `payloads` is (name, expanded, raw) per entry, and BOTH forms have to
+        be looked for, because a .pcf is a mixture of the two. precomp expands
+        the streams whose parameters preflate can derive and LEAVES THE REST
+        COMPRESSED, silently — CYB_COV1 is 14 jpgs of which it expands 12 and
+        skips BUSTMV2F and INTMO-F. Searching only for the expanded form found
+        12 of 14 and reported "the content is not a contiguous run", which read
+        as a preflate failure when preflate had in fact reconstructed the
+        archive perfectly. That is why the many-file zips all failed together
+        and the three-entry ones mostly passed: one skipped stream is enough,
+        and the more streams an archive has the likelier one is skipped.
+
+        The walk is forward-only, so the holes come out in ascending order and
+        hole i is payload i — an invariant the caller and the manifest both
+        rely on. Where a payload matches in more than one place it BACKTRACKS
+        rather than committing to the first hit: identical members are legal
+        (the 2005 LGC trainers ship bunzip2.exe and bzip2.exe byte-identical)
+        and a two-byte member — CDRUTILS ships a 2 B FRL.NFO — matches almost
+        anywhere, so the first hit is not always the one that lets the rest of
+        the archive resolve."""
+        n = len(payloads)
+        for _nm, exp, rawb in payloads:
+            if not exp and not rawb:
+                return None                      # nothing to look for
+
+        MAX_CAND = 64                            # per entry
+        MAX_STEPS = 50_000                       # over the whole walk
+
+        def cands(i: int, start: int) -> list:
+            """Where payload i could sit at or after `start`, nearest first."""
+            out, seen = [], set()
+            exp, rawb = payloads[i][1], payloads[i][2]
+            forms = [("expanded", exp)]
+            if rawb and rawb != exp:
+                forms.append(("raw", rawb))
+            for form, data in forms:
+                if not data:
+                    continue
+                probe = data[:1 << 16]
+                j = pcf.find(probe, start)
+                while j >= 0 and len(out) < MAX_CAND:
+                    if j not in seen and pcf[j:j + len(data)] == data:
+                        seen.add(j)
+                        out.append((j, len(data), form))
+                    j = pcf.find(probe, j + 1)
+            out.sort()
+            return out
+
+        # Iterative, not recursive: a zip may hold thousands of members and
+        # one frame per member would run into the interpreter's stack limit.
+        holes: list = []
+        levels: list = []
+        i = steps = 0
+        while i < n:
+            if steps > MAX_STEPS:
                 return None
-            i = pcf.find(data[:1 << 16], cur)
-            while i >= 0 and pcf[i:i + len(data)] != data:
-                i = pcf.find(data[:1 << 16], i + 1)
-            if i < 0:
-                return None
-            holes.append([i, len(data), name])
-            cur = i + len(data)
-        holes.sort()
+            if i == len(levels):
+                start = holes[-1][0] + holes[-1][1] if holes else 0
+                levels.append([cands(i, start), 0])
+            cs, k = levels[i]
+            if k >= len(cs):
+                levels.pop()
+                i -= 1
+                if i < 0:
+                    return None                  # no arrangement works
+                holes.pop()
+                levels[i][1] += 1
+                continue
+            off, ln, form = cs[k]
+            steps += 1
+            holes.append([off, ln, payloads[i][0], form])
+            i += 1
+
         skel = bytearray()
         pos = 0
-        for off, ln, _n in holes:
+        for off, ln, _nm, _form in holes:
             if off < pos:
                 return None                      # overlapping payloads
             skel += pcf[pos:off]
@@ -2556,6 +2611,9 @@ class RsrToolAPI:
                 # made the first .rsr TWICE the size of the archive it
                 # describes.
                 biggest = max((e["size"] or 0) for e in ents)
+                bigs = [((e["size"] or 0) >= biggest
+                         or (cap and (e["size"] or 0) >= cap))
+                        for e in ents]
                 prefer_pf = self._zip_prefers_preflate(_release_group(rel))
                 for e in ents:
                     with open(zp, "rb") as fh:
@@ -2645,7 +2703,12 @@ class RsrToolAPI:
                     # than the thing it describes. The small ones are carried
                     # as extras exactly as they are in a recipe capture, so
                     # what remains is only preflate's reconstruction data.
-                    payloads = [(e["name"], zip_payload(raw, e)) for e in ents]
+                    # Both forms of every entry: a .pcf mixes expanded and
+                    # still-compressed streams (see _pcf_cut).
+                    payloads = [(e["name"], zip_payload(raw, e),
+                                 raw[e["data_offset"]:
+                                     e["data_offset"] + e["packed_size"]])
+                                for e in ents]
                     cut = self._pcf_cut(pcf, payloads)
                     if cut is None:
                         self._log("    ✗ preflate ran, but the content is not "
@@ -2655,16 +2718,35 @@ class RsrToolAPI:
                                 "error": f"{zp.name}: preflate output could "
                                          f"not be separated from the content"}
                     skel, holes = cut
+                    # Which form of each entry the .pcf actually holds. An
+                    # entry precomp left compressed is fine as an EXTRA — the
+                    # capture simply carries those bytes instead of the
+                    # expanded ones, and carries fewer of them. It is fatal for
+                    # CONTENT: content is supplied loose at rebuild, expanded,
+                    # and putting it back compressed would mean re-deflating it
+                    # exactly — the one thing preflate was called in to avoid.
+                    pf_bytes = [payloads[i][1] if h[3] == "expanded"
+                                else payloads[i][2]
+                                for i, h in enumerate(holes)]
+                    stuck = [h[2] for i, h in enumerate(holes)
+                             if h[3] == "raw" and bigs[i]]
+                    if stuck:
+                        self._log(f"    ✗ preflate left the content stream "
+                                  f"({', '.join(stuck[:3])}) compressed, so it "
+                                  f"cannot be supplied from the loose file at "
+                                  f"rebuild.", "err")
+                        return {"ok": False,
+                                "error": f"{zp.name}: preflate could not "
+                                         f"expand the content stream"}
                     # Prove it here, exactly as a recipe is proved: put the
                     # content back, restore, and byte-compare.
                     # By position, not by name. `holes` is built by scanning
-                    # forward through the .pcf in payload order and then
-                    # sorted by offset, so hole i is payload i — whereas a
-                    # name-keyed dict hands two same-named entries the same
-                    # bytes, which the byte-compare below then rejects as a
-                    # preflate failure it never was.
+                    # forward through the .pcf in payload order, so hole i is
+                    # payload i — whereas a name-keyed dict hands two
+                    # same-named entries the same bytes, which the byte-compare
+                    # below then rejects as a preflate failure it never was.
                     back = zip_assemble(skel, [[h[0], h[1]] for h in holes],
-                                        {h[0]: payloads[i][1]
+                                        {h[0]: pf_bytes[i]
                                          for i, h in enumerate(holes)})
                     restored = self._pcf_restore(back, work / "pf")
                     if restored != raw:
@@ -2704,8 +2786,10 @@ class RsrToolAPI:
                             k = f"zips/{zi_no}/pf/{len(files)}.bin"
                             # By position, not by name: two entries of the same
                             # name are legal in a ZIP and a dict silently keeps
-                            # one of them.
-                            embedded[k] = payloads[idx][1]
+                            # one of them. The bytes are whichever form the
+                            # .pcf holds for this entry — the rebuild drops
+                            # them straight back into the hole.
+                            embedded[k] = pf_bytes[idx]
                             rec["stored"] = k
                         files.append(rec)
                     # Measure what the .rsr will actually cost, not what the
@@ -2743,6 +2827,7 @@ class RsrToolAPI:
                         "method": "preflate", "skeleton": key,
                         "holes": [[h[0], h[1]] for h in holes],
                         "hole_names": [h[2] for h in holes],
+                        "hole_forms": [h[3] for h in holes],
                         "files": files, "verify": "exact",
                     })
                     continue
