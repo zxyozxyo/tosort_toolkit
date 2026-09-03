@@ -165,6 +165,14 @@ def _human_bytes(n: int) -> str:
 _SIDECAR_EXT = {".nfo", ".sfv", ".diz", ".txt", ".jpg", ".jpeg", ".png", ".gif",
                 ".m3u", ".srr", ".srs", ".md5", ".sha1", ".log", ".cue", ".par2"}
 
+# Archive formats that are archives, just not ours. Kept apart from "this
+# folder holds no archive" because the two need opposite reactions: a .lzh
+# release is complete and correctly stored and simply cannot be described by a
+# format that replays rar.exe, while a folder of loose files has lost the
+# archive it came in.
+_FOREIGN_ARCHIVE_EXT = {".lzh", ".lha", ".lzx", ".arj", ".ace", ".7z", ".zoo",
+                        ".arc", ".cab", ".tar", ".gz", ".bz2", ".xz", ".sit"}
+
 _FIX_TAGS = ("DIRFIX", "NFOFIX", "PROOFFIX", "SFVFIX", "SAMPLEFIX",
              "RARFIX", "SUBFIX", "SYNCFIX")
 
@@ -1935,6 +1943,46 @@ class RsrToolAPI:
             files = [p for p in folder.rglob("*") if p.is_file()]
             if files and all(p.suffix.lower() in _SIDECAR_EXT for p in files):
                 return self._capture_metadata(folder, store, s, rel, files)
+            # "no archive" is the largest error class in the index — 338 of
+            # 360 — and it was three completely different things wearing one
+            # label, which is why it never got looked at. Say which.
+            loose = sorted({p.suffix.lower() for p in files
+                            if p.suffix.lower() not in _SIDECAR_EXT})
+            foreign = [x for x in loose if x in _FOREIGN_ARCHIVE_EXT]
+            if foreign:
+                # An archive we do not read. 329 of those 338 are .lzh/.lha —
+                # the 1996 PSX DOX scene packed in LHA, not RAR or ZIP — and
+                # calling them "no archive" said the folder was empty of
+                # archives when it is nothing but archive. Nothing here is
+                # broken and nothing is missing; the format is simply outside
+                # what this tool packs.
+                self._log(f"  {', '.join(foreign)} archive — outside the RAR "
+                          f"and ZIP formats this tool reproduces. Not a miss: "
+                          f"there is no recipe to look for.", "warn")
+                return {"ok": False,
+                        "error": f"unsupported archive format "
+                                 f"({', '.join(foreign)})"}
+            if any(_classify_volume(p.name) for p in files):
+                # Volume parts with nothing that carries a RAR marker: the
+                # head of the set is missing, so there is no archive to read
+                # even though the folder is full of one.
+                self._log("  Volume parts with no readable head volume — the "
+                          "first part of the set is missing, so there is "
+                          "nothing to read the recipe out of.", "warn")
+                return {"ok": False, "error": "incomplete set — head volume "
+                                              "missing"}
+            if loose:
+                # An UNPACKED release: the content is sitting loose and the
+                # archive that carried it is gone. A .rsr is a recipe for
+                # reproducing an archive, and this folder has none, so no
+                # re-run and no bigger build pack will change the answer.
+                self._log(f"  Unpacked release — {', '.join(loose)} sitting "
+                          f"loose with no archive around it. A .rsr describes "
+                          f"how to rebuild an archive, so there is nothing "
+                          f"here to capture; this will not change on a "
+                          f"re-run.", "warn")
+                return {"ok": False, "error": "unpacked — no archive to "
+                                              "reproduce"}
             self._log("  No archive set found in this folder"
                       + (f" (contains: {', '.join(sorted(k for k in kinds if k)[:6])})"
                          if kinds else " — folder is empty") + ".", "warn")
