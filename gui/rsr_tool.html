@@ -234,6 +234,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
                    oninput="workersPreview()" onchange="workersApply()">
             <span class="cpu-val" id="workers-val">auto</span>
           </div>
+          <div class="cpu-row" title="How many releases to capture at the same time. Takes effect as slots free, even mid-scan.">
+            <div class="lbl" style="min-width:auto">At once</div>
+            <input type="range" id="jobs" min="1" max="8" step="1" value="1"
+                   oninput="jobsPreview()" onchange="jobsApply()">
+            <span class="cpu-val" id="jobs-val">1 release</span>
+          </div>
           <div class="row" style="margin-top:2px">
             <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
             <button class="btn btn-sm" id="btn-skip" onclick="skipFile()" disabled
@@ -419,6 +425,8 @@ window.addEventListener('pywebviewready', async () => {
   if (CPU_CORES) $('workers').max = CPU_CORES * 2;
   $('workers').value = Math.min(s.workers || 0, +$('workers').max);
   workersPreview();
+  $('jobs').value = s.jobs || 1;
+  jobsPreview();
   refreshStats();
   dbSearch();
   checkPriors();
@@ -513,6 +521,7 @@ function cfg() {
     retry_walls: $('retry_walls').checked,
     small_first: $('small_first').checked,
     workers: $('workers').value,
+    jobs: $('jobs').value,
   };
 }
 
@@ -559,6 +568,18 @@ async function workersApply(){
     if (r && r.cores) CPU_CORES = r.cores;
     workersPreview();
   } catch (e) { /* the log line from the API says what happened */ }
+}
+
+function jobsPreview(){
+  const n = +$('jobs').value;
+  $('jobs-val').innerHTML = n === 1
+    ? `<b>1</b> release at a time`
+    : `<b>${n}</b> releases at once`;
+}
+
+async function jobsApply(){
+  try { await window.pywebview.api.set_jobs(+$('jobs').value); }
+  catch (e) { /* the API logs what happened */ }
 }
 
 async function startScan() {

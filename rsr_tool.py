@@ -1555,16 +1555,58 @@ class RsrToolAPI:
         self._procs: set = set()
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
-        self._deadline = None          # wall clock for the sweep, set per set
         self._budget_min = 0
-        self._budget_hit = False
-        self._budget_override = False  # operator lifted it for THIS release
         self._consumed: list = []      # content files a rebuild actually used
         self._content_root = None      # never delete the root itself
-        self._sweep_pos = (0, "")      # how far a parked sweep got
+        # Per-CAPTURE state, kept per thread. With several releases in flight
+        # at once these are the things that would otherwise collide: one
+        # release's sweep deadline applied to another, one release's "budget
+        # hit" relabelling the next as parked, one release's resume position
+        # written against another's name. A thread-local slot gives each
+        # capture its own without changing a single call signature.
+        #
+        # _consumed and _content_root are deliberately NOT here: they belong
+        # to the REBUILD path, which is still one release at a time, and
+        # _consumed is what delete-source works from — the last thing that
+        # should ever be shared or guessed at.
+        self._tl = threading.local()
         self._seeded = False           # recipe priors backfilled this process
 
     # ── plumbing ──────────────────────────────────────────────────────────
+
+    # ── per-capture state, one slot per thread (see __init__) ────────────
+
+    @property
+    def _deadline(self):
+        return getattr(self._tl, "deadline", None)
+
+    @_deadline.setter
+    def _deadline(self, v):
+        self._tl.deadline = v
+
+    @property
+    def _budget_hit(self):
+        return getattr(self._tl, "budget_hit", False)
+
+    @_budget_hit.setter
+    def _budget_hit(self, v):
+        self._tl.budget_hit = v
+
+    @property
+    def _budget_override(self):
+        return getattr(self._tl, "budget_override", False)
+
+    @_budget_override.setter
+    def _budget_override(self, v):
+        self._tl.budget_override = v
+
+    @property
+    def _sweep_pos(self):
+        return getattr(self._tl, "sweep_pos", (0, ""))
+
+    @_sweep_pos.setter
+    def _sweep_pos(self, v):
+        self._tl.sweep_pos = v
 
     def set_window(self, w):
         self._window = w
@@ -1581,6 +1623,13 @@ class RsrToolAPI:
             pass
 
     def _log(self, msg: str, cls: str = "info"):
+        # With several captures in flight the log interleaves, and a bare
+        # "extracting 4,098 MB" belongs to no visible release. The tag is
+        # thread-local, so each capture stamps its own lines and a single
+        # capture prints exactly as it always did.
+        tag = getattr(self._tl, "tag", "")
+        if tag and msg.strip() and "══" not in msg:
+            msg = f"{tag}{msg}"
         self._emit("log", {"msg": msg, "cls": cls})
 
     def _progress(self, msg: str):
@@ -1797,6 +1846,8 @@ class RsrToolAPI:
             # rar THREADS the sweep may use at once; 0 = auto (half the
             # machine, so it stays usable while a scan runs). See _cpu_budget.
             "workers": _num(cfg.get("workers"), 0, int),
+            # Releases captured at once. See _job_slots.
+            "jobs": max(1, min(16, _num(cfg.get("jobs"), 1, int))),
             # Not a setting — what the machine has, so the GUI can size its
             # slider and say what "auto" currently works out to.
             "cores": os.cpu_count() or 0,
@@ -1823,6 +1874,7 @@ class RsrToolAPI:
             "small_first": bool(s.get("small_first", cur["small_first"])),
             "workers": max(0, min(256, _num(s.get("workers"),
                                             cur["workers"], int))),
+            "jobs": max(1, min(16, _num(s.get("jobs"), cur["jobs"], int))),
         }
         # Keep anything already in the file that this method does not model.
         # It writes a fixed whitelist, so every save silently DROPPED the
@@ -2125,10 +2177,31 @@ class RsrToolAPI:
 
         done = ok = failed = skipped = zips = parked = walls = meta = 0
         partial = broken = 0
-        for i, folder in enumerate(folders, 1):
+        # ── capture, several releases at a time ──────────────────────────
+        #
+        # One release at a time left the machine at 15% CPU: a release that
+        # lands on its group prior does ONE pack at -mt8, and around it sits a
+        # single-threaded extract and a single-threaded hash of the original
+        # streams. Parallelising the sweep does nothing for that, because such
+        # a release barely sweeps. Releases are the unit with real work in
+        # them, so they are what has to overlap.
+        #
+        # `jobs` is read afresh every time a slot frees, so the count can be
+        # changed while a scan runs, exactly like the core budget. The core
+        # budget is DIVIDED between whatever is in flight, so four releases do
+        # not each ask for the whole machine.
+        lock = threading.Lock()
+        counters = {"done": 0, "ok": 0, "failed": 0, "skipped": 0, "zips": 0,
+                    "parked": 0, "walls": 0, "meta": 0, "partial": 0}
+
+        def _one(i, folder):
+            rel_short = _release_name(folder)[:22]
+            self._tl.tag = (f"<{rel_short}> "
+                            if self._job_slots() > 1 else "")
+
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
-                break
+                return
             rel = _release_name(folder)
             # Clear any skip from the PREVIOUS release here, not when the skip
             # fires — otherwise a skip pressed late in one release could still
@@ -2154,8 +2227,9 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "already captured",
                                    "kind": "captured-before"})
-                skipped += 1
-                continue
+                with lock:
+                    counters["skipped"] += 1
+                return
             wall = None if s.get("retry_walls") else self._known_wall(rel)
             if wall:
                 self._log(f"  Already swept to exhaustion on "
@@ -2164,8 +2238,9 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "known wall",
                                    "kind": "wall"})
-                walls += 1
-                continue
+                with lock:
+                    counters["walls"] += 1
+                return
             try:
                 res = self._capture_release(folder, store, s, exes)
             except Exception as e:
@@ -2180,15 +2255,17 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "skipped by hand",
                                    "kind": "skipped"})
-                skipped += 1
-                continue
+                with lock:
+                    counters["skipped"] += 1
+                return
             if res.get("error") == "zip release":
                 # Out of scope, not a failure. Counted apart so the summary's
                 # "failed" figure stays a number worth reading.
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "zip", "kind": "zip"})
-                zips += 1
-                continue
+                with lock:
+                    counters["zips"] += 1
+                return
             if res.get("damaged"):
                 # Not a wall and not our failure: the bytes on disk are not
                 # what the release shipped. Recorded so it can say so later,
@@ -2199,7 +2276,7 @@ class RsrToolAPI:
                                    "recipe": "damaged — fails its .sfv",
                                    "kind": "damaged"})
                 broken += 1
-                continue
+                return
             if res.get("partial"):
                 # Same reasoning: a fix release is complete in itself, it just
                 # is not a set anyone can rebuild on its own.
@@ -2207,8 +2284,9 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "skipped",
                                    "recipe": "fix release — partial set",
                                    "kind": "partial"})
-                partial += 1
-                continue
+                with lock:
+                    counters["partial"] += 1
+                return
             if self._budget_hit and not res.get("ok"):
                 # Not a wall and not a failure — an unfinished search. Kept
                 # apart so a later re-run (with better priors) can be pointed
@@ -2223,26 +2301,31 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "parked",
                                    "recipe": "parked — time budget",
                                    "kind": "parked"})
-                parked += 1
-                continue
-            done += 1
+                with lock:
+                    counters["parked"] += 1
+                return
+            with lock:
+                counters["done"] += 1
             if res.get("metadata"):
                 # A complete release that simply has no archive. Counted apart
                 # so "verified" keeps meaning "a recipe was proved".
-                meta += 1
+                with lock:
+                    counters["meta"] += 1
                 self._db_forget(rel)
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": res.get("recipe", "metadata only"),
                                    "kind": "metadata"})
-                continue
+                return
             if res.get("ok"):
-                ok += 1
+                with lock:
+                    counters["ok"] += 1
                 self._db_forget(rel)          # it worked; the miss is stale
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": res.get("recipe", ""),
                                    "kind": "ok"})
             else:
-                failed += 1
+                with lock:
+                    counters["failed"] += 1
                 err = res.get("error", "")
                 if err == "recipe not found":
                     # Exhaustively searched. Remember it against the size of
@@ -2259,6 +2342,36 @@ class RsrToolAPI:
                                    "recipe": err,
                                    "kind": "wall" if err == "recipe not found"
                                            else "error"})
+
+
+        # Keep `jobs` slots busy, re-reading the setting each time one frees.
+        pending = list(enumerate(folders, 1))
+        live: list = []
+        while pending or live:
+            if self._stop.is_set():
+                break
+            want = self._job_slots()
+            while pending and len(live) < want:
+                i, folder = pending.pop(0)
+                th = threading.Thread(target=_one, args=(i, folder),
+                                      daemon=True)
+                th.start()
+                live.append(th)
+                self._live_jobs = len(live)
+            if not live:
+                break
+            # Reap whatever has finished; a short join keeps the loop
+            # responsive to a `jobs` change and to Stop.
+            live[0].join(timeout=0.5)
+            live = [th for th in live if th.is_alive()]
+            self._live_jobs = max(1, len(live))
+        for th in live:
+            th.join()
+        done = counters["done"]; ok = counters["ok"]
+        failed = counters["failed"]; skipped = counters["skipped"]
+        zips = counters["zips"]; parked = counters["parked"]
+        walls = counters["walls"]; meta = counters["meta"]
+        partial = counters["partial"]
 
         self._log("", "")
         self._log(f"Capture complete — {ok} verified, {failed} failed, "
@@ -4322,6 +4435,39 @@ class RsrToolAPI:
         return {"ok": True, "workers": n, "effective": eff,
                 "cores": os.cpu_count() or 0}
 
+    def set_jobs(self, n) -> dict:
+        """Change how many releases capture at once, from the next free slot.
+
+        Same contract as set_workers: written straight to the config, read
+        back by the scan loop, and therefore live."""
+        n = max(1, min(16, _num(n, 1, int)))
+        try:
+            cfg = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            cfg = {}
+        cfg["jobs"] = n
+        try:
+            self._config_path.write_text(json.dumps(cfg, indent=2), "utf-8")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        # Work the share out from the number being SET, not from whatever
+        # this instance currently has in flight — the GUI's call and the
+        # running scan are different objects, and quoting _cpu_budget() here
+        # said "each gets about 48 of the 48" no matter what was asked for.
+        w = _num(self.get_settings().get("workers"), 0, int)
+        total = max(1, min(w, 256)) if w > 0 else max(1, (os.cpu_count() or 4) // 2)
+        self._log(f"Releases at once: {n}"
+                  + (f" — about {max(1, total // n)} rar thread(s) each, "
+                     f"of {total}." if n > 1 else " (one at a time).")
+                  + (" A running scan applies this as slots free."
+                     if self._running else ""), "info")
+        return {"ok": True, "jobs": n}
+
+    def _job_slots(self) -> int:
+        """How many releases to capture at once, read fresh every time a slot
+        frees so it can be changed while a scan runs."""
+        return max(1, min(16, _num(self.get_settings().get("jobs"), 1, int)))
+
     def _cpu_budget(self) -> int:
         """How many rar threads the sweep may use at once.
 
@@ -4334,9 +4480,11 @@ class RsrToolAPI:
         a scan runs for hours and the point is to be able to keep using the
         PC while it does."""
         want = _num(self.get_settings().get("workers"), 0, int)
-        if want > 0:
-            return max(1, min(want, 256))
-        return max(1, (os.cpu_count() or 4) // 2)
+        total = (max(1, min(want, 256)) if want > 0
+                 else max(1, (os.cpu_count() or 4) // 2))
+        # Shared between the captures actually in flight: four releases each
+        # taking the whole budget would ask for four times the machine.
+        return max(1, total // max(1, getattr(self, "_live_jobs", 1)))
 
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
