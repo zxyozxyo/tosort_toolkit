@@ -239,7 +239,17 @@ _SWEEP_GEN = 2
 # re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
 # _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
 # auto-invalidates the cache so every wall gets one fresh attempt.
-_WALL_CACHE_GEN = 7   # 2026-08-10: gen 6 could not REACH -mt0. It sat last in
+_WALL_CACHE_GEN = 8   # 2026-09-03: gen 7 STILL could not reach -mt0. It moved
+                      # 0 up inside _MT_COMMON, but both sweep sites order by
+                      # `_mt_freq_rank() + _MT_COMMON` and the rank is nine
+                      # values wide, so 0 went from 13th overall to 10th — on a
+                      # 256 MB -m5 release, where one pass is the whole budget,
+                      # that is the same thing as last. Only three releases were
+                      # ever measured under gen 7 and all three recorded a
+                      # version wall; _sweep_mts() now puts 0 third and they are
+                      # re-opened. See _sweep_mts for the measurement.
+                      #
+                      # gen 7 — 2026-08-10: gen 6 could not REACH -mt0. It sat last in
                       # _MT_COMMON, so the recipe sweep only got there after
                       # nine full passes over the pack — which the 15-minute
                       # budget never allowed on a compressed release. Every
@@ -2613,6 +2623,38 @@ class SrrdbToolAPI:
         except Exception:
             return []
 
+    def _sweep_mts(self) -> list:
+        """The -mt order a full sweep walks: the learned rank, with 0 forced to
+        the front of it.
+
+        Reordering _MT_COMMON is not enough on its own, and the 2026-08-10
+        attempt at this got it wrong. Both sweep sites build their order as
+        `_mt_freq_rank() + _MT_COMMON`, and the rank is NINE values wide
+        ([8, 1, 2, 4, 3, 6, 5, 12, 7] as of today), so moving 0 to third inside
+        _MT_COMMON only moved it from 13th overall to 10th. On
+        Bakumatsu_Renka_Shinsengumi-2CH — 256 MB, -m5, 30 date-capped builds,
+        20-60 s a combo — one pass is already the whole 15-minute budget, so
+        10th is exactly as unreachable as 13th. The 2026-08-10 run proved it:
+        it tried `2005-11-21 3.60`, recorded it in versions_tried, and still
+        reported a version wall. That build at -mt0 reproduces the stream byte
+        for byte (183,589,149 B, verified 2026-09-03).
+
+        The rank cannot fix this by itself, because it is built from past WINS:
+        -mt0 has never been reachable, so it never wins, so it never enters the
+        rank, so it stays last. It has to be promoted by hand, and it earns the
+        place by being a distinct CODER rather than a rare setting — everything
+        else in the list varies the block split.
+
+        Position 3, behind the two counts that genuinely dominate real wins."""
+        rank = self._mt_freq_rank()
+        order = (rank[:2] + [0] + rank[2:] + list(_MT_COMMON)) if rank \
+            else list(_MT_COMMON)
+        out: list = []
+        for m in order:
+            if m not in out:
+                out.append(m)
+        return out
+
     def _order_mts(self, candidates, front=()) -> list:
         """Order candidate -mt ints by: `front` values first (in given order),
         then our own win-frequency (_mt_freq_rank), then the common scene counts
@@ -3867,10 +3909,7 @@ class SrrdbToolAPI:
                 self._log("  Recipe sweep: the staged set produced no checkable "
                           "stream CRC — skipping rather than guessing.", "dim")
                 return None
-            mts: list = []
-            for m in (self._mt_freq_rank() + list(_MT_COMMON)):
-                if m not in mts:
-                    mts.append(m)
+            mts: list = self._sweep_mts()
             phases = [(cmd_files, checks, mts)]
             if was_cut:
                 whole_files, whole_checks = self._stage_sweep_sources(
@@ -4408,10 +4447,7 @@ class SrrdbToolAPI:
                     shutil.copy2(str(p), str(link))
             files.append(str(link))
 
-        mts: list = []
-        for m in (self._mt_freq_rank() + list(_MT_COMMON)):
-            if m not in mts:
-                mts.append(m)
+        mts: list = self._sweep_mts()
         self._log(
             f"  Recipe sweep: no volume-split file, so the SRR carries no stream "
             f"CRC — matching all {len(files)} file(s) on exact packed SIZE across "
