@@ -3976,9 +3976,10 @@ class RsrToolAPI:
             # through the identical code path with no `groups` key at all, so
             # every .rsr written before today still rebuilds unchanged.
             recipe["groups"] = [list(g) for g in mgroups]
+        packed_dir = recipe.pop("_packed", None)
         verify, volmeta, deltas = self._verify_replay(
             recipe, src_files, vols, work, comment, st, si,
-            base=srcdir if keep_paths else None)
+            base=srcdir if keep_paths else None, packed=packed_dir)
         embedded.update(deltas)
         recipe["verify"] = verify
 
@@ -4536,7 +4537,11 @@ class RsrToolAPI:
                     ex_, n_ = chunk[s]
                     return {"exe": ex_.name, "version": _exe_label(ex_.name),
                             "mt": n_, "dict_kb": dict_kb,
-                            "tried": tried + s + 1}
+                            "tried": tried + s + 1,
+                            # Where this combo's volumes are. The replay can
+                            # often use them as they stand instead of packing
+                            # the whole archive a second time.
+                            "_packed": str(probe_dir / f"w{s}")}
             tried += len(chunk)
             idx += len(chunk)
 
@@ -4728,12 +4733,40 @@ class RsrToolAPI:
         return ordered or made
 
     def _verify_replay(self, recipe, src_files, vols, work, comment, st, si=0,
-                       base=None):
+                       base=None, packed=None):
         """The whole point of capture-time: don't claim the recipe works, run
         it and compare. Returns ('exact'|'delta'|'none', volume records,
         {path-in-rsr: patch bytes})."""
-        produced = self._replay(recipe, src_files, work, comment,
-                                st["format"], base=base)
+        produced = None
+        # The sweep just packed this set to prove its streams. When the replay
+        # command is the SAME command — no recovery record, no comment, no
+        # lock, the same volume size — it would spend minutes reproducing
+        # bytes that are already on disk. On a 4 GB 3DS release that is 35 s of
+        # a 117 s capture, packed once to check the streams and again to check
+        # the volumes.
+        #
+        # Re-running it proves nothing extra: rar is deterministic on identical
+        # input, and the archive's own filename does not reach the bytes
+        # (verified: probe.rar, replay.rar and some-other-name.rar produce
+        # identical volumes). What the replay adds over the sweep is comparing
+        # whole VOLUMES rather than streams, and that check runs the same
+        # either way.
+        if (packed and not recipe.get("rr_pct") and not comment
+                and not recipe.get("locked")):
+            try:
+                made = [q for q in sorted(Path(packed).iterdir())
+                        if q.is_file() and _classify_volume(q.name)]
+                made.sort(key=lambda q: _classify_volume(q.name)[2])
+            except OSError:
+                made = []
+            if made:
+                produced = made
+                self._log(f"    reusing the sweep's own pack — the replay "
+                          f"command is identical, so the {len(made)} volume(s) "
+                          f"are already on disk.", "dim")
+        if produced is None:
+            produced = self._replay(recipe, src_files, work, comment,
+                                    st["format"], base=base)
         volmeta, deltas = [], {}
         # The -rr percentage was derived from the block size, which is rounded
         # to whole sectors — so a set can sit between two percentages. If the
