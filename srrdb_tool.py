@@ -192,10 +192,28 @@ _LARGE_STREAM_BYTES = 16 * 1024 * 1024
 # for yet — tried before the odd/rare fill so a high-core release (mt16/24/32) is
 # reached sooner. Our own win-frequency (from the results DB) still ranks FIRST;
 # this only orders the not-yet-seen tail. NOT a filter — every value still runs.
-# -mt0 is a DISTINCT algorithm rescene otherwise skips (issue #173); include it
-# late in the prior so it's tried after the mainstream counts but before the odd
-# tail. Sweeps must add 0 to their candidate set for it to be reached.
-_MT_COMMON = (1, 2, 4, 6, 8, 12, 16, 24, 32, 0)
+# -mt0 is a DISTINCT algorithm rescene otherwise skips (issue #173); sweeps must
+# add 0 to their candidate set for it to be reached.
+#
+# It used to sit LAST here, which made it unreachable in practice. The recipe
+# sweep loops `for mt in mts: for fn in reps`, so a trailing 0 only gets its turn
+# after NINE full passes over ~146 builds — on an -m5 NDS release that never
+# happens inside the 15-minute budget, and the release is written off as "no good
+# RAR version found" while the answer is one pass away. (Measured on
+# 2009-…_Bakumatsu_Renka_Shinsengumi_DS_JPN_NDS-2CH, whose true recipe is
+# 3.60 -mt0.) 0 now follows the two counts that actually dominate real wins,
+# because it is a different CODER — not a rare setting like the odd tail, which
+# only varies the block split. Reached after 2 passes instead of 9.
+_MT_COMMON = (1, 8, 0, 2, 4, 6, 12, 16, 24, 32)
+
+# Thread counts the build-family fingerprint packs at (see _pack_family_reps).
+# A family is "one build per DISTINCT compressed output", and that verdict is
+# only as wide as the settings it was measured under. Measured at -mt1 alone,
+# builds that differ only at -mt0 were merged and the loser became unreachable
+# everywhere. 1 and 0 are the two algorithms that actually diverge; the ordinary
+# counts (2,4,8…) vary the block split, not the coder, and are handled by the
+# sweeps themselves. Two probes per build, paid once per recipe (cached).
+_FAM_PROBE_MTS = (1, 0)
 
 # Cross-version proof-jpg sweep: a scene group packs with a CONTEMPORARY WinRAR,
 # so the proof jpg's build is almost always within a few years of the game's
@@ -221,7 +239,22 @@ _SWEEP_GEN = 2
 # re-run, skip them instantly UNLESS the pack grew (new versions may crack it).
 # _WALL_CACHE_GEN is bumped only if version-hunt logic changes materially, which
 # auto-invalidates the cache so every wall gets one fresh attempt.
-_WALL_CACHE_GEN = 6   # 2026-08-06: gen 5 truncated any source over 48 MB for
+_WALL_CACHE_GEN = 7   # 2026-08-10: gen 6 could not REACH -mt0. It sat last in
+                      # _MT_COMMON, so the recipe sweep only got there after
+                      # nine full passes over the pack — which the 15-minute
+                      # budget never allowed on a compressed release. Every
+                      # "swept to exhaustion" verdict gen 6 recorded was
+                      # therefore measured in a space that excluded a whole
+                      # coder, so a release packed with -mt0 was written off as
+                      # a version wall with its winning build sitting in the
+                      # pack. Same class of mistake as gen 5's truncation: the
+                      # verdict was not wrong about what it tried, it just never
+                      # tried the answer. Also fixes the build-family
+                      # fingerprint, which merged builds on their -mt1 output
+                      # alone and dropped siblings that only differ at -mt0.
+                      # (gen 6: see below.)
+                      #
+                      # gen 6 — 2026-08-06: gen 5 truncated any source over 48 MB for
                       # the whole sweep, INCLUDING the thread-count dimension.
                       # Multithreaded RAR derives its per-thread chunk
                       # boundaries from the total input size, so a cut source
@@ -3253,20 +3286,40 @@ class SrrdbToolAPI:
                     probe.unlink(missing_ok=True)
                 except Exception:
                     pass
-                try:
-                    subprocess.run(
-                        [str(ex), "a", f"-m{level}", md,
-                         "-s" if solid else "-s-", "-ds", "-mt1", "-o+", "-ep",
-                         "-idcd", str(probe), disc],
-                        capture_output=True, timeout=180)
-                except subprocess.TimeoutExpired:
-                    continue
-                try:
-                    with RarStream(str(probe), packed_file_name=dname,
-                                   compressed=True) as rs:
-                        sig = hashlib.sha1(rs.read()).digest()
-                except Exception:
-                    sig = ("ERR", ex.name)
+                # Fingerprint at EVERY probe thread count, and key the family on
+                # the whole tuple. Identical output at one -mt does NOT imply
+                # identical output at another: -mt0 is a distinct algorithm (the
+                # very reason issue #173 exists), so two builds can collapse into
+                # one family at -mt1 and diverge at -mt0. Keyed on -mt1 alone,
+                # the sibling that only differs at -mt0 was dropped as a
+                # duplicate and became unreachable at EVERY thread count — the
+                # winning build included. That is how a release packed with
+                # 3.60 -mt0 reports "no good RAR version found" while the build
+                # sits in the pack. Builds predating -mt (RAR <3.60) ignore the
+                # switch, so their probes come back identical and they still
+                # collapse exactly as before — no families are split spuriously.
+                sig = []
+                for pmt in _FAM_PROBE_MTS:
+                    try:
+                        probe.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        subprocess.run(
+                            [str(ex), "a", f"-m{level}", md,
+                             "-s" if solid else "-s-", "-ds", f"-mt{pmt}",
+                             "-o+", "-ep", "-idcd", str(probe), disc],
+                            capture_output=True, timeout=180)
+                    except subprocess.TimeoutExpired:
+                        sig.append(("TIMEOUT", ex.name, pmt))
+                        continue
+                    try:
+                        with RarStream(str(probe), packed_file_name=dname,
+                                       compressed=True) as rs:
+                            sig.append(hashlib.sha1(rs.read()).digest())
+                    except Exception:
+                        sig.append(("ERR", ex.name, pmt))
+                sig = tuple(sig)
                 if sig not in seen:
                     seen.add(sig)
                     reps.append(ex.name)   # exact exe — final≠beta kept apart
