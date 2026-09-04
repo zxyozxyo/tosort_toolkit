@@ -1780,7 +1780,8 @@ class RsrToolAPI:
             "embed_max_mb": _num(cfg.get("embed_max_mb"), 16, int),
             "write_srr": bool(cfg.get("write_srr", True)),
             "skip_done": bool(cfg.get("skip_done", True)),
-            "dict_ladder": bool(cfg.get("dict_ladder", True)),
+            # Off by default -- see _dict_candidates: 7,541 of 7,541.
+            "dict_ladder": bool(cfg.get("dict_ladder", False)),
             "budget_min": _num(cfg.get("budget_min"), 45, int),
             "retry_walls": bool(cfg.get("retry_walls", False)),
             "small_first": bool(cfg.get("small_first", True)),
@@ -4049,7 +4050,22 @@ class RsrToolAPI:
         possible answer) that was six extra full sweeps of 232 builds x 17
         thread counts, each one recompressing the entire source, all of them
         incapable of matching. On Guitar_Rock_Tour…BAHAMUT — one 134 MB file —
-        that is the difference between one failed sweep and seven."""
+        that is the difference between one failed sweep and seven.
+
+        DEFAULT OFF since 2026-09-04, on the evidence of the whole corpus:
+        across ALL 7,541 verified sets the winning recipe used the dictionary
+        the header declares -- 7,541 of 7,541, no exceptions. Which follows
+        from the paragraph above rather than contradicting it: the header
+        records the dictionary the compressor ACTUALLY used, WinRAR can only
+        clamp a request down to that, and the effective window is what decides
+        the output. So packing at the header value reproduces the original
+        whatever the original command line asked for, and every rung above it
+        is a full sweep that cannot match.
+
+        It only ever ran when the first rung FAILED, so it never cost a hit
+        anything -- it tripled the cost of every WALL, which is exactly where
+        the hours go. Kept as a setting rather than deleted, in case a release
+        ever turns up that needs it; nothing in this corpus does."""
         if not ladder:
             return [primary]
         pool = RAR5_DICTS if fmt == "RAR5" else RAR4_DICTS
