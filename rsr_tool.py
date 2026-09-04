@@ -1785,6 +1785,9 @@ class RsrToolAPI:
             "budget_min": _num(cfg.get("budget_min"), 45, int),
             "retry_walls": bool(cfg.get("retry_walls", False)),
             "small_first": bool(cfg.get("small_first", True)),
+            # rar THREADS the sweep may use at once; 0 = auto (half the
+            # machine, so it stays usable while a scan runs). See _cpu_budget.
+            "workers": _num(cfg.get("workers"), 0, int),
         }
 
     def save_settings(self, s: dict) -> dict:
@@ -1806,6 +1809,8 @@ class RsrToolAPI:
                                                 cur["budget_min"], int))),
             "retry_walls": bool(s.get("retry_walls", cur["retry_walls"])),
             "small_first": bool(s.get("small_first", cur["small_first"])),
+            "workers": max(0, min(256, _num(s.get("workers"),
+                                            cur["workers"], int))),
         }
         # Keep anything already in the file that this method does not model.
         # It writes a fixed whitelist, so every save silently DROPPED the
@@ -4280,6 +4285,85 @@ class RsrToolAPI:
         lead = [m for m in won if m in mts]
         return lead + [m for m in mts if m not in lead] if lead else mts
 
+    def _cpu_budget(self) -> int:
+        """How many rar threads the sweep may use at once.
+
+        A budget in THREADS, not workers, because `rar -mt8` already uses
+        eight of them: eight workers at -mt8 would ask for 64 threads on a
+        32-core machine and thrash. The sweep divides this by the thread count
+        it is currently sweeping to decide how many combos to run together.
+
+        0 means auto, and auto deliberately leaves half the machine alone —
+        a scan runs for hours and the point is to be able to keep using the
+        PC while it does."""
+        want = _num(self.get_settings().get("workers"), 0, int)
+        if want > 0:
+            return max(1, min(want, 256))
+        return max(1, (os.cpu_count() or 4) // 2)
+
+    def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
+                   solid: bool, groups, srcs, vol_args, base, prefix,
+                   end_sig, hdr_ext, targets):
+        """One (build, -mt) candidate, in its own directory. True if it is the
+        recipe, False if not, None if the build cannot run this recipe at all.
+
+        Everything here was the body of the serial loop; it is a function so
+        that several can run at once. It touches no shared state except the
+        process set, which is already locked."""
+        cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
+                               wdir / "probe.rar", vol_args=vol_args,
+                               base=base)
+        if cmds is None:
+            return None
+        try:
+            if wdir.exists():
+                _rmtree(wdir)
+            wdir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+
+        # PREFIX PROBE — pack only until volume one is closed and judge on it.
+        if prefix and len(cmds) == 1 and vol_args:
+            head = wdir / "probe.rar"
+
+            def _closed():
+                # rar has opened volume two, so volume one is complete and
+                # flushed. Safer than watching volume one's size, which sits
+                # at its final value for a moment before the file is closed.
+                return any(q.name != "probe.rar" for q in wdir.iterdir())
+
+            if not self._run_until(cmds[0], _closed, timeout=900,
+                                   heartbeat=f"probe -mt{n} "
+                                             f"{_exe_label(ex.name)}",
+                                   cwd=base):
+                return False
+            verdict = self._prefix_verdict(head, prefix)
+            bad = (verdict is False
+                   or (end_sig is not None and end_block_sig(head) != end_sig)
+                   or (hdr_ext is not None
+                       and header_exttime(head) != hdr_ext))
+            for junk in wdir.iterdir():
+                try:
+                    junk.unlink()
+                except OSError:
+                    pass
+            if bad:
+                return False
+
+        if not all(self._run(c, timeout=900,
+                             heartbeat=f"sweep -mt{n} {_exe_label(ex.name)}",
+                             cwd=base)
+                   for c in cmds):
+            return False
+        head = self._probe_head(wdir)
+        if head is None:
+            return False
+        if end_sig is not None and end_block_sig(head) != end_sig:
+            return False
+        if hdr_ext is not None and header_exttime(head) != hdr_ext:
+            return False
+        return bool(self._streams_match(head, targets))
+
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
@@ -4349,125 +4433,78 @@ class RsrToolAPI:
         tried = 0
         total = len(combos)
         t0 = last = time.monotonic()
-        for ex, n in combos:
+        # ── the sweep, across as many cores as the budget allows ─────────
+        #
+        # Serially this left 31 of 32 cores idle: one rar.exe at a time, and
+        # with the prefix probe each combo is about a second of work, so the
+        # sweep had become mostly waiting. Combos are independent — each packs
+        # the same sources into its own directory and is judged on its own
+        # output — so they parallelise exactly.
+        #
+        # Determinism is preserved by evaluating each chunk IN ORDER: the
+        # winner is the lowest-index combo that matched, exactly as the serial
+        # sweep returned. Several builds of one family can match, and which one
+        # you get must not depend on which core happened to finish first.
+        budget = self._cpu_budget()
+        idx = 0
+        while idx < len(combos):
             if self._stop.is_set() or self._skip.is_set():
                 return None
-            # `tried` guard: always try at least one combo. Parking a release
-            # having tested nothing is the worst of both worlds — it pays the
-            # extract and the hashing and learns nothing, and the very first
-            # combo is the group's best-known recipe, which is the one most
-            # likely to just answer it.
-            #
-            # The override is read from self on every pass, not captured with
-            # `deadline` at entry: the operator only learns what a release
-            # costs from the per-combo line printed AFTER combo 1, so the
-            # button has to be able to lift the limit while the sweep is
-            # already running.
             if (tried and deadline and not self._budget_override
                     and time.monotonic() > deadline):
                 self._budget_hit = True
-                # Hand the position to _scan_run so the next run picks up here
-                # instead of re-grinding the same prefix forever.
                 self._sweep_pos = (start + tried, sig)
                 self._log(f"    ⏱ time budget reached after {tried} combo(s) "
                           f"({start + tried:,} of {start + len(combos):,} "
                           "overall) — parking this release; the next run "
                           "resumes from here.", "warn")
                 return None
-            cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
-                                   probe_dir / "probe.rar", vol_args=vol_args,
-                                   base=base)
-            if cmds is None:
-                continue
-            tried += 1
-            # Throttle on TIME, not on a combo count. Every-8-combos was fine
-            # when a combo was a fraction of a second, but one combo on a
-            # 512 MB source is minutes, so the display sat unchanged for the
-            # best part of half an hour and looked stopped.
-            now = time.monotonic()
-            if now - last > 0.5:
-                last = now
-                rate = tried / max(now - t0, 1e-6)
-                self._progress(
-                    f"sweep {tried}/{total} · -mt{n} · {_exe_label(ex.name)}"
-                    + (f" · {rate * 60:,.0f}/min" if rate < 8 else "")
-                    + (f" · {(deadline - now) / 60:,.0f} min left in budget"
-                       if deadline else ""))
-            probe_dir.mkdir(parents=True, exist_ok=True)
-            for junk in probe_dir.iterdir():
+
+            width = max(1, min(budget // max(1, combos[idx][1]),
+                               len(combos) - idx))
+            chunk = combos[idx:idx + width]
+            results: list = [None] * len(chunk)
+
+            def _slot(s: int):
+                ex_, n_ = chunk[s]
                 try:
-                    junk.unlink()
-                except OSError:
-                    pass
-            t_one = time.monotonic()
-            # PREFIX PROBE. One command, real volumes, and a first-volume
-            # slice to compare against: pack only until volume one is closed,
-            # judge on that, and pay for a full pack only on a survivor. A
-            # wrong build diverges inside volume one, so this rejects
-            # everything a full pack rejects while compressing a fraction as
-            # much — volume one is 5 MB of a 101 MB archive on Infinite_Space.
-            if prefix and len(cmds) == 1 and vol_args:
-                probe_head = probe_dir / "probe.rar"
+                    results[s] = self._try_combo(
+                        ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
+                        groups, srcs, vol_args, base, prefix, end_sig,
+                        hdr_ext, targets)
+                except Exception:
+                    results[s] = False
 
-                def _closed():
-                    # rar has opened volume two, so volume one is complete and
-                    # flushed. Safer than watching volume one's size, which
-                    # sits at its final value for a moment before the file is
-                    # closed.
-                    return any(q.name != "probe.rar"
-                               for q in probe_dir.iterdir())
+            if len(chunk) == 1:
+                _slot(0)
+            else:
+                ths = [threading.Thread(target=_slot, args=(s,), daemon=True)
+                       for s in range(len(chunk))]
+                for th in ths:
+                    th.start()
+                for th in ths:
+                    th.join()
 
-                if not self._run_until(
-                        cmds[0], _closed, timeout=900,
-                        heartbeat=f"probe {tried}/{total} · -mt{n} · "
-                                  f"{_exe_label(ex.name)}", cwd=base):
-                    continue
-                verdict = self._prefix_verdict(probe_head, prefix)
-                # Both build discriminators are properties of volume ONE — the
-                # capture reads them off vols[0] too — so they belong here
-                # rather than after a full pack. This is what makes the probe
-                # pay: a matching stream identifies a build FAMILY, not a
-                # build, so on a 3.x/4.x release a dozen builds sail through
-                # the byte compare and only these two tell them apart. Checked
-                # after the full pack they cost a full pack each; checked here
-                # they cost nothing.
-                bad = (verdict is False
-                       or (end_sig is not None
-                           and end_block_sig(probe_head) != end_sig)
-                       or (hdr_ext is not None
-                           and header_exttime(probe_head) != hdr_ext))
-                for junk in probe_dir.iterdir():
-                    try:
-                        junk.unlink()
-                    except OSError:
-                        pass
-                if bad:
-                    continue
-                # A None verdict means there was not enough output to be sure;
-                # pack it in full rather than trust a verdict worth nothing.
-            ran = all(self._run(c, timeout=900,
-                                heartbeat=f"sweep {tried}/{total} · -mt{n} · "
-                                          f"{_exe_label(ex.name)}",
-                                cwd=base)
-                      for c in cmds)
-            if tried == 1 and not rung:
-                # Say up front what this release is going to cost. One combo
-                # tells you whether an exhaustive sweep is minutes or weeks,
-                # and that is worth knowing at combo 1 rather than hour 3.
-                #
-                # Counting ONE rung of the dictionary ladder was the reason
-                # this number kept being wrong by a factor of three: a header
-                # that says -md1024KB and does not reproduce sends the whole
-                # sweep round again at 2048 and again at 4096, so the estimate
-                # promised "0.1h, budget allows 8,723 of 3,944" three separate
-                # times while the release quietly spent 12 minutes and parked.
-                # Quote the ladder, and quote it once instead of once a rung.
-                per = time.monotonic() - t_one
+            for s, res in enumerate(results):
+                if res is True:
+                    ex_, n_ = chunk[s]
+                    return {"exe": ex_.name, "version": _exe_label(ex_.name),
+                            "mt": n_, "dict_kb": dict_kb,
+                            "tried": tried + s + 1}
+            tried += len(chunk)
+            idx += len(chunk)
+
+            now = time.monotonic()
+            if tried <= len(chunk) and not rung:
+                # Say up front what this release is going to cost, now that a
+                # combo's cost and the number running together both matter.
+                per = (now - t0) / max(tried, 1)
                 worst = total * max(rungs, 1)
-                allows = (int(max(deadline - t_one, 0) / max(per, 1e-6))
+                allows = (int(max(deadline - t0, 0) / max(per, 1e-6))
                           if deadline else None)
-                msg = (f"    ~{per:,.1f}s per combo at this size — "
-                       f"{worst:,} would take {worst * per / 3600:,.1f}h")
+                msg = (f"    ~{per:,.2f}s per combo at this size across "
+                       f"{len(chunk)} core(s) — {worst:,} would take "
+                       f"{worst * per / 3600:,.1f}h")
                 if rungs > 1:
                     msg += (f" ({total:,} per dictionary × {rungs} on the "
                             f"ladder)")
@@ -4475,29 +4512,19 @@ class RsrToolAPI:
                     msg += f"; budget allows about {allows:,}"
                 self._log(msg, "dim")
                 if allows is not None and allows < worst:
-                    # Name the shortfall rather than making it a subtraction
-                    # the operator has to do in their head while it runs.
                     self._log(f"    ⏱ budget covers {allows:,} of {worst:,} "
                               f"— {worst - allows:,} short "
                               f"(~{(worst - allows) * per / 60:,.0f} min more). "
                               f"Press '{UI_FINISH_ONE}' to lift it for this "
                               f"release.", "warn")
-            if not ran:
-                continue
-            head = self._probe_head(probe_dir)
-            if head is None:
-                continue
-            # The archive has to match too, not just the streams it carries.
-            # Same cost either way — this reads a few hundred bytes of a file
-            # already on disk — and it is the only thing that tells two builds
-            # apart when their compressed output is identical.
-            if end_sig is not None and end_block_sig(head) != end_sig:
-                continue
-            if hdr_ext is not None and header_exttime(head) != hdr_ext:
-                continue
-            if self._streams_match(head, targets):
-                return {"exe": ex.name, "version": _exe_label(ex.name),
-                        "mt": n, "dict_kb": dict_kb, "tried": tried}
+            elif now - last > 0.5:
+                last = now
+                rate = tried / max(now - t0, 1e-6)
+                self._progress(
+                    f"sweep {tried}/{total} · {len(chunk)} at a time"
+                    + (f" · {rate * 60:,.0f}/min" if rate < 600 else "")
+                    + (f" · {(deadline - now) / 60:,.0f} min left in budget"
+                       if deadline else ""))
         # Count the resumed prefix too: "swept 4 combo(s)" after picking up
         # from 26 reads like a search that barely happened, when in fact the
         # whole space is now covered — which is exactly what makes the wall
