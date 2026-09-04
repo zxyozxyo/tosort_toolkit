@@ -1546,6 +1546,39 @@ def apply_delta(produced: bytes, patch: bytes) -> bytes:
 #  API
 # ══════════════════════════════════════════════════════════════════════════
 
+class _LockedConn:
+    """A sqlite connection that owns the index lock until it is closed.
+
+    Every DB helper in here already opens a connection, uses it, and closes it
+    in a finally -- 21 of them. Rather than wrap all 21 in a lock and trust
+    nobody to forget the 22nd, the lock is taken when the connection opens and
+    released when it closes, so the try/finally that already exists does the
+    unlocking."""
+
+    def __init__(self, con, lock):
+        self._con = con
+        self._lock = lock
+        self._closed = False
+
+    def __getattr__(self, k):
+        return getattr(self._con, k)
+
+    def __enter__(self):
+        return self._con.__enter__()
+
+    def __exit__(self, *a):
+        return self._con.__exit__(*a)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._con.close()
+        finally:
+            self._lock.release()
+
+
 class RsrToolAPI:
     def __init__(self):
         self._window = None
@@ -1570,6 +1603,13 @@ class RsrToolAPI:
         # _consumed is what delete-source works from — the last thing that
         # should ever be shared or guessed at.
         self._tl = threading.local()
+        # One writer at a time. Several captures now run at once and all of
+        # them record rows, misses and learned recipes. sqlite would serialise
+        # them anyway -- but by RAISING once its timeout expires, and _db_miss
+        # and _db_forget swallow exceptions, so a contended write was a record
+        # that vanished with nothing said. Re-entrant, because a couple of
+        # helpers open a connection while already holding one.
+        self._db_lock = threading.RLock()
         self._seeded = False           # recipe priors backfilled this process
 
     # ── plumbing ──────────────────────────────────────────────────────────
@@ -5945,7 +5985,23 @@ class RsrToolAPI:
         return self._app_dir / DB_NAME
 
     def _db(self) -> sqlite3.Connection:
-        con = sqlite3.connect(str(self._db_path))
+        self._db_lock.acquire()
+        try:
+            return self._open_db()
+        except Exception:
+            self._db_lock.release()
+            raise
+
+    def _open_db(self) -> sqlite3.Connection:
+        # 60s rather than sqlite's 5s default: belt and braces behind the lock,
+        # for when something OUTSIDE this process holds the file -- the srrdb
+        # tool reads this index live.
+        con = sqlite3.connect(str(self._db_path), timeout=60)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         con.execute("""CREATE TABLE IF NOT EXISTS releases(
             name TEXT PRIMARY KEY, rsr_path TEXT, created TEXT,
             format TEXT, sets INT, files INT, volumes INT,
@@ -6036,7 +6092,7 @@ class RsrToolAPI:
                     con.commit()
             except Exception:
                 pass
-        return con
+        return _LockedConn(con, self._db_lock)
 
     def _db_learn_zip(self, grp: str, recipe: dict):
         """Record a deflate that reproduced a stream, so the group's next
