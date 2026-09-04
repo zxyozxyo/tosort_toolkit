@@ -1873,7 +1873,7 @@ class RsrToolAPI:
         exes = self._pack_exes()
         if not exes:
             return ""
-        work = Path(tempfile.mkdtemp(prefix="rsr-cmt-"))
+        work = Path(tempfile.mkdtemp(prefix="rsr-cmt-", dir=self._work_root()))
         try:
             out = work / "comment.txt"
             for exe in reversed(exes[-4:]):        # newest first
@@ -1894,6 +1894,30 @@ class RsrToolAPI:
             return ""
         finally:
             _rmtree(work)
+
+    @staticmethod
+    def _work_root() -> Path:
+        """One parent for every scratch folder this tool makes.
+
+        They used to go straight into %TEMP% as rsr-XXXXXXXX, which works but
+        makes them impossible to name: excluding them from a virus scanner
+        would have meant excluding the whole of %TEMP%, and %TEMP% is where
+        every installer and browser on the machine stages its downloads. That
+        is far too much to give up for one release.
+
+        And it does need excluding. A scene release that ships a TOOL —
+        NINTENDO_DS_BETA_DUMPER-IND packs nds-dumper-beta.exe — gets its source
+        quarantined between the extract and the read, and the capture fails
+        with "Permission denied" on a file rar wrote seconds earlier. Nothing
+        is wrong with the release or the tool; a 2008 homebrew dumper simply
+        trips a heuristic.
+
+        Still under %TEMP% rather than beside the code: these hold the whole
+        extracted source, which is gigabytes for a 3DS release, and the system
+        temp drive is the one with room for that."""
+        root = Path(tempfile.gettempdir()) / "rsr-work"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
 
     def _pack_exes(self) -> list[Path]:
         pack = self._app_dir / "apps" / "winrar_pack-4.20"
@@ -2378,7 +2402,7 @@ class RsrToolAPI:
             broken_keep = [(folder / d["name"], d) for d in damaged]
             pair_seed = (folder, sib, union)
 
-        work = Path(tempfile.mkdtemp(prefix="rsr-"))
+        work = Path(tempfile.mkdtemp(prefix="rsr-", dir=self._work_root()))
         manifest = {
             "rsr_version": RSR_VERSION,
             "magic": RSR_MAGIC,
@@ -3106,7 +3130,7 @@ class RsrToolAPI:
         The same rule as everywhere else — the .rsr is written only after it
         has been reassembled here and compared byte for byte with the original
         archive."""
-        work = Path(tempfile.mkdtemp(prefix="rsr-zip-"))
+        work = Path(tempfile.mkdtemp(prefix="rsr-zip-", dir=self._work_root()))
         manifest = {
             "rsr_version": RSR_VERSION, "magic": RSR_MAGIC,
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -5358,7 +5382,7 @@ class RsrToolAPI:
             self._log(f"  captured {manifest.get('created_utc')} by "
                       f"{manifest.get('tool')}", "dim")
             out.mkdir(parents=True, exist_ok=True)
-            work = Path(tempfile.mkdtemp(prefix="rsr-rb-"))
+            work = Path(tempfile.mkdtemp(prefix="rsr-rb-", dir=self._work_root()))
             ok_all = True
             try:
                 for st in manifest.get("sets", []):
