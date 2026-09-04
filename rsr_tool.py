@@ -297,8 +297,17 @@ def _no_window() -> dict:
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0                              # SW_HIDE
+    # BELOW_NORMAL, so a scan can have the whole machine without owning it.
+    # The sweep now runs dozens of rar.exe at once and will happily sit at
+    # 100% CPU for hours; at normal priority that competes with whatever the
+    # operator is doing on equal terms. Below normal, Windows hands the scan
+    # every idle cycle on an empty machine — the throughput is unchanged when
+    # nothing else wants the CPU — and preempts it the moment anything
+    # interactive does. It makes a high core budget safe to leave set.
     return {"startupinfo": si,
-            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+            "creationflags": (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                              | getattr(subprocess,
+                                        "BELOW_NORMAL_PRIORITY_CLASS", 0))}
 
 
 def _method_groups(meta: list[dict]) -> list[tuple[int, int]]:
