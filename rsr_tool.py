@@ -2385,14 +2385,24 @@ class RsrToolAPI:
 
 
         # Keep `jobs` slots busy, re-reading the setting each time one frees.
+        # The queue lives on self so that requeue() can add to a run that is
+        # already going: on a long scan the useful moment to retry a parked
+        # release is while you are watching it park, not tomorrow.
         pending = list(enumerate(folders, 1))
+        self._queue = pending
+        self._queue_lock = threading.Lock()
+        self._queue_by_name = {_release_name(f): f for f in folders}
+        self._queue_total = len(folders)
         live: list = []
         while pending or live:
             if self._stop.is_set():
                 break
             want = self._job_slots()
-            while pending and len(live) < want:
-                i, folder = pending.pop(0)
+            while len(live) < want:
+                with self._queue_lock:
+                    if not pending:
+                        break
+                    i, folder = pending.pop(0)
                 th = threading.Thread(target=_one, args=(i, folder),
                                       daemon=True)
                 th.start()
@@ -4502,6 +4512,41 @@ class RsrToolAPI:
                   + (" A running scan applies this as slots free."
                      if self._running else ""), "info")
         return {"ok": True, "jobs": n}
+
+    def requeue(self, name: str) -> dict:
+        """Put a release back on the queue of the scan in progress.
+
+        For the release that just parked on the budget, or errored on
+        something you have since fixed — an antivirus exclusion, a file that
+        was locked. It goes to the BACK of the queue, keeps whatever sweep
+        position it had recorded, and gets the budget in force when it comes
+        round, so retrying costs only the combos it has not tried yet.
+
+        Only while a scan is running: outside one there is no queue to join,
+        and scanning the folder again is the same thing with fewer surprises.
+        """
+        name = (name or "").strip()
+        if not self._running:
+            return {"ok": False, "error": "no scan is running"}
+        folder = (getattr(self, "_queue_by_name", None) or {}).get(name)
+        if folder is None:
+            return {"ok": False,
+                    "error": f"{name} is not part of the run in progress"}
+        with getattr(self, "_queue_lock", threading.Lock()):
+            q = getattr(self, "_queue", None)
+            if q is None:
+                return {"ok": False, "error": "no queue"}
+            if any(f == folder for _i, f in q):
+                return {"ok": False, "error": f"{name} is already queued"}
+            self._queue_total = getattr(self, "_queue_total", 0) + 1
+            q.append((self._queue_total, folder))
+            ahead = len(q)
+        self._log(f"↻ {name} put back on the queue — {ahead} ahead of it.",
+                  "info")
+        self._emit("row", {"name": name, "status": "queued",
+                           "recipe": "waiting for another go",
+                           "kind": "running"})
+        return {"ok": True, "ahead": ahead}
 
     def _job_slots(self) -> int:
         """How many releases to capture at once, read fresh every time a slot

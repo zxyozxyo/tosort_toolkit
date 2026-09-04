@@ -383,6 +383,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
   <div class="modal">
     <div class="modal-hdr">
       <div class="t" id="mi-title">Release</div>
+      <button class="btn btn-sm" id="mi-retry" onclick="retryRelease()"
+              title="Put this release back on the queue of the run in progress">Try again</button>
       <button class="btn btn-sm" id="mi-open" onclick="openInfoFolder()">Open folder</button>
       <button class="btn btn-sm" onclick="closeInfo()">Close</button>
     </div>
@@ -535,7 +537,10 @@ async function pickRsr() {
 }
 function save() { window.pywebview.api.save_settings(cfg()); }
 
+let scanning = false;
+
 function setBusy(on) {
+  scanning = on;
   $('btn-scan').disabled = on;
   $('btn-rebuild').disabled = on;
   $('btn-rebuild1').disabled = on;
@@ -866,7 +871,33 @@ function closeInfo() { $('modal-bg').classList.remove('on'); }
 function openInfoFolder() { if (infoPath) window.pywebview.api.open_store(infoPath); }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeInfo(); });
 
+let infoName = '';
+
+function retryable(name) {
+  // Only worth offering for something that did NOT finish, and only while a
+  // scan is running — outside one there is no queue to join.
+  const r = rows.get(name);
+  return !!(scanning && r
+            && ['parked', 'error', 'wall'].includes(r.kind));
+}
+
+async function retryRelease() {
+  const b = $('mi-retry');
+  b.disabled = true;
+  try {
+    const r = await window.pywebview.api.requeue(infoName);
+    b.textContent = r && r.ok ? 'Queued ✓' : 'Not queued';
+  } catch (e) {
+    b.textContent = 'Not queued';
+  }
+  setTimeout(closeInfo, 700);
+}
+
 async function showInfo(key) {
+  infoName = key;
+  $('mi-retry').textContent = 'Try again';
+  $('mi-retry').disabled = false;
+  $('mi-retry').style.display = retryable(key) ? '' : 'none';
   $('mi-title').textContent = key;
   $('mi-body').innerHTML = '<div class="hint">loading…</div>';
   $('modal-bg').classList.add('on');
