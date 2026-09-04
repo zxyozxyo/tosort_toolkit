@@ -221,8 +221,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <input class="num" id="budget_min" type="number" min="0" max="1440" value="45">
             <span class="hint">minutes per release, 0 = no limit</span>
           </div>
-          <label class="chk-row"><input type="checkbox" id="dict_ladder" checked>
-            Retry larger dictionary sizes if the header's is wrong</label>
+          <label class="chk-row"><input type="checkbox" id="dict_ladder">
+            Retry larger dictionary sizes if the header's is wrong
+            <span class="hint">(never helped: 7,541 of 7,541)</span></label>
           <label class="chk-row"><input type="checkbox" id="retry_walls">
             Retry releases already swept to exhaustion</label>
           <label class="chk-row"><input type="checkbox" id="small_first" checked>
@@ -411,7 +412,11 @@ window.addEventListener('pywebviewready', async () => {
   $('retry_walls').checked = s.retry_walls;
   $('small_first').checked = s.small_first;
   CPU_CORES = s.cores || 0;
-  if (CPU_CORES) $('workers').max = CPU_CORES;
+  // Allow up to twice the core count. `rar -mtN` does not actually keep N
+  // cores busy — measured at 71% of a 32-core machine with a full 32-thread
+  // budget — so oversubscribing is how you get the rest, and it is only ever
+  // worth doing when nobody is using the PC.
+  if (CPU_CORES) $('workers').max = CPU_CORES * 2;
   $('workers').value = Math.min(s.workers || 0, +$('workers').max);
   workersPreview();
   refreshStats();
@@ -541,9 +546,10 @@ function workersPreview(){
   // slider does not write the config sixty times.
   const n = +$('workers').value;
   const auto = CPU_CORES ? Math.max(1, CPU_CORES >> 1) : '?';
+  const over = CPU_CORES && n > CPU_CORES ? ' — oversubscribed' : '';
   $('workers-val').innerHTML = n === 0
     ? `<b>auto</b> — ${auto} of ${CPU_CORES || '?'}`
-    : `<b>${n}</b> of ${CPU_CORES || '?'} thread(s)`;
+    : `<b>${n}</b> of ${CPU_CORES || '?'} thread(s)${over}`;
 }
 
 async function workersApply(){
