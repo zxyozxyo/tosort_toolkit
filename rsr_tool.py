@@ -180,6 +180,11 @@ _FOREIGN_ARCHIVE_EXT = {".lzx", ".arj", ".ace", ".7z", ".zoo",
 # out and back; two captures in one process must not interleave there.
 _RAR_COMMENT_LOCK = threading.RLock()
 
+# Least compressed output a prefix probe must see before its verdict counts.
+# Under this the streams have barely diverged and an "agrees so far" means
+# nothing, so the combo is packed in full instead.
+PROBE_MIN_BYTES = 1 << 20
+
 _FIX_TAGS = ("DIRFIX", "NFOFIX", "PROOFFIX", "SFVFIX", "SAMPLEFIX",
              "RARFIX", "SUBFIX", "SYNCFIX")
 
@@ -1188,6 +1193,50 @@ def _rar4_file_headers(vol: Path, limit: int = 8) -> list[dict]:
     return out
 
 
+def rar4_vol_blocks(vol: Path) -> dict[str, tuple[int, int]]:
+    """{packed name: (data offset, bytes IN THIS VOLUME)} for one RAR4 volume.
+
+    packed_blocks() goes through rarfile, which walks the whole set and wants a
+    proper end block. A volume left behind by a killed pack has neither, so the
+    headers are walked by hand here instead: a file block carries its own size
+    and its data length, which is all a prefix probe needs. Anything malformed
+    just ends the walk — a truncated tail is the normal case here, not an
+    error."""
+    out: dict[str, tuple[int, int]] = {}
+    try:
+        size_on_disk = vol.stat().st_size
+        with open(vol, "rb") as fh:
+            if fh.read(7) != RAR4_SIG:
+                return {}
+            pos = 7
+            while pos + 11 <= size_on_disk:
+                fh.seek(pos)
+                head = fh.read(32)
+                if len(head) < 11:
+                    break
+                typ = head[2]
+                flags = int.from_bytes(head[3:5], "little")
+                hsize = int.from_bytes(head[5:7], "little")
+                if hsize < 7:
+                    break
+                add = (int.from_bytes(head[7:11], "little")
+                       if flags & 0x8000 else 0)
+                if typ == 0x74:
+                    fh.seek(pos)
+                    full = fh.read(hsize)
+                    if len(full) < 32:
+                        break
+                    nlen = int.from_bytes(full[26:28], "little")
+                    name = full[32:32 + nlen].split(b"\0")[0]
+                    if name:
+                        out[name.decode("latin-1", "replace")] = (pos + hsize,
+                                                                  add)
+                pos += hsize + add
+    except OSError:
+        return {}
+    return out
+
+
 def header_exttime(vol: Path) -> bool | None:
     """Whether a volume's first file header carries the high-precision
     timestamp (LHD_EXTTIME, 0x1000), or None if there is no file header.
@@ -1606,6 +1655,51 @@ class RsrToolAPI:
                 p.kill()
             except Exception:
                 pass
+
+    def _run_until(self, cmd: list, ready, timeout: int,
+                   heartbeat: str = "", cwd=None) -> bool:
+        """Run a pack and kill it the moment `ready()` says there is enough
+        output to judge it on.
+
+        The INPUT still has to be whole. Multithreaded rar derives its
+        per-thread chunk boundaries from the total length of what it is given,
+        so a shortened source produces different bytes and proves nothing —
+        a mistake already made once in this project, and the reason a whole
+        generation of srrdb verdicts had to be thrown away. What can be cut
+        short is the OUTPUT: a wrong build diverges inside volume one and never
+        recovers, so everything after volume one is work spent producing
+        evidence nobody reads."""
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 cwd=(str(cwd) if cwd else None),
+                                 **_no_window())
+        except Exception:
+            return False
+        with self._proc_lock:
+            self._procs.add(p)
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                if p.poll() is not None:
+                    return p.returncode == 0
+                if self._stop.is_set() or self._skip.is_set():
+                    p.kill()
+                    return False
+                try:
+                    if ready():
+                        p.kill()
+                        p.wait(timeout=30)
+                        return True
+                except OSError:
+                    pass
+                if time.monotonic() > deadline:
+                    p.kill()
+                    return False
+                time.sleep(0.05)
+        finally:
+            with self._proc_lock:
+                self._procs.discard(p)
 
     def _run(self, cmd: list, timeout: int, heartbeat: str = "",
              cwd=None) -> bool:
@@ -3529,6 +3623,18 @@ class RsrToolAPI:
             return {"ok": False, "error": f"cannot read packed blocks: {e}"}
         targets = {f["name"]: stream_digest(blocks[f["name"]])
                    for f in meta if f["name"] in blocks}
+        # Where each packed file's FIRST volume slice lives in the original.
+        # The sweep compares a candidate against these bytes and can stop as
+        # soon as volume one is written, instead of compressing the entire
+        # source to produce output nothing looks at. Only useful on a real
+        # multi-volume set — with one volume there is nothing to stop before.
+        prefix = {}
+        if len(vols) > 1:
+            for f in meta:
+                b = blocks.get(f["name"]) or []
+                if b:
+                    vol, off, size = b[0]
+                    prefix[f["name"]] = (vol, off, size)
         missing = [f["name"] for f in meta if f["name"] not in blocks]
         if missing:
             self._log(f"    ⚠ no packed data located for: "
@@ -3756,7 +3862,8 @@ class RsrToolAPI:
                                         new_numbering=newnum, groups=mgroups,
                                         end_sig=want_end, hdr_ext=want_ext,
                                         rung=di, rungs=len(cands),
-                                        base=srcdir if keep_paths else None)
+                                        base=srcdir if keep_paths else None,
+                                        prefix=prefix)
             if recipe:
                 break
             if self._budget_hit:
@@ -4125,7 +4232,7 @@ class RsrToolAPI:
                       deadline=None, rel="", vol_bytes=0,
                       new_numbering=True, groups=None, end_sig=None,
                       hdr_ext=None, rung=0, rungs=1,
-                      base=None) -> dict | None:
+                      base=None, prefix=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -4240,6 +4347,51 @@ class RsrToolAPI:
                 except OSError:
                     pass
             t_one = time.monotonic()
+            # PREFIX PROBE. One command, real volumes, and a first-volume
+            # slice to compare against: pack only until volume one is closed,
+            # judge on that, and pay for a full pack only on a survivor. A
+            # wrong build diverges inside volume one, so this rejects
+            # everything a full pack rejects while compressing a fraction as
+            # much — volume one is 5 MB of a 101 MB archive on Infinite_Space.
+            if prefix and len(cmds) == 1 and vol_args:
+                probe_head = probe_dir / "probe.rar"
+
+                def _closed():
+                    # rar has opened volume two, so volume one is complete and
+                    # flushed. Safer than watching volume one's size, which
+                    # sits at its final value for a moment before the file is
+                    # closed.
+                    return any(q.name != "probe.rar"
+                               for q in probe_dir.iterdir())
+
+                if not self._run_until(
+                        cmds[0], _closed, timeout=900,
+                        heartbeat=f"probe {tried}/{total} · -mt{n} · "
+                                  f"{_exe_label(ex.name)}", cwd=base):
+                    continue
+                verdict = self._prefix_verdict(probe_head, prefix)
+                # Both build discriminators are properties of volume ONE — the
+                # capture reads them off vols[0] too — so they belong here
+                # rather than after a full pack. This is what makes the probe
+                # pay: a matching stream identifies a build FAMILY, not a
+                # build, so on a 3.x/4.x release a dozen builds sail through
+                # the byte compare and only these two tell them apart. Checked
+                # after the full pack they cost a full pack each; checked here
+                # they cost nothing.
+                bad = (verdict is False
+                       or (end_sig is not None
+                           and end_block_sig(probe_head) != end_sig)
+                       or (hdr_ext is not None
+                           and header_exttime(probe_head) != hdr_ext))
+                for junk in probe_dir.iterdir():
+                    try:
+                        junk.unlink()
+                    except OSError:
+                        pass
+                if bad:
+                    continue
+                # A None verdict means there was not enough output to be sure;
+                # pack it in full rather than trust a verdict worth nothing.
             ran = all(self._run(c, timeout=900,
                                 heartbeat=f"sweep {tried}/{total} · -mt{n} · "
                                           f"{_exe_label(ex.name)}",
@@ -4323,6 +4475,46 @@ class RsrToolAPI:
             return min(vols, key=lambda p: _classify_volume(p.name)[2])
         single = probe_dir / "probe.rar"
         return single if single.is_file() else None
+
+    @staticmethod
+    @staticmethod
+    def _prefix_verdict(probe_head: Path, prefix: dict):
+        """True if volume one agrees with the original, False if it does not,
+        None if there is not enough of it to say.
+
+        Compared over the COMMON PREFIX of the two slices, never over their
+        lengths. Two builds can write different-sized headers and so fit
+        different amounts of stream into a fixed-size volume while producing
+        the identical stream, and rejecting on length would throw away the
+        build that is actually right."""
+        got = rar4_vol_blocks(probe_head)
+        if not got:
+            return None
+        seen = 0
+        for name, (src_vol, src_off, src_len) in prefix.items():
+            if name not in got:
+                continue                       # not in volume one; no verdict
+            off, size = got[name]
+            n = min(size, src_len)
+            if n <= 0:
+                continue
+            try:
+                with open(probe_head, "rb") as a, open(src_vol, "rb") as b:
+                    a.seek(off)
+                    b.seek(src_off)
+                    left = n
+                    while left > 0:
+                        step = min(1 << 20, left)
+                        x, y = a.read(step), b.read(step)
+                        if len(x) < step or len(y) < step:
+                            return None
+                        if x != y:
+                            return False
+                        left -= step
+            except OSError:
+                return None
+            seen = max(seen, n)
+        return True if seen >= PROBE_MIN_BYTES else None
 
     @staticmethod
     def _streams_match(probe: Path, targets: dict) -> bool:
