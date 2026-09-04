@@ -1807,6 +1807,19 @@ class RsrToolAPI:
             "retry_walls": bool(s.get("retry_walls", cur["retry_walls"])),
             "small_first": bool(s.get("small_first", cur["small_first"])),
         }
+        # Keep anything already in the file that this method does not model.
+        # It writes a fixed whitelist, so every save silently DROPPED the
+        # priors-import bookkeeping (priors_imported_mtime / _records) that
+        # import_srrdb_priors writes — which made the "there are new srrdb
+        # results to import" reminder permanent, and made "when did I last
+        # import?" unanswerable, however many times the import had run.
+        try:
+            raw = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            raw = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                out.setdefault(k, v)
         try:
             self._config_path.write_text(json.dumps(out, indent=2), "utf-8")
         except Exception as e:
