@@ -57,6 +57,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
 .chk-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer}
 .chk-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
+.cpu-row{display:flex;align-items:center;gap:8px;margin-top:6px;padding:6px 8px;
+  background:var(--bg0);border:1px solid var(--border);border-radius:5px}
+.cpu-row input[type=range]{flex:1;accent-color:var(--acc);cursor:pointer;min-width:90px}
+.cpu-val{font-size:11px;color:var(--text);white-space:nowrap;min-width:104px;
+  font-variant-numeric:tabular-nums}
+.cpu-val b{color:var(--acc)}
 .num{width:58px;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-family:var(--font);font-size:11px;outline:none}
 
 .queue{flex:1;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px;min-height:90px}
@@ -221,6 +227,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             Retry releases already swept to exhaustion</label>
           <label class="chk-row"><input type="checkbox" id="small_first" checked>
             Smallest releases first (learn recipes cheaply)</label>
+          <div class="cpu-row" title="rar threads the sweep may use at once. Takes effect immediately, even mid-scan.">
+            <div class="lbl" style="min-width:auto">Cores</div>
+            <input type="range" id="workers" min="0" max="64" step="1" value="0"
+                   oninput="workersPreview()" onchange="workersApply()">
+            <span class="cpu-val" id="workers-val">auto</span>
+          </div>
           <div class="row" style="margin-top:2px">
             <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
             <button class="btn btn-sm" id="btn-skip" onclick="skipFile()" disabled
@@ -398,6 +410,10 @@ window.addEventListener('pywebviewready', async () => {
   $('budget_min').value = s.budget_min;
   $('retry_walls').checked = s.retry_walls;
   $('small_first').checked = s.small_first;
+  CPU_CORES = s.cores || 0;
+  if (CPU_CORES) $('workers').max = CPU_CORES;
+  $('workers').value = Math.min(s.workers || 0, +$('workers').max);
+  workersPreview();
   refreshStats();
   dbSearch();
   checkPriors();
@@ -491,6 +507,7 @@ function cfg() {
     budget_min: $('budget_min').value,
     retry_walls: $('retry_walls').checked,
     small_first: $('small_first').checked,
+    workers: $('workers').value,
   };
 }
 
@@ -515,6 +532,27 @@ function setBusy(on) {
   const p = $('status-pill');
   p.textContent = on ? 'running' : 'idle';
   p.className = 'pill' + (on ? ' running' : '');
+}
+
+let CPU_CORES = 0;
+
+function workersPreview(){
+  // Label only — nothing is applied until the drag ends, so scrubbing the
+  // slider does not write the config sixty times.
+  const n = +$('workers').value;
+  const auto = CPU_CORES ? Math.max(1, CPU_CORES >> 1) : '?';
+  $('workers-val').innerHTML = n === 0
+    ? `<b>auto</b> — ${auto} of ${CPU_CORES || '?'}`
+    : `<b>${n}</b> of ${CPU_CORES || '?'} thread(s)`;
+}
+
+async function workersApply(){
+  const n = +$('workers').value;
+  try {
+    const r = await window.pywebview.api.set_workers(n);
+    if (r && r.cores) CPU_CORES = r.cores;
+    workersPreview();
+  } catch (e) { /* the log line from the API says what happened */ }
 }
 
 async function startScan() {

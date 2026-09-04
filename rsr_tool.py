@@ -1788,6 +1788,9 @@ class RsrToolAPI:
             # rar THREADS the sweep may use at once; 0 = auto (half the
             # machine, so it stays usable while a scan runs). See _cpu_budget.
             "workers": _num(cfg.get("workers"), 0, int),
+            # Not a setting — what the machine has, so the GUI can size its
+            # slider and say what "auto" currently works out to.
+            "cores": os.cpu_count() or 0,
         }
 
     def save_settings(self, s: dict) -> dict:
@@ -4285,6 +4288,30 @@ class RsrToolAPI:
         lead = [m for m in won if m in mts]
         return lead + [m for m in mts if m not in lead] if lead else mts
 
+    def set_workers(self, n) -> dict:
+        """Change the core budget, taking effect on the next chunk.
+
+        Deliberately NOT part of save_settings: that is the whole-form save,
+        and this has to work while a scan is running, when the rest of the
+        form is disabled and re-saving it would be wrong."""
+        n = max(0, min(256, _num(n, 0, int)))
+        try:
+            cfg = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            cfg = {}
+        cfg["workers"] = n
+        try:
+            self._config_path.write_text(json.dumps(cfg, indent=2), "utf-8")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        eff = self._cpu_budget()
+        self._log(f"Core budget: {'auto' if not n else n} "
+                  f"→ {eff} rar thread(s) of {os.cpu_count() or '?'}"
+                  + (" — a running sweep picks this up at its next chunk."
+                     if self._running else ""), "info")
+        return {"ok": True, "workers": n, "effective": eff,
+                "cores": os.cpu_count() or 0}
+
     def _cpu_budget(self) -> int:
         """How many rar threads the sweep may use at once.
 
@@ -4445,9 +4472,19 @@ class RsrToolAPI:
         # winner is the lowest-index combo that matched, exactly as the serial
         # sweep returned. Several builds of one family can match, and which one
         # you get must not depend on which core happened to finish first.
-        budget = self._cpu_budget()
         idx = 0
+        last_budget = 0
         while idx < len(combos):
+            # Re-read every chunk rather than once per sweep. A sweep can run
+            # for hours, and the whole point of the setting is to be able to
+            # hand the machine back — turn it down at breakfast and the very
+            # next chunk is smaller, without stopping the scan and losing the
+            # sweep position.
+            budget = self._cpu_budget()
+            if budget != last_budget and last_budget:
+                self._log(f"    core budget changed to {budget} thread(s) — "
+                          f"applies from this chunk on.", "dim")
+            last_budget = budget
             if self._stop.is_set() or self._skip.is_set():
                 return None
             if (tried and deadline and not self._budget_override
