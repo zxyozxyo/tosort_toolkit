@@ -49,6 +49,9 @@ from datetime import datetime, timezone
 
 import webview
 
+# Serialises the on-disk log across capture threads (see _log_to_file).
+_LOG_LOCK = threading.Lock()
+
 
 RSR_VERSION   = 1
 RSR_MAGIC     = "RSR/1 Reproducible Scene Release"
@@ -1671,9 +1674,48 @@ class RsrToolAPI:
         if tag and msg.strip() and "══" not in msg:
             msg = f"{tag}{msg}"
         self._emit("log", {"msg": msg, "cls": cls})
+        self._log_to_file(msg, cls)
 
     def _progress(self, msg: str):
         self._emit("progress", {"msg": msg})
+
+    # ── the log on disk ─────────────────────────────────────────────────────
+    # The log window is the only record a run leaves, and it lives in the
+    # browser: close the window and a night of scanning goes with it. An
+    # overnight run that errors on one group is exactly when the lines matter
+    # and exactly when they are hardest to keep, so mirror every line to a
+    # file that outlives the window and can be read back afterwards.
+    _LOG_MAX_BYTES = 20 << 20        # roll at 20 MB, keep one previous file
+
+    @property
+    def _log_path(self) -> Path:
+        return self._app_dir / "rsr_tool.log"
+
+    def _log_to_file(self, msg: str, cls: str = "info"):
+        with _LOG_LOCK:
+            try:
+                path = self._log_path
+                if (path.exists()
+                        and path.stat().st_size > self._LOG_MAX_BYTES):
+                    prev = path.parent / (path.name + ".1")
+                    try:
+                        prev.unlink()
+                    except OSError:
+                        pass
+                    path.rename(prev)
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                with path.open("a", encoding="utf-8", errors="replace") as fh:
+                    fh.write(f"{stamp} [{cls}] {msg}" + chr(10))
+            except Exception:
+                pass          # a log that breaks the run is worse than no log
+
+    def log_path(self) -> str:
+        """Where the run log is written (for the GUI's 'Open log' button)."""
+        try:
+            self._log_to_file("log path requested", "dim")
+            return str(self._log_path)
+        except Exception:
+            return ""
 
     def browse_folder(self) -> str:
         try:
