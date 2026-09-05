@@ -5399,6 +5399,7 @@ class RsrToolAPI:
             claims.setdefault(p, set()).add(rel)
         consumed_by: dict = {}
         failed_rels: set = set()
+        built: set = set()          # releases rebuilt AND verified so far
 
         for i, (rel, (p, hit)) in enumerate(sorted(matched.items()), 1):
             if self._stop.is_set():
@@ -5436,9 +5437,27 @@ class RsrToolAPI:
                 res = {"ok": False}
             if res.get("ok"):
                 done += 1
+                built.add(rel)
                 if delete_content:
+                    ready = []
                     for c in self._consumed:
                         consumed_by.setdefault(c, set()).add(rel)
+                        # Delete NOW if nothing else is still owed this file.
+                        # Waiting for the whole batch was safe but could need
+                        # the unpacked corpus and the rebuilt one on the disk
+                        # at the same time — 1.4 TB of 3DS twice over. A
+                        # source is freed the moment its LAST claimant has
+                        # been rebuilt and hash-verified, which is exactly the
+                        # test the end-of-run sweep applied, just applied
+                        # sooner.
+                        if not (claims.get(c, set()) - built):
+                            ready.append(c)
+                    if ready:
+                        keep_all, self._consumed = self._consumed, ready
+                        freed += self._delete_consumed(out)
+                        self._consumed = keep_all
+                        for c in ready:
+                            consumed_by.pop(c, None)
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": "rebuilt", "kind": "ok"})
             else:
@@ -5448,9 +5467,12 @@ class RsrToolAPI:
                                    "recipe": "rebuild failed", "kind": "error"})
 
         if delete_content and consumed_by:
-            # A source goes only once every release that claimed it has been
-            # built and hash-verified. Anything still owed to a release that
-            # failed, or that the run never reached, stays where it is.
+            # Backstop. Most sources are freed as their last claimant finishes
+            # (above); what reaches here is shared content whose other
+            # claimants came later in the run. Same rule either way: a source
+            # goes only once EVERY release that claimed it has been built and
+            # hash-verified, so anything still owed to a release that failed,
+            # or that the run never reached, stays where it is.
             held = 0
             keep = []
             for srcp, built in consumed_by.items():
