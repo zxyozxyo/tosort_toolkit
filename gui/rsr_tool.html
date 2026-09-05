@@ -281,6 +281,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <label class="chk-row"><input type="checkbox" id="metadata_releases" checked>
               Also write the nfo-only releases (dirfix / nfofix) &mdash; they have
               no content to match on</label>
+            <div class="cpu-row" title="How many releases to rebuild at the same time. Takes effect as slots free, even mid-rebuild. There is no core slider here: -mt is part of each release's recipe, so a rebuild has to pack at the thread count it was captured with.">
+              <div class="lbl" style="min-width:auto">At once</div>
+              <input type="range" id="rebuild_jobs" min="1" max="8" step="1" value="1"
+                     oninput="rebuildJobsPreview()" onchange="rebuildJobsApply()">
+              <span class="cpu-val" id="rebuild_jobs-val">1 release</span>
+            </div>
             <div class="row">
               <button class="btn btn-go" id="btn-rebuild" onclick="startBatch()">Rebuild all</button>
               <span class="hint">matched on size + CRC32, not on name</span>
@@ -429,6 +435,8 @@ window.addEventListener('pywebviewready', async () => {
   workersPreview();
   $('jobs').value = s.jobs || 1;
   jobsPreview();
+  $('rebuild_jobs').value = s.rebuild_jobs || 1;
+  rebuildJobsPreview();
   refreshStats();
   dbSearch();
   checkPriors();
@@ -584,6 +592,18 @@ function jobsPreview(){
 
 async function jobsApply(){
   try { await window.pywebview.api.set_jobs(+$('jobs').value); }
+  catch (e) { /* the API logs what happened */ }
+}
+
+function rebuildJobsPreview(){
+  const n = +$('rebuild_jobs').value;
+  $('rebuild_jobs-val').innerHTML = n === 1
+    ? `<b>1</b> release at a time`
+    : `<b>${n}</b> releases at once`;
+}
+
+async function rebuildJobsApply(){
+  try { await window.pywebview.api.set_rebuild_jobs(+$('rebuild_jobs').value); }
   catch (e) { /* the API logs what happened */ }
 }
 

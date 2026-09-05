@@ -1592,7 +1592,6 @@ class RsrToolAPI:
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
         self._budget_min = 0
-        self._consumed: list = []      # content files a rebuild actually used
         self._content_root = None      # never delete the root itself
         # Per-CAPTURE state, kept per thread. With several releases in flight
         # at once these are the things that would otherwise collide: one
@@ -1601,11 +1600,15 @@ class RsrToolAPI:
         # written against another's name. A thread-local slot gives each
         # capture its own without changing a single call signature.
         #
-        # _consumed and _content_root are deliberately NOT here: they belong
-        # to the REBUILD path, which is still one release at a time, and
-        # _consumed is what delete-source works from — the last thing that
-        # should ever be shared or guessed at.
+        # _consumed is HERE for the same reason, now that the rebuild also
+        # runs several releases at once. It is what delete-source works from —
+        # the last thing that should ever be shared or guessed at — so each
+        # rebuild thread gets its own list and can never read another
+        # release's sources and delete them. What may be deleted is still
+        # decided centrally, against claims/built under the batch lock.
+        # _content_root stays shared: it is one root for the whole batch.
         self._tl = threading.local()
+        self._consumed = []            # content files a rebuild actually used
         # One writer at a time. Several captures now run at once and all of
         # them record rows, misses and learned recipes. sqlite would serialise
         # them anyway -- but by RAISING once its timeout expires, and _db_miss
@@ -1618,6 +1621,18 @@ class RsrToolAPI:
     # ── plumbing ──────────────────────────────────────────────────────────
 
     # ── per-capture state, one slot per thread (see __init__) ────────────
+
+    @property
+    def _consumed(self) -> list:
+        """Content files THIS thread's rebuild actually read (see __init__)."""
+        v = getattr(self._tl, "consumed", None)
+        if v is None:
+            v = self._tl.consumed = []
+        return v
+
+    @_consumed.setter
+    def _consumed(self, v):
+        self._tl.consumed = list(v)
 
     @property
     def _deadline(self):
@@ -1930,6 +1945,9 @@ class RsrToolAPI:
             "workers": _num(cfg.get("workers"), 0, int),
             # Releases captured at once. See _job_slots.
             "jobs": max(1, min(16, _num(cfg.get("jobs"), 1, int))),
+            # Releases REBUILT at once. Separate from `jobs` because a rebuild
+            # replays one command at its recipe's own -mt. See _rebuild_slots.
+            "rebuild_jobs": max(1, min(8, _num(cfg.get("rebuild_jobs"), 1, int))),
             # Not a setting — what the machine has, so the GUI can size its
             # slider and say what "auto" currently works out to.
             "cores": os.cpu_count() or 0,
@@ -4555,6 +4573,28 @@ class RsrToolAPI:
                      if self._running else ""), "info")
         return {"ok": True, "jobs": n}
 
+    def set_rebuild_jobs(self, n) -> dict:
+        """Change how many releases rebuild at once, from the next free slot.
+
+        Same live contract as set_workers/set_jobs. Note there is deliberately
+        no core slider for the rebuild: -mt is part of the recipe, and packing
+        at any other thread count changes the bytes and fails verification."""
+        n = max(1, min(8, _num(n, 1, int)))
+        try:
+            cfg = json.loads(self._config_path.read_text("utf-8"))
+        except Exception:
+            cfg = {}
+        cfg["rebuild_jobs"] = n
+        try:
+            self._config_path.write_text(json.dumps(cfg, indent=2), "utf-8")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._log(f"Rebuilds at once: {n}"
+                  + ("" if n > 1 else " (one at a time)")
+                  + (" — a running rebuild applies this as slots free."
+                     if self._running else ""), "info")
+        return {"ok": True, "rebuild_jobs": n}
+
     def requeue(self, name: str) -> dict:
         """Put a release back on the queue of the scan in progress.
 
@@ -4594,6 +4634,16 @@ class RsrToolAPI:
         """How many releases to capture at once, read fresh every time a slot
         frees so it can be changed while a scan runs."""
         return max(1, min(16, _num(self.get_settings().get("jobs"), 1, int)))
+
+    def _rebuild_slots(self) -> int:
+        """How many releases to REBUILD at once, re-read as each one ends.
+
+        Separate from `jobs` because the two sides size differently: a capture
+        sweeps many rar builds at once and is happy to take the machine, while
+        a rebuild replays ONE command at the thread count its recipe recorded,
+        so a single release often leaves most of the CPU idle."""
+        return max(1, min(8, _num(
+            self.get_settings().get("rebuild_jobs"), 1, int)))
 
     def _cpu_budget(self) -> int:
         """How many rar threads the sweep may use at once.
@@ -5443,12 +5493,20 @@ class RsrToolAPI:
         failed_rels: set = set()
         built: set = set()          # releases rebuilt AND verified so far
 
-        for i, (rel, (p, hit)) in enumerate(sorted(matched.items()), 1):
-            if self._stop.is_set():
-                self._log("Stopped.", "warn")
-                break
+        # Several releases at once (see _rebuild_slots). The bookkeeping that
+        # decides what may be DELETED — claims, built, consumed_by — is shared,
+        # so every read-and-act on it happens under one lock; the per-release
+        # source list is thread-local and never crosses between them.
+        book = threading.Lock()
+        total = len(matched)
+
+        def _rebuild_one(i, rel, p, hit):
+            nonlocal done, failed, freed
+            # Tag this thread's lines so parallel rebuilds stay readable, the
+            # same way captures do.
+            self._tl.tag = f"[{rel[:24]}] " if self._rebuild_slots() > 1 else ""
             self._log("", "")
-            self._log(f"══ [{i}/{len(matched)}] {rel} ══", "info")
+            self._log(f"══ [{i}/{total}] {rel} ══", "info")
             self._log(f"  matched {p.name}  CRC={hit['crc32']}  "
                       f"{hit['size']:,} B", "dim")
             if hit.get("others"):
@@ -5463,8 +5521,9 @@ class RsrToolAPI:
                           "err")
                 self._emit("row", {"name": rel, "status": "error",
                                    "recipe": ".rsr missing", "kind": "error"})
-                failed += 1
-                continue
+                with book:
+                    failed += 1
+                return
             self._emit("row", {"name": rel, "status": "running",
                                "kind": "running"})
             self._consumed = []
@@ -5478,35 +5537,62 @@ class RsrToolAPI:
                 self._log(traceback.format_exc(), "dim")
                 res = {"ok": False}
             if res.get("ok"):
-                done += 1
-                built.add(rel)
-                if delete_content:
+                mine = list(self._consumed)
+                with book:
+                    done += 1
+                    built.add(rel)
                     ready = []
-                    for c in self._consumed:
-                        consumed_by.setdefault(c, set()).add(rel)
-                        # Delete NOW if nothing else is still owed this file.
-                        # Waiting for the whole batch was safe but could need
-                        # the unpacked corpus and the rebuilt one on the disk
-                        # at the same time — 1.4 TB of 3DS twice over. A
-                        # source is freed the moment its LAST claimant has
-                        # been rebuilt and hash-verified, which is exactly the
-                        # test the end-of-run sweep applied, just applied
-                        # sooner.
-                        if not (claims.get(c, set()) - built):
-                            ready.append(c)
-                    if ready:
-                        keep_all, self._consumed = self._consumed, ready
-                        freed += self._delete_consumed(out)
-                        self._consumed = keep_all
+                    if delete_content:
+                        for c in mine:
+                            consumed_by.setdefault(c, set()).add(rel)
+                            # Delete NOW if nothing else is still owed this
+                            # file. Waiting for the whole batch was safe but
+                            # could need the unpacked corpus and the rebuilt
+                            # one on the disk at the same time — 1.4 TB of 3DS
+                            # twice over. A source is freed the moment its
+                            # LAST claimant has been rebuilt and hash-verified,
+                            # which is exactly the test the end-of-run sweep
+                            # applied, just applied sooner. A release still in
+                            # flight has not been added to `built`, so its
+                            # sources cannot be freed out from under it.
+                            if not (claims.get(c, set()) - built):
+                                ready.append(c)
                         for c in ready:
                             consumed_by.pop(c, None)
+                if ready:
+                    keep_all, self._consumed = self._consumed, ready
+                    n = self._delete_consumed(out)
+                    self._consumed = keep_all
+                    with book:
+                        freed += n
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": "rebuilt", "kind": "ok"})
             else:
-                failed += 1
-                failed_rels.add(rel)
+                with book:
+                    failed += 1
+                    failed_rels.add(rel)
                 self._emit("row", {"name": rel, "status": "error",
                                    "recipe": "rebuild failed", "kind": "error"})
+
+        pending = list(enumerate(sorted(matched.items()), 1))
+        live: list = []
+        while pending or live:
+            if self._stop.is_set():
+                self._log("Stopped.", "warn")
+                break
+            want = self._rebuild_slots()
+            while pending and len(live) < want:
+                i, (rel, (p, hit)) = pending.pop(0)
+                th = threading.Thread(target=_rebuild_one,
+                                      args=(i, rel, p, hit), daemon=True)
+                th.start()
+                live.append(th)
+            live = [th for th in live if th.is_alive()]
+            if pending or live:
+                time.sleep(0.2)
+        for th in live:               # let what is in flight finish cleanly
+            th.join()
+        self._tl.tag = ""
 
         if delete_content and consumed_by:
             # Backstop. Most sources are freed as their last claimant finishes
@@ -5517,9 +5603,9 @@ class RsrToolAPI:
             # or that the run never reached, stays where it is.
             held = 0
             keep = []
-            for srcp, built in consumed_by.items():
+            for srcp, claimed_by in consumed_by.items():
                 owed = claims.get(srcp, set())
-                if owed - built:
+                if owed - claimed_by:
                     held += 1
                     continue
                 keep.append(srcp)
