@@ -4055,9 +4055,31 @@ class RsrToolAPI:
             data = sp.read_bytes()
             f["sha256"] = _sha256(data)
             base = Path(f["name"]).name
-            key = f"extras/{base}"
-            if key in embedded and embedded[key] != data:
-                key = f"extras/{st['stem']}/{base}"     # two sets, same name
+            # The key has to be unique per DISTINCT file. Keyed on the
+            # basename, a release carrying six different Config.cia under six
+            # SDK-x.y.z directories (SDK.DevKit.Tools does) had the last one
+            # overwrite the previous five: the manifest still named all six,
+            # the bytes of five were gone, and the release could never rebuild.
+            # The single `stem/base` fallback only ever resolved the FIRST
+            # collision, so anything past the second silently clobbered.
+            # Identical bytes still share one entry — that dedupe is the point
+            # of comparing rather than always making a new key.
+            relname = f["name"].replace("\\", "/").strip("/")
+            key = None
+            for cand in dict.fromkeys((f"extras/{base}",
+                                       f"extras/{relname}",
+                                       f"extras/{st['stem']}/{relname}")):
+                if cand not in embedded or embedded[cand] == data:
+                    key = cand
+                    break
+            if key is None:
+                n = 2
+                while True:
+                    cand = f"extras/{st['stem']}/{n}/{relname}"
+                    if cand not in embedded or embedded[cand] == data:
+                        key = cand
+                        break
+                    n += 1
             if s["embed_extras"]:
                 embedded[key] = data
                 f["stored"] = key
