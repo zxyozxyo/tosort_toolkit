@@ -1400,6 +1400,31 @@ def _delta3(produced: bytes, original: bytes, max_ops: int = 64) -> bytes | None
     return bytes(out)
 
 
+# PPM candidates, appended AFTER the ordinary sweep (see _sweep_recipe).
+# -mct+ forces the text/PPM coder; -mc<order>:<mem>t+ tunes its model order and
+# memory. Measured: the coder is identical across 4.x and 5.x builds and
+# differs only in the 3.x era, so this sweeps orders against a few build eras
+# rather than the whole pack -- 3.x, 4.x and 5.x, which is every distinct PPM
+# behaviour the pack contains.
+PPM_ORDERS = (0, 63, 58, 40, 37, 34, 25, 20, 16, 12, 10, 8, 6, 4, 2,
+              62, 61, 60, 59, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47,
+              46, 45, 44, 43, 42, 41, 39, 38, 36, 35, 33, 32, 31, 30, 29,
+              28, 27, 26, 24, 23, 22, 21, 19, 18, 17, 15, 14, 13, 11, 9,
+              7, 5, 3)
+PPM_MEMS = (64, 16, 4, 128, 256)
+
+
+def _ppm_switches() -> list[tuple]:
+    """Every -mc variant to try, cheapest and likeliest first."""
+    out = [("-mct+",)]
+    for order in PPM_ORDERS:
+        if not order:
+            continue
+        for mem in PPM_MEMS:
+            out.append((f"-mc{order}:{mem}t+",))
+    return out
+
+
 def diff_bytes(produced: bytes, original: bytes) -> bytes | None:
     """The smallest patch turning `produced` into `original`, or None.
 
@@ -4380,6 +4405,16 @@ class RsrToolAPI:
             return None
         return pre + [f"-mt{mt}"]
 
+    def _pack_cmds_extra(self, cmds, extra):
+        """Splice extra switches into each command, after the -m/-md block.
+
+        rar takes switches in any position before the archive name, and every
+        command _pack_cmds builds starts [exe, "a", ...switches..., archive],
+        so inserting at index 2 is always inside the switch run."""
+        if not extra or cmds is None:
+            return cmds
+        return [list(c[:2]) + list(extra) + list(c[2:]) for c in cmds]
+
     def _pack_cmds(self, ex: Path, fmt: str, dict_kb: int, mt: int, solid: bool,
                    groups, srcs: list, target: Path, tail=(),
                    vol_args=(), base=None) -> list[list[str]] | None:
@@ -4509,12 +4544,12 @@ class RsrToolAPI:
                 for ex in group:
                     if (ex.name, mt) not in seen:
                         seen.add((ex.name, mt))
-                        order.append((ex, mt))
+                        order.append((ex, mt, ()))
         for mt in mts:
             for ex in ranked:
                 if (ex.name, mt) not in seen:
                     seen.add((ex.name, mt))
-                    order.append((ex, mt))
+                    order.append((ex, mt, ()))
         return order, hot
 
     def _mt_order(self, mts: list[int]) -> list[int]:
@@ -4687,7 +4722,7 @@ class RsrToolAPI:
 
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
-                   end_sig, hdr_ext, targets):
+                   end_sig, hdr_ext, targets, extra=()):
         """One (build, -mt) candidate, in its own directory. True if it is the
         recipe, False if not, None if the build cannot run this recipe at all.
 
@@ -4697,6 +4732,7 @@ class RsrToolAPI:
         cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
                                wdir / "probe.rar", vol_args=vol_args,
                                base=base)
+        cmds = self._pack_cmds_extra(cmds, extra)
         if cmds is None:
             return None
         try:
@@ -4782,6 +4818,27 @@ class RsrToolAPI:
                 return None
 
         combos, hot = self._order_combos(exes, mts, fmt, level, grp, year)
+        # The PPM tail. -m5 can compress with LZSS or PPMd and rar chooses per
+        # file; ask for the default only and an archive whose packer forced PPM
+        # is unreachable at every build and thread count. These go LAST so a
+        # release that matches normally never pays for them, and the sweep
+        # returns on first match — the cost lands only on releases that have
+        # already failed everything else, where the alternative is no capture
+        # at all. One thread each: PPM ignores -mt.
+        if fmt == "RAR4" and level == 5:
+            ppm_exes = []
+            for want in ("_rar5", "_rar4", "_rar3"):
+                hit = next((e for e in exes if want in e.name), None)
+                if hit is not None:
+                    ppm_exes.append(hit)
+            for sw in _ppm_switches():
+                for ex in ppm_exes:
+                    combos.append((ex, 1, sw))
+            if ppm_exes:
+                self._log(f"    {len(_ppm_switches()) * len(ppm_exes):,} PPM "
+                          "(-mc) combo(s) queued behind the ordinary sweep — "
+                          "tried only if every build and thread count fails.",
+                          "dim")
         if hot:
             self._log(f"    {hot} known recipe(s)"
                       + (f" for {grp}" if grp else "")
@@ -4860,12 +4917,12 @@ class RsrToolAPI:
             results: list = [None] * len(chunk)
 
             def _slot(s: int):
-                ex_, n_ = chunk[s]
+                ex_, n_, extra_ = chunk[s]
                 try:
                     results[s] = self._try_combo(
                         ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
                         groups, srcs, vol_args, base, prefix, end_sig,
-                        hdr_ext, targets)
+                        hdr_ext, targets, extra_)
                 except Exception:
                     results[s] = False
 
@@ -4881,9 +4938,14 @@ class RsrToolAPI:
 
             for s, res in enumerate(results):
                 if res is True:
-                    ex_, n_ = chunk[s]
+                    ex_, n_, extra_ = chunk[s]
                     return {"exe": ex_.name, "version": _exe_label(ex_.name),
                             "mt": n_, "dict_kb": dict_kb,
+                            # The coder switch, when this was a PPM combo.
+                            # Without it the recipe names build and thread
+                            # count, says nothing about the coder, and the
+                            # replay packs with the default and diverges.
+                            "mc": list(extra_) if extra_ else [],
                             "tried": tried + s + 1,
                             # Where this combo's volumes are. The replay can
                             # often use them as they stand instead of packing
@@ -5037,9 +5099,10 @@ class RsrToolAPI:
             # Tail, so it lands on the last command only — rar cannot append
             # to an archive it has already locked.
             tail.append("-k")
-        return self._pack_cmds(ex, fmt, recipe["dict_kb"], recipe["mt"],
+        cmds = self._pack_cmds(ex, fmt, recipe["dict_kb"], recipe["mt"],
                                recipe["solid"], groups, srcs, target,
                                tail=tail, vol_args=vol_args, base=base)
+        return self._pack_cmds_extra(cmds, recipe.get("mc") or ())
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
                 fmt: str, base=None) -> list[Path] | None:
@@ -6590,8 +6653,9 @@ class RsrToolAPI:
         """Fingerprint of a combo ORDER, so recorded progress is only reused
         against the sequence it was actually measured in."""
         h = hashlib.sha256()
-        for ex, n in combos:
-            h.update(f"{ex.name}:{n}\n".encode())
+        for ex, n, *rest in combos:
+            sw = ",".join(rest[0]) if rest and rest[0] else ""
+            h.update(f"{ex.name}:{n}:{sw}\n".encode())
         return h.hexdigest()[:16]
 
     def _resume_point(self, rel: str, sig: str) -> tuple[int, str]:
