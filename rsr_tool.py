@@ -4522,7 +4522,12 @@ class RsrToolAPI:
         order changes, and the order is the entire cost when the answer is
         found early."""
         by_name = {e.name: e for e in exes}
-        order: list[tuple[Path, int]] = []
+        # (build, -mt, extra switches). The third element carries the PPM
+        # coder switches; it is () for an ordinary combo. Every append here
+        # MUST produce three, including the priors path below — a 2-tuple
+        # reaching the sweep is an unpack error on the first combo of every
+        # release that has priors, which is nearly all of them.
+        order: list[tuple[Path, int, tuple]] = []
         seen: set[tuple[str, int]] = set()
         for exe_name, mt in self._hot_recipes(fmt, level, grp):
             ex = by_name.get(exe_name)
@@ -4534,7 +4539,7 @@ class RsrToolAPI:
             for n in (mts if mt < 0 else [mt]):
                 if n in mts and (exe_name, n) not in seen:
                     seen.add((exe_name, n))
-                    order.append((ex, n))
+                    order.append((ex, n, ()))
         hot = len(order)
         ranked = sorted(exes, key=lambda e: self._build_rank(e.name, year))
         mts = self._mt_order(mts)
@@ -4947,7 +4952,8 @@ class RsrToolAPI:
             results: list = [None] * len(chunk)
 
             def _slot(s: int):
-                ex_, n_, extra_ = chunk[s]
+                ex_, n_, *rest_ = chunk[s]
+                extra_ = rest_[0] if rest_ else ()
                 try:
                     results[s] = self._try_combo(
                         ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
@@ -4968,7 +4974,8 @@ class RsrToolAPI:
 
             for s, res in enumerate(results):
                 if res is True:
-                    ex_, n_, extra_ = chunk[s]
+                    ex_, n_, *rest_ = chunk[s]
+                    extra_ = rest_[0] if rest_ else ()
                     return {"exe": ex_.name, "version": _exe_label(ex_.name),
                             "mt": n_, "dict_kb": dict_kb,
                             # The coder switch, when this was a PPM combo.
