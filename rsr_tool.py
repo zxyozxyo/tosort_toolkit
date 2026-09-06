@@ -6260,6 +6260,209 @@ class RsrToolAPI:
     #  Index
     # ══════════════════════════════════════════════════════════════════
 
+    # ══════════════════════════════════════════════════════════════════
+    #  The blocked list — what cannot be captured, and how sure we are
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # Deliberately NOT the misses table and deliberately not automatic. Two
+    # separate questions, and collapsing them would make the list worse than
+    # nothing:
+    #
+    #   class  — WHY. "missing-volume" is a fact about the files (the .r00 is
+    #            not on the disk and never will be). "unsolved" is a fact about
+    #            US (every axis tried, nothing found, and that changes: 264
+    #            releases were unrebuildable one morning and fine that
+    #            afternoon once a stale-delta bug was found).
+    #   status — HOW SURE. The scanner may only ever write `proposed`. Nothing
+    #            counts as blocked until a person confirms it, so an
+    #            in-progress corpus cannot silently populate the list.
+    #
+    # And entries expire: anything later captured flips to `resolved` by
+    # itself, because a blocklist nobody re-checks becomes wrong quietly.
+    BLOCKED_CLASSES = ("no-archive", "missing-volume", "damaged",
+                       "superseded", "unsolved")
+
+    @property
+    def _blocked_path(self) -> Path:
+        return self._app_dir / "rsr_blocked.db"
+
+    def _blocked_db(self) -> sqlite3.Connection:
+        con = sqlite3.connect(str(self._blocked_path), timeout=60)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("""CREATE TABLE IF NOT EXISTS blocked (
+            release   TEXT PRIMARY KEY,
+            system    TEXT,
+            year      INTEGER,
+            grp       TEXT,
+            path      TEXT,
+            class     TEXT,
+            reason    TEXT,
+            evidence  TEXT,
+            status    TEXT,
+            first_seen TEXT,
+            decided    TEXT,
+            decided_by TEXT)""")
+        return con
+
+    def blocked_add(self, rows: list, status: str = "proposed",
+                    by: str = "") -> dict:
+        """Record releases as blocked. `rows` are dicts with at least
+        `release`, `class` and `reason`; `evidence` is what was actually
+        checked, and is the field that makes an entry re-checkable later."""
+        now = datetime.now().isoformat(timespec="seconds")
+        status = status if status in ("proposed", "confirmed") else "proposed"
+        n = 0
+        con = self._blocked_db()
+        try:
+            for r in rows or []:
+                rel = (r.get("release") or "").strip()
+                if not rel:
+                    continue
+                cls = r.get("class") or "unsolved"
+                if cls not in self.BLOCKED_CLASSES:
+                    cls = "unsolved"
+                con.execute(
+                    """INSERT INTO blocked (release, system, year, grp, path,
+                           class, reason, evidence, status, first_seen,
+                           decided, decided_by)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(release) DO UPDATE SET
+                           class=excluded.class, reason=excluded.reason,
+                           evidence=excluded.evidence, status=excluded.status,
+                           decided=excluded.decided,
+                           decided_by=excluded.decided_by""",
+                    (rel, r.get("system", ""), _num(r.get("year"), 0, int),
+                     r.get("group", ""), r.get("path", ""), cls,
+                     r.get("reason", ""), r.get("evidence", ""), status, now,
+                     now, by or ("scanner" if status == "proposed" else "")))
+                n += 1
+            con.commit()
+        finally:
+            con.close()
+        self._log(f"Blocked list: {n} release(s) recorded as {status}.", "info")
+        return {"ok": True, "recorded": n}
+
+    def blocked_confirm(self, releases: list, by: str = "operator") -> dict:
+        """Promote proposals to confirmed — the only way anything counts."""
+        now = datetime.now().isoformat(timespec="seconds")
+        con = self._blocked_db()
+        try:
+            cur = con.executemany(
+                "UPDATE blocked SET status='confirmed', decided=?, decided_by=?"
+                " WHERE release=?", [(now, by, r) for r in releases or []])
+            con.commit()
+            n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(releases or [])
+        finally:
+            con.close()
+        return {"ok": True, "confirmed": n}
+
+    def blocked_sync(self) -> dict:
+        """Flip anything since captured to `resolved`.
+
+        The whole risk of a list like this is that it goes stale and starts
+        answering "impossible" for things that were fixed. Re-checking it
+        against the index costs nothing and keeps it honest."""
+        if not self._db_path.is_file():
+            return {"ok": False, "error": "no index"}
+        con = self._db()
+        try:
+            have = {n for (n,) in con.execute("SELECT name FROM releases")}
+        finally:
+            con.close()
+        now = datetime.now().isoformat(timespec="seconds")
+        b = self._blocked_db()
+        try:
+            rows = [r[0] for r in b.execute(
+                "SELECT release FROM blocked WHERE status!='resolved'")]
+            hit = [r for r in rows if r in have]
+            for r in hit:
+                b.execute("UPDATE blocked SET status='resolved', decided=?,"
+                          " decided_by='sync' WHERE release=?", (now, r))
+            b.commit()
+        finally:
+            b.close()
+        if hit:
+            self._log(f"Blocked list: {len(hit)} entr(y/ies) have since been "
+                      "captured — marked resolved.", "ok")
+        return {"ok": True, "resolved": len(hit), "names": hit[:20]}
+
+    def blocked_list(self, status: str = "") -> list:
+        """Everything on the list, newest decision first."""
+        con = self._blocked_db()
+        try:
+            q = ("SELECT release, system, year, grp, class, reason, evidence,"
+                 " status, first_seen, decided, decided_by, path FROM blocked")
+            args: tuple = ()
+            if status:
+                q += " WHERE status=?"
+                args = (status,)
+            q += " ORDER BY class, release"
+            cols = ("release", "system", "year", "group", "class", "reason",
+                    "evidence", "status", "first_seen", "decided",
+                    "decided_by", "path")
+            return [dict(zip(cols, r)) for r in con.execute(q, args)]
+        finally:
+            con.close()
+
+    def blocked_export(self, dest: str = "", fmt: str = "both") -> dict:
+        """Write the list somewhere a person can read it.
+
+        `txt` is grouped by class with the reason and the evidence spelled
+        out, because "it does not work" is useless six months later — the
+        evidence is what lets you tell a permanent fact about the files from
+        something we simply had not solved yet. `csv` is for a spreadsheet."""
+        self.blocked_sync()
+        rows = self.blocked_list()
+        out = Path(dest) if dest else (self._app_dir / "rsr_blocked")
+        made = []
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if fmt in ("csv", "both"):
+            f = out.with_suffix(".csv")
+            with f.open("w", encoding="utf-8-sig", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["release", "system", "year", "group", "class",
+                            "reason", "evidence", "status", "first_seen",
+                            "decided", "decided_by", "path"])
+                for r in rows:
+                    w.writerow([r[k] for k in
+                                ("release", "system", "year", "group", "class",
+                                 "reason", "evidence", "status", "first_seen",
+                                 "decided", "decided_by", "path")])
+            made.append(str(f))
+        if fmt in ("txt", "both"):
+            f = out.with_suffix(".txt")
+            by_class: dict = {}
+            for r in rows:
+                by_class.setdefault(r["class"], []).append(r)
+            L = [f"RSR — releases this tool cannot capture", f"generated {stamp}",
+                 "", f"{len(rows)} entr(y/ies): "
+                 + ", ".join(f"{s}={sum(1 for r in rows if r['status'] == s)}"
+                             for s in ("confirmed", "proposed", "resolved")),
+                 "",
+                 "confirmed = checked and agreed.  proposed = the scanner's",
+                 "suggestion, NOT yet agreed.  resolved = captured since, and",
+                 "kept only as a record that the list was once wrong about it.",
+                 ""]
+            for cls in sorted(by_class):
+                items = by_class[cls]
+                L.append(f"── {cls}  ({len(items)}) " + "─" * max(0, 50 - len(cls)))
+                for r in items:
+                    L.append(f"  {r['release']}")
+                    L.append(f"      status   : {r['status']}"
+                             + (f"  (by {r['decided_by']}, {r['decided']})"
+                                if r["decided_by"] else ""))
+                    L.append(f"      reason   : {r['reason']}")
+                    if r["evidence"]:
+                        L.append(f"      evidence : {r['evidence']}")
+                    if r["path"]:
+                        L.append(f"      path     : {r['path']}")
+                    L.append("")
+                L.append("")
+            f.write_text("\n".join(L), encoding="utf-8")
+            made.append(str(f))
+        self._log("Blocked list exported: " + ", ".join(made), "ok")
+        return {"ok": True, "files": made, "rows": len(rows)}
+
     @property
     def _db_path(self) -> Path:
         return self._app_dir / DB_NAME

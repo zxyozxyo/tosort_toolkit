@@ -291,6 +291,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
               <button class="btn btn-go" id="btn-rebuild" onclick="startBatch()">Rebuild all</button>
               <span class="hint">matched on size + CRC32, not on name</span>
             </div>
+            <div class="row" style="margin-top:6px">
+              <button class="btn btn-sm" onclick="exportBlocked()"
+                      title="Write rsr_blocked.txt and .csv — the releases this tool cannot capture, with the evidence for each. Anything since captured is marked resolved first.">Export won&rsquo;t-capture list</button>
+              <span class="hint" id="blocked-hint">confirmed = agreed &middot; proposed = not yet reviewed</span>
+            </div>
           </div>
 
           <!-- Single: an explicit .rsr, for one-offs and testing -->
@@ -605,6 +610,22 @@ function rebuildJobsPreview(){
 async function rebuildJobsApply(){
   try { await window.pywebview.api.set_rebuild_jobs(+$('rebuild_jobs').value); }
   catch (e) { /* the API logs what happened */ }
+}
+
+async function exportBlocked(){
+  const hint = $('blocked-hint');
+  try {
+    const r = await window.pywebview.api.blocked_export('', 'both');
+    if (r && r.ok) {
+      hint.textContent = `${r.rows} entr(y/ies) written`;
+      log(`Won't-capture list exported (${r.rows} entries): `
+          + (r.files || []).join(', '), 'ok');
+    } else {
+      hint.textContent = 'export failed';
+    }
+  } catch (e) {
+    hint.textContent = 'export failed';
+  }
 }
 
 async function startScan() {
