@@ -3929,15 +3929,34 @@ class RsrToolAPI:
         # Where each packed file's FIRST volume slice lives in the original.
         # The sweep compares a candidate against these bytes and can stop as
         # soon as volume one is written, instead of compressing the entire
-        # source to produce output nothing looks at. Only useful on a real
-        # multi-volume set — with one volume there is nothing to stop before.
+        # source to produce output nothing looks at.
+        #
+        # A single-volume original gets one too. The probe's command is OURS to
+        # choose, so we can ask rar for volumes the original never had: cutting
+        # the output does not change it (measured — a 40 MB source packed whole
+        # and packed at -v1000000b give a byte-identical stream over the common
+        # prefix). Only for sets that are actually COMPRESSED: rar decides
+        # store-vs-compress differently when streaming to volumes, and a stored
+        # set needs no probe anyway because storing is deterministic and the
+        # sweep ends on its first combo.
         prefix = {}
-        if len(vols) > 1:
-            for f in meta:
-                b = blocks.get(f["name"]) or []
-                if b:
-                    vol, off, size = b[0]
-                    prefix[f["name"]] = (vol, off, size)
+        for f in meta:
+            b = blocks.get(f["name"]) or []
+            if b:
+                vol, off, size = b[0]
+                prefix[f["name"]] = (vol, off, size)
+        probe_vol = 0
+        if len(vols) == 1 and prefix:
+            stored_only = all(int(f.get("method", 0) or 0) == 0 for f in meta)
+            biggest = max((f.get("size") or 0) for f in meta)
+            packed_total = sum(sz for _v, _o, sz in prefix.values())
+            if (not stored_only and packed_total > 4 * PROBE_MIN_BYTES
+                    and biggest):
+                probe_vol = max(PROBE_MIN_BYTES, packed_total // 8)
+                self._log(f"    single volume: probing on the first "
+                          f"{probe_vol / (1 << 20):,.0f} MB of "
+                          f"{packed_total / (1 << 20):,.0f} MB rather than "
+                          "packing it all for every combo.", "dim")
         missing = [f["name"] for f in meta if f["name"] not in blocks]
         if missing:
             self._log(f"    ⚠ no packed data located for: "
@@ -4188,7 +4207,8 @@ class RsrToolAPI:
                                         end_sig=want_end, hdr_ext=want_ext,
                                         rung=di, rungs=len(cands),
                                         base=srcdir if keep_paths else None,
-                                        prefix=prefix)
+                                        prefix=prefix,
+                                        probe_vol=probe_vol)
             if recipe:
                 break
             if self._budget_hit:
@@ -4722,7 +4742,7 @@ class RsrToolAPI:
 
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
-                   end_sig, hdr_ext, targets, extra=()):
+                   end_sig, hdr_ext, targets, extra=(), probe_vol=0):
         """One (build, -mt) candidate, in its own directory. True if it is the
         recipe, False if not, None if the build cannot run this recipe at all.
 
@@ -4743,7 +4763,16 @@ class RsrToolAPI:
             return None
 
         # PREFIX PROBE — pack only until volume one is closed and judge on it.
-        if prefix and len(cmds) == 1 and vol_args:
+        # A synthetic split, for an original that was one volume. The
+        # end-of-archive and header checks are skipped for it: volume one of a
+        # split is not the end of an archive and carries the volume flag, so
+        # neither signature can match by construction.
+        synthetic = bool(probe_vol) and not vol_args
+        probe_cmds = cmds
+        if synthetic:
+            probe_cmds = self._pack_cmds_extra(
+                cmds, (f"-v{probe_vol}b", "-vn"))
+        if prefix and len(cmds) == 1 and (vol_args or synthetic):
             head = wdir / "probe.rar"
 
             def _closed():
@@ -4752,15 +4781,16 @@ class RsrToolAPI:
                 # at its final value for a moment before the file is closed.
                 return any(q.name != "probe.rar" for q in wdir.iterdir())
 
-            if not self._run_until(cmds[0], _closed, timeout=900,
+            if not self._run_until(probe_cmds[0], _closed, timeout=900,
                                    heartbeat=f"probe -mt{n} "
                                              f"{_exe_label(ex.name)}",
                                    cwd=base):
                 return False
             verdict = self._prefix_verdict(head, prefix)
             bad = (verdict is False
-                   or (end_sig is not None and end_block_sig(head) != end_sig)
-                   or (hdr_ext is not None
+                   or (not synthetic and end_sig is not None
+                       and end_block_sig(head) != end_sig)
+                   or (not synthetic and hdr_ext is not None
                        and header_exttime(head) != hdr_ext))
             for junk in wdir.iterdir():
                 try:
@@ -4789,7 +4819,7 @@ class RsrToolAPI:
                       deadline=None, rel="", vol_bytes=0,
                       new_numbering=True, groups=None, end_sig=None,
                       hdr_ext=None, rung=0, rungs=1,
-                      base=None, prefix=None) -> dict | None:
+                      base=None, prefix=None, probe_vol=0) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -4922,7 +4952,7 @@ class RsrToolAPI:
                     results[s] = self._try_combo(
                         ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
                         groups, srcs, vol_args, base, prefix, end_sig,
-                        hdr_ext, targets, extra_)
+                        hdr_ext, targets, extra_, probe_vol)
                 except Exception:
                     results[s] = False
 
