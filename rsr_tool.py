@@ -329,9 +329,32 @@ def _method_groups(meta: list[dict]) -> list[tuple[int, int]]:
 
     Grouping is by RUN rather than by value: rar appends, so the order files
     appear in the archive is the order the commands ran."""
-    out: list[list[int]] = []
+    # rar stores a file it cannot shrink, INSIDE whatever command was
+    # running: `rar a -m3` over a .bin and a 77-byte .cue records the .cue at
+    # -m0. That is not a second command -- packing both in one call gives
+    # byte-identical output -- so an auto-stored file must not start a group.
+    # Signature: method 0 AND packed size == unpacked size.
+    eff: list[list] = []
     for f in meta:
         m = int(f.get("method", 0))
+        auto = (m == 0
+                and int(f.get("packed_size") or 0) == int(f.get("size") or 0))
+        eff.append([m, auto])
+    for i, (_m, auto) in enumerate(eff):
+        if not auto:
+            continue
+        # The command it belongs to: the nearest compressed file behind it,
+        # or ahead of it when the stored file comes first (a .cue often does).
+        prev = next((eff[j][0] for j in range(i - 1, -1, -1)
+                     if not eff[j][1]), None)
+        nxt = next((eff[j][0] for j in range(i + 1, len(eff))
+                    if not eff[j][1]), None)
+        if prev is not None:
+            eff[i][0] = prev
+        elif nxt is not None:
+            eff[i][0] = nxt
+    out: list[list[int]] = []
+    for m, _auto in eff:
         if out and out[-1][0] == m:
             out[-1][1] += 1
         else:
