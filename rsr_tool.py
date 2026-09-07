@@ -4208,7 +4208,8 @@ class RsrToolAPI:
                                         rung=di, rungs=len(cands),
                                         base=srcdir if keep_paths else None,
                                         prefix=prefix,
-                                        probe_vol=probe_vol)
+                                        probe_vol=probe_vol,
+                                        want_vols=len(vols))
             if recipe:
                 break
             if self._budget_hit:
@@ -4747,7 +4748,8 @@ class RsrToolAPI:
 
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
-                   end_sig, hdr_ext, targets, extra=(), probe_vol=0):
+                   end_sig, hdr_ext, targets, extra=(), probe_vol=0,
+                   want_vols=0, vol_first=0):
         """One (build, -mt) candidate, in its own directory. True if it is the
         recipe, False if not, None if the build cannot run this recipe at all.
 
@@ -4813,6 +4815,16 @@ class RsrToolAPI:
         head = self._probe_head(wdir)
         if head is None:
             return False
+        # Asked for volumes, so it has to make them. A build whose streams
+        # match but which cannot split where the original splits did not make
+        # this archive -- see the module note on RAR 2.x and 15,000,000 B.
+        if vol_args and want_vols > 1:
+            made = sorted(q for q in wdir.iterdir()
+                          if q.is_file() and q.name.startswith(head.stem + "."))
+            if len(made) != want_vols:
+                return False
+            if vol_first and head.stat().st_size != vol_first:
+                return False
         if end_sig is not None and end_block_sig(head) != end_sig:
             return False
         if hdr_ext is not None and header_exttime(head) != hdr_ext:
@@ -4824,7 +4836,8 @@ class RsrToolAPI:
                       deadline=None, rel="", vol_bytes=0,
                       new_numbering=True, groups=None, end_sig=None,
                       hdr_ext=None, rung=0, rungs=1,
-                      base=None, prefix=None, probe_vol=0) -> dict | None:
+                      base=None, prefix=None, probe_vol=0,
+                      want_vols=0) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -4899,6 +4912,8 @@ class RsrToolAPI:
                       "was — rar treats an incompressible file differently when "
                       "it is streaming to volumes.", "dim")
         srcs = [str(p) for p in src_files]
+        # What the original's volume structure has to come back as.
+        vol_first = vol_bytes if (vol_bytes and want_vols > 1) else 0
         groups = list(groups or [(level, len(src_files))])
         if len(groups) > 1:
             self._log("    this set holds files at "
@@ -4958,7 +4973,8 @@ class RsrToolAPI:
                     results[s] = self._try_combo(
                         ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
                         groups, srcs, vol_args, base, prefix, end_sig,
-                        hdr_ext, targets, extra_, probe_vol)
+                        hdr_ext, targets, extra_, probe_vol,
+                        want_vols, vol_first)
                 except Exception:
                     results[s] = False
 
