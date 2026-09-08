@@ -5224,7 +5224,14 @@ class RsrToolAPI:
         # because when this signature is present no ordinary combo can match;
         # the ordinary ones still follow as a backstop.
         if expanded and fmt == "RAR4":
-            s1 = [(e, n, ("-s1",)) for e, n, x in combos if not x]
+            # -ds disables the name sort solid mode would otherwise apply.
+            # Without it rar writes the right blocks in extension order, which
+            # the original (non-solid, command-line order) never had -- and in
+            # a MULTI-VOLUME set that cannot be spliced back afterwards, since
+            # a file's data may cross a volume boundary. 37 of the 43 sets
+            # carrying this signature are multi-volume, so -ds is what makes
+            # the axis cover the class rather than a sixth of it.
+            s1 = [(e, n, ("-s1", "-ds")) for e, n, x in combos if not x]
             if s1:
                 combos = s1 + combos
                 hot = 0
