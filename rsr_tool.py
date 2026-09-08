@@ -1317,6 +1317,55 @@ def rar4_unp_max(vols) -> int:
     return best
 
 
+def _reorder_rar4_blocks(data: bytes, want: list) -> bytes | None:
+    """Put a RAR4 archive's file blocks back into `want` order.
+
+    Solid mode sorts by extension; the Unix packs this exists for did not.
+    Each file block is header+data and, with no file carrying the solid bit,
+    is independent of the others -- so reordering is a splice, and every
+    header CRC inside stays valid because no block's own bytes change.
+
+    None when the archive does not hold exactly the wanted names, so a
+    mismatch falls back to the ordinary comparison rather than corrupting
+    anything."""
+    if not data.startswith(RAR4_SIG):
+        return None
+    pos, head_end, tail = 7, None, b""
+    blocks: dict[str, bytes] = {}
+    order: list[str] = []
+    while pos + 11 <= len(data):
+        typ = data[pos + 2]
+        flags = int.from_bytes(data[pos + 3:pos + 5], "little")
+        hsize = int.from_bytes(data[pos + 5:pos + 7], "little")
+        if hsize < 7:
+            return None
+        add = (int.from_bytes(data[pos + 7:pos + 11], "little")
+               if flags & 0x8000 else 0)
+        span = hsize + add
+        if typ == 0x73:
+            head_end = pos + span
+        elif typ == 0x74:
+            if flags & 0x10 or pos + 32 > len(data):
+                return None            # a solid file: not independent
+            nl = int.from_bytes(data[pos + 26:pos + 28], "little")
+            nm = data[pos + 32:pos + 32 + nl].split(b"\0")[0]
+            nm = nm.decode("latin-1", "replace")
+            if nm in blocks:
+                return None            # duplicate names: order is ambiguous
+            blocks[nm] = data[pos:pos + span]
+            order.append(nm)
+        elif typ == 0x7b:
+            tail = data[pos:]
+            break
+        pos += span
+    if head_end is None or sorted(order) != sorted(want):
+        return None
+    if order == list(want):
+        return data
+    out = data[:head_end] + b"".join(blocks[n] for n in want) + tail
+    return out if len(out) == len(data) else None
+
+
 def _fmt_fits(fname: str, unp_max: int) -> bool:
     """Could this build have written an archive stamped `unp_max`?
 
@@ -4347,7 +4396,12 @@ class RsrToolAPI:
                                         probe_vol=probe_vol,
                                         want_vols=len(vols),
                                         unp_max=rar4_unp_max(vols)
-                                        if st["format"] == "RAR4" else 0)
+                                        if st["format"] == "RAR4" else 0,
+                                        expanded=any(
+                                            int(f.get("method") or 0) != 0
+                                            and int(f.get("packed_size") or 0)
+                                            >= int(f.get("size") or 0)
+                                            for f in meta))
             if recipe:
                 break
             if self._budget_hit:
@@ -4368,11 +4422,16 @@ class RsrToolAPI:
         # of the prior.
         self._db_learn(st["format"], level, grp, recipe)
 
+        extra_sw = list(recipe.get("mc") or [])
+        solid_sw = next((x for x in extra_sw if str(x).startswith("-s")),
+                        "-s" if solid else "-s-")
+        rest_sw = " ".join(str(x) for x in extra_sw
+                           if not str(x).startswith("-s"))
         self._log(f"    ✓ RECIPE: {recipe['version']} "
                   f"{_mt_label(recipe['exe'], recipe['mt'])} "
-                  f"(-m{level} -md{recipe['dict_kb']}KB "
-                  f"{'-s' if solid else '-s-'}) — all {len(targets)} stream(s) "
-                  "byte-exact.", "ok")
+                  f"(-m{level} -md{recipe['dict_kb']}KB {solid_sw}"
+                  + (f" {rest_sw}" if rest_sw else "")
+                  + f") — all {len(targets)} stream(s) byte-exact.", "ok")
 
         # ── replay the whole set and byte-compare every volume ────────────
         # A byte-split set is ONE archive chopped up afterwards, so the replay
@@ -4572,7 +4631,13 @@ class RsrToolAPI:
         so inserting at index 2 is always inside the switch run."""
         if not extra or cmds is None:
             return cmds
-        return [list(c[:2]) + list(extra) + list(c[2:]) for c in cmds]
+        # A solid switch in `extra` must REPLACE the one _pack_cmds wrote, not
+        # sit beside it: rar honours the last one it sees, so -s1 inserted in
+        # front of a trailing -s- would be silently cancelled.
+        drop = any(str(x).startswith("-s") for x in extra)
+        return [list(c[:2]) + list(extra)
+                + [a for a in c[2:] if not (drop and a in ("-s", "-s-"))]
+                for c in cmds]
 
     def _pack_cmds(self, ex: Path, fmt: str, dict_kb: int, mt: int, solid: bool,
                    groups, srcs: list, target: Path, tail=(),
@@ -5121,7 +5186,7 @@ class RsrToolAPI:
                       new_numbering=True, groups=None, end_sig=None,
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
-                      want_vols=0, unp_max=0) -> dict | None:
+                      want_vols=0, unp_max=0, expanded=False) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -5151,6 +5216,22 @@ class RsrToolAPI:
 
         combos, hot = self._order_combos(exes, mts, fmt, level, grp, year,
                                          unp_max)
+        # A compressed file that came out no smaller than its input is a file
+        # WinRAR would have STORED -- so the packer did not do the store
+        # fallback, which is the signature of RAR for Unix. -s1 (solid groups
+        # of one) suppresses that fallback without giving any file the
+        # previous one's context, reproducing the streams exactly. Led with,
+        # because when this signature is present no ordinary combo can match;
+        # the ordinary ones still follow as a backstop.
+        if expanded and fmt == "RAR4":
+            s1 = [(e, n, ("-s1",)) for e, n, x in combos if not x]
+            if s1:
+                combos = s1 + combos
+                hot = 0
+                self._log(f"    a compressed file is no smaller than its "
+                          f"input — the packer skipped the store fallback "
+                          f"(RAR for Unix does not do it), so {len(s1):,} "
+                          f"-s1 combo(s) lead the sweep.", "dim")
         # The PPM tail. -m5 can compress with LZSS or PPMd and rar chooses per
         # file; ask for the default only and an archive whose packer forced PPM
         # is unreachable at every build and thread count. These go LAST so a
@@ -5516,7 +5597,26 @@ class RsrToolAPI:
             return None
         ordered = [p for p in made if _classify_volume(p.name)]
         ordered.sort(key=lambda p: _classify_volume(p.name)[2])
-        return ordered or made
+        out_vols = ordered or made
+        # -s1 makes rar sort the files by extension; the Unix packs this axis
+        # exists for did not, so the right blocks come back in the wrong
+        # order. Splice them into the recorded order HERE rather than in the
+        # caller: capture goes through _verify_replay but a rebuild calls
+        # _replay directly, and only this is on both paths. A delta cannot
+        # stand in for it -- moving a stream would blow DELTA_MAX_BYTES.
+        if len(out_vols) == 1 and "-s1" in (recipe.get("mc") or ()):
+            want = [Path(s).name for s in src_files]
+            try:
+                raw = out_vols[0].read_bytes()
+                fixed = _reorder_rar4_blocks(raw, want)
+                if fixed is not None and fixed != raw:
+                    out_vols[0].write_bytes(fixed)
+                    self._log(f"    -s1 sorted the files by extension; "
+                              f"{len(want)} block(s) spliced back into the "
+                              "order the original holds them.", "dim")
+            except OSError:
+                pass
+        return out_vols
 
     def _verify_replay(self, recipe, src_files, vols, work, comment, st, si=0,
                        base=None, packed=None):
@@ -6397,10 +6497,14 @@ class RsrToolAPI:
                      work: Path) -> bool:
         recipe = st["recipe"]
         stem = st["stem"]
+        _ex = list(recipe.get("mc") or [])
+        _sw = next((x for x in _ex if str(x).startswith("-s")),
+                   "-s" if recipe["solid"] else "-s-")
+        _rest = " ".join(str(x) for x in _ex if not str(x).startswith("-s"))
         self._log(f"  {stem}: replaying {recipe['version']} "
                   f"{_mt_label(recipe.get('exe', ''), recipe['mt'])} "
-                  f"(-m{recipe['level']} -md{recipe['dict_kb']}KB "
-                  f"{'-s' if recipe['solid'] else '-s-'})", "info")
+                  f"(-m{recipe['level']} -md{recipe['dict_kb']}KB {_sw}"
+                  + (f" {_rest}" if _rest else "") + ")", "info")
 
         # Gather sources: loose content from the user's folder, archive-only
         # extras straight out of the container.
