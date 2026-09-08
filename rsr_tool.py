@@ -1283,6 +1283,51 @@ def rar4_vol_blocks(vol: Path) -> dict[str, tuple[int, int]]:
     return out
 
 
+def rar4_unp_max(vols) -> int:
+    """Highest unp_ver over the COMPRESSED file headers of a RAR4 set.
+
+    0 when nothing compressed was found, which is the honest answer rather
+    than a misleading 20: a stored file is stamped 20 by every build ever
+    made, so it says nothing about which one wrote it."""
+    best = 0
+    for vol in vols:
+        try:
+            size_on_disk = Path(vol).stat().st_size
+            with open(vol, "rb") as fh:
+                if fh.read(7) != RAR4_SIG:
+                    continue
+                pos = 7
+                while pos + 11 <= size_on_disk:
+                    fh.seek(pos)
+                    head = fh.read(32)
+                    if len(head) < 11:
+                        break
+                    typ = head[2]
+                    flags = int.from_bytes(head[3:5], "little")
+                    hsize = int.from_bytes(head[5:7], "little")
+                    if hsize < 7:
+                        break
+                    add = (int.from_bytes(head[7:11], "little")
+                           if flags & 0x8000 else 0)
+                    if typ == 0x74 and len(head) >= 26 and head[25] != 0x30:
+                        best = max(best, head[24])
+                    pos += hsize + add
+        except OSError:
+            continue
+    return best
+
+
+def _fmt_fits(fname: str, unp_max: int) -> bool:
+    """Could this build have written an archive stamped `unp_max`?
+
+    RAR 3.00 is the line: below it a build writes 2.0 format only, at or above
+    it a build writes 2.9 for anything it compresses."""
+    if not unp_max:
+        return True
+    return (_exe_number(fname) >= 300) if unp_max >= 29 \
+        else (_exe_number(fname) < 300)
+
+
 def header_exttime(vol: Path) -> bool | None:
     """Whether a volume's first file header carries the high-precision
     timestamp (LHD_EXTTIME, 0x1000), or None if there is no file header.
@@ -4270,7 +4315,9 @@ class RsrToolAPI:
                                         base=srcdir if keep_paths else None,
                                         prefix=prefix,
                                         probe_vol=probe_vol,
-                                        want_vols=len(vols))
+                                        want_vols=len(vols),
+                                        unp_max=rar4_unp_max(vols)
+                                        if st["format"] == "RAR4" else 0)
             if recipe:
                 break
             if self._budget_hit:
@@ -4571,7 +4618,7 @@ class RsrToolAPI:
             return (0, year - by, name)
         return (1, by - year, name)
 
-    def _order_combos(self, exes, mts, fmt, level, grp, year):
+    def _order_combos(self, exes, mts, fmt, level, grp, year, unp_max=0):
         """Every (build, -mt) pair — exhaustively, but in the order most likely
         to hit first.
 
@@ -4604,6 +4651,12 @@ class RsrToolAPI:
             # mt == -1 is an imported prior: the BUILD is known but the thread
             # count is not, so sweep that one build across every -mt before
             # touching the other 231. Seventeen combos rather than 3,944.
+            # A prior that cannot write this archive's format is still a
+            # prior for the corpus, just not for this release. Left OUT of
+            # `seen` so the backstop tier picks it up again -- the set that
+            # gets swept is identical, only the position changes.
+            if not _fmt_fits(exe_name, unp_max):
+                continue
             for n in (mts if mt < 0 else [mt]):
                 if n in mts and (exe_name, n) not in seen:
                     seen.add((exe_name, n))
@@ -4625,13 +4678,28 @@ class RsrToolAPI:
         # one. Same 3,944 combos, and the full product still follows as a
         # backstop so nothing is dropped — but the mean position of the winning
         # combo drops from 224 to 109 and the worst case from 1,987 to 827.
-        groups = [ranked]
-        if year:
-            older = [e for e in ranked
-                     if _exe_year(e.name) and _exe_year(e.name) <= year]
-            if older and len(older) < len(ranked):
-                rest = [e for e in ranked if e not in set(older)]
-                groups = [older, rest]
+        # The archive's own unp_ver stamp says which ERA of build could
+        # have written it -- see rar4_unp_max. Builds that could not, go last
+        # rather than being dropped: the sweep returns on first match so the
+        # speed is the same either way, but a wall it reports is still real.
+        tiers = [ranked]
+        if unp_max:
+            fits = [e for e in ranked if _fmt_fits(e.name, unp_max)]
+            miss = [e for e in ranked if e not in set(fits)]
+            if fits and miss:
+                tiers = [fits, miss]
+                self._log("    archive is RAR "
+                          f"{'2.0' if unp_max < 29 else '3.x'} format "
+                          f"(unp_ver {unp_max}) — leading with the "
+                          f"{len(fits)} build(s) that can write it, the other "
+                          f"{len(miss)} behind them as a backstop.", "dim")
+        groups = []
+        for tier in tiers:
+            older = [e for e in tier
+                     if _exe_year(e.name) and _exe_year(e.name) <= year] \
+                if year else []
+            rest = [e for e in tier if e not in set(older)]
+            groups += [older, rest] if (older and rest) else [tier]
         for group in groups:
             for mt in mts[:2]:
                 for ex in group:
@@ -5009,7 +5077,7 @@ class RsrToolAPI:
                       new_numbering=True, groups=None, end_sig=None,
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
-                      want_vols=0) -> dict | None:
+                      want_vols=0, unp_max=0) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -5037,7 +5105,8 @@ class RsrToolAPI:
                 self._log("    no RAR5-capable build in the pack.", "err")
                 return None
 
-        combos, hot = self._order_combos(exes, mts, fmt, level, grp, year)
+        combos, hot = self._order_combos(exes, mts, fmt, level, grp, year,
+                                         unp_max)
         # The PPM tail. -m5 can compress with LZSS or PPMd and rar chooses per
         # file; ask for the default only and an archive whose packer forced PPM
         # is unreachable at every build and thread count. These go LAST so a
@@ -5063,7 +5132,12 @@ class RsrToolAPI:
         # compressor from WinRAR of the same version, and until now the sweep
         # had only ever searched the Windows line -- see _run_dos_pack.
         dos = self._dos_exes()
-        if dos and fmt == "RAR4":
+        if dos and fmt == "RAR4" and unp_max >= 29:
+            self._log("    DOS builds skipped: this archive is RAR 3.x format "
+                      f"(unp_ver {unp_max}) and the DOS line ended at 2.50, "
+                      "which writes 2.0 — no DOS build could have made it.",
+                      "dim")
+        elif dos and fmt == "RAR4":
             names = [Path(s).name for s in src_files]
             if all(self._is_83(x) for x in names):
                 for ex in dos:
