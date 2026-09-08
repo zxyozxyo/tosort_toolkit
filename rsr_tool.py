@@ -2215,11 +2215,41 @@ class RsrToolAPI:
 
     def _dos_exes(self) -> list[Path]:
         """RAR for DOS builds, newest-looking last. Empty when DOSBox is not
-        installed, since without it they cannot be run at all."""
+        installed, since without it they cannot be run at all.
+
+        OS/2 builds are excluded. The SFX installers these were extracted from
+        carried both, and 8 of the 24 turned out to be OS/2 -- each one a
+        DOSBox boot that gets as far as "This program must be run under OS/2"
+        and dies."""
         if not self._dosbox_exe():
             return []
         pack = self._app_dir / "apps" / "dosrar_pack"
-        return sorted(pack.glob("*_dosrar*.exe")) if pack.is_dir() else []
+        if not pack.is_dir():
+            return []
+        return [e for e in sorted(pack.glob("*_dosrar*.exe"))
+                if self._is_dos_exe(e)]
+
+    @staticmethod
+    def _is_dos_exe(p: Path) -> bool:
+        """True for a real-mode DOS binary: MZ with no extended header.
+
+        An OS/2 (LX), Win16 (NE) or Windows (PE) image is also an MZ, with a
+        stub whose whole job is to print a refusal under DOS -- so the
+        signature at e_lfanew is what separates them."""
+        try:
+            with open(p, "rb") as fh:
+                head = fh.read(0x40)
+                if head[:2] != b"MZ":
+                    return False
+                if len(head) < 0x40:
+                    return True
+                lfa = int.from_bytes(head[0x3c:0x40], "little")
+                if lfa <= 0:
+                    return True
+                fh.seek(lfa)
+                return fh.read(2) not in (b"LX", b"LE", b"NE", b"PE")
+        except OSError:
+            return False
 
     def _dosbox_exe(self) -> Path | None:
         p = self._app_dir / "apps" / "dosbox" / "dosbox.exe"
@@ -4949,18 +4979,32 @@ class RsrToolAPI:
         what is left is the banner, the archive and the per-file verdicts."""
         try:
             txt = raw.decode("cp437", "replace")
-            out = []
+            out: list[str] = []
+            at: dict[str, int] = {}
             for line in txt.replace("\r", "\n").split("\n"):
                 s = re.sub(r"\s*\d{1,3}%", "", line).strip()
                 if not s or s == "RSRDONE":
                     continue
                 if s.startswith("Type RAR") or "Please register" in s:
                     continue
+                # rar reports one file on one line, rewriting it with a
+                # carriage return for every few hundred KB of progress. Those
+                # fragments all say "Adding <name>" and only the last carries
+                # the verdict, so collapse them onto the file rather than
+                # letting a dozen repeats fill the whole echo.
+                key = re.sub(r"\s+", " ", s).split(" ")[0:2]
+                key = " ".join(key) if s.startswith(("Adding", "Updating")) else ""
+                if key and key in at:
+                    if len(s) > len(out[at[key]]):
+                        out[at[key]] = s
+                    continue
+                if key:
+                    at[key] = len(out)
                 out.append(s)
-            for s in out[:6]:
+            for s in out[:8]:
                 self._log(f"      DOS │ {s[:110]}", "dim")
-            if len(out) > 6:
-                self._log(f"      DOS │ … {len(out) - 6} more line(s)", "dim")
+            if len(out) > 8:
+                self._log(f"      DOS │ … {len(out) - 8} more line(s)", "dim")
         except Exception:
             pass
 
