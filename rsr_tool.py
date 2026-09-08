@@ -1916,7 +1916,7 @@ class RsrToolAPI:
                 self._procs.discard(p)
 
     def _run(self, cmd: list, timeout: int, heartbeat: str = "",
-             cwd=None) -> bool:
+             cwd=None, env=None) -> bool:
         """Run a pack/extract command so that stop and skip can interrupt it.
 
         subprocess.run() is unkillable from another thread, so a skip pressed
@@ -1937,7 +1937,7 @@ class RsrToolAPI:
         # killed it — an hour per release, and it consumed the whole search
         # budget before a single combo had been tried.
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+            p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL,
                                  cwd=(str(cwd) if cwd else None),
                                  **_no_window())
@@ -4848,13 +4848,53 @@ class RsrToolAPI:
                     f"[autoexec]\nmount c \"{wdir}\"\nc:\ncall GO.BAT\nexit\n")
             cfg = wdir / "dosbox.conf"
             cfg.write_text(conf, encoding="utf-8")
+            # Headless. Without this DOSBox opens a window for every
+            # combo and steals focus while it does; a release reaching the
+            # DOS tail would throw two dozen of them at whoever is using the
+            # machine. The dummy SDL driver removes the window and changes
+            # nothing about the output.
+            env = dict(os.environ, SDL_VIDEODRIVER="dummy")
             self._run([str(box), "-conf", str(cfg), "-noconsole"],
                       timeout=timeout,
-                      heartbeat=f"DOS {ex.name}", cwd=None)
+                      heartbeat=f"DOS {_exe_label(ex.name)}", cwd=None,
+                      env=env)
             log = wdir / "RARLOG.TXT"
-            return log.is_file() and b"RSRDONE" in log.read_bytes()
+            if not log.is_file():
+                self._log(f"      DOS {_exe_label(ex.name)}: produced no log — "
+                          "DOSBox did not run the batch.", "warn")
+                return False
+            raw = log.read_bytes()
+            self._log_dos(ex, raw)
+            return b"RSRDONE" in raw
         except Exception:
             return False
+
+    def _log_dos(self, ex: Path, raw: bytes) -> None:
+        """Echo the DOS archiver's own words, minus the progress spam.
+
+        A DOS combo is otherwise a black box: DOSBox runs with no window, so
+        from outside all you see is a long pause. The banner rar prints is
+        also the definitive statement of WHICH archiver ran.
+
+        rar emits a percentage every few hundred KB — some seven thousand of
+        them for a 130 MB file, all on one line — so those are stripped and
+        what is left is the banner, the archive and the per-file verdicts."""
+        try:
+            txt = raw.decode("cp437", "replace")
+            out = []
+            for line in txt.replace("\r", "\n").split("\n"):
+                s = re.sub(r"\s*\d{1,3}%", "", line).strip()
+                if not s or s == "RSRDONE":
+                    continue
+                if s.startswith("Type RAR") or "Please register" in s:
+                    continue
+                out.append(s)
+            for s in out[:6]:
+                self._log(f"      DOS │ {s[:110]}", "dim")
+            if len(out) > 6:
+                self._log(f"      DOS │ … {len(out) - 6} more line(s)", "dim")
+        except Exception:
+            pass
 
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
@@ -5072,6 +5112,7 @@ class RsrToolAPI:
                       "replay them in order.", "dim")
         tried = 0
         total = len(combos)
+        said_dos = False
         t0 = last = time.monotonic()
         # ── the sweep, across as many cores as the budget allows ─────────
         #
@@ -5110,8 +5151,23 @@ class RsrToolAPI:
                           "resumes from here.", "warn")
                 return None
 
-            width = max(1, min(budget // max(1, combos[idx][1]),
-                               len(combos) - idx))
+            # The DOS tail is announced when it is queued, thousands of
+            # combos earlier. Say it again on arrival: each DOS combo is a
+            # DOSBox boot plus a full pack, so the pace drops hard here and
+            # silence would read as a hang.
+            cur = combos[idx]
+            if not said_dos and len(cur) > 2 and cur[2] and \
+                    cur[2][0] == self.DOS_MARK:
+                said_dos = True
+                left = sum(1 for c in combos[idx:]
+                           if len(c) > 2 and c[2] and c[2][0] == self.DOS_MARK)
+                self._log(f"    ▶ no Windows build matched — now trying the "
+                          f"{left} DOS RAR build(s) through DOSBox. These are "
+                          "slower (a full pack each, no prefix probe) and run "
+                          "with no window.", "info")
+            width = 1 if (len(cur) > 2 and cur[2] and cur[2][0] == self.DOS_MARK) \
+                else max(1, min(budget // max(1, combos[idx][1]),
+                                len(combos) - idx))
             chunk = combos[idx:idx + width]
             results: list = [None] * len(chunk)
 
