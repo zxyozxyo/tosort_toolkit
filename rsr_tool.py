@@ -2165,6 +2165,33 @@ class RsrToolAPI:
         pack = self._app_dir / "apps" / "winrar_pack-4.20"
         return sorted(pack.glob("*_rar*.exe")) if pack.is_dir() else []
 
+    # ── the DOS line (see the module note on _try_dos_combo) ───────────────
+    DOS_MARK = "__DOS__"
+
+    def _dos_exes(self) -> list[Path]:
+        """RAR for DOS builds, newest-looking last. Empty when DOSBox is not
+        installed, since without it they cannot be run at all."""
+        if not self._dosbox_exe():
+            return []
+        pack = self._app_dir / "apps" / "dosrar_pack"
+        return sorted(pack.glob("*_dosrar*.exe")) if pack.is_dir() else []
+
+    def _dosbox_exe(self) -> Path | None:
+        p = self._app_dir / "apps" / "dosbox" / "dosbox.exe"
+        return p if p.is_file() else None
+
+    @staticmethod
+    def _is_83(name: str) -> bool:
+        """A name DOS sees unchanged. Anything else is mangled to ~1 form on
+        the mount, so the archive would carry names the original never had."""
+        stem, _, ext = name.rpartition(".")
+        if not stem:
+            stem, ext = name, ""
+        if len(stem) > 8 or len(ext) > 3 or not stem:
+            return False
+        bad = set(' +,;=[]"*?<>|/\\:')
+        return not (set(stem) & bad or set(ext) & bad)
+
     # ══════════════════════════════════════════════════════════════════
     #  SCAN — capture
     # ══════════════════════════════════════════════════════════════════
@@ -4786,6 +4813,49 @@ class RsrToolAPI:
         # taking the whole budget would ask for four times the machine.
         return max(1, total // max(1, getattr(self, "_live_jobs", 1)))
 
+    def _run_dos_pack(self, ex: Path, wdir: Path, level: int, solid: bool,
+                      srcs: list, vol_bytes: int, timeout: int = 1800) -> bool:
+        """Pack `srcs` with a 16-bit DOS RAR, under DOSBox, into `wdir`.
+
+        DOSBox gets its own mount per combo so nothing is shared between
+        candidates. The switches are the ones DOS RAR actually accepts --
+        measured: -m0..-m5, -ep, -y and -v<N>b work; -md and -mt do not, and
+        -vn breaks -v exactly as it does on 2.x Windows builds."""
+        box = self._dosbox_exe()
+        if box is None:
+            return False
+        try:
+            if wdir.exists():
+                _rmtree(wdir)
+            wdir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ex, wdir / "RAR.EXE")
+            names = []
+            for s in srcs:
+                src = Path(s)
+                dst = wdir / src.name.upper()
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+                names.append(dst.name)
+            args = [f"-m{level}", "-ep", "-y", "-s" if solid else "-s-"]
+            if vol_bytes:
+                args.append(f"-v{vol_bytes}b")
+            bat = ("@echo off\r\n"
+                   "RAR.EXE a " + " ".join(args) + " PROBE.RAR "
+                   + " ".join(names) + " > RARLOG.TXT\r\n"
+                   "echo RSRDONE >> RARLOG.TXT\r\n")
+            (wdir / "GO.BAT").write_bytes(bat.encode("ascii", "replace"))
+            conf = (f"[sdl]\noutput=texture\n[cpu]\ncore=auto\ncycles=max\n"
+                    f"[autoexec]\nmount c \"{wdir}\"\nc:\ncall GO.BAT\nexit\n")
+            cfg = wdir / "dosbox.conf"
+            cfg.write_text(conf, encoding="utf-8")
+            self._run([str(box), "-conf", str(cfg), "-noconsole"],
+                      timeout=timeout,
+                      heartbeat=f"DOS {ex.name}", cwd=None)
+            log = wdir / "RARLOG.TXT"
+            return log.is_file() and b"RSRDONE" in log.read_bytes()
+        except Exception:
+            return False
+
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
                    end_sig, hdr_ext, targets, extra=(), probe_vol=0,
@@ -4796,16 +4866,37 @@ class RsrToolAPI:
         Everything here was the body of the serial loop; it is a function so
         that several can run at once. It touches no shared state except the
         process set, which is already locked."""
-        cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
-                               wdir / "probe.rar", vol_args=vol_args,
-                               base=base)
-        cmds = self._pack_cmds_extra(cmds, extra)
-        if cmds is None:
-            return None
+        # A DOS build is not driven by a command line we can run directly:
+        # it is 16-bit, so it goes through DOSBox and produces its output
+        # before the ordinary verification below picks up from _probe_head.
+        if extra and extra[0] == self.DOS_MARK:
+            if len(groups) != 1:
+                return None            # appending under DOS is not modelled
+            vb = 0
+            for a in vol_args:
+                if a.startswith("-v") and a.endswith("b"):
+                    try:
+                        vb = int(a[2:-1])
+                    except ValueError:
+                        vb = 0
+            if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs, vb):
+                return False
+            cmds = []
+        else:
+            cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
+                                   wdir / "probe.rar", vol_args=vol_args,
+                                   base=base)
+            cmds = self._pack_cmds_extra(cmds, extra)
+            if cmds is None:
+                return None
         try:
-            if wdir.exists():
-                _rmtree(wdir)
-            wdir.mkdir(parents=True, exist_ok=True)
+            # _run_dos_pack already made this directory and filled it -- DOSBox
+            # mounts it, so it has to exist before the pack runs. Wiping it
+            # here would delete the very output we are about to verify.
+            if not (extra and extra[0] == self.DOS_MARK):
+                if wdir.exists():
+                    _rmtree(wdir)
+                wdir.mkdir(parents=True, exist_ok=True)
         except OSError:
             return None
 
@@ -4814,12 +4905,13 @@ class RsrToolAPI:
         # end-of-archive and header checks are skipped for it: volume one of a
         # split is not the end of an archive and carries the volume flag, so
         # neither signature can match by construction.
-        synthetic = bool(probe_vol) and not vol_args
+        is_dos = bool(extra) and extra[0] == self.DOS_MARK
+        synthetic = bool(probe_vol) and not vol_args and not is_dos
         probe_cmds = cmds
         if synthetic:
             probe_cmds = self._pack_cmds_extra(
                 cmds, (f"-v{probe_vol}b", "-vn"))
-        if prefix and len(cmds) == 1 and (vol_args or synthetic):
+        if prefix and cmds and len(cmds) == 1 and (vol_args or synthetic):
             head = wdir / "probe.rar"
 
             def _closed():
@@ -4927,6 +5019,23 @@ class RsrToolAPI:
                           "(-mc) combo(s) queued behind the ordinary sweep — "
                           "tried only if every build and thread count fails.",
                           "dim")
+        # The DOS tail, behind everything else. RAR for DOS is a different
+        # compressor from WinRAR of the same version, and until now the sweep
+        # had only ever searched the Windows line -- see _run_dos_pack.
+        dos = self._dos_exes()
+        if dos and fmt == "RAR4":
+            names = [Path(s).name for s in src_files]
+            if all(self._is_83(x) for x in names):
+                for ex in dos:
+                    combos.append((ex, 1, (self.DOS_MARK,)))
+                self._log(f"    {len(dos)} DOS RAR build(s) queued behind the "
+                          "Windows sweep — a different compressor, tried only "
+                          "if every Windows build fails.", "dim")
+            else:
+                bad = [x for x in names if not self._is_83(x)][:2]
+                self._log(f"    DOS builds skipped: {', '.join(bad)} "
+                          "is not an 8.3 name, so DOS would pack it under a "
+                          "mangled one.", "dim")
         if hot:
             self._log(f"    {hot} known recipe(s)"
                       + (f" for {grp}" if grp else "")

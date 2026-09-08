@@ -95,3 +95,4 @@ _fp_*.lst
 
 # precomp scratch files: it writes these beside the working directory
 ~temp*.dat
+apps/dosbox/
