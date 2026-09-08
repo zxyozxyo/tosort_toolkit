@@ -96,3 +96,12 @@ _fp_*.lst
 # precomp scratch files: it writes these beside the working directory
 ~temp*.dat
 apps/dosbox/
+
+# Third-party archiver binaries and per-run artefacts
+apps/dosrar_pack/
+__rar_*
+rsr_tool.log
+rsr_tool.log.1
+rsr_blocked.db
+rsr_blocked.csv
+rsr_blocked.txt
