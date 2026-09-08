@@ -368,6 +368,17 @@ def _mt_label(exe: str, mt) -> str:
     return f"-mt{mt}" if _supports_mt(exe or "") else "no -mt"
 
 
+def _supports_vn(fname: str) -> bool:
+    """Does this build understand -vn (old-style .rar/.r00 volume naming)?
+
+    It arrived in 3.00. On 2.x the switch is not merely ignored: it takes -v
+    down with it, so `rar a -v20000000b -vn` writes ONE archive of the full
+    size and the sweep sees a build that "cannot make volumes". Measured on
+    2.70b4 and 2.71. Redundant there in any case -- .rar/.r00 IS the 2.x
+    default, which is the whole of what -vn asks for."""
+    return _exe_number(fname) >= 300
+
+
 def _supports_mt(fname: str) -> bool:
     """Does this build understand -mt at all?
 
@@ -4496,7 +4507,13 @@ class RsrToolAPI:
             if not base:
                 cmd.append("-ep")
             if gi == len(groups) - 1:
-                cmd += list(vol_args) + list(tail)
+                # -vn is meaningless before 3.00 and actively harmful:
+                # it cancels -v, so the build makes one archive instead of
+                # volumes. Old naming is already what those builds do.
+                va = list(vol_args)
+                if not _supports_vn(ex.name):
+                    va = [a for a in va if a != "-vn"]
+                cmd += va + list(tail)
             names = []
             for q in srcs[at:at + count]:
                 if base:
