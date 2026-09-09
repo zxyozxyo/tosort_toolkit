@@ -1366,6 +1366,36 @@ def _reorder_rar4_blocks(data: bytes, want: list) -> bytes | None:
     return out if len(out) == len(data) else None
 
 
+def rar4_host(vols) -> int:
+    """HOST_OS of the first file header: 0 MS-DOS, 1 OS/2, 2 Win32, 3 Unix,
+    4 Mac, 5 BeOS. -1 when it cannot be read."""
+    for vol in vols:
+        try:
+            size = Path(vol).stat().st_size
+            with open(vol, "rb") as fh:
+                if fh.read(7) != RAR4_SIG:
+                    continue
+                pos = 7
+                while pos + 11 <= size:
+                    fh.seek(pos)
+                    head = fh.read(32)
+                    if len(head) < 16:
+                        break
+                    typ = head[2]
+                    flags = int.from_bytes(head[3:5], "little")
+                    hsize = int.from_bytes(head[5:7], "little")
+                    if hsize < 7:
+                        break
+                    add = (int.from_bytes(head[7:11], "little")
+                           if flags & 0x8000 else 0)
+                    if typ == 0x74:
+                        return head[15]
+                    pos += hsize + add
+        except OSError:
+            continue
+    return -1
+
+
 def _fmt_fits(fname: str, unp_max: int) -> bool:
     """Could this build have written an archive stamped `unp_max`?
 
@@ -2275,8 +2305,16 @@ class RsrToolAPI:
         pack = self._app_dir / "apps" / "dosrar_pack"
         if not pack.is_dir():
             return []
-        return [e for e in sorted(pack.glob("*_dosrar*.exe"))
-                if self._is_dos_exe(e)]
+        caps = self._dos_caps()
+        out = []
+        for e in sorted(pack.glob("*_dosrar*.exe")):
+            if not self._is_dos_exe(e):
+                continue
+            c = caps.get(e.name) or {}
+            if c.get("hang") or (c and not c.get("alive", True)):
+                continue          # measured: never answers, burns the timeout
+            out.append(e)
+        return out
 
     @staticmethod
     def _is_dos_exe(p: Path) -> bool:
@@ -2299,6 +2337,96 @@ class RsrToolAPI:
                 return fh.read(2) not in (b"LX", b"LE", b"NE", b"PE")
         except OSError:
             return False
+
+    def _dos_caps(self) -> dict:
+        """{build name: {"s1": bool, "vol": bool, "hang": bool}}.
+
+        Cached in apps/dosrar_pack/_caps.json against each build's size, so a
+        build is probed once ever and a changed or added one is re-probed.
+        See the module note on _probe_dos_build for why this matters."""
+        cached = getattr(self, "_dos_caps_cache", None)
+        if cached is not None:
+            return cached
+        pack = self._app_dir / "apps" / "dosrar_pack"
+        cf = pack / "_caps.json"
+        try:
+            caps = json.loads(cf.read_text(encoding="utf-8"))
+        except Exception:
+            caps = {}
+        changed = False
+        for ex in sorted(pack.glob("*_dosrar*.exe")):
+            if not self._is_dos_exe(ex):
+                continue
+            try:
+                size = ex.stat().st_size
+            except OSError:
+                continue
+            have = caps.get(ex.name)
+            if isinstance(have, dict) and have.get("size") == size:
+                continue
+            self._log(f"    probing what {_exe_label(ex.name)} supports "
+                      "(once, cached)…", "dim")
+            caps[ex.name] = dict(self._probe_dos_build(ex), size=size)
+            changed = True
+        if changed:
+            try:
+                cf.write_text(json.dumps(caps, indent=1, sort_keys=True),
+                              encoding="utf-8")
+            except OSError:
+                pass
+        self._dos_caps_cache = caps
+        return caps
+
+    def _probe_dos_build(self, ex: Path) -> dict:
+        """Pack a tiny fixture two ways to see what this build accepts.
+
+        Short timeout on purpose: a build that does not answer in a minute on
+        300 KB is a build that hangs, and the only useful thing to learn about
+        it is that it must never be run again."""
+        out = {"s1": False, "vol": False, "hang": False, "alive": False}
+        work = Path(tempfile.mkdtemp(prefix="rsrdoscap"))
+        try:
+            for key, extra, volb in (("s1", ("-s1", "-ds"), 0),
+                                     ("vol", (), 200000)):
+                wd = work / key
+                wd.mkdir(parents=True, exist_ok=True)
+                src = wd / "src"
+                src.mkdir(exist_ok=True)
+                (src / "T.CUE").write_bytes(b'FILE "T.BIN" BINARY\r\n')
+                (src / "T.BIN").write_bytes(os.urandom(300000))
+                ok = self._run_dos_pack(ex, wd / "run", 3, False,
+                                        [str(src / "T.CUE"),
+                                         str(src / "T.BIN")],
+                                        volb, timeout=60, extra=extra)
+                made = []
+                try:
+                    made = [q for q in (wd / "run").iterdir()
+                            if q.is_file() and q.name.startswith("PROBE.")]
+                except OSError:
+                    pass
+                if not ok and not made:
+                    # No log and no output: either a rejected switch (rar
+                    # printed its usage screen and stopped) or a hang. Both
+                    # disqualify the build for this mode; a hang disqualifies
+                    # it entirely, which the caller sees as vol==s1==False.
+                    continue
+                # Producing SOMETHING proves the build runs, even if it
+                # did the wrong thing with the switches. 1.51/1.52 reject -s1
+                # and mis-handle -v, but they pack a plain archive perfectly
+                # well and may be the right answer for a non-volumed set --
+                # so "cannot do X" must not be confused with "cannot run".
+                if made:
+                    out["alive"] = True
+                if key == "s1":
+                    out["s1"] = bool(made)
+                else:
+                    out["vol"] = 2 <= len(made) <= 4
+            out["hang"] = not out["alive"]
+        except Exception:
+            out["hang"] = True
+        finally:
+            _rmtree(work)
+        return out
 
     def _dosbox_exe(self) -> Path | None:
         p = self._app_dir / "apps" / "dosbox" / "dosbox.exe"
@@ -4401,7 +4529,9 @@ class RsrToolAPI:
                                             int(f.get("method") or 0) != 0
                                             and int(f.get("packed_size") or 0)
                                             >= int(f.get("size") or 0)
-                                            for f in meta))
+                                            for f in meta),
+                                        host=rar4_host(vols)
+                                        if st["format"] == "RAR4" else -1)
             if recipe:
                 break
             if self._budget_hit:
@@ -5196,7 +5326,8 @@ class RsrToolAPI:
                       new_numbering=True, groups=None, end_sig=None,
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
-                      want_vols=0, unp_max=0, expanded=False) -> dict | None:
+                      want_vols=0, unp_max=0, expanded=False,
+                      host=-1) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -5282,18 +5413,71 @@ class RsrToolAPI:
         elif dos and fmt == "RAR4":
             names = [Path(s).name for s in src_files]
             if all(self._is_83(x) for x in names):
+                caps = self._dos_caps()
+                # Lead with what has already won for this group. The priors
+                # table has been recording DOS winners all along; only
+                # _order_combos could not use them, because it resolves names
+                # against the Windows pack. Ordering matters far more here
+                # than on the Windows side: a DOS combo has no prefix probe,
+                # so every build tried ahead of the right one is a full pack
+                # of the whole set through DOSBox.
+                prior = [n for n, _ in self._hot_recipes(fmt, level, grp)]
+                rank = {n: i for i, n in enumerate(prior)}
+                if any(e.name in rank for e in dos):
+                    dos = sorted(dos, key=lambda e: (rank.get(e.name, 1 << 20),
+                                                     e.name))
+                    lead = next(e for e in dos if e.name in rank)
+                    self._log(f"    {_exe_label(lead.name)} has won for "
+                              f"{grp or 'this format'} before — trying that "
+                              "DOS build first.", "dim")
+                skipped_vol = []
                 for ex in dos:
+                    c = caps.get(ex.name) or {}
+                    # 1.51/1.52/1.53/1.40 do not understand -v<N>b, and do not
+                    # fail cleanly -- 1.52 was seen splitting a 74-byte .CUE
+                    # across ~1800 volumes. Never hand them a volumed set.
+                    if vol_bytes and not c.get("vol", True):
+                        skipped_vol.append(ex.name)
+                        continue
                     # The store-fallback signature is not a Windows-only
                     # thing: DOS rar does not do the fallback either, and it
                     # is always the tiny .CUE that expands. Lead each build
-                    # with its -s1 form when the signature is present.
-                    if expanded:
+                    # with its -s1 form -- but only where the switch exists;
+                    # 1.51/1.52 print their usage screen and pack nothing.
+                    if expanded and c.get("s1", True):
                         combos.append((ex, 1,
                                        (self.DOS_MARK, "-s1", "-ds")))
                     combos.append((ex, 1, (self.DOS_MARK,)))
-                self._log(f"    {len(dos)} DOS RAR build(s) queued behind the "
-                          "Windows sweep — a different compressor, tried only "
-                          "if every Windows build fails.", "dim")
+                if skipped_vol:
+                    self._log(f"    {len(skipped_vol)} DOS build(s) skipped — "
+                              "they predate -v<N>b and would mis-split this "
+                              "volumed set.", "dim")
+                # The header names the machine that packed it. A Windows
+                # build has never reproduced a DOS-host archive in this
+                # corpus (1 of 186 captured releases was DOS-host, and a
+                # dosrar build made it), so when the byte says MS-DOS the DOS
+                # line leads and the Windows sweep is the backstop. The full
+                # Windows product still follows, so a wall is still a wall.
+                if host == 0:
+                    dcount = sum(1 for c in combos
+                                 if len(c) > 2 and c[2]
+                                 and c[2][0] == self.DOS_MARK)
+                    head_dos = [c for c in combos
+                                if len(c) > 2 and c[2]
+                                and c[2][0] == self.DOS_MARK]
+                    rest = [c for c in combos
+                            if not (len(c) > 2 and c[2]
+                                    and c[2][0] == self.DOS_MARK)]
+                    combos = head_dos + rest
+                    hot = 0
+                    self._log(f"    the header says this was packed on MS-DOS "
+                              f"— leading with the {dcount} DOS combo(s); the "
+                              "Windows sweep follows as a backstop.", "dim")
+                else:
+                    self._log(f"    {len(dos)} DOS RAR build(s) queued behind "
+                              "the Windows sweep — a different compressor, "
+                              "tried only if every Windows build fails.",
+                              "dim")
             else:
                 bad = [x for x in names if not self._is_83(x)][:2]
                 self._log(f"    DOS builds skipped: {', '.join(bad)} "
