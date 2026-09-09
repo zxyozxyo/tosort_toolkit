@@ -1366,6 +1366,41 @@ def _reorder_rar4_blocks(data: bytes, want: list) -> bytes | None:
     return out if len(out) == len(data) else None
 
 
+def rar4_reserved_data_offset(path: Path, name: str):
+    """Where the packed data starts in an archive rar is STILL WRITING.
+
+    There is no file header to parse yet: rar reserves the space and leaves
+    it zeroed until it closes the file, because it cannot know the packed
+    size or CRC before then. Verified on an in-flight archive --
+
+        pos= 7  type=0x73 (MAIN) hsize=13
+        pos=20  0x00 ... zeros through 56, data begins at 57   (name "T.BIN")
+
+    -- and the geometry is fixed: 32 bytes plus the name. T.BIN (5) puts data
+    at 57; KAL-LSR.BIN (11) puts it at 63, which is exactly where the finished
+    original has it. None when the reserved area is not zeroed, which means
+    the guess about which file comes first is wrong."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if not head.startswith(RAR4_SIG) or len(head) < 64:
+        return None
+    flags = int.from_bytes(head[10:12], "little")
+    hsize = int.from_bytes(head[12:14], "little")
+    if hsize < 7:
+        return None
+    add = int.from_bytes(head[14:18], "little") if flags & 0x8000 else 0
+    main_end = 7 + hsize + add
+    off = main_end + 32 + len(name)
+    if off > len(head):
+        return None
+    if any(head[main_end:off]):
+        return None            # not a reserved (zeroed) header: wrong guess
+    return off
+
+
 def rar4_rr_sectors(vol: Path) -> int:
     """N, the recovery-sector count, of one RAR4 volume -- 0 if it has none.
 
@@ -5220,7 +5255,8 @@ class RsrToolAPI:
 
     def _run_dos_pack(self, ex: Path, wdir: Path, level: int, solid: bool,
                       srcs: list, vol_bytes: int, timeout: int = 1800,
-                      extra=(), first_volume_only: bool = False) -> bool:
+                      extra=(), first_volume_only: bool = False,
+                      stop_after: int = 0, rr_sectors: int = -1) -> bool:
         """Pack `srcs` with a 16-bit DOS RAR, under DOSBox, into `wdir`.
 
         DOSBox gets its own mount per combo so nothing is shared between
@@ -5258,6 +5294,12 @@ class RsrToolAPI:
                        for x in extra):
                 args.append("-s" if solid else "-s-")
             args += extra
+            # A recovery record, when the original has one. -1 means "not
+            # asked for"; 0 means "one, of rar's default size", which is what
+            # the scene typed. See the -rr unit note: N counts 512-byte
+            # sectors, it is not a percentage.
+            if rr_sectors >= 0:
+                args.append("-rr" if not rr_sectors else f"-rr{rr_sectors}")
             if vol_bytes:
                 args.append(f"-v{vol_bytes}b")
             bat = ("@echo off\r\n"
@@ -5279,6 +5321,24 @@ class RsrToolAPI:
             # nothing about the output.
             env = dict(os.environ, SDL_VIDEODRIVER="dummy")
             argv = [str(box), "-conf", str(cfg), "-noconsole"]
+            if stop_after:
+                # Enough DATA to disprove a build, and no more. Verified that
+                # bytes rar has written are already on the host even though it
+                # still holds the file open -- only the header is a
+                # placeholder until close.
+                out = wdir / "PROBE.RAR"
+
+                def _enough():
+                    try:
+                        return out.stat().st_size >= stop_after
+                    except OSError:
+                        return False
+
+                self._run_until(argv, _enough, timeout=timeout,
+                                heartbeat=f"DOS first look "
+                                          f"{_exe_label(ex.name)}",
+                                cwd=None, env=env)
+                return _enough()
             if first_volume_only and vol_bytes:
                 # Same bargain the Windows sweep makes in _run_until: a wrong
                 # build diverges inside volume one, so once volume two opens
@@ -5372,8 +5432,22 @@ class RsrToolAPI:
                         vb = int(a[2:-1])
                     except ValueError:
                         vb = 0
-            # Cheap disproof first. Everything after volume one is work
-            # spent on a build that has already been ruled out.
+            # Cheapest disproof first: a megabyte, not a volume. At
+            # DOSBox's ~0.5 MB/s a volume costs minutes and a wrong build has
+            # usually parted company inside the first megabyte.
+            if prefix:
+                look = wdir / "look"
+                try:
+                    if self._run_dos_pack(ex, look, groups[0][0], solid, srcs,
+                                          vb, timeout=600,
+                                          extra=extra[1:],
+                                          stop_after=(1 << 20) + 4096):
+                        if self._early_verdict(look / "PROBE.RAR", prefix,
+                                               1 << 20) is False:
+                            return False
+                finally:
+                    _rmtree(look)
+            # Then volume one, as the Windows sweep does.
             if prefix and vb and want_vols > 1:
                 if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
                                           vb, extra=extra[1:],
@@ -5590,10 +5664,18 @@ class RsrToolAPI:
                     # is always the tiny .CUE that expands. Lead each build
                     # with its -s1 form -- but only where the switch exists;
                     # 1.51/1.52 print their usage screen and pack nothing.
-                    if expanded and c.get("s1", True):
-                        combos.append((ex, 1,
-                                       (self.DOS_MARK, "-s1", "-ds")))
-                    combos.append((ex, 1, (self.DOS_MARK,)))
+                    # Multimedia compression. RAR 2.x picks it per file
+                    # and the sweep never asked for it, so an archive whose
+                    # packer used it was unreachable at every build -- the
+                    # 20 KALISTO -m5+solid releases are exactly that. Paired
+                    # with each ordinary variant rather than replacing it,
+                    # since it changes nothing for data rar would not have
+                    # applied it to.
+                    for mm in ((), ("-mm",)):
+                        if expanded and c.get("s1", True):
+                            combos.append((ex, 1, (self.DOS_MARK, "-s1",
+                                                   "-ds") + mm))
+                        combos.append((ex, 1, (self.DOS_MARK,) + mm))
                 if skipped_vol:
                     self._log(f"    {len(skipped_vol)} DOS build(s) skipped — "
                               "they predate -v<N>b and would mis-split this "
@@ -5840,6 +5922,58 @@ class RsrToolAPI:
         return single if single.is_file() else None
 
     @staticmethod
+    def _early_verdict(probe_head: Path, prefix: dict, min_bytes: int):
+        """False only if NO reading of this half-written archive agrees with
+        the original; None if it might still be right, or if there is not yet
+        enough to say.
+
+        Never returns True: a megabyte of agreement is a reprieve, not a
+        verdict -- the build still has to pass the volume-one probe and then
+        reproduce every stream. This exists only to stop paying three minutes
+        at DOSBox's 0.5 MB/s for what the first megabyte has already ruled out.
+
+        Deliberately asymmetric. Which file rar put first depends on switches
+        (-ds keeps command-line order, solid mode sorts by extension), and
+        guessing wrong would discard a build that was right. So every
+        candidate is tried and the answer is False only when every one of them
+        disagrees; anything else survives to be judged properly.
+
+        The length is bounded by the FILE ON DISK, never by the header, which
+        does not exist yet."""
+        try:
+            size = probe_head.stat().st_size
+        except OSError:
+            return None
+        looked = False
+        for nm, (src_vol, src_off, src_len) in prefix.items():
+            off = rar4_reserved_data_offset(probe_head, nm)
+            if off is None:
+                continue
+            n = min(size - off, src_len)
+            if n < min_bytes:
+                continue
+            looked = True
+            try:
+                with open(probe_head, "rb") as a, open(src_vol, "rb") as b:
+                    a.seek(off)
+                    b.seek(src_off)
+                    left, same = n, True
+                    while left > 0:
+                        step = min(1 << 20, left)
+                        x, y = a.read(step), b.read(step)
+                        if len(x) < step or len(y) < step:
+                            same = False
+                            break
+                        if x != y:
+                            same = False
+                            break
+                        left -= step
+                if same:
+                    return None            # this reading agrees: survives
+            except OSError:
+                return None
+        return False if looked else None
+
     @staticmethod
     def _prefix_verdict(probe_head: Path, prefix: dict):
         """True if volume one agrees with the original, False if it does not,
@@ -5969,7 +6103,10 @@ class RsrToolAPI:
                                       recipe["solid"],
                                       [str(q) for q in src_files],
                                       recipe.get("volume_bytes") or 0,
-                                      timeout=3600, extra=mc[1:]):
+                                      timeout=3600, extra=mc[1:],
+                                      rr_sectors=(
+                                          int(recipe.get("rr_sectors") or 0)
+                                          if recipe.get("rr_pct") else -1)):
                 return None
             dmade = sorted(q for q in out.iterdir()
                            if q.is_file() and _classify_volume(q.name)
