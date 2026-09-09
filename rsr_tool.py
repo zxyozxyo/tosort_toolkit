@@ -4422,7 +4422,8 @@ class RsrToolAPI:
         # of the prior.
         self._db_learn(st["format"], level, grp, recipe)
 
-        extra_sw = list(recipe.get("mc") or [])
+        extra_sw = [x for x in (recipe.get("mc") or [])
+                    if str(x) != self.DOS_MARK]
         solid_sw = next((x for x in extra_sw if str(x).startswith("-s")),
                         "-s" if solid else "-s-")
         rest_sw = " ".join(str(x) for x in extra_sw
@@ -4977,7 +4978,8 @@ class RsrToolAPI:
         return max(1, total // max(1, getattr(self, "_live_jobs", 1)))
 
     def _run_dos_pack(self, ex: Path, wdir: Path, level: int, solid: bool,
-                      srcs: list, vol_bytes: int, timeout: int = 1800) -> bool:
+                      srcs: list, vol_bytes: int, timeout: int = 1800,
+                      extra=()) -> bool:
         """Pack `srcs` with a 16-bit DOS RAR, under DOSBox, into `wdir`.
 
         DOSBox gets its own mount per combo so nothing is shared between
@@ -4999,7 +5001,14 @@ class RsrToolAPI:
                 if not dst.exists():
                     shutil.copy2(src, dst)
                 names.append(dst.name)
-            args = [f"-m{level}", "-ep", "-y", "-s" if solid else "-s-"]
+            args = [f"-m{level}", "-ep", "-y"]
+            # A solid switch in `extra` REPLACES the default one -- rar honours
+            # the last it sees, so -s1 beside a trailing -s- is cancelled.
+            extra = [str(x) for x in extra if str(x) != self.DOS_MARK]
+            if not any(x.startswith("-s") and not x.startswith("-se")
+                       for x in extra):
+                args.append("-s" if solid else "-s-")
+            args += extra
             if vol_bytes:
                 args.append(f"-v{vol_bytes}b")
             bat = ("@echo off\r\n"
@@ -5096,7 +5105,8 @@ class RsrToolAPI:
                         vb = int(a[2:-1])
                     except ValueError:
                         vb = 0
-            if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs, vb):
+            if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
+                                      vb, extra=extra[1:]):
                 return False
             cmds = []
         else:
@@ -5273,6 +5283,13 @@ class RsrToolAPI:
             names = [Path(s).name for s in src_files]
             if all(self._is_83(x) for x in names):
                 for ex in dos:
+                    # The store-fallback signature is not a Windows-only
+                    # thing: DOS rar does not do the fallback either, and it
+                    # is always the tiny .CUE that expands. Lead each build
+                    # with its -s1 form when the signature is present.
+                    if expanded:
+                        combos.append((ex, 1,
+                                       (self.DOS_MARK, "-s1", "-ds")))
                     combos.append((ex, 1, (self.DOS_MARK,)))
                 self._log(f"    {len(dos)} DOS RAR build(s) queued behind the "
                           "Windows sweep — a different compressor, tried only "
@@ -5586,6 +5603,32 @@ class RsrToolAPI:
             # and lose the whole thing as "replay unverified".
             cfile.write_text(comment, encoding="utf-8", errors="replace",
                              newline="")
+        # A DOS recipe is not a command line we can run: it is a 16-bit
+        # binary living in apps/dosrar_pack, driven through DOSBox. Without
+        # this the rebuild resolved the build against the WINDOWS pack, failed
+        # to find it, and reported "the replay command produced no volumes at
+        # all" -- while capture had reported verify=exact, having reused the
+        # sweep's own pack rather than calling this at all.
+        mc = [str(x) for x in (recipe.get("mc") or [])]
+        if mc and mc[0] == self.DOS_MARK:
+            dex = self._app_dir / "apps" / "dosrar_pack" / recipe["exe"]
+            if not dex.is_file():
+                self._log(f"    ✗ the DOS build {recipe['exe']} is not in "
+                          "apps/dosrar_pack — cannot replay this recipe.",
+                          "err")
+                return None
+            if not self._run_dos_pack(dex, out, recipe["level"],
+                                      recipe["solid"],
+                                      [str(q) for q in src_files],
+                                      recipe.get("volume_bytes") or 0,
+                                      timeout=3600, extra=mc[1:]):
+                return None
+            dmade = sorted(q for q in out.iterdir()
+                           if q.is_file() and _classify_volume(q.name)
+                           and q.suffix.lower() != ".exe")
+            dmade.sort(key=lambda q: _classify_volume(q.name)[2])
+            return dmade or None
+
         cmds = self._replay_cmds(recipe, out / "replay.rar",
                                  [str(p) for p in src_files], cfile, fmt,
                                  base=base)
@@ -6504,14 +6547,17 @@ class RsrToolAPI:
                      work: Path) -> bool:
         recipe = st["recipe"]
         stem = st["stem"]
-        _ex = list(recipe.get("mc") or [])
+        _ex = [x for x in (recipe.get("mc") or [])
+               if str(x) != self.DOS_MARK]
+        _dos = " DOS" if self.DOS_MARK in [str(x) for x in
+                                           (recipe.get("mc") or [])] else ""
         _sw = next((x for x in _ex if str(x).startswith("-s")),
                    "-s" if recipe["solid"] else "-s-")
         _rest = " ".join(str(x) for x in _ex if not str(x).startswith("-s"))
         self._log(f"  {stem}: replaying {recipe['version']} "
                   f"{_mt_label(recipe.get('exe', ''), recipe['mt'])} "
                   f"(-m{recipe['level']} -md{recipe['dict_kb']}KB {_sw}"
-                  + (f" {_rest}" if _rest else "") + ")", "info")
+                  + (f" {_rest}" if _rest else "") + f"){_dos}", "info")
 
         # Gather sources: loose content from the user's folder, archive-only
         # extras straight out of the container.
