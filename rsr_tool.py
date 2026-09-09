@@ -1826,6 +1826,15 @@ class RsrToolAPI:
         # decided centrally, against claims/built under the batch lock.
         # _content_root stays shared: it is one root for the whole batch.
         self._tl = threading.local()
+        # The budget grant is the one piece of per-release state that is NOT
+        # thread-local, and deliberately: the click arrives on the GUI thread,
+        # so anything kept per-thread never reaches the sweeps. Keyed by
+        # release name, under a lock, so a grant finds the right release
+        # whichever thread is running it.
+        self._budget_lock = threading.Lock()
+        self._budget_flagged: dict = {}   # rel -> announced a shortfall
+        self._budget_lifted: set = set()  # rel -> granted "finish this one"
+        self._budget_inflight: set = set()
         self._consumed = []            # content files a rebuild actually used
         # One writer at a time. Several captures now run at once and all of
         # them record rows, misses and learned recipes. sqlite would serialise
@@ -1996,6 +2005,36 @@ class RsrToolAPI:
         self._log("  ⏭ Skip requested — abandoning this release now.", "warn")
         return {"ok": True}
 
+    def _budget_free(self, rel: str) -> bool:
+        """Has this release been granted its extension?
+
+        The thread-local override is still honoured for in-thread callers;
+        the shared set is what a click on the GUI thread can reach."""
+        if self._budget_override:
+            return True
+        if not rel:
+            return False
+        with self._budget_lock:
+            return rel in self._budget_lifted
+
+    def _budget_enter(self, rel: str):
+        if rel:
+            with self._budget_lock:
+                self._budget_inflight.add(rel)
+
+    def _budget_leave(self, rel: str):
+        """Forget this release. The grant was for one release, once."""
+        if rel:
+            with self._budget_lock:
+                self._budget_inflight.discard(rel)
+                self._budget_flagged.pop(rel, None)
+                self._budget_lifted.discard(rel)
+
+    def _budget_flag(self, rel: str, short: str):
+        if rel:
+            with self._budget_lock:
+                self._budget_flagged[rel] = short
+
     def extend_budget(self) -> dict:
         """Lift the time budget for the release being captured RIGHT NOW.
 
@@ -2009,14 +2048,31 @@ class RsrToolAPI:
         Deliberately does not touch the saved budget_min."""
         if not self._running:
             return {"ok": False, "error": "nothing running"}
-        if self._budget_override:
+        with self._budget_lock:
+            # Everything that has asked for more time. Several releases run at
+            # once and several can flag in a row, so the button answers all of
+            # them rather than whichever was loudest last.
+            want = [r for r in self._budget_flagged if r not in
+                    self._budget_lifted]
+            if not want:
+                # Nothing has flagged yet — take it to mean "let whatever is
+                # running finish", which is what reaching for it implies.
+                want = [r for r in self._budget_inflight
+                        if r not in self._budget_lifted]
+            self._budget_lifted.update(want)
+            already = not want and bool(self._budget_lifted)
+        if already:
             return {"ok": True, "already": True}
-        self._budget_override = True
-        self._deadline = None
-        self._log("  ⏱ Budget lifted for THIS release — the sweep will run to "
-                  "completion. The next release gets the normal budget again.",
+        if not want:
+            self._log("  ⏱ Nothing is waiting on the budget just now.", "dim")
+            return {"ok": True, "lifted": 0}
+        for r in want:
+            self._log(f"  ⏱ Budget lifted for {r} — it will sweep to "
+                      "completion.", "warn")
+        self._log(f"  ⏱ {len(want)} release(s) lifted. Any OTHER release, and "
+                  "every release after these, gets the normal budget again.",
                   "warn")
-        return {"ok": True}
+        return {"ok": True, "lifted": len(want), "releases": sorted(want)}
 
     def _kill_procs(self):
         """Kill whatever rar.exe is running for this job. Safe to call when
@@ -2720,6 +2776,11 @@ class RsrToolAPI:
                 self._log(f"  ERROR: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
                 res = {"ok": False, "error": str(e)}
+            finally:
+                # The grant was for this release, once. Forget it here rather
+                # than at the next release's start: with several in flight,
+                # "the next release" is not a single thing.
+                self._budget_leave(rel)
             if self._skip.is_set():
                 # Skipped by hand: not a failure, and nothing partial is left
                 # in the store — _capture_release only writes a .rsr after its
@@ -4612,6 +4673,7 @@ class RsrToolAPI:
         # lengths come out wrong.
         rr_bytes = recovery_record(head)
         rr_pct = 0
+        rr_sectors = 0          # no recovery record unless one is found
         if rr_bytes:
             arch = sum(v.stat().st_size for v in vols)
             rr_pct = max(1, min(100, round(rr_bytes * 100
@@ -5596,6 +5658,8 @@ class RsrToolAPI:
         tried = 0
         total = len(combos)
         said_dos = False
+        said_lift = False
+        self._budget_enter(rel)
         t0 = last = time.monotonic()
         # ── the sweep, across as many cores as the budget allows ─────────
         #
@@ -5624,7 +5688,16 @@ class RsrToolAPI:
             last_budget = budget
             if self._stop.is_set() or self._skip.is_set():
                 return None
-            if (tried and deadline and not self._budget_override
+            if deadline and not said_lift and self._budget_free(rel):
+                # Granted while this sweep was running. Say so HERE, in this
+                # release's own log context, so it is clear which releases a
+                # click actually reached.
+                said_lift = True
+                deadline = None
+                self._deadline = None
+                self._log("    ⏱ budget lifted for this release — carrying on "
+                          "to the end of the sweep.", "ok")
+            if (tried and deadline and not self._budget_free(rel)
                     and time.monotonic() > deadline):
                 self._budget_hit = True
                 self._sweep_pos = (start + tried, sig)
@@ -5718,6 +5791,7 @@ class RsrToolAPI:
                               f"(~{(worst - allows) * per / 60:,.0f} min more). "
                               f"Press '{UI_FINISH_ONE}' to lift it for this "
                               f"release.", "warn")
+                    self._budget_flag(rel, f"{allows:,}/{worst:,}")
             elif now - last > 0.5:
                 last = now
                 rate = tried / max(now - t0, 1e-6)
