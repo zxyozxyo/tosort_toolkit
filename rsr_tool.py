@@ -1366,6 +1366,41 @@ def _reorder_rar4_blocks(data: bytes, want: list) -> bytes | None:
     return out if len(out) == len(data) else None
 
 
+def rar4_rr_sectors(vol: Path) -> int:
+    """N, the recovery-sector count, of one RAR4 volume -- 0 if it has none.
+
+    RR_bytes = 2*ceil(protected/512) + 512*N, exactly, so N comes straight
+    back out. See the module note on the -rr unit error."""
+    try:
+        d = Path(vol).read_bytes()
+    except OSError:
+        return 0
+    i = d.find(RAR4_SIG)
+    if i < 0:
+        return 0
+    i += 7
+    rr = prot = 0
+    while i + 11 <= len(d):
+        typ = d[i + 2]
+        flags = int.from_bytes(d[i + 3:i + 5], "little")
+        hsize = int.from_bytes(d[i + 5:i + 7], "little")
+        if hsize < 7:
+            break
+        add = (int.from_bytes(d[i + 7:i + 11], "little")
+               if flags & 0x8000 else 0)
+        if typ == 0x78:
+            rr = add
+        else:
+            prot += hsize + add
+        if typ == 0x7b:
+            break
+        i += hsize + add
+    if not rr:
+        return 0
+    n = (rr - 2 * -(-prot // 512)) / 512
+    return int(n) if n > 0 and n == int(n) else 0
+
+
 def rar4_host(vols) -> int:
     """HOST_OS of the first file header: 0 MS-DOS, 1 OS/2, 2 Win32, 3 Unix,
     4 Mac, 5 BeOS. -1 when it cannot be read."""
@@ -4581,11 +4616,17 @@ class RsrToolAPI:
             arch = sum(v.stat().st_size for v in vols)
             rr_pct = max(1, min(100, round(rr_bytes * 100
                                            / max(arch - rr_bytes, 1))))
-            self._log(f"    recovery record: {rr_bytes:,} B (~{rr_pct}% of the "
-                      "archive) — the replay will ask for one too.", "dim")
+            rr_sectors = rar4_rr_sectors(head)
+            self._log(f"    recovery record: {rr_bytes:,} B — "
+                      + (f"{rr_sectors} recovery sectors, which the replay "
+                         "will ask for exactly."
+                         if rr_sectors else
+                         "its sector count could not be read, so the replay "
+                         "will ask for rar's default."), "dim")
         recipe.update({"level": level, "solid": solid,
                        "volume_bytes": vol_bytes, "naming": st["scheme"],
                        "new_numbering": newnum, "rr_pct": rr_pct,
+                       "rr_sectors": rr_sectors,
                        "byte_split": st["byte_split"],
                        "keep_paths": keep_paths,
                        "locked": arch_locked,
@@ -5792,7 +5833,13 @@ class RsrToolAPI:
                 vol_args.append("-vn")     # .rar/.r00 rather than .partN.rar
         tail = []
         if recipe.get("rr_pct"):
-            tail.append(f"-rr{recipe['rr_pct']}p")
+            # Plain -rr by default: it is what the scene typed, and only
+            # the default SCALES the short last volume down (2.70 gives
+            # 307/108 where an explicit -rr307 gives 307/307). The exact
+            # recovered count is the fallback, for a release that really did
+            # ask for a specific size -- see the walk in _verify_replay.
+            n = int(recipe.get("rr_sectors") or 0)
+            tail.append(f"-rr{n}" if recipe.get("rr_exact") and n else "-rr")
         if comment_file:
             tail.append(f"-z{comment_file}")
         if recipe.get("locked"):
@@ -5930,15 +5977,35 @@ class RsrToolAPI:
         if produced and recipe.get("rr_pct") and not st["byte_split"]:
             want = sum(v.stat().st_size for v in vols)
             if sum(p.stat().st_size for p in produced) != want:
-                for pct in (1, 2, 3, 4, 5, 10):
-                    if pct == recipe["rr_pct"]:
-                        continue
-                    alt = self._replay(dict(recipe, rr_pct=pct), src_files,
-                                       work, comment, st["format"])
+                # The sweep matches on STREAMS, and builds of one version
+                # produce identical streams while disagreeing about the
+                # default recovery record -- 2.70b4 writes 307 sectors on
+                # every volume where 2.70 scales the short last one down.
+                # So the variable to walk is the sibling build, not a
+                # percentage that this switch never took.
+                fam = _exe_number(recipe["exe"])
+                sibs = [e.name for e in self._pack_exes()
+                        if _exe_number(e.name) == fam
+                        and e.name != recipe["exe"]]
+                cands = [dict(recipe, exe=name) for name in sibs[:8]]
+                # ...and, last, this build asked for the exact recovered
+                # count, for a release that did name a size rather than
+                # taking the default.
+                if recipe.get("rr_sectors"):
+                    cands.append(dict(recipe, rr_exact=True))
+                for cand in cands:
+                    name = cand["exe"]
+                    alt = self._replay(cand, src_files, work, comment,
+                                       st["format"], base=base)
                     if alt and sum(p.stat().st_size for p in alt) == want:
-                        self._log(f"    recovery record is -rr{pct}p, not "
-                                  f"-rr{recipe['rr_pct']}p — corrected.", "dim")
-                        recipe["rr_pct"] = pct
+                        self._log(f"    the recovery record came back wrong "
+                                  f"for {_exe_label(recipe['exe'])}; "
+                                  f"{_exe_label(name)} makes it exactly — "
+                                  "same streams, different -rr default.",
+                                  "dim")
+                        recipe["exe"] = name
+                        recipe["version"] = _exe_label(name)
+                        recipe["rr_exact"] = cand.get("rr_exact", False)
                         produced = alt
                         break
         if not produced:
