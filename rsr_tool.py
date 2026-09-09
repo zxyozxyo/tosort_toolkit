@@ -4637,8 +4637,16 @@ class RsrToolAPI:
                 return {"ok": False, "error": "time budget exceeded",
                         "set": {"stem": st["stem"], "format": st["format"],
                                 "files": meta, "parked": True}}
-            self._log("    ✗ no build × -mt reproduces these streams — the "
-                      "exact build is outside the pack.", "err")
+            if self._skip.is_set() or self._stop.is_set():
+                # Nothing was swept to exhaustion — someone pressed a button.
+                # Saying "the exact build is outside the pack" here is a claim
+                # about the pack that was never tested, and it reads in the
+                # log exactly like a real wall.
+                self._log("    ▪ stopped by hand before the sweep finished — "
+                          "no verdict on this release.", "dim")
+            else:
+                self._log("    ✗ no build × -mt reproduces these streams — the "
+                          "exact build is outside the pack.", "err")
             return {"ok": False, "error": "recipe not found",
                     "set": {"stem": st["stem"], "format": st["format"],
                             "files": meta, "wall": True}}
