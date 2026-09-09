@@ -1995,7 +1995,7 @@ class RsrToolAPI:
                 pass
 
     def _run_until(self, cmd: list, ready, timeout: int,
-                   heartbeat: str = "", cwd=None) -> bool:
+                   heartbeat: str = "", cwd=None, env=None) -> bool:
         """Run a pack and kill it the moment `ready()` says there is enough
         output to judge it on.
 
@@ -2008,7 +2008,7 @@ class RsrToolAPI:
         recovers, so everything after volume one is work spent producing
         evidence nobody reads."""
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+            p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL,
                                  cwd=(str(cwd) if cwd else None),
                                  **_no_window())
@@ -5109,7 +5109,7 @@ class RsrToolAPI:
 
     def _run_dos_pack(self, ex: Path, wdir: Path, level: int, solid: bool,
                       srcs: list, vol_bytes: int, timeout: int = 1800,
-                      extra=()) -> bool:
+                      extra=(), first_volume_only: bool = False) -> bool:
         """Pack `srcs` with a 16-bit DOS RAR, under DOSBox, into `wdir`.
 
         DOSBox gets its own mount per combo so nothing is shared between
@@ -5124,13 +5124,21 @@ class RsrToolAPI:
                 _rmtree(wdir)
             wdir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ex, wdir / "RAR.EXE")
-            names = []
-            for s in srcs:
-                src = Path(s)
-                dst = wdir / src.name.upper()
-                if not dst.exists():
-                    shutil.copy2(src, dst)
-                names.append(dst.name)
+            # Mount the sources rather than copying them. DOSBox needs to SEE
+            # them, not own them, and copying cost a full duplicate of the set
+            # per combo -- ~14 GB across the DOS tail of one 600 MB release.
+            parents = {Path(s).parent.resolve() for s in srcs}
+            srcdir = parents.pop() if len(parents) == 1 else None
+            if srcdir is not None:
+                names = [f"D:\\{Path(s).name.upper()}" for s in srcs]
+            else:
+                names = []
+                for s in srcs:
+                    src = Path(s)
+                    dst = wdir / src.name.upper()
+                    if not dst.exists():
+                        shutil.copy2(src, dst)
+                    names.append(dst.name)
             args = [f"-m{level}", "-ep", "-y"]
             # A solid switch in `extra` REPLACES the default one -- rar honours
             # the last it sees, so -s1 beside a trailing -s- is cancelled.
@@ -5146,8 +5154,11 @@ class RsrToolAPI:
                    + " ".join(names) + " > RARLOG.TXT\r\n"
                    "echo RSRDONE >> RARLOG.TXT\r\n")
             (wdir / "GO.BAT").write_bytes(bat.encode("ascii", "replace"))
+            mounts = f"mount c \"{wdir}\"\n"
+            if srcdir is not None:
+                mounts += f"mount d \"{srcdir}\" -t dir\n"
             conf = (f"[sdl]\noutput=texture\n[cpu]\ncore=auto\ncycles=max\n"
-                    f"[autoexec]\nmount c \"{wdir}\"\nc:\ncall GO.BAT\nexit\n")
+                    f"[autoexec]\n{mounts}c:\ncall GO.BAT\nexit\n")
             cfg = wdir / "dosbox.conf"
             cfg.write_text(conf, encoding="utf-8")
             # Headless. Without this DOSBox opens a window for every
@@ -5156,8 +5167,23 @@ class RsrToolAPI:
             # machine. The dummy SDL driver removes the window and changes
             # nothing about the output.
             env = dict(os.environ, SDL_VIDEODRIVER="dummy")
-            self._run([str(box), "-conf", str(cfg), "-noconsole"],
-                      timeout=timeout,
+            argv = [str(box), "-conf", str(cfg), "-noconsole"]
+            if first_volume_only and vol_bytes:
+                # Same bargain the Windows sweep makes in _run_until: a wrong
+                # build diverges inside volume one, so once volume two opens
+                # there is nothing left to learn. Volume one is complete and
+                # flushed by then, because rar had to close it to open the
+                # next.
+                def _second_volume():
+                    return any(q.name.upper().startswith("PROBE.R")
+                               and q.name.upper() != "PROBE.RAR"
+                               for q in wdir.iterdir())
+
+                self._run_until(argv, _second_volume, timeout=timeout,
+                                heartbeat=f"DOS probe {_exe_label(ex.name)}",
+                                cwd=None, env=env)
+                return (wdir / "PROBE.RAR").is_file() and _second_volume()
+            self._run(argv, timeout=timeout,
                       heartbeat=f"DOS {_exe_label(ex.name)}", cwd=None,
                       env=env)
             log = wdir / "RARLOG.TXT"
@@ -5235,6 +5261,15 @@ class RsrToolAPI:
                         vb = int(a[2:-1])
                     except ValueError:
                         vb = 0
+            # Cheap disproof first. Everything after volume one is work
+            # spent on a build that has already been ruled out.
+            if prefix and vb and want_vols > 1:
+                if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
+                                          vb, extra=extra[1:],
+                                          first_volume_only=True):
+                    return False
+                if self._prefix_verdict(wdir / "PROBE.RAR", prefix) is False:
+                    return False
             if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
                                       vb, extra=extra[1:]):
                 return False
