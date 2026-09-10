@@ -5639,6 +5639,28 @@ class RsrToolAPI:
                           f"behind the ordinary sweep — RAR 2.x chooses the "
                           f"multimedia coder per file and the sweep has never "
                           f"asked for it.", "dim")
+        # Order by CAPABILITY, not just lead with it.
+        #
+        # The stamp gate already put the builds that can write this format at
+        # the front -- but only within the plain sweep. Everything appended
+        # since (the -s1 forms, and now -mm) landed BEHIND the 203 builds that
+        # provably cannot write it, so on a 9,059-combo sweep -mm sat at combo
+        # 8,127 and a 60-minute budget reached 1,365. It could never run.
+        #
+        # This is still a REORDER: nothing is dropped, the incapable builds
+        # remain as a backstop, and a wall this sweep reports is still a real
+        # wall. The prior-led combos stay at the front untouched, because
+        # _order_combos already filters them through _fmt_fits.
+        if fmt == "RAR4" and unp_max:
+            cap = [c for c in combos if _fmt_fits(c[0].name, unp_max)]
+            inc = [c for c in combos if not _fmt_fits(c[0].name, unp_max)]
+            if inc:
+                combos = cap + inc
+                self._log(f"    {len(cap):,} combo(s) from builds that can "
+                          f"write {'2.0' if unp_max < 29 else '3.x'} format "
+                          f"lead — including their -s1 and -mm forms; the "
+                          f"{len(inc):,} that cannot follow as a backstop.",
+                          "dim")
         # The PPM tail. -m5 can compress with LZSS or PPMd and rar chooses per
         # file; ask for the default only and an archive whose packer forced PPM
         # is unreachable at every build and thread count. These go LAST so a
@@ -5646,7 +5668,17 @@ class RsrToolAPI:
         # returns on first match — the cost lands only on releases that have
         # already failed everything else, where the alternative is no capture
         # at all. One thread each: PPM ignores -mt.
-        if fmt == "RAR4" and level == 5:
+        if fmt == "RAR4" and level == 5 and unp_max and unp_max < 29:
+            # Measured, not assumed: rar 2.50 given -mct+ produces NO archive
+            # at all (2.x has no PPM coder), and rar 3.00 stamps unp_ver 29
+            # whether PPM is forced or not. So a PPM stream can never carry a
+            # 2.0 stamp, and every one of these ~933 combos is a guaranteed
+            # miss on this archive. The axis is untouched for 3.x, which is
+            # what it was built for -- see the PLUS3DS trainers.
+            self._log("    PPM (-mc) tail skipped: this archive is RAR 2.0 "
+                      f"format (unp_ver {unp_max}) and PPM arrived with "
+                      "RAR 3.0 — no PPM stream can carry a 2.0 stamp.", "dim")
+        elif fmt == "RAR4" and level == 5:
             ppm_exes = []
             for want in ("_rar5", "_rar4", "_rar3"):
                 hit = next((e for e in exes if want in e.name), None)
