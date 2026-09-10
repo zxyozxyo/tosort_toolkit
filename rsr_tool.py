@@ -5879,6 +5879,8 @@ class RsrToolAPI:
         # A previous release's near-miss must not be reported against this one.
         self._best_partial = None
         said_dos = False
+        said_revised = False
+        per_first = 0.0
         said_lift = False
         self._budget_enter(rel)
         t0 = last = time.monotonic()
@@ -6007,10 +6009,33 @@ class RsrToolAPI:
             idx += len(chunk)
 
             now = time.monotonic()
+            # The first estimate is measured on the FIRST CHUNK, which carries
+            # the extraction warm-up and a cold cache, and it was never
+            # revised. Measured tonight on Puyo_Puyo_Box: it announced 10.76s
+            # per combo and 31.8h, then delivered 5,735 combos in 59 minutes —
+            # 0.62s, seventeen times faster. That figure is what the user reads
+            # before deciding whether to press "Finish this one", so being
+            # wrong by 17x in the pessimistic direction is not harmless.
+            if (not said_revised and not rung and per_first
+                    and tried >= 200 and now - t0 > 60):
+                said_revised = True
+                per_now = (now - t0) / max(tried, 1)
+                if per_now < per_first / 1.5 or per_now > per_first * 1.5:
+                    worst_ = total * max(rungs, 1)
+                    allows_ = (int(max(deadline - t0, 0) / max(per_now, 1e-6))
+                               if deadline else None)
+                    faster = per_now < per_first
+                    msg_ = (f"    ~{per_now:,.2f}s per combo now that the "
+                            f"sweep has settled ({'faster' if faster else 'slower'}"
+                            f" than the {per_first:,.2f}s first measured) — "
+                            f"{worst_:,} would take {worst_ * per_now / 3600:,.1f}h")
+                    if allows_ is not None:
+                        msg_ += f"; budget allows about {allows_:,}"
+                    self._log(msg_, "dim")
             if tried <= len(chunk) and not rung:
                 # Say up front what this release is going to cost, now that a
                 # combo's cost and the number running together both matter.
-                per = (now - t0) / max(tried, 1)
+                per = per_first = (now - t0) / max(tried, 1)
                 worst = total * max(rungs, 1)
                 allows = (int(max(deadline - t0, 0) / max(per, 1e-6))
                           if deadline else None)
