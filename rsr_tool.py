@@ -4690,7 +4690,8 @@ class RsrToolAPI:
                 return {"ok": False, "error": "time budget exceeded",
                         "set": {"stem": st["stem"], "format": st["format"],
                                 "files": meta, "parked": True}}
-            if self._skip.is_set() or self._stop.is_set():
+            aborted = self._skip.is_set() or self._stop.is_set()
+            if aborted:
                 # Nothing was swept to exhaustion — someone pressed a button.
                 # Saying "the exact build is outside the pack" here is a claim
                 # about the pack that was never tested, and it reads in the
@@ -4713,9 +4714,17 @@ class RsrToolAPI:
                               f"{'' if mt_ < 0 else f' -mt{mt_}'}{sw_txt}"
                               + (f" — {', '.join(missed[:3])} never did."
                                  if missed else "."), "warn")
-            return {"ok": False, "error": "recipe not found",
+            # A hand-stop is NOT a wall, and the caller decides which by
+            # matching this string: "recipe not found" there means "swept to
+            # exhaustion, skip it on future runs". Returning it for a release
+            # nobody actually searched writes that release off -- the log has
+            # said "no verdict" since the skip fix, while the DB quietly
+            # recorded kind='wall' with combos=0.
+            return {"ok": False,
+                    "error": ("stopped before the sweep finished" if aborted
+                              else "recipe not found"),
                     "set": {"stem": st["stem"], "format": st["format"],
-                            "files": meta, "wall": True}}
+                            "files": meta, "wall": not aborted}}
         # Learn it NOW rather than at _db_record time: a recipe that was found
         # but whose replay later fails on a header detail is still the right
         # build for the NEXT release by that group, and that is the whole value
