@@ -1928,6 +1928,18 @@ class RsrToolAPI:
     def _sweep_pos(self, v):
         self._tl.sweep_pos = v
 
+    @property
+    def _best_partial(self):
+        """The closest a combo got, for the wall message: (n, label, mt,
+        switches, matched names). Thread-local like the budget state, because
+        several releases sweep at once and one release's near-miss must not be
+        reported against another."""
+        return getattr(self._tl, "best_partial", None)
+
+    @_best_partial.setter
+    def _best_partial(self, v):
+        self._tl.best_partial = v
+
     def set_window(self, w):
         self._window = w
 
@@ -4688,6 +4700,19 @@ class RsrToolAPI:
             else:
                 self._log("    ✗ no build × -mt reproduces these streams — the "
                           "exact build is outside the pack.", "err")
+                bp = self._best_partial
+                if bp and bp[0]:
+                    n_ok, label, mt_, sw_, names = bp
+                    # `targets`, not `meta`: only files present in the packed
+                    # blocks are ever swept, so meta can overstate the total.
+                    total_s = len(targets)
+                    missed = [k for k in targets if k not in names]
+                    sw_txt = (" " + " ".join(str(x) for x in sw_)) if sw_ else ""
+                    self._log(f"      closest: {n_ok} of {total_s} stream(s) "
+                              f"matched under {label}"
+                              f"{'' if mt_ < 0 else f' -mt{mt_}'}{sw_txt}"
+                              + (f" — {', '.join(missed[:3])} never did."
+                                 if missed else "."), "warn")
             return {"ok": False, "error": "recipe not found",
                     "set": {"stem": st["stem"], "format": st["format"],
                             "files": meta, "wall": True}}
@@ -5552,7 +5577,13 @@ class RsrToolAPI:
             return False
         if hdr_ext is not None and header_exttime(head) != hdr_ext:
             return False
-        return bool(self._streams_match(head, targets))
+        matched = self._streams_match(head, targets)
+        if len(matched) == len(targets):
+            return True
+        # Not a match, but say how close: the caller keeps the best of these
+        # for the wall message. Never `is True`, so the winner test is
+        # unaffected, and this is the only caller.
+        return matched
 
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
@@ -5631,14 +5662,35 @@ class RsrToolAPI:
         # for the same reason PPM is -- a release that matches normally never
         # pays, because the sweep returns on first match.
         if fmt == "RAR4" and unp_max and unp_max < 29:
-            mm = [(e, n, x + ("-mm",)) for e, n, x in combos
-                  if _fmt_fits(e.name, unp_max)]
+            fit = [(e, n, x) for e, n, x in combos
+                   if _fmt_fits(e.name, unp_max)]
+            # RAR 2.x documents the switch as `mm[f]` -- multimedia
+            # compression [FORCE]. They are two different coders, not a switch
+            # and its synonym. Measured on mixed PCM/noise with rar 2.70,
+            # -m5 -md1024:
+            #
+            #     none   1,190,346      -mm  780,829      -mmf  878,375
+            #
+            # Plain -mm lets rar decide per block; -mmf forces multimedia
+            # throughout. On a PSX .BIN -- CD-DA audio interleaved with data
+            # tracks -- those two agree for a while and then diverge partway
+            # through the file, which is exactly the shape of the Power_Rangers
+            # note and of MUSCLE_RANKING_3, whose .nfo and .cue are provably
+            # reproducible while its 534 MB .bin never matched.
+            #
+            # -mmf is version-invariant across 2.06-2.70 (all produce 878,375
+            # above) but the build still decides the OTHER streams and the
+            # headers, so it is paired the same way -mm is. -mm leads, because
+            # it is the one with 26 wins behind it.
+            mm = [(e, n, x + ("-mm",)) for e, n, x in fit]
+            mmf = [(e, n, x + ("-mmf",)) for e, n, x in fit]
             if mm:
-                combos = combos + mm
-                self._log(f"    {len(mm):,} -mm (multimedia) combo(s) queued "
-                          f"behind the ordinary sweep — RAR 2.x chooses the "
-                          f"multimedia coder per file and the sweep has never "
-                          f"asked for it.", "dim")
+                combos = combos + mm + mmf
+                self._log(f"    {len(mm):,} -mm and {len(mmf):,} -mmf "
+                          f"(multimedia) combo(s) queued behind the ordinary "
+                          f"sweep — RAR 2.x chooses the multimedia coder per "
+                          f"file, and -mmf forces it; the sweep has never "
+                          f"asked for either.", "dim")
         # Order by CAPABILITY, not just lead with it.
         #
         # The stamp gate already put the builds that can write this format at
@@ -5824,6 +5876,8 @@ class RsrToolAPI:
                       "replay them in order.", "dim")
         tried = 0
         total = len(combos)
+        # A previous release's near-miss must not be reported against this one.
+        self._best_partial = None
         said_dos = False
         said_lift = False
         self._budget_enter(rel)
@@ -5915,6 +5969,17 @@ class RsrToolAPI:
                     th.start()
                 for th in ths:
                     th.join()
+
+            # Keep the closest miss. _try_combo returns the matched names
+            # when it fell short, so the wall can name the one stream that
+            # never came back rather than shrugging at all of them.
+            for s, res in enumerate(results):
+                if isinstance(res, list) and len(res) > (self._best_partial
+                                                         or (0,))[0]:
+                    ex_, n_, *rest_ = chunk[s]
+                    self._best_partial = (len(res), _exe_label(ex_.name), n_,
+                                          tuple(rest_[0]) if rest_ else (),
+                                          list(res))
 
             for s, res in enumerate(results):
                 if res is True:
@@ -6091,15 +6156,43 @@ class RsrToolAPI:
         return True if seen >= PROBE_MIN_BYTES else None
 
     @staticmethod
-    def _streams_match(probe: Path, targets: dict) -> bool:
+    def _streams_match(probe: Path, targets: dict) -> list:
+        """Which streams matched, cheapest first — not just whether all did.
+
+        Returns the names that matched, stopping at the first that did not, so
+        callers test `len(...) == len(targets)`. A bool threw away the one
+        thing a wall most needs to say: a set where every stream but the big
+        one matches is a completely different problem from a set where nothing
+        matches, and MUSCLE_RANKING_3 cost an afternoon precisely because the
+        log could not tell those apart.
+
+        Checked in ASCENDING SIZE order, which also makes this cheaper than
+        the version it replaces: an 80-byte .cue that disagrees now rules the
+        combo out before anything hashes 383 MB of .bin."""
         try:
             blocks = packed_blocks(probe)
         except Exception:
-            return False
-        for name, target in targets.items():
-            if name not in blocks or stream_digest(blocks[name]) != target:
-                return False
-        return True
+            return []
+
+        def _size(k):
+            return sum(sz for _, _, sz in blocks.get(k, ()))
+
+        matched = []
+        for name in sorted(targets, key=_size):
+            got = blocks.get(name)
+            if not got:
+                break
+            tgt = targets[name]
+            # LENGTH FIRST, and it costs no I/O: packed_blocks already knows
+            # every stream's size from the block table, and stream_digest
+            # returns (length, sha1). A stream of the wrong size cannot match,
+            # so there is no reason to read 383 MB to prove it.
+            if isinstance(tgt, tuple) and tgt and _size(name) != tgt[0]:
+                break
+            if stream_digest(got) != tgt:
+                break
+            matched.append(name)
+        return matched
 
     # ── replay + verify ───────────────────────────────────────────────────
 
