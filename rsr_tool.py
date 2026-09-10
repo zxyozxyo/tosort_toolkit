@@ -5686,9 +5686,15 @@ class RsrToolAPI:
                     dos = sorted(dos, key=lambda e: (rank.get(e.name, 1 << 20),
                                                      e.name))
                     lead = next(e for e in dos if e.name in rank)
-                    self._log(f"    {_exe_label(lead.name)} has won for "
-                              f"{grp or 'this format'} before — trying that "
-                              "DOS build first.", "dim")
+                    if self._grp_won_with(lead.name, grp):
+                        self._log(f"    {_exe_label(lead.name)} has won for "
+                                  f"{grp} before — trying that DOS build "
+                                  "first.", "dim")
+                    else:
+                        self._log(f"    no DOS win on record for "
+                                  f"{grp or 'this format'}; leading the DOS "
+                                  f"tail with {_exe_label(lead.name)} on the "
+                                  "corpus-wide prior.", "dim")
                 skipped_vol = []
                 for ex in dos:
                     c = caps.get(ex.name) or {}
@@ -7989,6 +7995,28 @@ class RsrToolAPI:
         if r[1] and len(self._pack_exes()) > r[1]:
             return None
         return r
+
+    def _grp_won_with(self, exe_name: str, grp: str) -> bool:
+        """Has THIS group actually won with this build, or is the prior just
+        the corpus talking?
+
+        _hot_recipes widens through rings -- group, then corpus, then format --
+        which is right for ordering and wrong for a claim. On the DOS tail the
+        corpus ring is entirely KALISTO's: it is the only group in the corpus
+        with DOS wins (87, every one dosrar200), so every other group was told
+        a KALISTO build "has won for" it."""
+        if not grp or not self._db_path.is_file():
+            return False
+        try:
+            con = self._db()
+            try:
+                row = con.execute("SELECT 1 FROM recipes WHERE grp=? AND exe=? "
+                                  "LIMIT 1", (grp, exe_name)).fetchone()
+            finally:
+                con.close()
+            return row is not None
+        except Exception:
+            return False
 
     def _hot_recipes(self, fmt: str, level: int, grp: str) -> list[tuple]:
         """Known-good (exe, mt) pairs, best bet first.
