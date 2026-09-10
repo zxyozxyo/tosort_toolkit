@@ -91,6 +91,8 @@ Place binaries in the `apps/` subfolder (created manually). All scripts search `
 | `chdman.exe` | CHD file handling | MAME project |
 | `xdms.exe` | Amiga DMS extraction | Various Amiga sources |
 | `zip_pack/precomp/windows/precomp.exe` | preflate fallback for RSR ZIP capture | schnaader/precomp-cpp |
+| `dosbox/dosbox.exe` | runs the DOS RAR builds for RSR capture | dosbox-staging |
+| `dosrar_pack/*.exe` | RAR for DOS, 1.40-2.50 | see **The DOS RAR line** below |
 
 **Notes:**
 - For RAR output in the IA pre-processors, `rar.exe` is preferred.
@@ -98,6 +100,7 @@ Place binaries in the `apps/` subfolder (created manually). All scripts search `
 - The `apps/winrar_pack-4.20/` subfolder contains WinRAR setup packages for legacy RAR versions. These are only required for reconstructing compressed scene RARs (rare for video releases). Standard uncompressed scene RARs do not need them — pyReScene handles those natively.
 - **WinRAR 7.x is deliberately excluded** from the extracted pack: 7.00 removed RAR4 creation entirely (`Unknown option: ma4`), so 6.24 is the last RAR4-capable build. Versions 5.00–6.24 *are* useful — post-2013 scene releases were made with modern WinRAR in RAR4 mode, and the tools inject `-ma4`.
 - `precomp.exe` is only needed for RSR's ZIP capture, and only as a fallback when no deflate setting reproduces a stream. RAR capture never touches it.
+- `apps/dosbox/` and `apps/dosrar_pack/` are only needed for pre-2002 releases packed on MS-DOS. Everything else ignores them, and RSR says so in the log rather than failing when they are absent.
 
 ---
 
@@ -137,6 +140,9 @@ srr_cache/                    # srrdb persistent SRR download cache
 rsr_tool.json                 # RSR scanner saved settings
 rsr_index.db                  # RSR index — captures, misses, recipe priors (auto-generated)
 rsr_store/                    # Captured .rsr files and their extras (your data)
+rsr_store_bak-*/              # Store backups taken before a risky change
+apps/dosbox/                  # dosbox-staging, for the DOS RAR line
+apps/dosrar_pack/             # RAR for DOS binaries + auto-generated _caps.json
 reference_fingerprint_db.json # Scene recreator fingerprint DB (auto-generated, can be large)
 excluded_references.txt       # Scene recreator exclusion list (local)
 tosort_settings_export.json
@@ -464,6 +470,67 @@ Outcomes are named rather than lumped together: captured, known wall, damaged, p
 #### ZIP capture
 
 ZIP releases are captured through the same prove-it-then-write discipline. The tool learns which deflate implementation a group zips with and seeds those priors from the store rather than relearning them each run. When no deflate setting reproduces a stream, it falls back to **preflate** (via `precomp.exe`), which derives the parameters from the stream itself. Groups only preflate can crack skip the settings grid entirely.
+
+#### The DOS RAR line
+
+**RAR for DOS is a different compressor from WinRAR of the same version**, not a repackaging of it. Measured on one 300 KB file at `-m3`/64K, identical method and `unp_ver` in both headers:
+
+```
+DOS RAR 2.50    6,226 bytes
+WinRAR  2.50    6,252 bytes
+```
+
+That 26-byte gap is why a whole class of 1990s releases was unreachable. `Woody_Woodpecker_Racing_USA-KALISTO` had been swept against all 239 Windows builds twice and written off as a wall; DOS RAR 2.50 reproduces it exactly. On the PSX year-2000 corpus the DOS line produced **110 verified captures in 10 hours** - KALISTO 44, HOOLiGANS 9 - from two groups previously declared unreachable.
+
+**Setting it up.** Both pieces live under `apps/` and both are gitignored:
+
+| Path | What |
+|---|---|
+| `apps/dosbox/dosbox.exe` | **dosbox-staging** (~105 MB extracted). Plain DOSBox works too; staging is what this was measured against. |
+| `apps/dosrar_pack/*.exe` | The DOS RAR binaries, named `YYYY-MM-DD_dosrarNNN.exe` - e.g. `1996-05-08_dosrar200.exe`. |
+
+The DOS RAR releases are the original self-extracting distributions (`rar140.exe` through `rar250.exe`), found in RARLAB's old-version archive and the usual scene-tool mirrors. Rename each to the dated form above - the date is the build date, and RSR uses it to order the sweep by era. Drop them in the folder; nothing else is required.
+
+**They are capability-probed once** and the result cached in `apps/dosrar_pack/_caps.json` (auto-generated, safe to delete). The probe matters because these builds fail in ways that are not obvious:
+
+- 151/152 reject `-s1`/`-ds` - they print their usage screen and pack nothing
+- 151/152/153/140 do not understand `-v<N>b` and **do not fail cleanly**; 1.52 was seen splitting a 74-byte `.CUE` across ~1,800 volumes
+- **8 of the 24 binaries are OS/2**, not DOS. The SFX installers shipped an OS/2 build beside the DOS one, and it boots DOSBox only to print *"This program must be run under OS/2"*. Detected by header (`MZ` + `LX`/`NE`/`PE`), never by filename. The usable tail is **16 builds**.
+
+**Three gates decide whether DOS can apply at all**, all measured rather than assumed:
+
+| Gate | Rule |
+|---|---|
+| **Format** | `unp_ver >= 29` rules DOS out completely - RAR 2.9 format arrived with RAR 3.00 (2002) and there was never a DOS RAR 3.x. Read from a *compressed* header: a stored file is stamped 20 by every build ever made. |
+| **Filenames** | A name that is not 8.3 rules DOS out completely. RAR 2.50 stores `HLG-MO~1.BIN` for `hlg-monopol.bin`, and forcing DOSBox `lfn=true` changes nothing - it is 16-bit real mode and int21 find-first only ever returns 8.3. |
+| **Host** | When the archive's host byte says MS-DOS, the DOS builds are tried **first**. Across 186 captured releases with sources on disk, a Windows build has never reproduced a DOS-host archive. |
+
+Otherwise the DOS tail sits behind everything else: a DOS combo is a DOSBox boot plus a full pack with no prefix probe, and DOSBox runs at roughly **0.5 MB/s** regardless of compression level. Budget hours rather than minutes for a large DOS-line release - rebuilds pay the same ceiling, 10-16 minutes for a 25-volume set against about 1 for a Windows-built one.
+
+DOSBox runs headless (`SDL_VIDEODRIVER=dummy`) - byte-identical output, measured - because otherwise it opens a focus-stealing window for every combo.
+
+> **Only one group in the corpus needs it.** A host-byte survey of PSX 2000 found KALISTO packing 138 of its releases on MS-DOS while every other group of any size was pure Windows - KALISTO alone is 93% of all DOS-packed releases. The line is narrow, but it is the only thing that opens that group.
+
+#### Coder and packer axes
+
+A sweep can only find what it thinks to ask for. Several axes exist because a release proved unreachable without them:
+
+| Axis | Why |
+|---|---|
+| **`-mm` / `-mmf`** | RAR 2.x's multimedia coder, documented as `mm[f]` - compression *[force]*. Plain `-mm` lets rar choose per block; `-mmf` forces it. They are different coders producing different streams, and neither was ever asked for. On HOOLiGANS this took the group from 3 to 28 of 29 captures, with **26 wins and no ordinary recipes at all**. |
+| **`-s1 -ds`** | RAR for Unix does not do WinRAR's store-fallback: where Windows stores a file whose compression came out larger than the input, the Unix build keeps the expanded stream. `-s1` (solid groups of one) suppresses the fallback without giving any file the previous one's context; `-ds` stops solid mode re-sorting the members by extension. |
+| **`-mc` (PPM)** | `-m5` compresses with LZSS *or* PPMd and rar chooses per file, so a packer that forced PPM was unreachable at every build. Skipped automatically on RAR 2.0 archives - PPM arrived with RAR 3.0, so no PPM stream can carry a 2.0 stamp. |
+| **`-rr`** | The recovery record is a **512-byte sector count, not a percentage**, and RAR 2.x ignores a `p`/`%` suffix entirely. A short record lets more file data into volume one and shifts every later volume boundary. |
+
+The sweep is ordered by capability: builds that could have written the archive's format lead - in their plain, `-s1` and multimedia forms - and the rest follow as a backstop. Nothing is ever removed, so a wall the tool reports is still a real wall.
+
+When a sweep does exhaust without a match, it says how close it got:
+
+```
+X no build x -mt reproduces these streams - the exact build is outside the pack.
+  closest: 2 of 3 stream(s) matched under 2000-11-30 2.70 b4 -mm
+    - hlg-muscle.bin never did.
+```
 
 #### Rebuild
 

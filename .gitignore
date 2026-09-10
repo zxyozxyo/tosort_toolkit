@@ -31,6 +31,7 @@ srrdb_results.json.bak*
 rsr_tool.json
 rsr_index.db
 rsr_index.db.bak-*
+rsr_store_bak-*/
 rsr_index.db-journal
 rsr_index.db-wal
 rsr_index.db-shm
