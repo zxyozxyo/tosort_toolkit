@@ -4701,19 +4701,7 @@ class RsrToolAPI:
             else:
                 self._log("    ✗ no build × -mt reproduces these streams — the "
                           "exact build is outside the pack.", "err")
-                bp = self._best_partial
-                if bp and bp[0]:
-                    n_ok, label, mt_, sw_, names = bp
-                    # `targets`, not `meta`: only files present in the packed
-                    # blocks are ever swept, so meta can overstate the total.
-                    total_s = len(targets)
-                    missed = [k for k in targets if k not in names]
-                    sw_txt = (" " + " ".join(str(x) for x in sw_)) if sw_ else ""
-                    self._log(f"      closest: {n_ok} of {total_s} stream(s) "
-                              f"matched under {label}"
-                              f"{'' if mt_ < 0 else f' -mt{mt_}'}{sw_txt}"
-                              + (f" — {', '.join(missed[:3])} never did."
-                                 if missed else "."), "warn")
+                self._log_best_partial(targets)
             # A hand-stop is NOT a wall, and the caller decides which by
             # matching this string: "recipe not found" there means "swept to
             # exhaustion, skip it on future runs". Returning it for a release
@@ -5938,6 +5926,7 @@ class RsrToolAPI:
                           f"({start + tried:,} of {start + len(combos):,} "
                           "overall) — parking this release; the next run "
                           "resumes from here.", "warn")
+                self._log_best_partial(targets)
                 return None
 
             # The DOS tail is announced when it is queued, thousands of
@@ -8160,6 +8149,26 @@ class RsrToolAPI:
         if r[1] and len(self._pack_exes()) > r[1]:
             return None
         return r
+
+    def _log_best_partial(self, targets: dict):
+        """Say how close the sweep got, wherever it stopped.
+
+        A wall said this and a PARK did not, which is backwards: a release cut
+        short by the budget is exactly the one you cannot reason about from
+        the log, and "2 of 3 streams matched, the big one never did" is just
+        as true after 3,000 combos as after 10,000. Costs nothing -- the sweep
+        already tracked it."""
+        bp = self._best_partial
+        if not bp or not bp[0] or not targets:
+            return
+        n_ok, label, mt_, sw_, names = bp
+        missed = [k for k in targets if k not in names]
+        sw_txt = (" " + " ".join(str(x) for x in sw_)) if sw_ else ""
+        self._log(f"      closest: {n_ok} of {len(targets)} stream(s) "
+                  f"matched under {label}"
+                  f"{'' if mt_ < 0 else f' -mt{mt_}'}{sw_txt}"
+                  + (f" — {', '.join(missed[:3])} never did." if missed
+                     else "."), "warn")
 
     def _grp_won_with(self, exe_name: str, grp: str) -> bool:
         """Has THIS group actually won with this build, or is the prior just
