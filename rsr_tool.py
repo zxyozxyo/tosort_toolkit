@@ -2143,7 +2143,9 @@ class RsrToolAPI:
         with self._proc_lock:
             self._procs.add(p)
         try:
-            deadline = time.monotonic() + timeout
+            started = time.monotonic()
+            deadline = started + timeout
+            beat = 0.0
             while True:
                 if p.poll() is not None:
                     return p.returncode == 0
@@ -2157,7 +2159,11 @@ class RsrToolAPI:
                         return True
                 except OSError:
                     pass
-                if time.monotonic() > deadline:
+                now = time.monotonic()
+                if heartbeat and now - beat > 1.0:
+                    beat = now
+                    self._progress(f"{heartbeat} · {now - started:,.0f}s")
+                if now > deadline:
                     p.kill()
                     return False
                 time.sleep(0.05)
@@ -5444,6 +5450,14 @@ class RsrToolAPI:
                                           stop_after=(1 << 20) + 4096):
                         if self._early_verdict(look / "PROBE.RAR", prefix,
                                                1 << 20) is False:
+                            # _progress only reaches the GUI, and the log is
+                            # the only record an overnight run leaves. Without
+                            # a line here there is no way to tell afterwards
+                            # whether the probe ever ran -- which is exactly
+                            # what happened on the first HOOLiGANS night.
+                            self._log(f"      first look: "
+                                      f"{_exe_label(ex.name)} ruled out on "
+                                      f"the first MB.", "dim")
                             return False
                 finally:
                     _rmtree(look)
@@ -5600,6 +5614,31 @@ class RsrToolAPI:
                           f"input — the packer skipped the store fallback "
                           f"(RAR for Unix does not do it), so {len(s1):,} "
                           f"-s1 combo(s) lead the sweep.", "dim")
+        # The multimedia coder -- the same blind spot the PPM tail closed for
+        # -m5, one format era earlier. RAR 2.x picks it per file and the sweep
+        # only ever asked for the default, so an archive whose packer forced
+        # it is unreachable at every build and thread count.
+        #
+        # It went into the DOS line first, where it cannot do most of its job:
+        # DOS is ruled out ENTIRELY by a name that is not 8.3, and that is most
+        # of the PSX sets (13 of the 29 HOOLiGANS releases in one night). So
+        # the 2.0-format releases that most look like they need this could
+        # never reach it. The Windows 2.x builds take -mm identically.
+        #
+        # Only builds that could have written this format are paired: -mm on a
+        # 3.x build cannot produce a 2.0 stream, and pairing all 239 would
+        # double a 9,059-combo sweep to buy nothing. Behind the ordinary sweep,
+        # for the same reason PPM is -- a release that matches normally never
+        # pays, because the sweep returns on first match.
+        if fmt == "RAR4" and unp_max and unp_max < 29:
+            mm = [(e, n, x + ("-mm",)) for e, n, x in combos
+                  if _fmt_fits(e.name, unp_max)]
+            if mm:
+                combos = combos + mm
+                self._log(f"    {len(mm):,} -mm (multimedia) combo(s) queued "
+                          f"behind the ordinary sweep — RAR 2.x chooses the "
+                          f"multimedia coder per file and the sweep has never "
+                          f"asked for it.", "dim")
         # The PPM tail. -m5 can compress with LZSS or PPMd and rar chooses per
         # file; ask for the default only and an archive whose packer forced PPM
         # is unreachable at every build and thread count. These go LAST so a
