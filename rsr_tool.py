@@ -5046,8 +5046,8 @@ class RsrToolAPI:
         # reaching the sweep is an unpack error on the first combo of every
         # release that has priors, which is nearly all of them.
         order: list[tuple[Path, int, tuple]] = []
-        seen: set[tuple[str, int]] = set()
-        for exe_name, mt in self._hot_recipes(fmt, level, grp):
+        seen: set[tuple[str, int, tuple]] = set()
+        for exe_name, mt, sw in self._hot_recipes(fmt, level, grp):
             ex = by_name.get(exe_name)
             if ex is None:
                 continue
@@ -5061,9 +5061,12 @@ class RsrToolAPI:
             if not _fmt_fits(exe_name, unp_max):
                 continue
             for n in (mts if mt < 0 else [mt]):
-                if n in mts and (exe_name, n) not in seen:
-                    seen.add((exe_name, n))
-                    order.append((ex, n, ()))
+                # The switches ride with the build. A group that packs with a
+                # coder switch wins with it every time, and leading with the
+                # build alone just re-proves that it does not work on its own.
+                if n in mts and (exe_name, n, sw) not in seen:
+                    seen.add((exe_name, n, sw))
+                    order.append((ex, n, sw))
         hot = len(order)
         ranked = sorted(exes, key=lambda e: self._build_rank(e.name, year))
         mts = self._mt_order(mts)
@@ -5764,7 +5767,7 @@ class RsrToolAPI:
                 # than on the Windows side: a DOS combo has no prefix probe,
                 # so every build tried ahead of the right one is a full pack
                 # of the whole set through DOSBox.
-                prior = [n for n, _ in self._hot_recipes(fmt, level, grp)]
+                prior = [n for n, _, _ in self._hot_recipes(fmt, level, grp)]
                 rank = {n: i for i, n in enumerate(prior)}
                 if any(e.name in rank for e in dos):
                     dos = sorted(dos, key=lambda e: (rank.get(e.name, 1 << 20),
@@ -7733,8 +7736,8 @@ class RsrToolAPI:
         # nothing at all.
         con.execute("""CREATE TABLE IF NOT EXISTS recipes(
             fmt TEXT, level INT, grp TEXT, exe TEXT, mt INT,
-            hits INT DEFAULT 0, last_used TEXT,
-            PRIMARY KEY(fmt, level, grp, exe, mt))""")
+            sw TEXT DEFAULT '', hits INT DEFAULT 0, last_used TEXT,
+            PRIMARY KEY(fmt, level, grp, exe, mt, sw))""")
         cols = {r[1] for r in con.execute("PRAGMA table_info(recipes)")}
         if "grp" not in cols:
             # Built by an earlier version keyed on `system`. Those rows cannot
@@ -7744,9 +7747,32 @@ class RsrToolAPI:
             con.execute("DROP TABLE recipes")
             con.execute("""CREATE TABLE recipes(
                 fmt TEXT, level INT, grp TEXT, exe TEXT, mt INT,
-                hits INT DEFAULT 0, last_used TEXT,
-                PRIMARY KEY(fmt, level, grp, exe, mt))""")
+                sw TEXT DEFAULT '', hits INT DEFAULT 0, last_used TEXT,
+                PRIMARY KEY(fmt, level, grp, exe, mt, sw))""")
             self._seeded = False
+        if "sw" not in {r[1] for r in con.execute(
+                "PRAGMA table_info(recipes)")}:
+            # The winning SWITCHES belong in the prior too. Without them a -mm
+            # win was learned as build+mt alone, so the next release of the
+            # same group led with that build PLAIN, failed, and ground back
+            # down to the -mm block -- about 1,224 combos re-derived per
+            # release, across a group that used -mm on all 26 of its captures.
+            #
+            # `sw` joins the PRIMARY KEY rather than sitting beside it:
+            # `2.70 b4` and `2.70 b4 -mm` are different recipes and must count
+            # their hits apart, or whichever won last silently overwrites the
+            # other. That needs a rebuild rather than an ALTER -- done here
+            # preserving every existing row, each becoming the switchless form
+            # it always was.
+            con.execute("""CREATE TABLE recipes_new(
+                fmt TEXT, level INT, grp TEXT, exe TEXT, mt INT,
+                sw TEXT DEFAULT '', hits INT DEFAULT 0, last_used TEXT,
+                PRIMARY KEY(fmt, level, grp, exe, mt, sw))""")
+            con.execute("INSERT INTO recipes_new(fmt, level, grp, exe, mt, "
+                        "sw, hits, last_used) SELECT fmt, level, grp, exe, "
+                        "mt, '', hits, last_used FROM recipes")
+            con.execute("DROP TABLE recipes")
+            con.execute("ALTER TABLE recipes_new RENAME TO recipes")
         # ...and what has already been proven unreachable, so a resumed scan
         # does not re-grind it. A release that walls writes no .rsr, so
         # skip_done cannot see it and every re-run pays the FULL sweep for it
@@ -7910,17 +7936,22 @@ class RsrToolAPI:
         return out
 
     def _db_learn(self, fmt: str, level: int, grp: str, recipe: dict):
-        """Record a winning (build, -mt) so later releases try it first."""
+        """Record a winning (build, -mt, switches) so later releases try it
+        first — switches included, or a coder axis is re-derived every time."""
+        # DOS_MARK is an internal routing flag, not something rar is ever
+        # handed, so it must not become part of the prior.
+        sw = ",".join(str(x) for x in (recipe.get("mc") or ())
+                      if str(x) != self.DOS_MARK)
         try:
             con = self._db()
             try:
                 con.execute(
-                    "INSERT INTO recipes(fmt, level, grp, exe, mt, hits, "
-                    "last_used) VALUES(?,?,?,?,?,1,?) "
-                    "ON CONFLICT(fmt, level, grp, exe, mt) DO UPDATE SET "
+                    "INSERT INTO recipes(fmt, level, grp, exe, mt, sw, hits, "
+                    "last_used) VALUES(?,?,?,?,?,?,1,?) "
+                    "ON CONFLICT(fmt, level, grp, exe, mt, sw) DO UPDATE SET "
                     "hits = hits + 1, last_used = excluded.last_used",
                     (fmt, int(level), grp or "", recipe["exe"],
-                     int(recipe["mt"]),
+                     int(recipe["mt"]), sw,
                      datetime.now(timezone.utc).isoformat(timespec="seconds")))
                 con.commit()
             finally:
@@ -8144,7 +8175,7 @@ class RsrToolAPI:
             return False
 
     def _hot_recipes(self, fmt: str, level: int, grp: str) -> list[tuple]:
-        """Known-good (exe, mt) pairs, best bet first.
+        """Known-good (exe, mt, switches) triples, best bet first.
 
         Widening rings, sharpest first: this group at this compression level,
         then this group at any level, then the corpus at this level, then the
@@ -8172,12 +8203,14 @@ class RsrToolAPI:
             con = self._db()
             try:
                 for where, args in rings:
-                    for exe, mt in con.execute(
-                            f"SELECT exe, mt FROM recipes WHERE {where} "
+                    for exe, mt, sw in con.execute(
+                            f"SELECT exe, mt, sw FROM recipes WHERE {where} "
                             "ORDER BY hits DESC, last_used DESC LIMIT 24", args):
-                        if (exe, mt) not in seen:
-                            seen.add((exe, mt))
-                            out.append((exe, int(mt)))
+                        if (exe, mt, sw or "") not in seen:
+                            seen.add((exe, mt, sw or ""))
+                            out.append((exe, int(mt),
+                                        tuple(x for x in (sw or "").split(",")
+                                              if x)))
             finally:
                 con.close()
         except Exception:
