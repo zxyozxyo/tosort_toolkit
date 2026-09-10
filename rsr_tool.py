@@ -5975,8 +5975,13 @@ class RsrToolAPI:
             # when it fell short, so the wall can name the one stream that
             # never came back rather than shrugging at all of them.
             for s, res in enumerate(results):
-                if isinstance(res, list) and len(res) > (self._best_partial
-                                                         or (0,))[0]:
+                # `is None` rather than a 0 default: a combo that reached the
+                # comparison and matched NOTHING is different information from
+                # one that never got there, and `len(res) > 0` threw the first
+                # case away — leaving a wall silent in both.
+                if isinstance(res, list) and (self._best_partial is None
+                                              or len(res)
+                                              > self._best_partial[0]):
                     ex_, n_, *rest_ = chunk[s]
                     self._best_partial = (len(res), _exe_label(ex_.name), n_,
                                           tuple(rest_[0]) if rest_ else (),
@@ -8158,10 +8163,24 @@ class RsrToolAPI:
         the log, and "2 of 3 streams matched, the big one never did" is just
         as true after 3,000 combos as after 10,000. Costs nothing -- the sweep
         already tracked it."""
+        if not targets:
+            return
         bp = self._best_partial
-        if not bp or not bp[0] or not targets:
+        if bp is None:
+            # Nothing ever got as far as comparing streams, so the rejections
+            # happened earlier -- volume structure, end block or header. That
+            # is a different problem from "the streams do not match", and
+            # saying nothing at all reads as a broken diagnostic.
+            self._log("      no combo reached the stream comparison — every "
+                      "one was rejected on volume structure, end block or "
+                      "header first.", "warn")
             return
         n_ok, label, mt_, sw_, names = bp
+        if not n_ok:
+            self._log(f"      closest: 0 of {len(targets)} stream(s) — no "
+                      f"build reproduced even one, nearest was {label}"
+                      f"{'' if mt_ < 0 else f' -mt{mt_}'}.", "warn")
+            return
         missed = [k for k in targets if k not in names]
         sw_txt = (" " + " ".join(str(x) for x in sw_)) if sw_ else ""
         self._log(f"      closest: {n_ok} of {len(targets)} stream(s) "
