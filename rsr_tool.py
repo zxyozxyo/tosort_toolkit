@@ -5968,6 +5968,24 @@ class RsrToolAPI:
                           f"{left} DOS RAR build(s) through DOSBox. These are "
                           "slower (a full pack each, no prefix probe) and run "
                           "with no window.", "info")
+                # THIS is the moment worth warning at: the DOS leg is starting
+                # and what is left of the budget is finally a known number. A
+                # DOS combo is a full pack, so 30s each is a floor, not an
+                # estimate -- if the remainder cannot cover even that, the
+                # release will park in the tail exactly as San_Francisco_Rush
+                # did twice, and no amount of re-queuing will change it.
+                if deadline:
+                    mins = max(deadline - time.monotonic(), 0) / 60
+                    if mins * 60 < left * 30:
+                        self._log(f"    ⏱ only {mins:,.0f} min of budget left "
+                                  f"for {left} DOS combo(s) — at a full pack "
+                                  f"each this will park in the tail. "
+                                  f"'{UI_FINISH_ONE}' is the way through; more "
+                                  f"budget on a later run will not help, the "
+                                  f"position is not kept.", "warn")
+                    else:
+                        self._log(f"    {mins:,.0f} min of budget left for "
+                                  f"{left} DOS combo(s).", "dim")
             width = 1 if (len(cur) > 2 and cur[2] and cur[2][0] == self.DOS_MARK) \
                 else max(1, min(budget // max(1, combos[idx][1]),
                                 len(combos) - idx))
@@ -6090,17 +6108,17 @@ class RsrToolAPI:
                               f"this release.", "warn")
                     self._budget_flag(rel, f"{allows:,}/{win_worst:,}")
                 if dos_n:
-                    # Said even when the Windows figure looks comfortable,
-                    # because that is exactly the case that misled us: the
-                    # headroom is real for the Windows leg and irrelevant to
-                    # the DOS one sitting behind it.
-                    self._log(f"    ⏱ {dos_n} DOS combo(s) sit behind those "
-                              f"and are NOT in the figure above — DOSBox packs "
-                              f"at ~0.5 MB/s, so a DOS tail can take the whole "
-                              f"budget on its own. A release that parks in the "
-                              f"last few combos is usually stuck here; "
-                              f"'{UI_FINISH_ONE}' is the way through it.",
-                              "warn")
+                    # Context, not an alarm. I first raised this at "warn" on
+                    # the reasoning that a comfortable Windows figure is
+                    # exactly what misled us -- but the Windows leg almost
+                    # always looks comfortable, so it fired on 100% of swept
+                    # releases and became wallpaper. The actionable moment is
+                    # not here, it is when the sweep actually REACHES the DOS
+                    # leg and the remaining budget is a known quantity.
+                    self._log(f"    {dos_n} DOS combo(s) sit behind those and "
+                              f"are NOT in the figure above — DOSBox packs at "
+                              f"~0.5 MB/s and they are not priced until one "
+                              f"runs.", "dim")
             elif now - last > 0.5:
                 last = now
                 rate = tried / max(now - t0, 1e-6)
