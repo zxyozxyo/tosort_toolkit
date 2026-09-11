@@ -8247,16 +8247,29 @@ class RsrToolAPI:
                       "header first.", "warn")
             return
         n_ok, label, mt_, sw_, names = bp
+        # A DOS combo carries DOS_MARK and has no -mt axis at all; printing
+        # "-mt1" for one is noise that reads as a real thread count.
+        is_dos = bool(sw_) and str(sw_[0]) == self.DOS_MARK
+        mt_txt = "" if (mt_ < 0 or is_dos) else f" -mt{mt_}"
         if not n_ok:
+            # NOT "nearest". The tracker keeps the first combo to reach the
+            # comparison and only replaces it on a STRICTLY better match, so
+            # when nothing ever matches it still holds combo one. Naming it
+            # "nearest" invited the one inference the data cannot support --
+            # that this build was somehow closer than the others. It was not;
+            # they all scored zero.
             self._log(f"      closest: 0 of {len(targets)} stream(s) — no "
-                      f"build reproduced even one, nearest was {label}"
-                      f"{'' if mt_ < 0 else f' -mt{mt_}'}.", "warn")
+                      f"build reproduced even one. The sweep did reach the "
+                      f"stream comparison (first to do so: {label}{mt_txt}), "
+                      f"so the packs are being built and rejected on content, "
+                      f"not on structure.", "warn")
             return
         missed = [k for k in targets if k not in names]
-        sw_txt = (" " + " ".join(str(x) for x in sw_)) if sw_ else ""
+        sw_txt = (" " + " ".join(str(x) for x in sw_ if str(x) != self.DOS_MARK)
+                  ) if sw_ else ""
         self._log(f"      closest: {n_ok} of {len(targets)} stream(s) "
                   f"matched under {label}"
-                  f"{'' if mt_ < 0 else f' -mt{mt_}'}{sw_txt}"
+                  f"{mt_txt}{sw_txt}"
                   + (f" — {', '.join(missed[:3])} never did." if missed
                      else "."), "warn")
 
