@@ -5480,9 +5480,16 @@ class RsrToolAPI:
                             # a line here there is no way to tell afterwards
                             # whether the probe ever ran -- which is exactly
                             # what happened on the first HOOLiGANS night.
+                            # Name the switches too. The probe runs per
+                            # COMBO, not per build, so one build legitimately
+                            # appears several times in a row with different
+                            # switches -- and with only the build named that
+                            # reads as the tool repeating itself.
+                            sw_ = " ".join(str(a) for a in extra[1:])
                             self._log(f"      first look: "
-                                      f"{_exe_label(ex.name)} ruled out on "
-                                      f"the first MB.", "dim")
+                                      f"{_exe_label(ex.name)}"
+                                      f"{' ' + sw_ if sw_ else ''} ruled out "
+                                      f"on the first MB.", "dim")
                             return False
                 finally:
                     _rmtree(look)
