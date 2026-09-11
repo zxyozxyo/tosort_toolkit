@@ -5547,6 +5547,7 @@ class RsrToolAPI:
                                    heartbeat=f"probe -mt{n} "
                                              f"{_exe_label(ex.name)}",
                                    cwd=base):
+                self._tally_reject("the probe pack never produced volume two")
                 return False
             verdict = self._prefix_verdict(head, prefix)
             bad = (verdict is False
@@ -5560,6 +5561,12 @@ class RsrToolAPI:
                 except OSError:
                     pass
             if bad:
+                self._tally_reject(
+                    "volume one's header did not match" if verdict is False
+                    else "the end block did not match"
+                    if (end_sig is not None
+                        and end_block_sig(head) != end_sig)
+                    else "the header timestamp did not match")
                 return False
 
         if not all(self._run(c, timeout=900,
@@ -5577,12 +5584,17 @@ class RsrToolAPI:
             made = sorted(q for q in wdir.iterdir()
                           if q.is_file() and q.name.startswith(head.stem + "."))
             if len(made) != want_vols:
+                self._tally_reject(f"the pack split into {len(made)} volume(s), "
+                                   f"not {want_vols}")
                 return False
             if vol_first and head.stat().st_size != vol_first:
+                self._tally_reject("volume one came out a different size")
                 return False
         if end_sig is not None and end_block_sig(head) != end_sig:
+            self._tally_reject("the end block did not match")
             return False
         if hdr_ext is not None and header_exttime(head) != hdr_ext:
+            self._tally_reject("the header timestamp did not match")
             return False
         matched = self._streams_match(head, targets)
         if len(matched) == len(targets):
@@ -5893,6 +5905,14 @@ class RsrToolAPI:
                     if len(c) > 2 and c[2] and c[2][0] == self.DOS_MARK)
         # A previous release's near-miss must not be reported against this one.
         self._best_partial = None
+        # WHY combos are being rejected, not just that they were. "rejected on
+        # volume structure, end block or header" lumps six distinct checks into
+        # one sentence, so a release that burns 7,000 combos without ever
+        # reaching the content comparison -- Puyo_Puyo_Box, Libero_Grande_2 and
+        # Radikal_Bikers_FINAL_CRACKED all did today -- tells you it is
+        # structural but not which structure. Count them and name the dominant
+        # one; it is the difference between a guess and a next step.
+        self._reject = {}
         said_dos = False
         said_revised = False
         per_first = 0.0
@@ -8244,6 +8264,18 @@ class RsrToolAPI:
             return None
         return r
 
+    def _tally_reject(self, why: str):
+        """Record WHY a combo was rejected. Diagnostics only.
+
+        Combos run in a thread pool, so this takes the lock the process set
+        already uses rather than trusting a Counter increment to be atomic.
+        Nothing reads it but the log line below."""
+        try:
+            with self._proc_lock:
+                self._reject[why] = self._reject.get(why, 0) + 1
+        except Exception:
+            pass
+
     def _log_best_partial(self, targets: dict):
         """Say how close the sweep got, wherever it stopped.
 
@@ -8260,9 +8292,21 @@ class RsrToolAPI:
             # happened earlier -- volume structure, end block or header. That
             # is a different problem from "the streams do not match", and
             # saying nothing at all reads as a broken diagnostic.
-            self._log("      no combo reached the stream comparison — every "
-                      "one was rejected on volume structure, end block or "
-                      "header first.", "warn")
+            tally = getattr(self, "_reject", None)
+            if tally:
+                top = sorted(tally.items(), key=lambda kv: -kv[1])[:3]
+                n_all = sum(tally.values())
+                lead = ", ".join(f"{w} ({c:,})" for w, c in top)
+                self._log(f"      no combo reached the stream comparison — "
+                          f"all {n_all:,} were rejected on structure first. "
+                          f"Dominant reason(s): {lead}. Sweeping more builds "
+                          f"cannot fix this; the mismatch is in how the "
+                          f"archive is laid out, not how it is compressed.",
+                          "warn")
+            else:
+                self._log("      no combo reached the stream comparison — every "
+                          "one was rejected on volume structure, end block or "
+                          "header first.", "warn")
             return
         n_ok, label, mt_, sw_, names = bp
         # A DOS combo carries DOS_MARK and has no -mt axis at all; printing
