@@ -5883,6 +5883,14 @@ class RsrToolAPI:
                       "replay them in order.", "dim")
         tried = 0
         total = len(combos)
+        # The cost estimate below is measured on the FIRST chunk, which is
+        # always Windows -- the DOS tail is ordered last. Pricing DOS combos
+        # at the Windows rate is what made San_Francisco_Rush announce "budget
+        # allows about 19,187" of 4,114 (5x headroom, so no warning at all),
+        # then park 19 short after 69 minutes, stuck in a DOSBox pack. Count
+        # them so the two legs can be reported apart.
+        dos_n = sum(1 for c in combos
+                    if len(c) > 2 and c[2] and c[2][0] == self.DOS_MARK)
         # A previous release's near-miss must not be reported against this one.
         self._best_partial = None
         said_dos = False
@@ -6036,14 +6044,18 @@ class RsrToolAPI:
                 said_revised = True
                 per_now = (now - t0) / max(tried, 1)
                 if per_now < per_first / 1.5 or per_now > per_first * 1.5:
-                    worst_ = total * max(rungs, 1)
+                    # Windows-only, for the same reason as the first estimate:
+                    # this revision fires ~200 combos in, long before the DOS
+                    # tail, so per_now describes Windows packs too.
+                    worst_ = (total - dos_n) * max(rungs, 1)
                     allows_ = (int(max(deadline - t0, 0) / max(per_now, 1e-6))
                                if deadline else None)
                     faster = per_now < per_first
                     msg_ = (f"    ~{per_now:,.2f}s per combo now that the "
                             f"sweep has settled ({'faster' if faster else 'slower'}"
                             f" than the {per_first:,.2f}s first measured) — "
-                            f"{worst_:,} would take {worst_ * per_now / 3600:,.1f}h")
+                            f"{worst_:,} Windows combo(s) would take "
+                            f"{worst_ * per_now / 3600:,.1f}h")
                     if allows_ is not None:
                         msg_ += f"; budget allows about {allows_:,}"
                     self._log(msg_, "dim")
@@ -6051,25 +6063,44 @@ class RsrToolAPI:
                 # Say up front what this release is going to cost, now that a
                 # combo's cost and the number running together both matter.
                 per = per_first = (now - t0) / max(tried, 1)
+                # Price only what this rate actually describes. `per` came
+                # from Windows packs; a DOS combo is a DOSBox boot plus a real
+                # pack at ~0.5 MB/s and can run minutes, so folding the two
+                # together understates the total by orders of magnitude.
+                win_worst = (total - dos_n) * max(rungs, 1)
                 worst = total * max(rungs, 1)
                 allows = (int(max(deadline - t0, 0) / max(per, 1e-6))
                           if deadline else None)
-                msg = (f"    ~{per:,.2f}s per combo at this size across "
-                       f"{len(chunk)} core(s) — {worst:,} would take "
-                       f"{worst * per / 3600:,.1f}h")
+                # "core(s)" was wrong -- this is the chunk width, i.e. how
+                # many combos run together, and it is pinned to 1 for DOS.
+                msg = (f"    ~{per:,.2f}s per combo at this size, "
+                       f"{len(chunk)} at a time — {win_worst:,} Windows "
+                       f"combo(s) would take {win_worst * per / 3600:,.1f}h")
                 if rungs > 1:
-                    msg += (f" ({total:,} per dictionary × {rungs} on the "
-                            f"ladder)")
+                    msg += (f" ({total - dos_n:,} per dictionary × {rungs} on "
+                            f"the ladder)")
                 if allows is not None:
                     msg += f"; budget allows about {allows:,}"
                 self._log(msg, "dim")
-                if allows is not None and allows < worst:
-                    self._log(f"    ⏱ budget covers {allows:,} of {worst:,} "
-                              f"— {worst - allows:,} short "
-                              f"(~{(worst - allows) * per / 60:,.0f} min more). "
-                              f"Press '{UI_FINISH_ONE}' to lift it for this "
-                              f"release.", "warn")
-                    self._budget_flag(rel, f"{allows:,}/{worst:,}")
+                if allows is not None and allows < win_worst:
+                    self._log(f"    ⏱ budget covers {allows:,} of "
+                              f"{win_worst:,} — {win_worst - allows:,} short "
+                              f"(~{(win_worst - allows) * per / 60:,.0f} min "
+                              f"more). Press '{UI_FINISH_ONE}' to lift it for "
+                              f"this release.", "warn")
+                    self._budget_flag(rel, f"{allows:,}/{win_worst:,}")
+                if dos_n:
+                    # Said even when the Windows figure looks comfortable,
+                    # because that is exactly the case that misled us: the
+                    # headroom is real for the Windows leg and irrelevant to
+                    # the DOS one sitting behind it.
+                    self._log(f"    ⏱ {dos_n} DOS combo(s) sit behind those "
+                              f"and are NOT in the figure above — DOSBox packs "
+                              f"at ~0.5 MB/s, so a DOS tail can take the whole "
+                              f"budget on its own. A release that parks in the "
+                              f"last few combos is usually stuck here; "
+                              f"'{UI_FINISH_ONE}' is the way through it.",
+                              "warn")
             elif now - last > 0.5:
                 last = now
                 rate = tried / max(now - t0, 1e-6)
