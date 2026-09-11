@@ -5931,10 +5931,18 @@ class RsrToolAPI:
                     and time.monotonic() > deadline):
                 self._budget_hit = True
                 self._sweep_pos = (start + tried, sig)
+                # "resumes from here" was a promise the tool cannot keep: the
+                # saved position is only reusable while the combo ORDER is
+                # unchanged, and every recipe learned in the meantime re-orders
+                # it. Radikal_Bikers parked 95 short, came back to a shifted
+                # order, re-swept ~10,500 combos and parked FURTHER from the
+                # end than it started. Say what actually governs it.
                 self._log(f"    ⏱ time budget reached after {tried} combo(s) "
                           f"({start + tried:,} of {start + len(combos):,} "
                           "overall) — parking this release; the next run "
-                          "resumes from here.", "warn")
+                          "resumes from here only if the combo order is "
+                          "unchanged, and starts over if new recipes have "
+                          "re-ordered it.", "warn")
                 self._log_best_partial(targets)
                 return None
 
