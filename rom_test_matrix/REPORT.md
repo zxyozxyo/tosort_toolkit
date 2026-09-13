@@ -1,6 +1,6 @@
 # ROM conversion test matrix
 
-Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User\ClaudeCode\tosort_toolkit\rom_test_matrix\matrix.db`
+Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User\ClaudeCode\tosort_toolkit\rom_test_matrix\matrix.db`
 
 **Status meanings:** PASS = output matched the expected DAT and/or converted back byte-exact · FAIL = crashed, wrong DAT, or round trip differs · UNVERIFIED = ran, but nothing could prove it right · UNAVAILABLE = engine not implemented or key/tool missing · N/A = file already in the target state.
 
@@ -8,10 +8,11 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 
 | Conversion | Tested | PASS | FAIL | UNVERIFIED | UNAVAILABLE / N/A | DAT match | Round trip | Tool verify wrong | Code |
 |---|---|---|---|---|---|---|---|---|---|
+| `iso:iso->zso` | 16 | 10 | 6 | 0 | 0 | None/0 | 10/10 | 0 | bf7f5382c2,d15202fe81,38f3f6ad14 |
 | `chd:cd->chd` | 15 | 14 | 1 | 0 | 0 | None/0 | 14/15 | 1 | 2ed1e069c5,5e1db6994c,e6cef9b724,ba1811571c,d02dd3fb76 |
-| `iso:iso->zso` | 10 | 9 | 1 | 0 | 0 | None/0 | 9/9 | 0 | bf7f5382c2,d15202fe81,83de16a730 |
 | `loopy:big-endian->little-endian` | 13 | 12 | 1 | 0 | 0 | 11/12 | 13/13 | 1 | d15202fe81 |
 | `loopy:little-endian->big-endian` | 12 | 11 | 1 | 0 | 0 | 11/12 | 12/12 | 1 | d15202fe81 |
+| `ps3:iso->deciso` | 7 | 6 | 1 | 0 | 0 | None/0 | 6/6 | 0 | 83de16a730,38f3f6ad14 |
 | `3ds:decrypted->encrypted` | 9 | 9 | 0 | 0 | 0 | 9/9 | 9/9 | 0 | bf7f5382c2 |
 | `3ds:encrypted->decrypted` | 10 | 10 | 0 | 0 | 0 | 10/10 | 10/10 | 0 | bf7f5382c2 |
 | `a78:headered->headerless` | 8 | 8 | 0 | 0 | 0 | 8/8 | 8/8 | 0 | d15202fe81 |
@@ -23,7 +24,7 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 | `c64:d81->files` | 10 | 1 | 0 | 9 | 0 | 1/1 | None/0 | 0 | e6cef9b724 |
 | `c64:p00->prg` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | d15202fe81 |
 | `c64:t64->prg` | 10 | 8 | 0 | 2 | 0 | 8/8 | None/0 | 0 | 1ee9692bcd |
-| `chd:iso->chd` | 11 | 11 | 0 | 0 | 0 | None/0 | 11/11 | 0 | bf7f5382c2,d15202fe81,83de16a730,38f3f6ad14 |
+| `chd:iso->chd` | 16 | 16 | 0 | 0 | 0 | None/0 | 16/16 | 0 | bf7f5382c2,d15202fe81,83de16a730,38f3f6ad14 |
 | `cia:cia->cdn` | 13 | 13 | 0 | 0 | 0 | 13/13 | 13/13 | 0 | e570be8db0 |
 | `cia:encrypted->decrypted` | 13 | 13 | 0 | 0 | 0 | None/0 | 13/13 | 0 | e570be8db0 |
 | `disc:gc:iso->ciso` | 2 | 2 | 0 | 0 | 0 | None/0 | 2/2 | 0 | 2ed1e069c5 |
@@ -55,7 +56,6 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 | `pc:imd->img` | 6 | 1 | 0 | 1 | 4 | 1/1 | None/0 | 0 | e6cef9b724 |
 | `pc:td0->img` | 18 | 6 | 0 | 3 | 9 | 6/6 | None/0 | 0 | e6cef9b724 |
 | `pce:headerless->headered` | 25 | 25 | 0 | 0 | 0 | None/0 | 25/25 | 0 | d15202fe81 |
-| `ps3:iso->deciso` | 2 | 2 | 0 | 0 | 0 | None/0 | 2/2 | 0 | 83de16a730 |
 | `psp:iso->cso` | 8 | 8 | 0 | 0 | 0 | None/0 | 8/8 | 0 | bf7f5382c2 |
 | `psp:pkg->decrypted` | 44 | 43 | 0 | 1 | 0 | 43/43 | None/0 | 0 | 4e8421a87a,7aa604fe3a,46fedd0eb9,041567de78 |
 | `snes:headerless->headered` | 34 | 34 | 0 | 0 | 0 | None/0 | 34/34 | 0 | bf7f5382c2 |
@@ -142,7 +142,7 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 | Sony - PlayStation | 3 | 3 | 3 |
 | Sony - PlayStation (PS one Classics) (PSN) | 5 | 5 | 5 |
 | Sony - PlayStation 2 | 1 | 1 | 1 |
-| Sony - PlayStation 3 | 2 | 2 | 2 |
+| Sony - PlayStation 3 | 7 | 7 | 7 |
 | Sony - PlayStation 3 (PSN) | 3 | 3 | 3 |
 | Sony - PlayStation Portable (PSN) (Decrypted) | 8 | 8 | 8 |
 | Sony - PlayStation Portable (PSN) (Encrypted) | 36 | 36 | 36 |
@@ -156,7 +156,7 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 - Apple - II [PO]: **1** detected as UNKNOWN / unknown / None — no known signature  (e.g. `8-bit Apple II Game Compilation - 32 Games in Total (1991)(cvxmelody)[b].po`)
 - Casio - Loopy (LittleEndian): **1** detected as LOOPY / BIN / big-endian — Casio Loopy cartridge, big-endian  (e.g. `Chakrakun no Omajinai Paradise (Japan).bin`)
 
-## Failures (4)
+## Failures (10)
 
 ### `chd:cd->chd` — verify — 1 file(s)
 
@@ -164,11 +164,16 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 
 - `Makaroni Hourensou Interactive (Japan).cue` · source DAT: 3DO Interactive Multiplayer · tool verify: yes (chdman verify passed)
 
-### `iso:iso->zso` — convert — 1 file(s)
+### `iso:iso->zso` — convert — 6 file(s)
 
 > error: 'I' format requires 0 <= number <= 4294967295
 
-- `Persona 4 Arena Ultimax (Europe).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
+- `PES 2010 - Pro Evolution Soccer (Europe) (Fr,De,Es,It,Pt).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
+- `Star Wars - The Clone Wars - Republic Heroes (Europe) (En,Fr,De,Es,It).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
+- `Steins;Gate (Europe).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
+- `Syndicate (Europe) (En,Fr,De,Es,It,Ru).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
+- `X Edge (Japan).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
+- `XCOM - Enemy Unknown (Europe) (Pl,Ru).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
 
 ### `loopy:big-endian->little-endian` — verify — 1 file(s)
 
@@ -181,6 +186,12 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 > output not in expected DAT
 
 - `Chakrakun no Omajinai Paradise (Japan).bin` · source DAT: Casio - Loopy (LittleEndian) · tool verify: yes (byte-exact)
+
+### `ps3:iso->deciso` — convert — 1 file(s)
+
+> ConversionError: no disc key for "X Edge (Japan)" - put its Redump .key (or .dkey/.ird) in B:\User\ClaudeCode\tosort_toolkit\apps\romtools\keys\ps3_keys
+
+- `X Edge (Japan).iso` · source DAT: Sony - PlayStation 3 · tool verify: no (None)
 
 ## Notes
 
@@ -279,13 +290,13 @@ Generated 2026-09-13 20:15  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 
 ## Recent runs
 
+- `20260913-211049` code `38f3f6ad14` · 1 tests · args `--only Sony - PlayStation 3 --conv zso --limit 1 --retry-failed` · finished 2026-09-13T21:23:17.285473 · log `logs/run-20260913-211049.log`
+- `20260913-211033` code `38f3f6ad14` · 0 tests · args `--only Sony - PlayStation 3 --conv zso --limit 1` · finished 2026-09-13T21:10:38.224746 · log `logs/run-20260913-211033.log`
 - `20260913-201416` code `38f3f6ad14` · 2 tests · args `--only Vita (PSN) (Content)` · finished 2026-09-13T20:15:20.840109 · log `logs/run-20260913-201416.log`
-- `20260913-195530` code `041567de78` · 0 tests · args `--only Sony - PlayStation 3` · finished NOT FINISHED · log `logs/run-20260913-195530.log`
+- `20260913-195530` code `041567de78` · 21 tests · args `--only Sony - PlayStation 3` · finished 2026-09-13T21:10:15.210407 · log `logs/run-20260913-195530.log`
 - `20260913-194101` code `46fedd0eb9` · 5 tests · args `--only PS one Classics` · finished 2026-09-13T19:55:29.356387 · log `logs/run-20260913-194101.log`
 - `20260913-191158` code `7aa604fe3a` · 3 tests · args `--only PlayStation 3 (PSN)` · finished 2026-09-13T19:12:08.571825 · log `logs/run-20260913-191158.log`
 - `20260913-181525` code `d02dd3fb76` · 2 tests · args `--only SNK - Neo Geo CD --redo` · finished 2026-09-13T18:15:42.359025 · log `logs/run-20260913-181525.log`
 - `20260913-181326` code `ba1811571c` · 2 tests · args `--only 3DO --redo` · finished 2026-09-13T18:14:19.835532 · log `logs/run-20260913-181326.log`
 - `20260913-181305` code `ba1811571c` · 2 tests · args `--only PC Engine CD --redo` · finished 2026-09-13T18:13:25.130541 · log `logs/run-20260913-181305.log`
 - `20260913-181248` code `ba1811571c` · 2 tests · args `--only SNK - Neo Geo CD --redo` · finished 2026-09-13T18:13:04.878928 · log `logs/run-20260913-181248.log`
-- `20260913-181219` code `ba1811571c` · 2 tests · args `--only Sega - Mega CD --redo` · finished 2026-09-13T18:12:47.151264 · log `logs/run-20260913-181219.log`
-- `20260913-181159` code `ba1811571c` · 2 tests · args `--only Sega - Saturn --redo` · finished 2026-09-13T18:12:18.843634 · log `logs/run-20260913-181159.log`
