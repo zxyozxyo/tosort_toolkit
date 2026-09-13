@@ -392,6 +392,25 @@ def _supports_mt(fname: str) -> bool:
     return _exe_number(fname) >= 360
 
 
+def _rejects_mt0(fname: str) -> bool:
+    """Does this build refuse `-mt0` outright?
+
+    Measured 2026-09-12 over all 239 builds in the pack: 3.60 through 4.11
+    accept `-mt0` (57 builds), and **4.20 onward reject it** with
+    "ERROR: Unknown option: mt0" (101 builds) — rar dropped 0 from -mt's range.
+    Pre-3.60 never sees the switch at all, because _supports_mt keeps it off
+    the command.
+
+    This is the same waste _supports_mt was written to cure, at the other end
+    of the version range: -mt0 is a live slot in the sweep (_mt_order records
+    six wins at it), so without this every release spent 101 combos on builds
+    that died in milliseconds on option parsing and were still counted as
+    tried. The combo is dropped rather than falling back to a bare command:
+    omitting -mt on 4.20+ means auto-detect, so the thread count would depend
+    on the machine and the recipe would not be reproducible anywhere else."""
+    return _exe_number(fname) >= 420
+
+
 def _win_attrs(path: Path) -> int | None:
     """Windows file attribute mask, or None off Windows. RAR stores it in the
     file header, so a rebuild that ignores it can differ by a byte."""
@@ -4650,6 +4669,65 @@ class RsrToolAPI:
                       "shape cannot be replayed. Sweeping as one command.",
                       "warn")
             mgroups = [(level, len(meta))]
+        # A recovery record is a block the replay has to be TOLD to make, and
+        # for a VOLUMED set the sweep has to be told too. The record lives
+        # inside every volume, so leaving it out of the probe moves every
+        # volume boundary: the displaced payload shrinks the tail, and where
+        # the tail was smaller than the record the set comes out one volume
+        # short. That is rejected on structure before any stream is compared,
+        # so the sweep burns its whole budget on combos that cannot match
+        # (measured 2026-09-12: 9 of 72 structure-rejected PSX failures, and
+        # for 7 of them the last volume was smaller than the total record).
+        # Detected HERE rather than after the sweep, which is where it used
+        # to be, so the probe can ask for it. See [[rsr-recovery-record]] for
+        # why the ask is a plain -rr: only the default scales the short last
+        # volume, and N is a 512-byte sector count, never a percentage.
+        rr_bytes = recovery_record(head)
+        rr_pct = 0
+        rr_sectors = 0          # no recovery record unless one is found
+        if rr_bytes:
+            arch = sum(v.stat().st_size for v in vols)
+            rr_pct = max(1, min(100, round(rr_bytes * 100
+                                           / max(arch - rr_bytes, 1))))
+            rr_sectors = rar4_rr_sectors(head)
+            self._log(f"    recovery record: {rr_bytes:,} B — "
+                      + (f"{rr_sectors} recovery sectors, which the replay "
+                         "will ask for exactly."
+                         if rr_sectors else
+                         "its sector count could not be read, so the replay "
+                         "will ask for rar's default."), "dim")
+        # NARROWLY gated, and the narrowing is the whole point. The sweep is
+        # deliberately record-AGNOSTIC: it matches STREAMS, which -rr does not
+        # change, and _verify_replay fixes the record afterwards by walking
+        # sibling builds of the same version (see [[rsr-recovery-record]] --
+        # "came back wrong for 2.70 b4; 2.70 makes it exactly"). Asking for -rr
+        # during the sweep would reject a right-stream build before that
+        # correction could run, because the default record size varies by build.
+        #
+        # So it is asked for ONLY where leaving it out changes the VOLUME COUNT,
+        # which happens exactly when the last volume is smaller than the whole
+        # record: the displaced payload then swallows the tail and the pack comes
+        # out one volume short, and every combo dies on structure.
+        #
+        # Measured over this run's 418 captures and 149 volumed-with-record
+        # failures (2026-09-12):
+        #     gate on len(vols) > 1 alone -> touches 132 WORKING captures
+        #     gate on tail < record       -> touches   0 working captures,
+        #                                    and still reaches 22 failures
+        sweep_rr = -1
+        if rr_bytes and len(vols) > 1:
+            try:
+                if vols[-1].stat().st_size < rr_bytes:
+                    sweep_rr = 0
+            except OSError:
+                pass
+        if sweep_rr >= 0:
+            self._log(f"    the last volume ({vols[-1].stat().st_size:,} B) is "
+                      f"smaller than the recovery record ({rr_bytes:,} B), so "
+                      "leaving the record out of the probe would lose a whole "
+                      "volume — the sweep asks for it too. Sets whose tail "
+                      "survives are swept without it, as before.", "dim")
+
         recipe = None
         budget = getattr(self, "_budget_min", 0)
         self._deadline = None if self._budget_override else (
@@ -4671,6 +4749,7 @@ class RsrToolAPI:
                                         base=srcdir if keep_paths else None,
                                         prefix=prefix,
                                         probe_vol=probe_vol,
+                                        rr_sectors=sweep_rr,
                                         want_vols=len(vols),
                                         unp_max=rar4_unp_max(vols)
                                         if st["format"] == "RAR4" else 0,
@@ -4737,25 +4816,10 @@ class RsrToolAPI:
         # splitter, not of RAR, and are restored from the volume records.
         vol_bytes = 0 if st["byte_split"] or len(vols) == 1 \
             else vols[0].stat().st_size
-        # A recovery record is a block the replay has to be TOLD to make. The
-        # percentage is not stored anywhere, but it is recoverable: the RR
-        # covers the rest of the archive, so its share of it is the -rr value
-        # that was asked for. _verify_replay corrects the guess if the volume
-        # lengths come out wrong.
-        rr_bytes = recovery_record(head)
-        rr_pct = 0
-        rr_sectors = 0          # no recovery record unless one is found
-        if rr_bytes:
-            arch = sum(v.stat().st_size for v in vols)
-            rr_pct = max(1, min(100, round(rr_bytes * 100
-                                           / max(arch - rr_bytes, 1))))
-            rr_sectors = rar4_rr_sectors(head)
-            self._log(f"    recovery record: {rr_bytes:,} B — "
-                      + (f"{rr_sectors} recovery sectors, which the replay "
-                         "will ask for exactly."
-                         if rr_sectors else
-                         "its sector count could not be read, so the replay "
-                         "will ask for rar's default."), "dim")
+        # rr_bytes / rr_pct / rr_sectors were measured BEFORE the sweep, so
+        # that the probe could ask for the record as well; the replay reads
+        # them off the recipe here. _verify_replay still corrects the ask if
+        # the volume lengths come out wrong.
         recipe.update({"level": level, "solid": solid,
                        "volume_bytes": vol_bytes, "naming": st["scheme"],
                        "new_numbering": newnum, "rr_pct": rr_pct,
@@ -4907,6 +4971,11 @@ class RsrToolAPI:
         third of the pack came to be untestable. Those builds are offered once,
         at the mt=0 slot, instead of failing 17 times."""
         is_r5 = bool(_R5_EXE.search(ex.name))
+        if mt == 0 and _rejects_mt0(ex.name):
+            # Before the format branches on purpose: 4.20 onward dropped 0 from
+            # -mt's range whatever they are asked to write, and the RAR5-capable
+            # builds return early below -- which is 97 of the 101 affected.
+            return None
         if fmt == "RAR5":
             if not is_r5:
                 return None                      # RAR4-era build can't write RAR5
@@ -5457,12 +5526,26 @@ class RsrToolAPI:
             if len(groups) != 1:
                 return None            # appending under DOS is not modelled
             vb = 0
+            # -1 is "do not ask"; 0 is "ask for rar's default", which is what
+            # the scene typed. vol_args is the single source of truth for both
+            # -v and -rr, so read the record out of it rather than carrying a
+            # second parameter down here — DOS RAR takes -rr just as 2.x does,
+            # and without it a volumed RR set is rejected on structure on the
+            # DOS line exactly as it was on the Windows one.
+            rrs = -1
             for a in vol_args:
                 if a.startswith("-v") and a.endswith("b"):
                     try:
                         vb = int(a[2:-1])
                     except ValueError:
                         vb = 0
+                elif a == "-rr":
+                    rrs = 0
+                elif a.startswith("-rr"):
+                    try:
+                        rrs = int(a[3:])
+                    except ValueError:
+                        rrs = 0
             # Cheapest disproof first: a megabyte, not a volume. At
             # DOSBox's ~0.5 MB/s a volume costs minutes and a wrong build has
             # usually parted company inside the first megabyte.
@@ -5472,6 +5555,7 @@ class RsrToolAPI:
                     if self._run_dos_pack(ex, look, groups[0][0], solid, srcs,
                                           vb, timeout=600,
                                           extra=extra[1:],
+                                          rr_sectors=rrs,
                                           stop_after=(1 << 20) + 4096):
                         if self._early_verdict(look / "PROBE.RAR", prefix,
                                                1 << 20) is False:
@@ -5497,12 +5581,13 @@ class RsrToolAPI:
             if prefix and vb and want_vols > 1:
                 if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
                                           vb, extra=extra[1:],
+                                          rr_sectors=rrs,
                                           first_volume_only=True):
                     return False
                 if self._prefix_verdict(wdir / "PROBE.RAR", prefix) is False:
                     return False
             if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
-                                      vb, extra=extra[1:]):
+                                      vb, extra=extra[1:], rr_sectors=rrs):
                 return False
             cmds = []
         else:
@@ -5573,9 +5658,18 @@ class RsrToolAPI:
                              heartbeat=f"sweep -mt{n} {_exe_label(ex.name)}",
                              cwd=base)
                    for c in cmds):
+            # Tallied, because it was not: a combo whose pack command never ran
+            # used to return here silently, so the wall line counted only the
+            # combos that got as far as the structure gate and reported "all 31
+            # were rejected on structure" for a release that had actually put
+            # 1,689 combos through the sweep. Measured on RC_Helicopter-NOITAMI
+            # 2026-09-12. A rejection nobody counts is a rejection nobody can
+            # diagnose.
+            self._tally_reject("the pack command itself failed to run")
             return False
         head = self._probe_head(wdir)
         if head is None:
+            self._tally_reject("the pack ran but produced no archive")
             return False
         # Asked for volumes, so it has to make them. A build whose streams
         # match but which cannot split where the original splits did not make
@@ -5611,7 +5705,7 @@ class RsrToolAPI:
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
                       want_vols=0, unp_max=0, expanded=False,
-                      host=-1) -> dict | None:
+                      host=-1, rr_sectors=-1) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -5883,6 +5977,13 @@ class RsrToolAPI:
             self._log(f"    packing in {vol_bytes:,} B volumes, as the original "
                       "was — rar treats an incompressible file differently when "
                       "it is streaming to volumes.", "dim")
+        # The original's recovery record, when it has one and is volumed. It
+        # goes in vol_args because those land on the LAST command only, which
+        # is where rar wants -rr, and a plain -rr is the ask: only the default
+        # scales the short last volume. Without this every combo is rejected
+        # on volume structure before its streams are ever looked at.
+        if rr_sectors >= 0:
+            vol_args.append("-rr" if not rr_sectors else f"-rr{rr_sectors}")
         srcs = [str(p) for p in src_files]
         # What the original's volume structure has to come back as.
         vol_first = vol_bytes if (vol_bytes and want_vols > 1) else 0
@@ -8294,15 +8395,35 @@ class RsrToolAPI:
             # saying nothing at all reads as a broken diagnostic.
             tally = getattr(self, "_reject", None)
             if tally:
-                top = sorted(tally.items(), key=lambda kv: -kv[1])[:3]
-                n_all = sum(tally.values())
-                lead = ", ".join(f"{w} ({c:,})" for w, c in top)
-                self._log(f"      no combo reached the stream comparison — "
-                          f"all {n_all:,} were rejected on structure first. "
-                          f"Dominant reason(s): {lead}. Sweeping more builds "
-                          f"cannot fix this; the mismatch is in how the "
-                          f"archive is laid out, not how it is compressed.",
-                          "warn")
+                # Two different verdicts hide in this tally and they demand
+                # opposite conclusions, so they are counted apart. A STRUCTURE
+                # rejection means the archive is laid out differently and more
+                # builds cannot help. A combo that never RAN says nothing about
+                # the archive at all -- it is a hole in the sweep. Reporting the
+                # sum as "rejected on structure" asserted the first about both.
+                broke = {w: c for w, c in tally.items()
+                         if w in ("the pack command itself failed to run",
+                                  "the pack ran but produced no archive")}
+                struct = {w: c for w, c in tally.items() if w not in broke}
+                n_s, n_b = sum(struct.values()), sum(broke.values())
+                if struct:
+                    top = sorted(struct.items(), key=lambda kv: -kv[1])[:3]
+                    lead = ", ".join(f"{w} ({c:,})" for w, c in top)
+                    self._log(f"      no combo reached the stream comparison — "
+                              f"{n_s:,} were rejected on structure. Dominant "
+                              f"reason(s): {lead}. Sweeping more builds cannot "
+                              f"fix those; the mismatch is in how the archive "
+                              f"is laid out, not how it is compressed.", "warn")
+                if not struct:
+                    self._log("      no combo reached the stream comparison, "
+                              "and none was rejected on structure either — "
+                              "every one failed before it could be judged.",
+                              "warn")
+                if n_b:
+                    self._log(f"      and {n_b:,} combo(s) never ran at all "
+                              f"({', '.join(f'{w} ({c:,})' for w, c in sorted(broke.items(), key=lambda kv: -kv[1]))})"
+                              " — those say nothing about this archive and are "
+                              "a gap in the sweep, not a wall.", "warn")
             else:
                 self._log("      no combo reached the stream comparison — every "
                           "one was rejected on volume structure, end block or "
