@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ROM Manipulation — ToSort Toolkit</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@400;500;600&display=swap');
+
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#0d0f12;--bg1:#141720;--bg2:#1c2030;--bg3:#252a3a;
+  --acc:#4af0a0;--acc2:#2aaa6e;--warn:#f0a030;--danger:#f04040;--info:#40a0f0;
+  --text:#c8d0e0;--text2:#7a8498;--text3:#4a5468;
+  --border:#2a3045;
+  --font:'Exo 2',sans-serif;--mono:'Share Tech Mono',monospace;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:var(--font);font-size:13px}
+#app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+.titlebar{background:var(--bg1);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.logo{font-family:var(--mono);font-size:13px;color:var(--acc);letter-spacing:2px}
+.sub{font-size:10px;color:var(--text2)}
+.pill{display:inline-block;padding:2px 10px;border-radius:10px;font-size:10px;font-family:var(--mono);border:1px solid var(--border);color:var(--text2);margin-left:auto}
+.pill.running{border-color:var(--warn);color:var(--warn)}
+.pill.done{border-color:var(--acc);color:var(--acc)}
+.pill.error{border-color:var(--danger);color:var(--danger)}
+
+.panels{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;display:flex;flex-direction:column;gap:12px}
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:6px;overflow:hidden;flex-shrink:0}
+.panel-hdr{background:var(--bg2);padding:7px 12px;font-size:10px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:6px;letter-spacing:.5px;text-transform:uppercase;cursor:pointer;user-select:none}
+.panel-hdr:hover{color:var(--text)}
+.panel-hdr .dot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex-shrink:0}
+.panel-hdr .chevron{margin-left:auto;transition:.15s}
+.panel-body{padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.panel-body.collapsed{display:none}
+
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lbl{font-size:11px;color:var(--text2);min-width:78px;flex-shrink:0}
+.txt{flex:1;min-width:180px;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:5px 8px;color:var(--text);font-family:var(--font);font-size:12px;outline:none}
+.txt:focus{border-color:var(--acc)}
+.hint{font-size:10px;color:var(--text3);line-height:1.5}
+.btn{padding:4px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text2);font-family:var(--font);font-size:11px;cursor:pointer;transition:.12s;flex-shrink:0}
+.btn:hover{border-color:var(--acc);color:var(--acc)}
+.btn-go{border-color:var(--acc2);color:var(--acc);font-weight:600;padding:6px 20px}
+.btn-go:hover{background:var(--acc2);color:#000}
+.btn-stop{border-color:var(--danger);color:var(--danger)}
+.btn-stop:hover{background:var(--danger);color:#fff}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+.chk{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text2);cursor:pointer}
+.sel{background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-family:var(--font);font-size:11px;outline:none;cursor:pointer;max-width:100%}
+.sel:focus{border-color:var(--acc)}
+
+/* environment */
+.envgrid{display:flex;gap:8px;flex-wrap:wrap}
+.envcard{flex:1;min-width:150px;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:8px 10px}
+.envcard .k{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
+.envcard .v{font-family:var(--mono);font-size:16px;margin-top:2px}
+.envcard.good .v{color:var(--acc)}
+.envcard.bad .v{color:var(--text3)}
+.missing{font-size:10px;color:var(--warn);font-family:var(--mono);line-height:1.7}
+.missing b{color:var(--text2);font-weight:400}
+
+/* summary chips */
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{background:var(--bg0);border:1px solid var(--border);border-radius:12px;padding:3px 10px;font-size:10px;font-family:var(--mono);cursor:pointer}
+.chip:hover{border-color:var(--acc);color:var(--acc)}
+.chip.on{border-color:var(--acc);color:var(--acc);background:var(--bg2)}
+.chip .n{color:var(--text2)}
+
+/* results table */
+.tblwrap{max-height:360px;overflow:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg0)}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{position:sticky;top:0;background:var(--bg2);color:var(--text2);font-size:10px;text-transform:uppercase;letter-spacing:.5px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);z-index:2;font-weight:600}
+td{padding:5px 8px;border-bottom:1px solid var(--bg1);vertical-align:middle}
+tr:hover td{background:var(--bg1)}
+td.name{font-family:var(--mono);color:var(--text);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.sys{font-family:var(--mono);color:var(--info)}
+td.fmt{font-family:var(--mono);color:var(--text2)}
+td.size{font-family:var(--mono);color:var(--text3);text-align:right;white-space:nowrap}
+.var{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:8px;border:1px solid var(--border);color:var(--text2)}
+.var.encrypted{border-color:var(--warn);color:var(--warn)}
+.var.decrypted{border-color:var(--acc);color:var(--acc)}
+.conf{font-size:9px;font-family:var(--mono);padding:0 4px;border-radius:3px}
+.conf.high{color:var(--acc)}
+.conf.medium{color:var(--warn)}
+.conf.low{color:var(--danger)}
+.conf.none{color:var(--text3)}
+.st{font-family:var(--mono);font-size:10px}
+.st.ok{color:var(--acc)}
+.st.err{color:var(--danger)}
+.st.skip{color:var(--text3)}
+.st.run{color:var(--warn)}
+.detail{font-size:10px;color:var(--text3);font-family:var(--mono)}
+
+/* log */
+.log-w{height:190px;overflow-y:auto;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-family:var(--mono);font-size:11px;line-height:1.6;user-select:text}
+.log-w .info{color:var(--text)}
+.log-w .dim{color:var(--text3)}
+.log-w .ok{color:var(--acc)}
+.log-w .warn{color:var(--warn)}
+.log-w .err{color:var(--danger)}
+
+.bar{height:3px;background:var(--bg3);border-radius:2px;overflow:hidden}
+.bar > div{height:100%;background:var(--acc);width:0;transition:width .2s}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div class="titlebar">
+    <div>
+      <div class="logo">ROM MANIPULATION</div>
+      <div class="sub">ToSort Toolkit — format conversion</div>
+    </div>
+    <span class="pill" id="status">idle</span>
+  </div>
+
+  <div class="panels">
+
+    <!-- ── Setup ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('setup')">
+        <div class="dot"></div>Source &amp; Output
+        <span class="chevron" id="chev-setup">▾</span>
+      </div>
+      <div class="panel-body" id="body-setup">
+        <div class="row">
+          <span class="lbl">Source</span>
+          <input class="txt" id="source" placeholder="folder to scan — detection is by file content, not extension">
+          <button class="btn" onclick="pick('source')">Browse</button>
+        </div>
+        <div class="row">
+          <span class="lbl">Output</span>
+          <input class="txt" id="output" placeholder="converted files land here; sources are never modified">
+          <button class="btn" onclick="pick('output')">Browse</button>
+        </div>
+        <div class="row">
+          <label class="chk"><input type="checkbox" id="recursive" checked> Recurse into subfolders</label>
+          <label class="chk"><input type="checkbox" id="verify" checked> Round-trip verify (byte-exact)</label>
+          <label class="chk"><input type="checkbox" id="overwrite"> Overwrite existing output</label>
+          <button class="btn btn-go" id="btnScan" onclick="doScan()">Scan</button>
+          <button class="btn btn-stop" id="btnStop" onclick="doStop()" disabled>Stop</button>
+        </div>
+        <div class="bar"><div id="scanbar"></div></div>
+        <div class="hint" id="scanhint">Output mirrors the source folder structure. Originals are opened read-only and never deleted.</div>
+      </div>
+    </div>
+
+    <!-- ── Environment ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('env')">
+        <div class="dot" style="background:var(--info)"></div>Engine availability
+        <span class="chevron" id="chev-env">▾</span>
+      </div>
+      <div class="panel-body collapsed" id="body-env">
+        <div class="envgrid" id="envgrid"></div>
+        <div class="missing" id="envmissing"></div>
+      </div>
+    </div>
+
+    <!-- ── Results ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('res')">
+        <div class="dot" style="background:var(--warn)"></div>Detected files
+        <span class="chevron" id="chev-res">▾</span>
+      </div>
+      <div class="panel-body" id="body-res">
+        <div class="chips" id="chips"></div>
+        <div class="row">
+          <button class="btn" onclick="selectAll(true)">Select all convertible</button>
+          <button class="btn" onclick="selectAll(false)">Clear</button>
+          <span class="hint" id="selinfo" style="margin-left:auto"></span>
+        </div>
+        <div class="tblwrap">
+          <table>
+            <thead><tr>
+              <th style="width:26px"></th>
+              <th>File</th><th>System</th><th>Format</th><th>State</th>
+              <th style="text-align:right">Size</th><th>Convert to</th><th>Result</th>
+            </tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <div class="row">
+          <button class="btn btn-go" id="btnConv" onclick="doConvert()" disabled>Convert selected</button>
+          <span class="hint" id="convhint"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── DAT verification ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('dat')">
+        <div class="dot" style="background:var(--acc2)"></div>Verify against DATs
+        <span class="chevron" id="chev-dat">▸</span>
+      </div>
+      <div class="panel-body collapsed" id="body-dat">
+        <div class="hint">Hashes every file in a folder and looks it up in known-good DATs — the same check RomVault does, without leaving the tool. Use the decrypted-set DATs to prove a decrypt was byte-correct.</div>
+        <div class="row">
+          <span class="lbl">Folder</span>
+          <input class="txt" id="datfolder" placeholder="folder to check — usually your output folder">
+          <button class="btn" onclick="pickDatFolder()">Browse</button>
+        </div>
+        <div class="row">
+          <span class="lbl">DATs</span>
+          <input class="txt" id="datfiles" placeholder="no DATs selected" readonly>
+          <button class="btn" onclick="pickDats()">Choose…</button>
+        </div>
+        <div class="row">
+          <button class="btn btn-go" id="btnDat" onclick="doDatVerify()">Check hashes</button>
+          <span class="hint" id="dathint"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Log ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('log')">
+        <div class="dot" style="background:var(--text3)"></div>Log
+        <span class="chevron" id="chev-log">▾</span>
+      </div>
+      <div class="panel-body" id="body-log">
+        <div class="log-w" id="log"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+let ITEMS = [], FILTER = null, BUSY = false;
+
+function togglePanel(id){
+  const b = document.getElementById('body-'+id), c = document.getElementById('chev-'+id);
+  b.classList.toggle('collapsed');
+  c.textContent = b.classList.contains('collapsed') ? '▸' : '▾';
+}
+function setStatus(t, cls){
+  const p = document.getElementById('status');
+  p.textContent = t; p.className = 'pill' + (cls ? ' '+cls : '');
+}
+function log(msg, cls){
+  const w = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = cls || 'info'; d.textContent = msg;
+  w.appendChild(d); w.scrollTop = w.scrollHeight;
+}
+function human(n){
+  if(n === undefined || n === null) return '';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while(n >= 1024 && i < u.length-1){ n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+function cfg(){
+  return {
+    source: document.getElementById('source').value.trim(),
+    output: document.getElementById('output').value.trim(),
+    recursive: document.getElementById('recursive').checked,
+    verify: document.getElementById('verify').checked,
+    overwrite: document.getElementById('overwrite').checked,
+  };
+}
+
+async function pick(which){
+  const p = await pywebview.api.browse_folder();
+  if(p) { document.getElementById(which).value = p; pywebview.api.save_config(cfg()); }
+}
+
+async function loadEnv(){
+  const e = await pywebview.api.environment();
+  const g = document.getElementById('envgrid');
+  g.innerHTML = '';
+  const order = [['native','Native (no deps)'],['keyed','Needs key file'],['external','Needs external tool']];
+  for(const [k, label] of order){
+    const v = e.engines[k] || {total:0, available:0};
+    const card = document.createElement('div');
+    card.className = 'envcard ' + (v.available ? 'good' : 'bad');
+    card.innerHTML = `<div class="k">${label}</div><div class="v">${v.available} / ${v.total}</div>`;
+    g.appendChild(card);
+  }
+  const miss = [];
+  for(const k of e.keys)  if(!k.present) miss.push(`<b>missing key</b>  ${k.what}<br>&nbsp;&nbsp;&nbsp;drop at: ${k.path}`);
+  for(const t of e.tools) if(!t.present) miss.push(`<b>missing tool</b> ${t.what}<br>&nbsp;&nbsp;&nbsp;drop at: ${t.path}`);
+  document.getElementById('envmissing').innerHTML = miss.length
+    ? miss.join('<br>')
+    : '<span style="color:var(--acc)">Everything available.</span>';
+  if(miss.length) document.getElementById('body-env').classList.remove('collapsed');
+}
+
+async function doScan(){
+  const c = cfg();
+  if(!c.source){ log('Pick a source folder first.', 'err'); return; }
+  document.getElementById('rows').innerHTML = '';
+  ITEMS = []; FILTER = null;
+  setBusy(true); setStatus('scanning', 'running');
+  const r = await pywebview.api.start_scan(c);
+  if(!r.ok){ log(r.error, 'err'); setBusy(false); }
+}
+async function doStop(){ await pywebview.api.stop(); log('Stopping…', 'warn'); }
+
+function setBusy(b){
+  BUSY = b;
+  document.getElementById('btnScan').disabled = b;
+  document.getElementById('btnConv').disabled = b || !anySelected();
+  document.getElementById('btnDat').disabled = b;
+  document.getElementById('btnStop').disabled = !b;
+}
+
+function renderChips(summary){
+  const c = document.getElementById('chips');
+  c.innerHTML = '';
+  const keys = Object.keys(summary).sort();
+  for(const k of keys){
+    const s = summary[k];
+    const el = document.createElement('div');
+    el.className = 'chip' + (FILTER === k ? ' on' : '');
+    el.innerHTML = `${k} <span class="n">${s.count} · ${human(s.bytes)}</span>`;
+    el.onclick = () => { FILTER = (FILTER === k ? null : k); renderChips(summary); renderRows(); };
+    c.appendChild(el);
+  }
+}
+
+function visible(){
+  return ITEMS.filter(it => !FILTER || (it.system + ' / ' + it.format) === FILTER);
+}
+
+function renderRows(){
+  const tb = document.getElementById('rows');
+  tb.innerHTML = '';
+  for(const it of visible()){
+    const opts = it.options || [];
+    const usable = opts.filter(o => o.available);
+    const tr = document.createElement('tr');
+    tr.dataset.path = it.path;
+
+    const cb = opts.length
+      ? `<input type="checkbox" class="pick" ${usable.length ? '' : 'disabled'} onchange="updateSel()">`
+      : '';
+    let sel = '<span class="detail">—</span>';
+    if(opts.length){
+      sel = `<select class="sel conv" ${usable.length ? '' : 'disabled'}>` +
+        opts.map(o => `<option value="${o.id}" ${o.available ? '' : 'disabled'}>` +
+                      `${o.label}${o.available ? '' : ' — ' + o.reason}</option>`).join('') +
+        '</select>';
+    }
+    const varCls = (it.variant || '').indexOf('encrypt') === 0 ? 'encrypted'
+                 : (it.variant || '').indexOf('decrypt') === 0 ? 'decrypted' : '';
+    tr.innerHTML =
+      `<td>${cb}</td>` +
+      `<td class="name" title="${it.path}">${it.name}<div class="detail">${it.detail||''}</div></td>` +
+      `<td class="sys">${it.system}</td>` +
+      `<td class="fmt">${it.format} <span class="conf ${it.confidence}">${it.confidence}</span></td>` +
+      `<td>${it.variant ? `<span class="var ${varCls}">${it.variant}</span>` : ''}</td>` +
+      `<td class="size">${human(it.size)}</td>` +
+      `<td>${sel}</td>` +
+      `<td class="st" data-st></td>`;
+    tb.appendChild(tr);
+  }
+  updateSel();
+}
+
+function selectAll(on){
+  document.querySelectorAll('#rows .pick').forEach(cb => { if(!cb.disabled) cb.checked = on; });
+  updateSel();
+}
+function anySelected(){ return document.querySelectorAll('#rows .pick:checked').length > 0; }
+function updateSel(){
+  const n = document.querySelectorAll('#rows .pick:checked').length;
+  document.getElementById('selinfo').textContent = n ? `${n} selected` : '';
+  document.getElementById('btnConv').disabled = BUSY || !n;
+}
+
+async function doConvert(){
+  const c = cfg();
+  if(!c.output){ log('Pick an output folder first.', 'err'); return; }
+  const jobs = [];
+  document.querySelectorAll('#rows tr').forEach(tr => {
+    const cb = tr.querySelector('.pick');
+    if(cb && cb.checked){
+      const conv = tr.querySelector('.conv');
+      jobs.push({ path: tr.dataset.path, conversion: conv.value });
+      tr.querySelector('[data-st]').textContent = '…';
+      tr.querySelector('[data-st]').className = 'st run';
+    }
+  });
+  if(!jobs.length) return;
+  setBusy(true); setStatus('converting', 'running');
+  const r = await pywebview.api.start_convert(jobs, c);
+  if(!r.ok){ log(r.error, 'err'); setBusy(false); setStatus('idle'); }
+}
+
+let DATS = [];
+async function pickDatFolder(){
+  const p = await pywebview.api.browse_folder();
+  if(p) document.getElementById('datfolder').value = p;
+}
+async function pickDats(){
+  const list = await pywebview.api.browse_dats();
+  if(list && list.length){
+    DATS = list;
+    document.getElementById('datfiles').value =
+      list.length === 1 ? list[0] : `${list.length} DAT files selected`;
+  }
+}
+async function doDatVerify(){
+  const folder = document.getElementById('datfolder').value.trim()
+              || document.getElementById('output').value.trim();
+  if(!folder){ log('Pick a folder to verify.', 'err'); return; }
+  document.getElementById('datfolder').value = folder;
+  if(!DATS.length){ log('Choose at least one DAT first.', 'err'); return; }
+  setBusy(true); setStatus('checking hashes', 'running');
+  const r = await pywebview.api.start_dat_verify(folder, DATS);
+  if(!r.ok){ log(r.error, 'err'); setBusy(false); setStatus('idle'); }
+}
+
+window.romEvent = function(ev, d){
+  if(ev === 'log') log(d.msg, d.cls);
+  else if(ev === 'scan_progress'){
+    const pct = d.total ? (d.done / d.total * 100) : 0;
+    document.getElementById('scanbar').style.width = pct + '%';
+    document.getElementById('scanhint').textContent = `${d.done} / ${d.total} — ${d.current}`;
+  }
+  else if(ev === 'scan_done'){
+    ITEMS = d.items.filter(i => i.system !== 'UNKNOWN' && i.system !== 'ERROR');
+    renderChips(d.summary); renderRows();
+    document.getElementById('scanbar').style.width = '100%';
+    document.getElementById('scanhint').textContent =
+      `${d.items.length} files scanned, ${ITEMS.length} recognised.`;
+    setStatus('scan done', 'done');
+  }
+  else if(ev === 'job_progress'){
+    document.getElementById('scanhint').textContent =
+      `${d.name} — ${d.label} ${d.total ? Math.floor(d.done/d.total*100)+'%' : ''}`;
+  }
+  else if(ev === 'job_done'){
+    const tr = document.querySelector(`#rows tr[data-path="${CSS.escape(d.path)}"]`);
+    if(tr){
+      const c = tr.querySelector('[data-st]');
+      if(d.ok){ c.textContent = d.verified ? 'verified' : 'done'; c.className = 'st ok'; }
+      else if(d.skipped){ c.textContent = 'skipped'; c.className = 'st skip'; }
+      else { c.textContent = 'failed'; c.className = 'st err'; c.title = d.error || ''; }
+    }
+    setStatus(`${d.index} / ${d.total}`, 'running');
+  }
+  else if(ev === 'idle'){ setBusy(false); setStatus('idle'); }
+};
+
+window.addEventListener('pywebviewready', async () => {
+  const c = await pywebview.api.get_config();
+  document.getElementById('source').value = c.source || '';
+  document.getElementById('output').value = c.output || '';
+  document.getElementById('recursive').checked = c.recursive !== false;
+  document.getElementById('verify').checked = c.verify !== false;
+  document.getElementById('overwrite').checked = !!c.overwrite;
+  await loadEnv();
+  log('Ready. Detection is by file content — extensions and folder names are only tie-breakers.', 'dim');
+});
+</script>
+</body>
+</html>

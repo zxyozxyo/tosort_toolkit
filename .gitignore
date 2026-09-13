@@ -106,3 +106,13 @@ rsr_tool.log.1
 rsr_blocked.db
 rsr_blocked.csv
 rsr_blocked.txt
+
+# ROM tools test bench: user test files, generated fixtures and bulky run data
+\!WIP/
+corpus/
+rom_test_matrix/matrix.db
+rom_test_matrix/dat_index.pickle
+rom_test_matrix/logs/
+rom_test_matrix/run*.txt
+rom_test_matrix/*console*.txt
+rom_test_matrix/stage_*.txt

@@ -18,6 +18,7 @@ from scene_recreator import SceneRecreatorAPI
 from misc_tools import MiscToolsAPI
 from srrdb_tool import SrrdbToolAPI
 from rsr_tool import RsrToolAPI
+from rom_tools import RomToolsAPI
 
 _dat_api = None
 _ia_api  = None
@@ -153,6 +154,21 @@ def open_rsr_tool():
     _rsr_api.set_window(rsr_window)
 
 
+def open_rom_tools():
+    """Open ROM Manipulation window."""
+    _rom_api = RomToolsAPI()
+    rom_window = webview.create_window(
+        title="ROM Manipulation — ToSort Toolkit",
+        url=os.path.join(os.path.dirname(__file__), "gui", "rom_tools.html"),
+        js_api=_rom_api,
+        width=1040,
+        height=860,
+        min_size=(780, 560),
+        background_color="#0d0f12",
+    )
+    _rom_api.set_window(rom_window)
+
+
 def open_misc_tools():
     """Open Miscellaneous Tools window."""
     _misc_api = MiscToolsAPI()
@@ -189,6 +205,7 @@ class LauncherAPI:
     def open_misc_tools(self):    open_misc_tools()
     def open_srrdb_tool(self):    open_srrdb_tool()
     def open_rsr_tool(self):      open_rsr_tool()
+    def open_rom_tools(self):     open_rom_tools()
 
     # --- startup auto-backup (settings shared with Misc Tools → Local Backup) ---
     def backup_startup_info(self):
