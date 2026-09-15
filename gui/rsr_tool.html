@@ -278,6 +278,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <label class="chk-row"><input type="checkbox" id="delete_content"
                      onchange="confirmDeleteContent(this)">
               Delete the unpacked file once its release is rebuilt &amp; verified</label>
+            <label class="chk-row"><input type="checkbox" id="skip_rebuilt" checked>
+              Skip releases already rebuilt in the output folder</label>
+            <label class="chk-row"><input type="checkbox" id="clean_extras">
+              Tidy the content folder: remove loose nfo / diz / cue / sfv&hellip; that are
+              byte-identical to a file in a rebuilt release</label>
             <label class="chk-row"><input type="checkbox" id="metadata_releases" checked>
               Also write the nfo-only releases (dirfix / nfofix) &mdash; they have
               no content to match on</label>
@@ -701,6 +706,8 @@ async function startBatch() {
     out: $('rb-bout').value.trim(),
     delete_content: $('delete_content').checked,
     metadata_releases: $('metadata_releases').checked,
+    skip_rebuilt: $('skip_rebuilt').checked,
+    clean_extras: $('clean_extras').checked,
   });
   if (!r.ok) { log('✗ ' + r.error, 'err'); setBusy(false); }
 }

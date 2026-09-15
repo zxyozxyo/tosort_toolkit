@@ -6935,13 +6935,18 @@ class RsrToolAPI:
         # Default ON: without it these releases are simply unreachable from
         # this screen, and a set is not complete without them.
         with_meta = bool((cfg or {}).get("metadata_releases", True))
+        # Default ON: a re-run should not redo what is already sitting in the
+        # output folder, finished and verified.
+        skip_rebuilt = bool((cfg or {}).get("skip_rebuilt", True))
+        clean_extras = bool((cfg or {}).get("clean_extras", False))
 
         def _bg():
             self._running = True
             self._stop.clear()
             self._size_map_cache = {}
             try:
-                self._rebuild_batch_run(root, out, delete_content, with_meta)
+                self._rebuild_batch_run(root, out, delete_content, with_meta,
+                                        skip_rebuilt, clean_extras)
             except Exception as e:
                 self._log(f"Batch rebuild error: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
@@ -6964,7 +6969,9 @@ class RsrToolAPI:
 
     def _rebuild_batch_run(self, root: Path, out: Path,
                            delete_content: bool = False,
-                           with_meta: bool = True):
+                           with_meta: bool = True,
+                           skip_rebuilt: bool = True,
+                           clean_extras: bool = False):
         self._log("══ BATCH REBUILD ══", "info")
         self._content_root = root
         # A re-run in the same session must see files added since the last one
@@ -7057,9 +7064,10 @@ class RsrToolAPI:
         # source list is thread-local and never crosses between them.
         book = threading.Lock()
         total = len(matched)
+        skipped = 0
 
         def _rebuild_one(i, rel, p, hit):
-            nonlocal done, failed, freed
+            nonlocal done, failed, freed, skipped
             # Tag this thread's lines so parallel rebuilds stay readable, the
             # same way captures do.
             self._tl.tag = f"[{rel[:24]}] " if self._rebuild_slots() > 1 else ""
@@ -7081,6 +7089,16 @@ class RsrToolAPI:
                                    "recipe": ".rsr missing", "kind": "error"})
                 with book:
                     failed += 1
+                return
+            if skip_rebuilt and self._already_rebuilt(rsr, out / rel):
+                self._log("  already rebuilt in the output folder — "
+                          "skipping.", "dim")
+                self._emit("row", {"name": rel, "status": "skipped",
+                                   "recipe": "already rebuilt",
+                                   "kind": "skipped"})
+                with book:
+                    skipped += 1
+                    built.add(rel)     # frees shared content for the others
                 return
             self._emit("row", {"name": rel, "status": "running",
                                "kind": "running"})
@@ -7174,15 +7192,23 @@ class RsrToolAPI:
                           f"needs them.", "dim")
 
         if with_meta:
-            done += self._rebuild_metadata(matched, out)
+            done += self._rebuild_metadata(matched, out, skip_rebuilt)
+
+        tidied = 0
+        if clean_extras and not self._stop.is_set():
+            tidied = self._clean_content_extras(root, out, matched, built)
 
         self._log("", "")
         self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "
                   f"{miss} unmatched file(s)."
+                  + (f" {skipped} already rebuilt, skipped." if skipped else "")
+                  + (f" {tidied} leftover extra(s) removed from the content "
+                     "folder." if tidied else "")
                   + (f" {_human_bytes(freed)} of unpacked sources deleted."
                      if freed else ""), "ok" if not failed else "warn")
 
-    def _rebuild_metadata(self, matched: dict, out: Path) -> int:
+    def _rebuild_metadata(self, matched: dict, out: Path,
+                          skip_rebuilt: bool = True) -> int:
         """Write the releases that are nothing but an nfo.
 
         A DIRFIX or NFOFIX release has no archive and therefore no content
@@ -7217,7 +7243,7 @@ class RsrToolAPI:
         self._log(f"══ {len(todo)} nfo-only release(s) ══", "info")
         self._log("  no content to match on, so these are written straight "
                   "from the store.", "dim")
-        n = 0
+        n = skipped_meta = 0
         for rel, rp in sorted(todo):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -7226,6 +7252,9 @@ class RsrToolAPI:
             rsr = Path(rp)
             if not rsr.is_file():
                 self._log(f"  ✗ {rel}: .rsr missing from the store.", "err")
+                continue
+            if skip_rebuilt and self._already_rebuilt(rsr, dest):
+                skipped_meta += 1
                 continue
             self._consumed = []
             try:
@@ -7237,8 +7266,190 @@ class RsrToolAPI:
                 n += 1
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": "nfo only", "kind": "ok"})
-        self._log(f"  ✓ {n} of {len(todo)} written.", "ok" if n else "warn")
+        self._log(f"  ✓ {n} of {len(todo)} written"
+                  + (f", {skipped_meta} already in the output folder"
+                     if skipped_meta else "") + ".",
+                  "ok" if n or skipped_meta else "warn")
         return n
+
+    def _clean_content_extras(self, root: Path, out: Path, matched: dict,
+                              built: set) -> int:
+        """End of a batch: clear the content folder of loose files that are
+        byte-identical to something in a rebuilt release folder.
+
+        Swept over EVERY indexed release already in the output folder, not only
+        this run's, so the backlog from earlier runs (whose content was deleted
+        long ago and so never matches again) goes too. A file that is the
+        content of a release this run matched but did not finish stays."""
+        con = self._db()
+        try:
+            known = {r[0] for r in con.execute("SELECT name FROM releases")}
+        finally:
+            con.close()
+        owed = set(matched) - set(built)
+        dirs = sorted(d for d in out.iterdir()
+                      if d.is_dir() and d.name in known)
+        if not dirs:
+            return 0
+        finished = set(built) | {d.name for d in dirs}
+
+        def protected(p: Path) -> bool:
+            # Kept when this run still owes it to a release, or when it is the
+            # CONTENT of any release not yet in the output folder -- a patch's
+            # .ips can be byte-identical to another release's extra, and
+            # removing it would strand that patch from this content folder.
+            try:
+                size, crc = p.stat().st_size, _file_crc32(p)
+            except OSError:
+                return True
+            con = self._db()
+            try:
+                rows = con.execute(
+                    "SELECT release, source FROM files WHERE size=? AND crc32=?",
+                    (size, crc)).fetchall()
+            finally:
+                con.close()
+            if {r for r, _s in rows} & owed:
+                return True
+            return any(src == "content" and r not in finished
+                       for r, src in rows)
+        self._log("", "")
+        self._log(f"══ tidying the content folder against {len(dirs)} rebuilt "
+                  f"release folder(s) ══", "info")
+        gone = 0
+        for i, d in enumerate(dirs, 1):
+            if self._stop.is_set():
+                break
+            self._progress(f"tidying {i}/{len(dirs)} · {d.name}")
+            gone += self._delete_duplicates(d, root, protected, quiet=True)
+        self._progress("")
+        self._log(f"  🗑 {gone} leftover file(s) removed — each byte-identical "
+                  "to a file in a rebuilt release.", "ok" if gone else "dim")
+        return gone
+
+    def _already_rebuilt(self, rsr: Path, dest: Path) -> bool:
+        """True when `dest` already holds this release as a rebuild writes it.
+
+        A rebuild only ever writes a volume after its hash has matched, and
+        stops at the first one that does not, so a folder with every volume
+        present at its exact size is a finished rebuild, not a partial one.
+        Checked on top of that: the first 4 KB of each volume against the
+        captured head hash, and every small file (sidecars, zips up to 16 MB)
+        in full. Cheap enough to run before every release, which is the point:
+        a re-run no longer redoes hundreds of patches and nfo fixes."""
+        if not dest.is_dir():
+            return False
+        try:
+            manifest, z = self.read_rsr(rsr)
+        except Exception:
+            return False
+        try:
+            self._infer_set_folders(manifest, z)   # reads the sfv sidecars
+        finally:
+            z.close()
+        want = []                  # (path, size, full sha256, head sha256)
+        for st in manifest.get("sets", []):
+            fld = st.get("folder", "")
+            if st.get("format") in ("ZIP", "LHA"):
+                name = st.get("name") or f"{st.get('stem')}.zip"
+                want.append((dest / fld / name, st.get("size"),
+                             st.get("sha256"), None))
+                continue
+            for v in st.get("volumes", []):
+                want.append((dest / v.get("folder", "") / v["name"],
+                             v.get("size"), None, v.get("head_sha")))
+        for f in manifest.get("sidecars", []):
+            if f.get("stored"):
+                want.append((dest / f.get("folder", "") / f["name"],
+                             f.get("size"), f.get("sha256"), None))
+        if not want:
+            return False
+        for path, size, sha, head in want:
+            try:
+                if not path.is_file() or (size is not None
+                                          and path.stat().st_size != size):
+                    return False
+                if sha and path.stat().st_size <= 16 << 20:
+                    if _file_sha256(path) != sha:
+                        return False
+                elif head:
+                    with open(path, "rb") as fh:
+                        if _sha256(fh.read(4096)) != head:
+                            return False
+            except OSError:
+                return False
+        return True
+
+    def _delete_duplicates(self, rel_out: Path, root: Path,
+                           protected=lambda p: False,
+                           quiet: bool = False) -> int:
+        """Remove loose files under `root` that are byte-identical to a file
+        this release's rebuild just wrote — the nfo, diz, sfv, cue, jpg that
+        came out of the unpacked archive and that the rebuild restored from
+        the .rsr anyway. Files removed.
+
+        Identical means size AND sha256, so nothing is lost: the same bytes are
+        in the rebuilt folder and in the .rsr. Never the rebuilt volumes, never
+        anything over 64 MB, never anything under the output folder, and never
+        a file `protected` says another release in this run still needs."""
+        if root is None or not rel_out.is_dir():
+            return 0
+        try:
+            out_res = rel_out.resolve()
+        except OSError:
+            return 0
+        wrote: dict[int, set] = {}
+        for q in rel_out.rglob("*"):
+            try:
+                if (q.is_file() and not _classify_volume(q.name)
+                        and q.stat().st_size <= 64 << 20):
+                    wrote.setdefault(q.stat().st_size, set()).add(
+                        _file_sha256(q))
+            except OSError:
+                continue
+        if not wrote:
+            return 0
+        cache = getattr(self, "_size_map_cache", None)
+        if cache is None:
+            cache = self._size_map_cache = {}
+        key = str(root)
+        if key not in cache:
+            sizes: dict[int, list[Path]] = {}
+            for p in Path(root).rglob("*"):
+                try:
+                    if p.is_file():
+                        sizes.setdefault(p.stat().st_size, []).append(p)
+                except OSError:
+                    continue
+            cache[key] = sizes
+        gone = 0
+        for size, shas in wrote.items():
+            for p in list(cache[key].get(size, [])):
+                try:
+                    rp = p.resolve()
+                    if (not p.is_file() or rp == out_res
+                            or out_res in rp.parents
+                            or _file_sha256(p) not in shas
+                            or protected(p)):
+                        continue
+                    try:
+                        p.unlink()
+                    except PermissionError:
+                        os.chmod(p, stat.S_IWRITE)
+                        p.unlink()
+                    cache[key][size].remove(p)
+                    gone += 1
+                    parent = p.parent
+                    if (parent.resolve() != Path(root).resolve()
+                            and not any(parent.iterdir())):
+                        parent.rmdir()
+                except (OSError, ValueError):
+                    continue
+        if gone and not quiet:
+            self._log(f"    🗑 {gone} leftover file(s) in the content folder "
+                      "were byte-identical to what was just rebuilt — "
+                      "removed.", "dim")
+        return gone
 
     def _delete_consumed(self, out: Path) -> int:
         """Delete the content files this release was rebuilt FROM. Bytes freed.
