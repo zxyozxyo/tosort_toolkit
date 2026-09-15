@@ -33,6 +33,7 @@ import csv
 import json
 import time
 import zlib
+import stat
 import struct
 import shutil
 import base64
@@ -6966,6 +6967,9 @@ class RsrToolAPI:
                            with_meta: bool = True):
         self._log("══ BATCH REBUILD ══", "info")
         self._content_root = root
+        # A re-run in the same session must see files added since the last one
+        # (the single-release path already cleared this; the batch never did).
+        self._size_map_cache = {}
         freed = 0
         if delete_content:
             self._log("  DELETE SOURCES is ON — an unpacked file will be "
@@ -7267,7 +7271,14 @@ class RsrToolAPI:
                               "inside the output folder.", "warn")
                     continue
                 size = src.stat().st_size
-                src.unlink()
+                try:
+                    src.unlink()
+                except PermissionError:
+                    # READONLY, as a lot of old scene dumps still are
+                    # (INF-DV2.BIN, Oct 2000): Windows refuses to unlink one.
+                    # It was verified and the operator asked for it gone.
+                    os.chmod(src, stat.S_IWRITE)
+                    src.unlink()
                 freed += size
                 self._log(f"    🗑 deleted source {src.name} "
                           f"({_human_bytes(size)}) — it is inside the "
@@ -7711,25 +7722,40 @@ class RsrToolAPI:
         want_crc = f.get("crc32")
         if not want_size or want_crc is None:
             return None
-        key = str(content)
+        # The batch hands each release the folder its MATCHED file sits in.
+        # A multi-disc release unpacked as CD1/ and CD2/ matched on CD1's image
+        # and then looked for CD2's only inside CD1/ -- 5 "missing source"
+        # failures on 2026-09-15 whose files were all on disk (pdi-aid2.bin in
+        # pdi-aid2/, CD2/pdx-csd2.ppf, peer-ffixb..d.bin). Fall back to the
+        # root the operator actually chose.
+        roots = [content]
+        root = self._content_root
+        if root is not None and Path(root) != Path(content):
+            try:
+                Path(content).resolve().relative_to(Path(root).resolve())
+                roots.append(Path(root))
+            except (ValueError, OSError):
+                pass
         cache = getattr(self, "_size_map_cache", None)
         if cache is None:
             cache = self._size_map_cache = {}
-        if key not in cache:
-            sizes: dict[int, list[Path]] = {}
-            for p in content.rglob("*"):
+        for where in roots:
+            key = str(where)
+            if key not in cache:
+                sizes: dict[int, list[Path]] = {}
+                for p in where.rglob("*"):
+                    try:
+                        if p.is_file():
+                            sizes.setdefault(p.stat().st_size, []).append(p)
+                    except OSError:
+                        continue
+                cache[key] = sizes
+            for p in cache[key].get(want_size, []):
                 try:
-                    if p.is_file():
-                        sizes.setdefault(p.stat().st_size, []).append(p)
+                    if _file_crc32(p) == want_crc:
+                        return p
                 except OSError:
                     continue
-            cache[key] = sizes
-        for p in cache[key].get(want_size, []):
-            try:
-                if _file_crc32(p) == want_crc:
-                    return p
-            except OSError:
-                continue
         return None
 
     def _restore_damaged(self, manifest, z, out: Path):
