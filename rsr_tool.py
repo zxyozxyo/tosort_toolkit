@@ -44,7 +44,7 @@ import platform
 import threading
 import subprocess
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
 
 import webview
@@ -3266,6 +3266,19 @@ class RsrToolAPI:
                     # "one or more sets unverified", which is the one thing the
                     # operator already knows and none of what they need.
                     set_errors.append(f"{st['stem']}: {res.get('error')}")
+                # A multi-disc release keeps each set in its own CD1/, CD2/...
+                # The sidecars already carried that in their names, the volumes
+                # did not, so a rebuild put every volume at the root beside
+                # three folders holding only an sfv each.
+                where = {p.name: p.parent for p in st.get("volumes", [])
+                         if isinstance(p, Path)}
+                for v in res.get("set", {}).get("volumes", []):
+                    par = where.get(v.get("name"))
+                    if par is not None and par != folder and "folder" not in v:
+                        try:
+                            v["folder"] = par.relative_to(folder).as_posix()
+                        except ValueError:
+                            pass       # a pair's partner: handled just below
                 if pair_origin:
                     for v in res.get("set", {}).get("volumes", []):
                         src = pair_origin.get(v.get("name"))
@@ -6434,7 +6447,11 @@ class RsrToolAPI:
             if not recipe.get("new_numbering"):
                 vol_args.append("-vn")     # .rar/.r00 rather than .partN.rar
         tail = []
-        if recipe.get("rr_pct"):
+        if recipe.get("rr_legacy_pct"):
+            # Only ever set by _legacy_rr_recipes, to reproduce the command a
+            # pre-2026-09-09 capture really built its delta against.
+            tail.append(f"-rr{int(recipe['rr_legacy_pct'])}p")
+        elif recipe.get("rr_pct"):
             # Plain -rr by default: it is what the scene typed, and only
             # the default SCALES the short last volume down (2.70 gives
             # 307/108 where an explicit -rr307 gives 307/307). The exact
@@ -6598,21 +6615,56 @@ class RsrToolAPI:
                 # taking the default.
                 if recipe.get("rr_sectors"):
                     cands.append(dict(recipe, rr_exact=True))
-                for cand in cands:
+                # Each candidate packs into its OWN folder. They used to share
+                # work/replay, which _replay wipes first -- so a walk that found
+                # nothing left `produced` pointing at the LAST candidate's
+                # volumes, the delta was built against those, and the recipe
+                # still named the original command. Capture said VERIFIED and
+                # every rebuild failed. Hidden_and_Dangerous_PAL_SPANISH: patch
+                # built on -rr177, recipe replays -rr. See _legacy_rr_recipes
+                # for the .rsr files already written that way.
+                last = None
+                for ci, cand in enumerate(cands):
                     name = cand["exe"]
-                    alt = self._replay(cand, src_files, work, comment,
+                    cwork = work / f"rrwalk{ci}"
+                    alt = self._replay(cand, src_files, cwork, comment,
                                        st["format"], base=base)
-                    if alt and sum(p.stat().st_size for p in alt) == want:
-                        self._log(f"    the recovery record came back wrong "
-                                  f"for {_exe_label(recipe['exe'])}; "
-                                  f"{_exe_label(name)} makes it exactly — "
-                                  "same streams, different -rr default.",
+                    if not (alt and sum(p.stat().st_size for p in alt) == want):
+                        if ci == len(cands) - 1:
+                            last = (cand, alt)
+                        else:
+                            _rmtree(cwork)   # a full set per candidate
+                        continue
+                    self._log(f"    the recovery record came back wrong "
+                              f"for {_exe_label(recipe['exe'])}; "
+                              f"{_exe_label(name)} makes it exactly — "
+                              "same streams, different -rr default.",
+                              "dim")
+                    recipe["exe"] = name
+                    recipe["version"] = _exe_label(name)
+                    recipe["rr_exact"] = cand.get("rr_exact", False)
+                    produced = alt
+                    break
+                else:
+                    # Nothing matched. The last candidate is still the one to
+                    # patch from: it is -rr<N>, the recovered count, and on
+                    # Hidden_and_Dangerous plain -rr came out too far off for
+                    # a delta at all while -rr177 needed 38 KB. What was wrong
+                    # before was never the choice, only that the recipe did not
+                    # say so -- so say so.
+                    if last and last[1]:
+                        cand = last[0]
+                        self._log(f"    no build reproduces the recovery "
+                                  f"record's size; patching from "
+                                  + (f"-rr{recipe.get('rr_sectors')}"
+                                     if cand.get("rr_exact") else
+                                     _exe_label(cand["exe"]))
+                                  + ", and the recipe replays the same.",
                                   "dim")
-                        recipe["exe"] = name
-                        recipe["version"] = _exe_label(name)
+                        recipe["exe"] = cand["exe"]
+                        recipe["version"] = _exe_label(cand["exe"])
                         recipe["rr_exact"] = cand.get("rr_exact", False)
-                        produced = alt
-                        break
+                        produced = last[1]
         if not produced:
             # Distinct from "the bytes differ": the replay command itself did
             # not deliver. Reported identically, this cost an hour of hunting a
@@ -7404,6 +7456,7 @@ class RsrToolAPI:
             out.mkdir(parents=True, exist_ok=True)
             work = Path(tempfile.mkdtemp(prefix="rsr-rb-", dir=self._work_root()))
             ok_all = True
+            self._infer_set_folders(manifest, z)
             try:
                 for st in manifest.get("sets", []):
                     if self._stop.is_set():
@@ -7552,26 +7605,100 @@ class RsrToolAPI:
             self._restore_extras(st, z, out)
             return True
 
-        if len(produced) != len(vols):
-            self._log(f"    ✗ replay made {len(produced)} volume(s), expected "
-                      f"{len(vols)}.", "err")
+        fail = self._write_replayed(produced, vols, z, out)
+        if fail:
+            # A capture whose recovery-record walk found nothing built its
+            # delta against the walk's LAST candidate, not the command the
+            # recipe names. Replay that one before calling the set lost; the
+            # sha256 check below is the same, so it can only ever succeed on
+            # the true bytes.
+            for cand, why in self._legacy_rr_recipes(recipe):
+                flat = not keep_paths or cand.get("rr_legacy_flat")
+                alt = self._replay(cand, srcs, setwork, comment, st["format"],
+                                   base=None if flat else srcdir)
+                if alt and not self._write_replayed(alt, vols, z, out):
+                    self._log(f"    · the capture's delta was built against "
+                              f"{why}, not the recipe's own command — "
+                              "replayed that instead.", "dim")
+                    fail = None
+                    break
+        if fail:
+            self._log(fail, "err")
             return False
-        for p, v in zip(produced, vols):
-            data = p.read_bytes()
-            if v.get("delta"):
-                data = apply_delta(data, z.read(v["delta"]))
-            if _sha256(data) != v["sha256"]:
-                self._log(f"    ✗ {v['name']}: hash mismatch after replay "
-                          f"({self._mismatch_hint(data, v)}).", "err")
-                return False
-            dst = out / v.get("folder", "") / v["name"]
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(data)
         self._log(f"    ✓ {len(vols)} volume(s) rebuilt, every one hash-exact.",
                   "ok")
 
         self._restore_extras(st, z, out)
         return True
+
+    def _write_replayed(self, produced, vols, z, out: Path) -> str | None:
+        """Patch, hash-check and write each replayed volume. None when every
+        one is exact, else the first failure's log line."""
+        if len(produced) != len(vols):
+            return (f"    ✗ replay made {len(produced)} volume(s), expected "
+                    f"{len(vols)}.")
+        for p, v in zip(produced, vols):
+            data = p.read_bytes()
+            if v.get("delta"):
+                data = apply_delta(data, z.read(v["delta"]))
+            if _sha256(data) != v["sha256"]:
+                return (f"    ✗ {v['name']}: hash mismatch after replay "
+                        f"({self._mismatch_hint(data, v)}).")
+            dst = out / v.get("folder", "") / v["name"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+        return None
+
+    def _legacy_rr_recipes(self, recipe: dict) -> list[tuple[dict, str]]:
+        """The command an older capture REALLY built its delta against.
+
+        _verify_replay's recovery-record walk used to pack every candidate into
+        the one replay folder. When none matched, the volumes left on disk were
+        the last candidate's, and the delta was taken against those while the
+        recipe kept its original command — so it verified at capture and could
+        never rebuild. Measured 2026-09-15: 59 of 62 PSX rebuild failures with
+        a pre-fix recovery record, plus ~20 more after it.
+
+          before a02d58f (no rr_sectors): walked -rr1p..-rr10p, ends -rr10p
+                                          (-rr5p when the recipe was already 10)
+          after it:                       walked sibling builds, then this build
+                                          with -rr<N>; ends on -rr<N>
+
+        A walk that SUCCEEDED rewrote the recipe to match, so this only ever
+        reproduces the failed-walk case."""
+        # Any walk that ended honestly -- a match, or (since the fix) a
+        # recorded last candidate -- wrote rr_exact. Its presence means the
+        # recipe already names the command the delta was built on.
+        if not recipe.get("rr_pct") or "rr_exact" in recipe:
+            return []
+        if self.DOS_MARK in [str(x) for x in (recipe.get("mc") or [])]:
+            return []                # the DOS replay never took these switches
+        out = []
+        if "rr_sectors" not in recipe:
+            last = 5 if int(recipe["rr_pct"]) == 10 else 10
+            # That walk also called _replay WITHOUT base=, so for an archive
+            # that stores paths its last candidate packed FLAT names (-ep) --
+            # Rc_de_Go_JAP-PARADOX packs rc/pdxrcg.bin, its delta is on
+            # pdxrcg.bin. base= reached the walk in the same commit as
+            # rr_sectors. The rebuild reads rr_legacy_flat.
+            out.append((dict(recipe, rr_legacy_pct=last, rr_legacy_flat=True),
+                        f"-rr{last}p"
+                        + (" with flat names" if recipe.get("keep_paths")
+                           else "")))
+        n = int(recipe.get("rr_sectors") or 0)
+        if n:
+            out.append((dict(recipe, rr_exact=True), f"-rr{n}"))
+            return out
+        # No sector count: the new walk ended on the last sibling build. Also
+        # tried for a recipe with no rr_sectors key at all, because a GUI that
+        # was still running pre-a02d58f code wrote those after the commit.
+        fam = _exe_number(recipe["exe"])
+        sibs = [e.name for e in self._pack_exes()
+                if _exe_number(e.name) == fam and e.name != recipe["exe"]][:8]
+        if sibs:
+            out.append((dict(recipe, exe=sibs[-1], version=_exe_label(sibs[-1])),
+                        _exe_label(sibs[-1])))
+        return out
 
     def _source_by_hash(self, content: Path, f: dict) -> Path | None:
         """The file in `content` whose bytes ARE this packed file, whatever it
@@ -7660,13 +7787,66 @@ class RsrToolAPI:
     @staticmethod
     def _restore_extras(st, z, out: Path):
         """Archive-only files belong in the rebuilt release folder too, not
-        only inside the archive we just made."""
+        only inside the archive we just made — beside the set's own volumes,
+        so a CD2 cue lands in CD2/."""
+        vols = st.get("volumes") or [{}]
+        home = out / vols[0].get("folder", "")
         for f in st["files"]:
             if not f.get("stored"):
                 continue
-            dst = out / Path(f["name"]).name
+            dst = home / Path(f["name"]).name
             if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(z.read(f["stored"]))
+
+    @staticmethod
+    def _infer_set_folders(manifest: dict, z) -> None:
+        """Put a set captured before volumes recorded their folder back in the
+        subfolder it came from (CD1/, CD2/ ...), in memory only.
+
+        The evidence is the release's own sfv: the sidecars always carried
+        their folder in the name, and a set's sfv lists its volumes. A set is
+        moved only when exactly one folder's sfv names its first volume, so a
+        flat release — or an sfv at the root — leaves it where it was.
+
+        Not for a joined pair (a RARFIX beside its release): capture already
+        foldered those volume by volume, and both folders' sfv list the same
+        names, so there is nothing an sfv could add."""
+        if manifest.get("pair"):
+            return
+        sets = [st for st in manifest.get("sets", [])
+                if st.get("volumes")
+                and not any(v.get("folder") for v in st["volumes"])]
+        if not sets:
+            return
+        listed: dict[str, set] = {}     # lower-case volume name -> folders
+        for f in manifest.get("sidecars", []):
+            path = PurePosixPath(f"{f.get('folder') or ''}/{f['name']}"
+                                 .replace("\\", "/").strip("/"))
+            if path.suffix.lower() != ".sfv" or not f.get("stored"):
+                continue
+            try:
+                text = z.read(f["stored"]).decode("latin-1")
+            except Exception:
+                continue
+            here = "" if str(path.parent) == "." else str(path.parent)
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith(";"):
+                    continue
+                entry = PurePosixPath(line.rsplit(None, 1)[0]
+                                      .replace("\\", "/")
+                                      if " " in line else line)
+                sub = "" if str(entry.parent) == "." else str(entry.parent)
+                fold = "/".join(x for x in (here, sub) if x)
+                listed.setdefault(entry.name.lower(), set()).add(fold)
+        for st in sets:
+            homes = listed.get(st["volumes"][0]["name"].lower(), set())
+            if len(homes) == 1:
+                (fold,) = homes
+                if fold:
+                    for v in st["volumes"]:
+                        v["folder"] = fold
 
     @staticmethod
     def _mismatch_hint(data: bytes, vol: dict) -> str:
