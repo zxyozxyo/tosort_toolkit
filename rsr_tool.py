@@ -449,15 +449,59 @@ def _set_win_attrs(path: Path, attrs: int | None):
     volume one differs; with the real attributes, it matches.
 
     READONLY is safe to set: _rmtree already clears it, which is precisely why
-    that helper exists."""
+    that helper exists.
+
+    SPARSE_FILE (0x200) cannot be set this way at all, and rar's own
+    extraction does not restore it either — DoukutsuPSX_Cave_Story-CONSOLEMAGiC
+    was packed from a sparse ISO (header attrs 0x0220), so all 5,232 combos of
+    its sweep failed on "volume one's header did not match" while rar 6.24 -m3
+    reproduced it exactly from a sparse copy. It is set first, with its own
+    FSCTL, because the handle needs write access that READONLY would refuse."""
     if os.name != "nt" or not attrs:
         return
+    if int(attrs) & 0x200:
+        _set_sparse(path)
     try:
         import ctypes
         ctypes.windll.kernel32.SetFileAttributesW(
             str(path), int(attrs) & _SETTABLE_ATTRS)
     except Exception:
         pass
+
+
+def _set_sparse(path: Path) -> bool:
+    """Mark a file sparse (FSCTL_SET_SPARSE), keeping its timestamps — rar
+    writes the modification time into the header too. True on success."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        st = os.stat(path)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                    wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE]
+        # clear READONLY for the moment it takes; the caller re-applies attrs
+        cur = k32.GetFileAttributesW(str(path))
+        if cur != 0xFFFFFFFF and cur & 0x1:
+            k32.SetFileAttributesW(str(path), cur & ~0x1)
+        h = k32.CreateFileW(str(path), 0xC0000000, 0x7, None, 3, 0, None)
+        if h in (None, wintypes.HANDLE(-1).value):
+            return False
+        try:
+            got = wintypes.DWORD(0)
+            ok = bool(k32.DeviceIoControl(wintypes.HANDLE(h), 0x000900C4,
+                                          None, 0, None, 0,
+                                          ctypes.byref(got), None))
+        finally:
+            k32.CloseHandle(wintypes.HANDLE(h))
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        return ok
+    except Exception:
+        return False
 
 
 def _rmtree(path: Path):
@@ -2455,6 +2499,10 @@ class RsrToolAPI:
 
     # ── the DOS line (see the module note on _try_dos_combo) ───────────────
     DOS_MARK = "__DOS__"
+    # The prefix probe's rejection. It compares volume one's compressed BYTES;
+    # it was labelled "volume one's header did not match", which pointed at the
+    # archive layout when the cause was compression (see _log_best_partial).
+    PREFIX_DIVERGED = "volume one's compressed data diverged"
 
     def _dos_exes(self) -> list[Path]:
         """RAR for DOS builds, newest-looking last. Empty when DOSBox is not
@@ -4532,6 +4580,16 @@ class RsrToolAPI:
             return {"ok": False,
                     "error": f"source locked after extraction: {locked[0]}"}
 
+        # The one attribute rar's extraction never restores. See _set_sparse.
+        sparse = [sp for f, sp in zip(meta, src_files)
+                  if str(f.get("host_os", "")).lower().startswith("win")
+                  and int(f.get("attrs") or 0) & 0x200 and _set_sparse(sp)]
+        if sparse:
+            self._log(f"    {len(sparse)} source(s) were packed from sparse "
+                      f"files (attribute 0x200) — marked sparse so the header "
+                      f"can match: {', '.join(p.name for p in sparse[:3])}",
+                      "dim")
+
         # The timestamp rar.exe just restored is the one that will be written
         # back into the header, at full 100 ns resolution. Record THAT rather
         # than the header's own 2-second DOS field: it is the exact input the
@@ -5661,7 +5719,7 @@ class RsrToolAPI:
                     pass
             if bad:
                 self._tally_reject(
-                    "volume one's header did not match" if verdict is False
+                    self.PREFIX_DIVERGED if verdict is False
                     else "the end block did not match"
                     if (end_sig is not None
                         and end_block_sig(head) != end_sig)
@@ -6266,6 +6324,7 @@ class RsrToolAPI:
         # from 26 reads like a search that barely happened, when in fact the
         # whole space is now covered — which is exactly what makes the wall
         # that follows trustworthy.
+        self._tl.sweep_max_mt = max_mt
         self._log(f"    swept {start + tried:,} combo(s) across {len(exes)} "
                   f"build(s) × -mt 0–{max_mt}"
                   + (f" ({tried:,} this run, {start:,} carried over)"
@@ -8826,11 +8885,25 @@ class RsrToolAPI:
                 if struct:
                     top = sorted(struct.items(), key=lambda kv: -kv[1])[:3]
                     lead = ", ".join(f"{w} ({c:,})" for w, c in top)
+                    # The prefix probe compares compressed BYTES, so when that
+                    # dominates it is a compression difference, and "more
+                    # builds cannot fix it" was exactly the wrong advice: on
+                    # DoukutsuPSX_Cave_Story all 5,232 were this, labelled a
+                    # header mismatch, and the answer was -mt32 with a max_mt
+                    # of 16.
+                    if top[0][0] == self.PREFIX_DIVERGED:
+                        why = ("that is a COMPRESSION difference — a build, "
+                               "thread count or switch the sweep did not try "
+                               f"(it went up to -mt{getattr(self._tl, 'sweep_max_mt', '?')}; "
+                               "a packer with more cores needs a higher "
+                               "max_mt)")
+                    else:
+                        why = ("sweeping more builds cannot fix those; the "
+                               "mismatch is in how the archive is laid out, "
+                               "not how it is compressed")
                     self._log(f"      no combo reached the stream comparison — "
-                              f"{n_s:,} were rejected on structure. Dominant "
-                              f"reason(s): {lead}. Sweeping more builds cannot "
-                              f"fix those; the mismatch is in how the archive "
-                              f"is laid out, not how it is compressed.", "warn")
+                              f"{n_s:,} were rejected before it. Dominant "
+                              f"reason(s): {lead}. {why}.", "warn")
                 if not struct:
                     self._log("      no combo reached the stream comparison, "
                               "and none was rejected on structure either — "
