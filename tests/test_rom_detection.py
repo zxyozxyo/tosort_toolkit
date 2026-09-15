@@ -188,7 +188,7 @@ EXPECT = [
     ('WII/galaxy.rvz',      'WII',  'RVZ',       'zstd-19-128k'),
     ('GC/melee.ciso',       'GC',   'CISO',      'nkit'),
     ('PSP/game.cso',        'PSP',  'CSO',       'compressed'),
-    ('PSP/EBOOT.PBP',       'PSP',  'EBOOT.PBP', 'encrypted'),
+    ('PSP/EBOOT.PBP',       'PSX',  'EBOOT.PBP', 'encrypted'),   # PSISOIMG = PS one Classic
     ('PSP/title.pkg',       'PSP',  'PKG',       'encrypted'),
     ('PSP/umd.iso',         'PSP',  'ISO',       'plain'),
     ('ARCHIVE/pack.zip',    'ARCHIVE', 'ZIP',    None),

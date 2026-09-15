@@ -7,6 +7,9 @@ import sys, hashlib, os, struct, shutil
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import rom_tools as rt
+import tempfile as _tempfile
+# stripping headers teaches the header library; keep test fixtures out of the real one
+rt.HEADER_LIBRARY_DIR = Path(_tempfile.mkdtemp(prefix='romtest_headers_'))
 
 ROOT = Path(os.environ.get('TEMP', '.')) / 'romconvert'
 shutil.rmtree(ROOT, ignore_errors=True)

@@ -560,14 +560,18 @@ def _detect_pbp(buf, path, fh):
         return None
     psar_off = _u32le(buf, 0x24)
     kind = _read_at(buf, fh, psar_off, 8)
+    if kind == b'NPUMDIMG':
+        return _result('PSP', 'EBOOT.PBP', 'encrypted', confidence='high',
+                       detail='PSN PSP game (NPUMDIMG)',
+                       conversions=['psp:pbp->iso'])
     if kind == b'PSISOIMG':
-        return _result('PSP', 'EBOOT.PBP', 'encrypted', confidence='high',
-                       detail='PSN PSP game (PSISOIMG)',
-                       conversions=['psp:pbp->iso'])
+        return _result('PSX', 'EBOOT.PBP', 'encrypted', confidence='high',
+                       detail='PS one Classic (PSISOIMG)',
+                       conversions=['psx:pbp->bin'])
     if kind == b'PSTITLEI':
-        return _result('PSP', 'EBOOT.PBP', 'encrypted', confidence='high',
-                       detail='PSN multi-disc title (PSTITLEIMG)',
-                       conversions=['psp:pbp->iso'])
+        return _result('PSX', 'EBOOT.PBP', 'encrypted', confidence='high',
+                       detail='PS one Classic, multi-disc (PSTITLEIMG)',
+                       conversions=['psx:pbp->bin'])
     return _result('PSP', 'PBP', 'plain', confidence='medium',
                    detail='PBP container (homebrew or unencrypted)',
                    conversions=[])
@@ -1299,15 +1303,6 @@ def _build_registry():
             'requires': need, 'why': KEY_FILES[need][1],
         }
 
-    for cid, label in (
-        ('psp:pbp->iso', 'PSP: EBOOT.PBP -> ISO'),
-        ('psp:dax->iso', 'PSP: DAX -> ISO'),
-        ('psp:jso->iso', 'PSP: JSO -> ISO'),
-    ):
-        reg[cid] = {'label': label, 'engine': ENGINE_KEYED, 'system': 'PSP',
-                    'ext': '.iso', 'fn': None, 'requires': 'psp_keys',
-                    'why': 'PSN content decryption is not implemented yet.'}
-
     for system in ('gc', 'wii'):
         for a in DISC_TARGETS[system.upper()]:
             for b in DISC_TARGETS[system.upper()]:
@@ -1618,6 +1613,40 @@ class RomToolsAPI:
             by_engine[spec['engine']]['available'] += bool(st['available'])
         return {'keys': keys, 'tools': tools, 'engines': by_engine,
                 'romtools_dir': str(ROMTOOLS_DIR)}
+
+    def start_learn_headers(self, folder):
+        """Teach the header library from a folder of headered dumps (zips too)."""
+        if self._busy:
+            return {'ok': False, 'error': 'already running'}
+        if not folder or not Path(folder).is_dir():
+            return {'ok': False, 'error': 'pick a folder of headered dumps first'}
+        self._stop.clear()
+        self._busy = True
+
+        def work():
+            try:
+                self._log(f'Learning headers from {folder} ...', 'info')
+
+                def progress(done, total, current):
+                    self._emit('scan_progress', {'done': done, 'total': total, 'current': current})
+
+                counts = learn_headers_from_folder(folder, progress, self._stop.is_set)
+                for kind, c in counts.items():
+                    if c['seen']:
+                        self._log(f'{HEADER_KINDS[kind][4]}: {c["seen"]} headered file(s), '
+                                  f'{c["new"]} new header(s) learned '
+                                  f'({len(header_library(kind))} known)', 'ok')
+                if not any(c['seen'] for c in counts.values()):
+                    self._log('No A78, LNX or 2IMG headers found in that folder.', 'warn')
+                self._emit('catalog_changed', {})
+            except Exception as e:
+                self._log(f'Learning headers failed: {type(e).__name__}: {e}', 'err')
+            finally:
+                self._busy = False
+                self._emit('idle', {})
+
+        threading.Thread(target=work, daemon=True).start()
+        return {'ok': True}
 
     def system_catalog(self):
         """The information view: every system, what it converts, what it needs."""
@@ -7540,6 +7569,475 @@ CONVERSIONS['apple:dsk->nib'] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PSP / PS one Classics EBOOT.PBP, and the DAX and JSO compressed ISOs
+#
+#  A standalone EBOOT.PBP is the same file a PSN package carries, so it goes
+#  through the engines already proven on PKGs: NPUMDIMG -> UMD ISO, PSISOIMG /
+#  PSTITLEIMG -> Redump-style bin/cue. A small reader serves the file where the
+#  engines expect a package item.
+#
+#  DAX (Dark_AleX) and JSO (Uncle Jam) are old PSP compressed-ISO containers.
+#  Layouts follow maxcso's DAX reader/writer and ARK-4's Inferno reader for
+#  both. JSO's LZO1X blocks use a port of minilzo, proven against real lzop
+#  output. JSO keeps an MD5 of the original image in its header, which the
+#  verifier checks.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _PbpFile:
+    """A file on disk that answers like a PKG item (item_bytes / size)."""
+
+    def __init__(self, path):
+        self.f = open(path, 'rb')
+        self.size = os.path.getsize(path)
+        self.item = {'size': self.size, 'name': Path(path).name}
+
+    def item_bytes(self, it, offset=0, size=None):
+        size = self.size - offset if size is None else size
+        self.f.seek(offset)
+        return self.f.read(size)
+
+    def close(self):
+        self.f.close()
+
+
+def _pbp_psar_magic(pbp):
+    head = pbp.item_bytes(pbp.item, 0, 0x28)
+    if head[:4] != b'\x00PBP':
+        raise ConversionError('not a PBP file')
+    psar = struct.unpack_from('<I', head, 0x24)[0]
+    return pbp.item_bytes(pbp.item, psar, 12)
+
+
+def pbp_to_iso(src, dst, progress=None):
+    pbp = _PbpFile(src)
+    try:
+        if _pbp_psar_magic(pbp)[:8] != b'NPUMDIMG':
+            raise ConversionError('this EBOOT.PBP is not a PSP game (no NPUMDIMG) - '
+                                  'PS one Classics use the PBP -> bin/cue conversion')
+        return _npumdimg_to_iso(pbp, pbp.item, dst, progress)
+    finally:
+        pbp.close()
+
+
+def pbp_to_psx_bin(src, dst, progress=None):
+    pbp = _PbpFile(src)
+    try:
+        if _pbp_psar_magic(pbp)[:8] not in (b'PSISOIMG', b'PSTITLEI'):
+            raise ConversionError('this EBOOT.PBP is not a PS one Classic (no PSISOIMG)')
+        res = psx_classic_to_bin(pbp, pbp.item, dst, progress)
+        if res is None:
+            raise ConversionError('no disc image found in the PBP')
+        return res
+    finally:
+        pbp.close()
+
+
+def lzo1x_decompress(src, out_len=None):
+    src = bytes(src)
+    n = len(src)
+    out = bytearray()
+    ip = 0
+
+    def need(k):
+        if ip + k > n:
+            raise ConversionError('LZO block is truncated')
+
+    def ext(t, base):
+        nonlocal ip
+        while True:
+            need(1)
+            if src[ip] != 0:
+                break
+            t += 255
+            ip += 1
+        t += base + src[ip]
+        ip += 1
+        return t
+
+    def copy_match(dist, length):
+        start = len(out) - dist
+        if start < 0:
+            raise ConversionError('LZO block refers back past its start')
+        if dist >= length:
+            out.extend(out[start:start + length])
+        else:
+            for k in range(length):
+                out.append(out[start + k])
+
+    def literals(t):
+        nonlocal ip
+        need(t)
+        out.extend(src[ip:ip + t])
+        ip += t
+
+    state = 'start'
+    t = 0
+    need(1)
+    if src[0] > 17:
+        t = src[0] - 17
+        ip = 1
+        literals(t)
+        state = 'first_literal_run' if t >= 4 else 'match_next_token'
+    while True:
+        if state == 'start':
+            need(1)
+            t = src[ip]
+            ip += 1
+            if t >= 16:
+                state = 'match'
+            else:
+                if t == 0:
+                    t = ext(t, 15)
+                literals(t + 3)
+                state = 'first_literal_run'
+            continue
+        if state == 'first_literal_run':
+            need(1)
+            t = src[ip]
+            ip += 1
+            if t >= 16:
+                state = 'match'
+                continue
+            need(1)
+            dist = 1 + 0x0800 + (t >> 2) + (src[ip] << 2)
+            ip += 1
+            copy_match(dist, 3)
+            state = 'match_done'
+            continue
+        if state == 'match_next_token':
+            need(1)
+            t = src[ip]
+            ip += 1
+            state = 'match'
+            continue
+        if state == 'match':
+            if t >= 64:                                   # M2
+                need(1)
+                dist = 1 + ((t >> 2) & 7) + (src[ip] << 3)
+                ip += 1
+                copy_match(dist, (t >> 5) - 1 + 2)
+            elif t >= 32:                                 # M3
+                t &= 31
+                if t == 0:
+                    t = ext(t, 31)
+                need(2)
+                dist = 1 + ((src[ip] | (src[ip + 1] << 8)) >> 2)
+                ip += 2
+                copy_match(dist, t + 2)
+            elif t >= 16:                                 # M4 / end of stream
+                dist = (t & 8) << 11
+                t &= 7
+                if t == 0:
+                    t = ext(t, 7)
+                need(2)
+                dist += (src[ip] | (src[ip + 1] << 8)) >> 2
+                ip += 2
+                if dist == 0:
+                    break                                 # end-of-stream marker
+                copy_match(dist + 0x4000, t + 2)
+            else:                                         # M1 (after a match)
+                need(1)
+                dist = 1 + (t >> 2) + (src[ip] << 2)
+                ip += 1
+                copy_match(dist, 2)
+            state = 'match_done'
+            continue
+        if state == 'match_done':
+            t = src[ip - 2] & 3
+            if t == 0:
+                state = 'start'
+            else:
+                literals(t)
+                state = 'match_next_token'
+            continue
+    if ip != n:
+        raise ConversionError(f'{n - ip} bytes left after end marker' if ip < n else 'input overrun')
+    if out_len is not None and len(out) != out_len:
+        raise ConversionError(f'decompressed to {len(out)} bytes, expected {out_len}')
+    return bytes(out)
+
+
+DAX_FRAME = 0x2000
+
+
+def dax_to_iso(src, dst, progress=None):
+    with open(src, 'rb') as f:
+        head = f.read(32)
+        if head[:4] != b'DAX\x00':
+            raise ConversionError('not a DAX file')
+        total, version, nc_count = struct.unpack_from('<III', head, 4)
+        if version > 1:
+            raise ConversionError(f'DAX version {version} is not supported')
+        frames = (total + DAX_FRAME - 1) // DAX_FRAME
+        index = struct.unpack(f'<{frames}I', f.read(4 * frames))
+        sizes = struct.unpack(f'<{frames}H', f.read(2 * frames))
+        stored = set()
+        if version >= 1:
+            for _ in range(nc_count):
+                start, count = struct.unpack('<II', f.read(8))
+                stored.update(range(start, start + count))
+        with open(dst, 'wb') as fo:
+            for n in range(frames):
+                want = min(DAX_FRAME, total - n * DAX_FRAME)
+                f.seek(index[n])
+                blob = f.read(sizes[n])
+                if n in stored:
+                    data = blob[:want]
+                else:
+                    try:
+                        data = zlib.decompress(blob)
+                    except zlib.error as e:
+                        raise ConversionError(f'DAX frame {n} does not inflate: {e}')
+                if len(data) < want:
+                    raise ConversionError(f'DAX frame {n} is {len(data)} bytes, expected {want}')
+                fo.write(data[:want])
+                if progress and n % 256 == 0:
+                    progress(n, frames, 'inflating DAX')
+    return {'frames': frames}
+
+
+JSO_HEADER = 0x30
+
+
+def _jso_header(head):
+    if head[:4] != b'JISO':
+        raise ConversionError('not a JSO file')
+    block_size = struct.unpack_from('<H', head, 6)[0]
+    block_headers, method = head[8], head[10]
+    total = struct.unpack_from('<I', head, 12)[0]
+    if not block_size or block_size & (block_size - 1):
+        raise ConversionError(f'JSO block size {block_size} is not a power of two')
+    if method not in (0, 1):
+        raise ConversionError(f'unknown JSO compression method {method}')
+    return block_size, block_headers, method, total, bytes(head[16:32])
+
+
+def jso_to_iso(src, dst, progress=None):
+    with open(src, 'rb') as f:
+        block_size, block_headers, method, total, md5 = _jso_header(f.read(JSO_HEADER))
+        blocks = (total + block_size - 1) // block_size
+        index = struct.unpack(f'<{blocks + 1}I', f.read(4 * (blocks + 1)))
+        skip = 4 if block_headers else 0
+        with open(dst, 'wb') as fo:
+            for n in range(blocks):
+                want = min(block_size, total - n * block_size)
+                start, end = index[n] & 0x7FFFFFFF, index[n + 1] & 0x7FFFFFFF
+                f.seek(start + skip)
+                blob = f.read(end - start - skip)
+                if len(blob) == block_size:
+                    data = blob                                  # stored block
+                elif method == 0:
+                    data = lzo1x_decompress(blob)
+                else:
+                    try:
+                        data = zlib.decompress(blob, -15)
+                    except zlib.error:
+                        try:
+                            data = zlib.decompress(blob)         # zlib-wrapped variant
+                        except zlib.error as e:
+                            raise ConversionError(f'JSO block {n} does not inflate: {e}')
+                if len(data) < want:
+                    raise ConversionError(f'JSO block {n} is {len(data)} bytes, expected {want}')
+                fo.write(data[:want])
+                if progress and n % 512 == 0:
+                    progress(n, blocks, 'decompressing JSO')
+    return {'blocks': blocks, 'method': 'LZO' if method == 0 else 'deflate'}
+
+
+def _jso_md5_verifier(src, out, progress=None):
+    with open(src, 'rb') as f:
+        md5 = _jso_header(f.read(JSO_HEADER))[4]
+    if not any(md5):
+        return None, 'decompressed; this JSO carries no MD5 to check against'
+    got = hashlib.md5()
+    with open(out, 'rb') as f:
+        for chunk in iter(lambda: f.read(CHUNK), b''):
+            got.update(chunk)
+    if got.digest() == md5:
+        return True, 'matches the MD5 of the original image stored in the JSO header'
+    return None, ('decompressed, but the header MD5 differs - that field is not '
+                  'documented, so this is not treated as a failure')
+
+
+CONVERSIONS['psp:pbp->iso'] = {
+    'label': 'PSP: EBOOT.PBP (PSN game) -> ISO', 'engine': ENGINE_NATIVE,
+    'system': 'PSP', 'ext': '.iso', 'fn': lambda s, d, p=None: pbp_to_iso(s, d, p),
+    'inverse': None, 'verify_mode': 'none',
+    'note': 'The same engine as PSN PKG -> ISO; check the ISO against the PSN (Decrypted) DAT.',
+}
+CONVERSIONS['psx:pbp->bin'] = {
+    'label': 'PS one Classics: EBOOT.PBP -> Redump bin/cue', 'engine': ENGINE_NATIVE,
+    'system': 'PSX', 'ext': '.bin', 'fn': lambda s, d, p=None: pbp_to_psx_bin(s, d, p),
+    'inverse': None, 'verify_mode': 'none',
+    'note': 'Data-only games can match Redump exactly. CD audio is stored as lossy ATRAC3 '
+            'and is not rebuilt, so games with audio tracks will not match.',
+}
+CONVERSIONS['psp:dax->iso'] = {
+    'label': 'PSP: DAX -> ISO (decompress)', 'engine': ENGINE_NATIVE,
+    'system': 'PSP', 'ext': '.iso', 'fn': lambda s, d, p=None: dax_to_iso(s, d, p),
+    'inverse': None, 'verify_mode': 'none',
+    'note': 'Every frame is checked by zlib as it inflates; DAX stores no checksum of the '
+            'whole image, so compare the ISO against a DAT.',
+}
+CONVERSIONS['psp:jso->iso'] = {
+    'label': 'PSP: JSO -> ISO (decompress)', 'engine': ENGINE_NATIVE,
+    'system': 'PSP', 'ext': '.iso', 'fn': lambda s, d, p=None: jso_to_iso(s, d, p),
+    'inverse': None, 'verify_mode': 'verifier', 'verifier': _jso_md5_verifier,
+    'note': 'LZO or deflate blocks. Not yet tested on a real JSO file.',
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEADER LIBRARY  -  Atari 7800 (.a78), Atari Lynx (.lnx), Apple II 2IMG
+#
+#  These headers hold facts the ROM body does not: the title, cart mapper and
+#  controllers of an A78, the name and bank layout of an LNX, the creator and
+#  flags of a 2IMG. None can be computed, and the DATs list only whole-file
+#  hashes. So headers are LEARNED from headered dumps the user already owns and
+#  kept per system, keyed by the SHA-1 of the headerless body: adding a header
+#  back writes the original bytes exactly, and an unknown ROM is refused rather
+#  than given a guessed header. Stripping a header also teaches the library.
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEADER_LIBRARY_DIR = KEYS_DIR / 'header_library'
+HEADER_KINDS = {
+    # kind: (library file, header size, signature check, system, label)
+    'a78': ('a78.tsv', A78_HEADER, lambda h: h[1:10] == b'ATARI7800', 'A7800', 'Atari 7800'),
+    'lnx': ('lnx.tsv', LNX_HEADER, lambda h: h[0:4] == b'LYNX', 'LYNX', 'Atari Lynx'),
+    '2mg': ('2mg.tsv', TWOMG_HEADER, lambda h: h[0:4] == TWOMG_MAGIC, 'APPLE2', 'Apple II 2IMG'),
+}
+for _kind, (_file, _size, _chk, _sys, _label) in HEADER_KINDS.items():
+    KEY_FILES[f'{_kind}_headers'] = (HEADER_LIBRARY_DIR / _file,
+                                     f'{_label} - header library ({_file}); learned from a headered '
+                                     'set with "Learn headers from a folder", or by stripping headers')
+_HEADER_CACHE = {}
+
+
+def header_library(kind):
+    """{body sha1: header bytes} for one kind, cached until the file changes."""
+    path = HEADER_LIBRARY_DIR / HEADER_KINDS[kind][0]
+    stamp = path.stat().st_mtime if path.exists() else None
+    cached = _HEADER_CACHE.get(kind)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    table = {}
+    if path.exists():
+        for line in path.read_text(encoding='utf-8').splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2 and len(parts[0]) == 40:
+                try:
+                    table[parts[0]] = bytes.fromhex(parts[1])
+                except ValueError:
+                    continue
+    _HEADER_CACHE[kind] = (stamp, table)
+    return table
+
+
+def _header_kind_of(header):
+    for kind, (_f, size, check, _s, _l) in HEADER_KINDS.items():
+        if len(header) >= size and check(bytes(header[:size])):
+            return kind
+    return None
+
+
+def learn_header(kind, header, body_sha1, name=''):
+    """Record one header; returns True when it was new."""
+    _f, size, check, _s, _l = HEADER_KINDS[kind]
+    header = bytes(header[:size])
+    if len(header) != size or not check(header):
+        return False
+    table = header_library(kind)
+    if table.get(body_sha1) == header:
+        return False
+    HEADER_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    with open(HEADER_LIBRARY_DIR / HEADER_KINDS[kind][0], 'a', encoding='utf-8') as f:
+        f.write(f'{body_sha1}\t{header.hex()}\t{name.replace(chr(9), " ")}\n')
+    _HEADER_CACHE.pop(kind, None)
+    return True
+
+
+def learn_headers_from_folder(folder, progress=None, should_stop=None):
+    """Walk a folder (loose files and zips, including RomVault zstd zips) and
+    learn every A78 / LNX / 2IMG header found. Returns counts per kind."""
+    import zipfile
+    try:
+        import zipfile_zstd  # noqa: F401 - adds zstd (method 93) to zipfile
+    except ImportError:
+        pass
+    counts = {k: {'seen': 0, 'new': 0} for k in HEADER_KINDS}
+    files = [q for q in Path(folder).rglob('*') if q.is_file()]
+
+    def consider(data, name):
+        kind = _header_kind_of(data[:128])
+        if not kind:
+            return
+        size = HEADER_KINDS[kind][1]
+        counts[kind]['seen'] += 1
+        counts[kind]['new'] += learn_header(kind, data[:size],
+                                           hashlib.sha1(data[size:]).hexdigest(), name)
+
+    for n, q in enumerate(files):
+        if should_stop and should_stop():
+            break
+        try:
+            if q.suffix.lower() == '.zip':
+                with zipfile.ZipFile(q) as z:
+                    for info in z.infolist():
+                        if not info.is_dir() and info.file_size <= 64 * 1024 * 1024:
+                            with z.open(info) as member:
+                                if _header_kind_of(member.read(128)):
+                                    consider(z.read(info), info.filename)
+            elif q.stat().st_size <= 64 * 1024 * 1024:
+                with open(q, 'rb') as f:
+                    if _header_kind_of(f.read(128)):
+                        consider(q.read_bytes(), q.name)
+        except (OSError, zipfile.BadZipFile, NotImplementedError, RuntimeError):
+            continue
+        if progress and n % 50 == 0:
+            progress(n + 1, len(files), q.name)
+    return counts
+
+
+def _strip_and_learn(kind, strip_fn):
+    def run(src, dst, progress=None):
+        header = strip_fn(src, dst, progress)
+        try:
+            learn_header(kind, header, _sha1_file(dst), Path(src).name)
+        except OSError:
+            pass                            # a read-only keys folder must not fail a strip
+        return header
+    return run
+
+
+def _add_from_library(kind, add_fn):
+    def run(src, dst, progress=None):
+        body = _sha1_file(src)
+        header = header_library(kind).get(body)
+        if header is None:
+            label = HEADER_KINDS[kind][4]
+            raise ConversionError(
+                f'no known {label} header for this ROM (body SHA-1 {body[:12]}...) - '
+                'teach the header library from a headered set first')
+        return add_fn(src, dst, header, progress)
+    return run
+
+
+for _kind, (_strip_id, _add_id, _strip_fn, _add_fn) in {
+        'a78': ('a78:headered->headerless', 'a78:headerless->headered', strip_a78_header, add_a78_header),
+        'lnx': ('lnx:headered->headerless', 'lnx:headerless->headered', strip_lnx_header, add_lnx_header),
+        '2mg': ('apple:2mg->raw', 'apple:raw->2mg', strip_2mg_header, add_2mg_header)}.items():
+    _learning_strip = _strip_and_learn(_kind, _strip_fn)
+    CONVERSIONS[_strip_id]['fn'] = lambda s, d, p=None, _f=_learning_strip: _f(s, d, p)
+    CONVERSIONS[_add_id].update({
+        'engine': ENGINE_NATIVE, 'requires': f'{_kind}_headers',
+        'fn': (lambda s, d, p=None, _f=_add_from_library(_kind, _add_fn): _f(s, d, p)),
+        'note': 'Writes the original header, looked up by the ROM\'s SHA-1 in the header '
+                'library; ROMs the library has not seen are refused, never guessed.',
+    })
+    CONVERSIONS[_add_id].pop('why', None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CATALOGUE  -  what each system can do, and what it needs (for the GUI)
 #
 #  The conversion registry says HOW to convert; this says what a person needs to
@@ -7570,10 +8068,11 @@ SYSTEM_NAMES = {
     'GC': ('Nintendo GameCube', 'ISO, CISO and RVZ disc images.'),
     'WII': ('Nintendo Wii', 'ISO, WBFS and RVZ disc images.'),
     'WIIU': ('Nintendo Wii U', 'WUD and compressed WUX images.'),
-    'PSP': ('PlayStation Portable', 'CSO compression and PSN packages - including PS one '
-            'Classics PKGs, which become PlayStation bin/cue.'),
+    'PSP': ('PlayStation Portable', 'CSO, DAX and JSO compression, EBOOT.PBP and PSN packages - '
+            'including PS one Classics PKGs, which become PlayStation bin/cue.'),
     'PSP/PS2': ('PSP / PS2 (ZSO)', 'zstd-compressed ISO containers.'),
     'PS3': ('PlayStation 3', 'Redump disc encryption.'),
+    'PSX': ('PlayStation (PS one Classics)', 'PSN EBOOT.PBP files to Redump-style bin/cue.'),
     'VITA': ('PlayStation Vita', 'PSN packages to NoNpDrm / decrypted folders.'),
     'CD': ('CD images (CHD)', 'Any cue/bin CD image: PlayStation, Saturn, Sega CD, '
            'Dreamcast, PC Engine CD, Neo Geo CD, 3DO ...'),
@@ -7600,7 +8099,8 @@ CONVERSION_INPUTS = {
     'nes:headered->headerless': ('.nes',), 'nes:headerless->headered': ('.nes',),
     'nes:unif->nes': ('.unf', '.unif'),
     'psp:iso->cso': ('.iso',), 'psp:cso->iso': ('.cso',),
-    'psp:pbp->iso': ('.pbp',), 'psp:dax->iso': ('.dax',), 'psp:jso->iso': ('.jso',),
+    'psp:pbp->iso': ('.pbp',), 'psx:pbp->bin': ('.pbp',),
+    'psp:dax->iso': ('.dax',), 'psp:jso->iso': ('.jso',),
     'psp:pkg->decrypted': ('.pkg',), 'psp:edat->decrypted': ('.edat',),
     'nds:encrypted->decrypted': ('.nds', '.dsi', '.srl'),
     'nds:decrypted->encrypted': ('.nds', '.dsi', '.srl'),
@@ -7662,6 +8162,9 @@ CONVERSION_NEEDS = {
     'cia:encrypted->decrypted': _3DS_NEEDS, 'cia:decrypted->encrypted': _3DS_NEEDS,
     'nes:headerless->headered': _NES_HEADER_NEEDS, 'nes:unif->nes': _NES_HEADER_NEEDS,
     'jag:rom->j64': [('jaguar_header', True, 'the boot header J64 files share')],
+    'a78:headerless->headered': [('a78_headers', True, 'the original header for this ROM')],
+    'lnx:headerless->headered': [('lnx_headers', True, 'the original header for this ROM')],
+    'apple:raw->2mg': [('2mg_headers', True, 'the original header for this disk')],
     'ps3:iso->deciso': [('ps3_keys', True, 'the disc key (or an IRD, which also holds it)'),
                         ('ps3_irds', False, 'checks every file of the decrypted disc')],
     'ps3:deciso->iso': [('ps3_keys', True, 'the disc key (or an IRD, which also holds it)')],
@@ -7675,8 +8178,8 @@ PYTHON_PACKAGES = {
 }
 _AES = ('pycryptodome', True, 'AES decryption')
 for _cid in CONVERSIONS:
-    if _cid.split(':')[0] in ('3ds', 'cia', 'ps3', 'vita') or _cid in ('psp:pkg->decrypted',
-                                                                  'psp:edat->decrypted'):
+    if _cid.split(':')[0] in ('3ds', 'cia', 'ps3', 'vita') or _cid in (
+            'psp:pkg->decrypted', 'psp:edat->decrypted', 'psp:pbp->iso', 'psx:pbp->bin'):
         CONVERSION_NEEDS[_cid] = CONVERSION_NEEDS.get(_cid, []) + [_AES]
     elif _cid in ('iso:iso->zso', 'iso:zso->iso'):
         CONVERSION_NEEDS[_cid] = [('zstandard', True, 'zstd compression')]

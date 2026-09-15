@@ -185,7 +185,7 @@ NOT_APPLICABLE = ('already trimmed', 'already decrypted', 'already encrypted',
                   'nothing to remove', 'nothing to encrypt or decrypt',
                   'is not in nes20db.xml', 'no header can be proven',
                   'does not use the common Jaguar boot header',
-                  'probably copy-protected')
+                  'probably copy-protected', 'no known')
 
 # conversions whose registry entry has no inverse, but a sibling undoes them
 ROUNDTRIP_VIA = {

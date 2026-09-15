@@ -353,6 +353,7 @@ async function loadCatalog(force){
   if(!r.ok){ log('Could not load the system list: ' + r.error, 'err'); return; }
   CATALOG = r;
   renderSysList();
+  if(SYS_SEL) renderSysDetail();
 }
 function sysMatches(s, q){
   if(!q) return true;
@@ -411,6 +412,10 @@ function renderSysDetail(){
     ? s.needs.map(needCard).join('')
     : '<div class="hint" style="color:var(--acc)">Nothing extra — every conversion here is built into the script.</div>';
 
+  if(s.needs.some(n => n.name.endsWith('_headers'))){
+    h += `<div class="row" style="margin-top:4px"><button class="btn" onclick="learnHeaders()">Learn headers from a folder…</button>` +
+         `<span class="hint">Point it at a headered set (loose files or RomVault zips). Headers are stored by the ROM's SHA-1, so adding one back is exact.</span></div>`;
+  }
   h += '<h4>Conversions</h4><div class="tblwrap" style="max-height:none"><table><thead><tr>' +
        '<th>From</th><th>To</th><th>Conversion</th><th>How the result is checked</th><th>Status</th>' +
        '</tr></thead><tbody>';
@@ -436,6 +441,14 @@ function renderSysDetail(){
        `key and data files in <span class="path">${esc(CATALOG.keys_dir)}</span>.</div>`;
   box.innerHTML = h;
   box.scrollTop = 0;
+}
+
+async function learnHeaders(){
+  const folder = await pywebview.api.browse_folder();
+  if(!folder) return;
+  setBusy(true); setStatus('learning headers', 'running');
+  const r = await pywebview.api.start_learn_headers(folder);
+  if(!r.ok){ log(r.error, 'err'); setBusy(false); setStatus('idle'); }
 }
 
 async function doScan(){
@@ -593,6 +606,7 @@ window.romEvent = function(ev, d){
     }
     setStatus(`${d.index} / ${d.total}`, 'running');
   }
+  else if(ev === 'catalog_changed'){ loadCatalog(true); }
   else if(ev === 'idle'){ setBusy(false); setStatus('idle'); }
 };
 
