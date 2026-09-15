@@ -100,6 +100,40 @@ td.size{font-family:var(--mono);color:var(--text3);text-align:right;white-space:
 .log-w .warn{color:var(--warn)}
 .log-w .err{color:var(--danger)}
 
+/* systems info */
+.sysinfo{display:flex;gap:10px;min-height:380px}
+.syslist{width:250px;flex-shrink:0;display:flex;flex-direction:column;gap:6px}
+.sysitems{flex:1;max-height:460px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg0)}
+.sysitem{padding:6px 9px;border-bottom:1px solid var(--bg1);cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px}
+.sysitem:hover{background:var(--bg2)}
+.sysitem.on{background:var(--bg3);border-left:3px solid var(--acc);padding-left:6px}
+.sysitem .cnt{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--text2)}
+.sysitem .cnt.part{color:var(--warn)}
+.sysitem .hit{font-family:var(--mono);font-size:9px;color:var(--info)}
+.sysdetail{flex:1;min-width:0;border:1px solid var(--border);border-radius:4px;background:var(--bg0);padding:10px 12px;max-height:500px;overflow-y:auto}
+.sysdetail h3{font-size:15px;font-weight:600;color:var(--text)}
+.sysdetail .about{font-size:11px;color:var(--text2);margin:2px 0 8px}
+.sysdetail h4{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text2);margin:12px 0 6px}
+.need{display:flex;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;margin-bottom:5px;background:var(--bg1)}
+.need .mark{font-family:var(--mono);font-size:13px;width:14px;flex-shrink:0}
+.need.ok .mark{color:var(--acc)}
+.need.no .mark{color:var(--danger)}
+.need.opt.no .mark{color:var(--warn)}
+.need .nm{font-family:var(--mono);font-size:12px;color:var(--text)}
+.need .tag{font-size:9px;font-family:var(--mono);border:1px solid var(--border);border-radius:8px;padding:0 6px;color:var(--text2);margin-left:4px}
+.need .tag.req{border-color:var(--warn);color:var(--warn)}
+.need .what{font-size:11px;color:var(--text2);margin-top:1px}
+.need .path{font-size:10px;color:var(--text3);font-family:var(--mono);word-break:break-all;user-select:text}
+.ext{display:inline-block;font-family:var(--mono);font-size:10px;padding:0 5px;margin:1px 2px 1px 0;border-radius:3px;background:var(--bg2);color:var(--info)}
+.ext.to{color:var(--acc)}
+.cstat{font-family:var(--mono);font-size:10px;white-space:nowrap}
+.cstat.ready{color:var(--acc)}
+.cstat.missing{color:var(--danger)}
+.cstat.planned{color:var(--text3)}
+.flag{font-size:9px;font-family:var(--mono);padding:0 5px;border-radius:8px;border:1px solid var(--warn);color:var(--warn);margin-left:4px}
+.flag.rev{border-color:var(--border);color:var(--text2)}
+.cnote{font-size:10px;color:var(--text3);margin-top:2px;line-height:1.4}
+
 .bar{height:3px;background:var(--bg3);border-radius:2px;overflow:hidden}
 .bar > div{height:100%;background:var(--acc);width:0;transition:width .2s}
 </style>
@@ -155,6 +189,26 @@ td.size{font-family:var(--mono);color:var(--text3);text-align:right;white-space:
       <div class="panel-body collapsed" id="body-env">
         <div class="envgrid" id="envgrid"></div>
         <div class="missing" id="envmissing"></div>
+      </div>
+    </div>
+
+    <!-- ── Systems info ── -->
+    <div class="panel">
+      <div class="panel-hdr" onclick="togglePanel('sys'); loadCatalog()">
+        <div class="dot" style="background:var(--info)"></div>Supported systems &amp; what they need
+        <span class="chevron" id="chev-sys">▸</span>
+      </div>
+      <div class="panel-body collapsed" id="body-sys">
+        <div class="hint">Pick a system to see which conversions it has, the file types each one starts from, how the result is checked, and anything that has to be placed in the apps folder first. Files are recognised by their contents, so the file types are a guide rather than a rule.</div>
+        <div class="sysinfo">
+          <div class="syslist">
+            <input class="txt" id="sysfilter" placeholder="filter: name or file type, e.g. .woz" oninput="renderSysList()" style="flex:none;min-width:0">
+            <div class="sysitems" id="sysitems"></div>
+            <div class="row"><span class="hint" id="systotals" style="flex:1"></span>
+              <button class="btn" onclick="loadCatalog(true)" title="re-check the apps folder after adding files">Refresh</button></div>
+          </div>
+          <div class="sysdetail" id="sysdetail"><div class="hint">Select a system on the left.</div></div>
+        </div>
       </div>
     </div>
 
@@ -285,6 +339,103 @@ async function loadEnv(){
     ? miss.join('<br>')
     : '<span style="color:var(--acc)">Everything available.</span>';
   if(miss.length) document.getElementById('body-env').classList.remove('collapsed');
+}
+
+// ── systems info ──────────────────────────────────────────────────────────────
+let CATALOG = null, SYS_SEL = null;
+function esc(s){
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+async function loadCatalog(force){
+  if(CATALOG && !force) return;
+  const r = await pywebview.api.system_catalog();
+  if(!r.ok){ log('Could not load the system list: ' + r.error, 'err'); return; }
+  CATALOG = r;
+  renderSysList();
+}
+function sysMatches(s, q){
+  if(!q) return true;
+  if(s.name.toLowerCase().includes(q) || s.code.toLowerCase().includes(q)) return true;
+  return s.conversions.some(c => c.to.toLowerCase() === q ||
+                                 c.from.some(f => f.toLowerCase() === q || f.toLowerCase() === '.' + q));
+}
+function renderSysList(){
+  if(!CATALOG) return;
+  const q = document.getElementById('sysfilter').value.trim().toLowerCase();
+  const box = document.getElementById('sysitems');
+  box.innerHTML = '';
+  const shown = CATALOG.systems.filter(s => sysMatches(s, q));
+  for(const s of shown){
+    const el = document.createElement('div');
+    el.className = 'sysitem' + (SYS_SEL === s.code ? ' on' : '');
+    const usable = s.total - s.planned;
+    el.innerHTML = `<span>${esc(s.name)}</span>` +
+      `<span class="cnt ${s.ready < usable ? 'part' : ''}" title="ready / conversions">${s.ready}/${s.total}</span>`;
+    el.onclick = () => { SYS_SEL = s.code; renderSysList(); renderSysDetail(); };
+    box.appendChild(el);
+    if(SYS_SEL === s.code) setTimeout(() => el.scrollIntoView({block: 'nearest'}), 0);
+  }
+  if(!shown.length) box.innerHTML = '<div class="sysitem" style="cursor:default;color:var(--text3)">No system matches.</div>';
+  const all = CATALOG.systems.reduce((a, s) => a + s.total, 0);
+  const ready = CATALOG.systems.reduce((a, s) => a + s.ready, 0);
+  document.getElementById('systotals').textContent =
+    `${CATALOG.systems.length} systems · ${ready} of ${all} conversions ready on this PC`;
+  if(!SYS_SEL && shown.length){ SYS_SEL = shown[0].code; renderSysList(); renderSysDetail(); }
+}
+function needCard(n){
+  const cls = 'need ' + (n.present ? 'ok' : 'no') + (n.required ? '' : ' opt');
+  const where = n.kind === 'python package'
+    ? `install with: ${esc(n.path)}`
+    : `${n.present ? 'found at' : 'place it at'}: ${esc(n.path)}`;
+  return `<div class="${cls}">
+      <div class="mark">${n.present ? '✓' : (n.required ? '✗' : '!')}</div>
+      <div style="min-width:0">
+        <div><span class="nm">${esc(n.name)}</span>
+          <span class="tag ${n.required ? 'req' : ''}">${n.required ? 'required' : 'optional'}</span>
+          <span class="tag">${esc(n.kind)}</span></div>
+        <div class="what">${esc(n.what)}</div>
+        <div class="path">${where}</div>
+      </div></div>`;
+}
+function renderSysDetail(){
+  const s = CATALOG && CATALOG.systems.find(x => x.code === SYS_SEL);
+  const box = document.getElementById('sysdetail');
+  if(!s){ box.innerHTML = '<div class="hint">Select a system on the left.</div>'; return; }
+  let h = `<h3>${esc(s.name)}</h3><div class="about">${esc(s.about)}</div>`;
+  h += `<div class="hint">${s.ready} of ${s.total} conversions ready on this PC` +
+       (s.planned ? ` · ${s.planned} not implemented yet` : '') + '.</div>';
+
+  h += '<h4>What it needs</h4>';
+  h += s.needs.length
+    ? s.needs.map(needCard).join('')
+    : '<div class="hint" style="color:var(--acc)">Nothing extra — every conversion here is built into the script.</div>';
+
+  h += '<h4>Conversions</h4><div class="tblwrap" style="max-height:none"><table><thead><tr>' +
+       '<th>From</th><th>To</th><th>Conversion</th><th>How the result is checked</th><th>Status</th>' +
+       '</tr></thead><tbody>';
+  for(const c of s.conversions){
+    const from = c.from.length ? c.from.map(f => `<span class="ext">${esc(f)}</span>`).join('') : '—';
+    const flags = (c.lossy ? '<span class="flag" title="some information is not kept">lossy</span>' : '') +
+                  (c.reversible ? '<span class="flag rev" title="there is a conversion back">reversible</span>' : '');
+    const needs = c.needs.filter(n => n.required).map(n => n.name);
+    const stat = c.status === 'ready' ? 'ready' : c.status === 'planned' ? 'planned' : 'missing';
+    const statTxt = c.status === 'ready' ? '✓ ready' : c.status === 'planned' ? 'not yet built' : '✗ needs files';
+    h += `<tr>
+      <td>${from}</td>
+      <td><span class="ext to">${esc(c.to)}</span></td>
+      <td>${esc(c.label)}${flags}
+        ${needs.length ? `<div class="cnote">needs: ${needs.map(esc).join(', ')}</div>` : ''}
+        ${c.note ? `<div class="cnote">${esc(c.note)}</div>` : ''}</td>
+      <td class="cnote" style="font-size:10px">${esc(c.verify)}</td>
+      <td><span class="cstat ${stat}" title="${esc(c.reason)}">${statTxt}</span></td>
+    </tr>`;
+  }
+  h += '</tbody></table></div>';
+  h += `<div class="hint" style="margin-top:8px">Programs go in <span class="path">${esc(CATALOG.apps_dir)}</span>, ` +
+       `key and data files in <span class="path">${esc(CATALOG.keys_dir)}</span>.</div>`;
+  box.innerHTML = h;
+  box.scrollTop = 0;
 }
 
 async function doScan(){

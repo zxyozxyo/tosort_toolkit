@@ -54,6 +54,14 @@ PAIRS = [
     ('Atari - Atari Jaguar (J64)', 'Atari - Atari Jaguar (ROM)', 12),
 ]
 
+# Apple II bit/nibble-level sets: every sampled title that also exists as a
+# [DSK] is staged with its DSK, so NIB/WOZ -> DSK can be judged by the DSK DAT.
+# (folder, sub, staged name, shared titles, extra unshared titles)
+APPLE_LEVELS = [
+    ('Apple II', '[NIB]', 'Apple - II [NIB]', 999, 40),
+    ('Apple II', '[WOZ]', 'Apple - II [WOZ]', 60, 20),
+]
+
 # optical discs: smallest N zips, one sub-folder per game (cue sheets need it)
 DISCS = [
     ('Nintendo GameCube', 'Nintendo - GameCube', 2),
@@ -114,8 +122,26 @@ def extract(zpath, dest, per_game=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--discs', action='store_true')
+    ap.add_argument('--only', help='stage only sets whose staged name contains this')
     args = ap.parse_args()
     STAGED.mkdir(exist_ok=True)
+    want = lambda name: not args.only or args.only.lower() in name.lower()
+
+    for folder, sub, name, shared_n, extra_n in APPLE_LEVELS:
+        if not want(name):
+            continue
+        dsk = {z.stem: z for z in zips_under(folder, '[DSK]')}
+        lvl = {z.stem: z for z in zips_under(folder, sub)}
+        shared = spread(set(lvl) & set(dsk), shared_n)
+        extra = spread(set(lvl) - set(dsk), extra_n)
+        for stem in shared:
+            extract(lvl[stem], STAGED / name)
+            extract(dsk[stem], STAGED / 'Apple - II [DSK]')
+        for stem in extra:
+            extract(lvl[stem], STAGED / name)
+        print(f'{name:<45} {len(shared)} titles with a [DSK] + {len(extra)} without')
+    if args.only:
+        return
 
     for folder, sub, name, n in SETS:
         zs = zips_under(folder, sub)

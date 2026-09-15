@@ -63,6 +63,23 @@ with tempfile.TemporaryDirectory() as tmp:
     (tmp / 'a.woz').write_bytes(woz2_from_nib((tmp / 'a.nib').read_bytes()))
     rt.apple_woz_to_dsk(tmp / 'a.woz', tmp / 'c.dsk')
     check('WOZ2 bit streams -> DSK', (tmp / 'c.dsk').read_bytes() == disk)
+    # WOZ1: each 6656-byte track record is the 6646-byte bitstream FIRST, then
+    # bytes used / bit count (real files proved the order; WOZ2 differs)
+    nib = (tmp / 'a.nib').read_bytes()
+    trks = bytearray()
+    for t in range(35):
+        stream = nib[t * 6656:t * 6656 + 6646]              # trailing sync bytes dropped
+        trks += stream + struct.pack('<HH', len(stream), len(stream) * 8) + bytes(6)
+    info = bytearray(60)
+    info[0], info[1] = 1, 1
+    tmap = bytes(b for t in range(40) for b in ([t] * 4 if t < 35 else [0xFF] * 4))
+    woz1 = (b'WOZ1' + bytes([0xFF, 0x0A, 0x0D, 0x0A]) + bytes(4) +
+            b'INFO' + struct.pack('<I', 60) + info +
+            b'TMAP' + struct.pack('<I', 160) + tmap +
+            b'TRKS' + struct.pack('<I', len(trks)) + trks)
+    (tmp / 'a1.woz').write_bytes(woz1)
+    rt.apple_woz_to_dsk(tmp / 'a1.woz', tmp / 'd.dsk')
+    check('WOZ1 track records (stream first) -> DSK', (tmp / 'd.dsk').read_bytes() == disk)
     check('WOZ detected with a conversion',
           'apple:woz->dsk' in rt.identify(str(tmp / 'a.woz'))['conversions'])
     # the physical -> DOS 3.3 interleave (dsk2woz: sector * 7 % 15)

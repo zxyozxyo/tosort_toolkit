@@ -1619,6 +1619,14 @@ class RomToolsAPI:
         return {'keys': keys, 'tools': tools, 'engines': by_engine,
                 'romtools_dir': str(ROMTOOLS_DIR)}
 
+    def system_catalog(self):
+        """The information view: every system, what it converts, what it needs."""
+        try:
+            return {'ok': True, 'systems': system_catalog(),
+                    'apps_dir': str(HERE / 'apps'), 'keys_dir': str(KEYS_DIR)}
+        except Exception as e:
+            return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
     # ── scan ──────────────────────────────────────────────────────────────────
 
     def start_scan(self, cfg):
@@ -7459,12 +7467,15 @@ def apple_woz_to_dsk(src, dst, progress=None):
             tracks.append(b'')
             continue
         if d[:4] == b'WOZ1':
+            # WOZ1 track record: 6646-byte bitstream FIRST, then bytes used
+            # (u16) and bit count (u16) at +6646 / +6648
             e = trks + idx * 6656
-            bit_count = struct.unpack_from('<H', d, e + 2)[0]
-            stream = d[e + 10:e + 10 + 6646]
+            stream = d[e:e + 6646]
+            bit_count = min(struct.unpack_from('<H', d, e + 6648)[0], 6646 * 8)
         else:
             start, blocks, bit_count = struct.unpack_from('<HHI', d, trks + idx * 8)
             stream = d[start * 512:(start + blocks) * 512]
+            bit_count = min(bit_count, len(stream) * 8)
         tracks.append(_a2_bits_to_nibbles(stream, bit_count))
         if progress:
             progress(t + 1, A2_TRACKS, 'reading bit streams')
@@ -7526,3 +7537,234 @@ CONVERSIONS['apple:dsk->nib'] = {
     'note': 'Writes a freshly formatted-style nibble image; it will not be byte-identical '
             'to a NIB captured from the original disk.',
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATALOGUE  -  what each system can do, and what it needs (for the GUI)
+#
+#  The conversion registry says HOW to convert; this says what a person needs to
+#  know before trying: the file types a conversion starts from, what has to be
+#  dropped into apps/ first, and how the result is checked. tests keep it in step
+#  with CONVERSIONS (tests/test_rom_catalog.py), so a new conversion without an
+#  entry here fails a test rather than silently vanishing from the info view.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# data files some native conversions read, registered like the other key files
+# so the environment report and the catalogue can both see them
+KEY_FILES['nes_header_dats'] = (KEYS_DIR / 'nes_header_dats',
+                                'NES - No-Intro "(Headered)" NES DATs (their header= attributes '
+                                'prove each header); preferred over nes20db.xml')
+KEY_FILES['jaguar_header'] = (KEYS_DIR / JAG_HEADER_FILE,
+                              'Atari Jaguar - the common 8 KiB J64 boot header (jaguar_header.bin)')
+KEY_FILES['nps'] = (KEYS_DIR / 'nps',
+                    'PS Vita - NoPayStation TSV files (PSV_GAMES.tsv etc.) holding zRIF licences; '
+                    'not needed when a work.bin sits beside the PKG')
+
+SYSTEM_NAMES = {
+    'N64': ('Nintendo 64 / Aleck64', 'Cartridge byte orders (.z64 / .v64 / .n64).'),
+    'NES': ('NES / Famicom', 'iNES headers, headerless No-Intro sets and UNIF.'),
+    'FDS': ('Famicom Disk System', 'FDS headers and the QD (Quick Disk) block format.'),
+    'SNES': ('Super Nintendo / Super Famicom', 'Copier headers.'),
+    'NDS': ('Nintendo DS / DSi', 'Secure Area encryption and trimming.'),
+    '3DS': ('Nintendo 3DS', 'NCCH encryption for .3ds carts and CIA packages.'),
+    'GC': ('Nintendo GameCube', 'ISO, CISO and RVZ disc images.'),
+    'WII': ('Nintendo Wii', 'ISO, WBFS and RVZ disc images.'),
+    'WIIU': ('Nintendo Wii U', 'WUD and compressed WUX images.'),
+    'PSP': ('PlayStation Portable', 'CSO compression and PSN packages - including PS one '
+            'Classics PKGs, which become PlayStation bin/cue.'),
+    'PSP/PS2': ('PSP / PS2 (ZSO)', 'zstd-compressed ISO containers.'),
+    'PS3': ('PlayStation 3', 'Redump disc encryption.'),
+    'VITA': ('PlayStation Vita', 'PSN packages to NoNpDrm / decrypted folders.'),
+    'CD': ('CD images (CHD)', 'Any cue/bin CD image: PlayStation, Saturn, Sega CD, '
+           'Dreamcast, PC Engine CD, Neo Geo CD, 3DO ...'),
+    'CHD': ('DVD / ISO images (CHD)', 'Plain ISO images in and out of CHD.'),
+    'MD': ('Sega Mega Drive / Genesis', 'SMD interleaved copier dumps.'),
+    'PCE': ('PC Engine / TurboGrafx-16', 'Copier headers.'),
+    'A7800': ('Atari 7800', 'A78 headers.'),
+    'LYNX': ('Atari Lynx', 'LNX headers.'),
+    'JAGUAR': ('Atari Jaguar', 'J64 and ROM layouts.'),
+    'A8BIT': ('Atari 8-bit', 'ATR and XFD disk images.'),
+    'ATARIST': ('Atari ST', 'ST and MSA disk images.'),
+    'AMIGA': ('Commodore Amiga', 'DMS compressed disks.'),
+    'C64': ('Commodore 64', 'PC64, tape and disk images to files.'),
+    'ZX': ('ZX Spectrum', 'Tape (TAP/TZX) and TR-DOS disk (TRD/SCL) images.'),
+    'APPLE2': ('Apple II', 'Sector order, 2IMG headers, nibble (NIB) and flux-level (WOZ) images.'),
+    'LOOPY': ('Casio Loopy', 'Cartridge byte order.'),
+    'PCFLOPPY': ('IBM PC floppy', 'ImageDisk (IMD) and Teledisk (TD0) to raw images.'),
+}
+
+# typical file types each conversion starts from. Detection is by content, so
+# these are what people will recognise, not a filter.
+_N64_EXT = {'big-endian': '.z64', 'byteswapped': '.v64', 'little-endian': '.n64'}
+CONVERSION_INPUTS = {
+    'nes:headered->headerless': ('.nes',), 'nes:headerless->headered': ('.nes',),
+    'nes:unif->nes': ('.unf', '.unif'),
+    'psp:iso->cso': ('.iso',), 'psp:cso->iso': ('.cso',),
+    'psp:pbp->iso': ('.pbp',), 'psp:dax->iso': ('.dax',), 'psp:jso->iso': ('.jso',),
+    'psp:pkg->decrypted': ('.pkg',), 'psp:edat->decrypted': ('.edat',),
+    'nds:encrypted->decrypted': ('.nds', '.dsi', '.srl'),
+    'nds:decrypted->encrypted': ('.nds', '.dsi', '.srl'),
+    'nds:untrimmed->trimmed': ('.nds',), 'nds:trimmed->untrimmed': ('.nds',),
+    '3ds:encrypted->decrypted': ('.3ds', '.cci', '.cxi'),
+    '3ds:decrypted->encrypted': ('.3ds', '.cci', '.cxi'),
+    'cia:encrypted->decrypted': ('.cia',), 'cia:decrypted->encrypted': ('.cia',),
+    'cia:cia->cdn': ('.cia',), 'cia:cdn->cia': ('tmd', 'cetk', 'content files'),
+    'disc:gc:iso->ciso': ('.iso', '.gcm'), 'disc:gc:iso->rvz': ('.iso', '.gcm'),
+    'disc:gc:ciso->iso': ('.ciso',), 'disc:gc:ciso->rvz': ('.ciso',),
+    'disc:gc:rvz->iso': ('.rvz',), 'disc:gc:rvz->ciso': ('.rvz',), 'disc:gc:rvz->rvz': ('.rvz',),
+    'disc:wii:iso->wbfs': ('.iso',), 'disc:wii:iso->rvz': ('.iso',),
+    'disc:wii:wbfs->iso': ('.wbfs',), 'disc:wii:wbfs->rvz': ('.wbfs',),
+    'disc:wii:rvz->iso': ('.rvz',), 'disc:wii:rvz->wbfs': ('.rvz',), 'disc:wii:rvz->rvz': ('.rvz',),
+    'wiiu:wud->wux': ('.wud',), 'wiiu:wux->wud': ('.wux',),
+    'chd:cd->chd': ('.cue', '.gdi', '.toc'), 'chd:iso->chd': ('.iso',),
+    'chd:chd->cd': ('.chd',), 'chd:chd->dvd': ('.chd',), 'chd:chd->raw': ('.chd',),
+    'iso:iso->zso': ('.iso',), 'iso:zso->iso': ('.zso',),
+    'ps3:iso->deciso': ('.iso',), 'ps3:deciso->iso': ('.iso',),
+    'vita:pkg->nonpdrm': ('.pkg',), 'vita:pkg->decrypted': ('.pkg',),
+    'snes:headered->headerless': ('.smc', '.sfc', '.swc', '.fig'),
+    'snes:headerless->headered': ('.sfc',),
+    'md:smd->bin': ('.smd',), 'md:bin->smd': ('.bin', '.md', '.gen'),
+    'pce:headered->headerless': ('.pce',), 'pce:headerless->headered': ('.pce',),
+    'a78:headered->headerless': ('.a78',), 'a78:headerless->headered': ('.bin',),
+    'lnx:headered->headerless': ('.lnx',), 'lnx:headerless->headered': ('.lyx', '.bin'),
+    'jag:j64->rom': ('.j64',), 'jag:rom->j64': ('.rom', '.jag'),
+    'a8:atr->xfd': ('.atr',), 'a8:xfd->atr': ('.xfd',),
+    'st:st->msa': ('.st',), 'st:msa->st': ('.msa',),
+    'amiga:dms->adf': ('.dms',),
+    'c64:p00->prg': ('.p00',), 'c64:t64->prg': ('.t64',),
+    'c64:d64->files': ('.d64',), 'c64:d81->files': ('.d81',),
+    'zx:tap->tzx': ('.tap',), 'zx:tzx->tap': ('.tzx',),
+    'zx:scl->trd': ('.scl',), 'zx:trd->scl': ('.trd',),
+    'apple:2mg->raw': ('.2mg', '.2img'), 'apple:raw->2mg': ('.po', '.dsk'),
+    'apple:do->po': ('.do', '.dsk'), 'apple:po->do': ('.po',),
+    'apple:nib->dsk': ('.nib',), 'apple:woz->dsk': ('.woz',),
+    'apple:dsk->nib': ('.dsk', '.do', '.po'),
+    'loopy:big-endian->little-endian': ('.bin',), 'loopy:little-endian->big-endian': ('.bin',),
+    'nes:fds-headered->headerless': ('.fds',), 'nes:fds-headerless->headered': ('.fds',),
+    'fds:qd->fds': ('.qd',), 'fds:fds->qd': ('.fds',),
+    'pc:imd->img': ('.imd',), 'pc:td0->img': ('.td0',),
+}
+for _cid in CONVERSIONS:
+    if _cid.startswith('n64:'):
+        CONVERSION_INPUTS[_cid] = (_N64_EXT[_cid[4:].split('->')[0]],)
+
+# what beyond the script itself a conversion reads: (requirement, required?, why)
+# requirement names are KEY_FILES / EXTERNAL_TOOLS entries
+_3DS_NEEDS = [('boot9', True, 'the 3DS key scrambler inputs'),
+              ('aes_keys', True, 'KeyX for 7.x and New 3DS titles'),
+              ('seeddb', False, 'only for eShop titles that use seed crypto')]
+_NES_HEADER_NEEDS = [('nes_header_dats', False, 'preferred source of proven headers'),
+                     ('nes20db', False, 'fallback header database - at least one of the two is needed')]
+CONVERSION_NEEDS = {
+    'nds:encrypted->decrypted': [('nds_blow', True, 'the KEY1 Blowfish table')],
+    'nds:decrypted->encrypted': [('nds_blow', True, 'the KEY1 Blowfish table')],
+    '3ds:encrypted->decrypted': _3DS_NEEDS, '3ds:decrypted->encrypted': _3DS_NEEDS,
+    'cia:encrypted->decrypted': _3DS_NEEDS, 'cia:decrypted->encrypted': _3DS_NEEDS,
+    'nes:headerless->headered': _NES_HEADER_NEEDS, 'nes:unif->nes': _NES_HEADER_NEEDS,
+    'jag:rom->j64': [('jaguar_header', True, 'the boot header J64 files share')],
+    'ps3:iso->deciso': [('ps3_keys', True, 'the disc key (or an IRD, which also holds it)'),
+                        ('ps3_irds', False, 'checks every file of the decrypted disc')],
+    'ps3:deciso->iso': [('ps3_keys', True, 'the disc key (or an IRD, which also holds it)')],
+    'vita:pkg->nonpdrm': [('nps', False, 'licence (zRIF) when no work.bin sits beside the PKG')],
+    'vita:pkg->decrypted': [('nps', False, 'licence (zRIF) when no work.bin sits beside the PKG')],
+}
+# Python packages some native engines import (requirements.txt installs them)
+PYTHON_PACKAGES = {
+    'pycryptodome': ('Crypto', 'pycryptodome - AES for the 3DS, CIA, PSN and PS3/Vita engines'),
+    'zstandard': ('zstandard', 'zstandard - zstd compression for ZSO'),
+}
+_AES = ('pycryptodome', True, 'AES decryption')
+for _cid in CONVERSIONS:
+    if _cid.split(':')[0] in ('3ds', 'cia', 'ps3', 'vita') or _cid in ('psp:pkg->decrypted',
+                                                                  'psp:edat->decrypted'):
+        CONVERSION_NEEDS[_cid] = CONVERSION_NEEDS.get(_cid, []) + [_AES]
+    elif _cid in ('iso:iso->zso', 'iso:zso->iso'):
+        CONVERSION_NEEDS[_cid] = [('zstandard', True, 'zstd compression')]
+for _cid, _spec in CONVERSIONS.items():
+    _tool = _spec.get('requires')
+    if _spec['engine'] == ENGINE_EXTERNAL and _tool in EXTERNAL_TOOLS:
+        CONVERSION_NEEDS.setdefault(_cid, [(_tool, True, 'does the conversion')])
+
+# conversions whose optional needs are alternatives - one of them is enough
+NEEDS_ONE_OF = {'nes:headerless->headered', 'nes:unif->nes'}
+
+_VERIFY_TEXT = {
+    'none': 'Not checked automatically - compare the result against a DAT.',
+    'payload': 'Both images are decoded and the disc data compared.',
+    'tool': 'chdman verifies the CHD it wrote.',
+    'tool_source': 'chdman verifies the source CHD before extracting.',
+    'verifier': 'A format-specific check (see the note).',
+    'roundtrip': 'Converted back and compared byte for byte.',
+}
+
+
+def _requirement(name):
+    if name in PYTHON_PACKAGES:
+        import importlib.util
+        module, what = PYTHON_PACKAGES[name]
+        return {'name': name, 'kind': 'python package', 'what': what,
+                'path': f'pip install {name}',
+                'present': importlib.util.find_spec(module) is not None}
+    if name in KEY_FILES:
+        path, what = KEY_FILES[name]
+        kind = 'folder' if not path.suffix else 'key / data file'
+    else:
+        path, what = EXTERNAL_TOOLS[name]
+        kind = 'program'
+    present = path.exists() and (not path.is_dir() or any(path.iterdir()))
+    return {'name': name, 'kind': kind, 'what': what, 'path': str(path), 'present': present}
+
+
+def system_catalog():
+    """Every system the script knows, its conversions and their requirements."""
+    systems = {}
+    for cid, spec in CONVERSIONS.items():
+        code = spec['system']
+        name, blurb = SYSTEM_NAMES.get(code, (code, ''))
+        sysd = systems.setdefault(code, {'code': code, 'name': name, 'about': blurb,
+                                         'conversions': [], 'needs': {}})
+        st = conversion_status(cid)
+        needs = []
+        for req, required, why in CONVERSION_NEEDS.get(cid, []):
+            r = dict(_requirement(req), required=required, why=why)
+            needs.append(r)
+            known = sysd['needs'].setdefault(req, dict(r))
+            known['required'] = known['required'] or required
+        # optional needs that come as alternatives: at least one must be present
+        either_missing = bool(needs) and all(not n['required'] for n in needs) and             cid in NEEDS_ONE_OF and not any(n['present'] for n in needs)
+        if spec.get('fn') is None:
+            status = 'planned'
+        elif not st['available'] or either_missing or                 any(n['required'] and not n['present'] for n in needs):
+            status = 'missing'
+        else:
+            status = 'ready'
+        inverse_built = bool(CONVERSIONS.get(spec.get('inverse') or '', {}).get('fn'))
+        mode = spec.get('verify_mode')
+        if mode is None:
+            verify = (_VERIFY_TEXT['roundtrip'] if inverse_built or spec.get('rebuild')
+                      else _VERIFY_TEXT['none'])
+        else:
+            verify = _VERIFY_TEXT.get(mode, mode)
+        reason = ''
+        if status == 'planned':
+            reason = 'not implemented yet'
+        elif status == 'missing':
+            reason = st['reason'] or 'a required file is missing'
+        sysd['conversions'].append({
+            'id': cid, 'label': spec['label'].split(': ', 1)[-1],
+            'from': list(CONVERSION_INPUTS.get(cid, ())), 'to': spec['ext'],
+            'engine': spec['engine'], 'status': status, 'reason': reason,
+            'lossy': 'lossy' in (spec['label'] + spec.get('note', '')).lower(),
+            'reversible': inverse_built,
+            'verify': verify, 'note': spec.get('note', ''), 'needs': needs,
+        })
+    out = []
+    for sysd in systems.values():
+        sysd['needs'] = sorted(sysd['needs'].values(),
+                               key=lambda r: (not r['required'], r['name']))
+        convs = sysd['conversions']
+        sysd['ready'] = sum(c['status'] == 'ready' for c in convs)
+        sysd['planned'] = sum(c['status'] == 'planned' for c in convs)
+        sysd['total'] = len(convs)
+        out.append(sysd)
+    return sorted(out, key=lambda s: s['name'].lower())

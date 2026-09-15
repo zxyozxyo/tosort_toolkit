@@ -1,6 +1,6 @@
 # ROM conversion test matrix
 
-Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User\ClaudeCode\tosort_toolkit\rom_test_matrix\matrix.db`
+Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User\ClaudeCode\tosort_toolkit\rom_test_matrix\matrix.db`
 
 **Status meanings:** PASS = output matched the expected DAT and/or converted back byte-exact · FAIL = crashed, wrong DAT, or round trip differs · UNVERIFIED = ran, but nothing could prove it right · UNAVAILABLE = engine not implemented or key/tool missing · N/A = file already in the target state.
 
@@ -9,6 +9,8 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 | Conversion | Tested | PASS | FAIL | UNVERIFIED | UNAVAILABLE / N/A | DAT match | Round trip | Tool verify wrong | Code |
 |---|---|---|---|---|---|---|---|---|---|
 | `iso:iso->zso` | 16 | 10 | 6 | 0 | 0 | None/0 | 10/10 | 0 | bf7f5382c2,d15202fe81,38f3f6ad14 |
+| `amiga:dms->adf` | 216 | 212 | 4 | 0 | 0 | 78/78 | 212/212 | 0 | 38f3f6ad14 |
+| `apple:do->po` | 110 | 109 | 1 | 0 | 0 | None/0 | 109/109 | 0 | d15202fe81,38f3f6ad14 |
 | `chd:cd->chd` | 15 | 14 | 1 | 0 | 0 | None/0 | 14/15 | 1 | 2ed1e069c5,5e1db6994c,e6cef9b724,ba1811571c,d02dd3fb76 |
 | `loopy:big-endian->little-endian` | 13 | 12 | 1 | 0 | 0 | 11/12 | 13/13 | 1 | d15202fe81 |
 | `loopy:little-endian->big-endian` | 12 | 11 | 1 | 0 | 0 | 11/12 | 12/12 | 1 | d15202fe81 |
@@ -19,7 +21,9 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 | `a8:atr->xfd` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | 7ea1b35567 |
 | `a8:xfd->atr` | 1 | 1 | 0 | 0 | 0 | None/0 | 1/1 | 0 | 7ea1b35567 |
 | `apple:2mg->raw` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | d15202fe81 |
-| `apple:do->po` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | d15202fe81 |
+| `apple:dsk->nib` | 99 | 99 | 0 | 0 | 0 | None/0 | 99/99 | 0 | 38f3f6ad14 |
+| `apple:nib->dsk` | 83 | 10 | 0 | 23 | 50 | 10/10 | None/0 | 0 | 38f3f6ad14 |
+| `apple:woz->dsk` | 80 | 25 | 0 | 23 | 32 | 25/25 | None/0 | 0 | 38f3f6ad14,cb14c6383b |
 | `c64:d64->files` | 10 | 7 | 0 | 3 | 0 | 7/7 | None/0 | 0 | 1ee9692bcd |
 | `c64:d81->files` | 10 | 1 | 0 | 9 | 0 | 1/1 | None/0 | 0 | e6cef9b724 |
 | `c64:p00->prg` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | d15202fe81 |
@@ -72,14 +76,15 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 | Folder | Files | Detected correctly | In a DAT |
 |---|---|---|---|
 | 3DO Interactive Multiplayer | 2 | 2 | 2 |
+| Amiga DMS | 216 | 216 | 0 |
 | Apple - II [2MG] | 10 | 10 | 0 |
 | Apple - II [A2R] | 2 | 2 | 1 |
-| Apple - II [DSK] | 10 | 10 | 0 |
+| Apple - II [DSK] | 110 | 109 | 100 |
 | Apple - II [EDD] | 3 | 3 | 0 |
 | Apple - II [HDV] | 3 | 3 | 0 |
-| Apple - II [NIB] | 5 | 5 | 0 |
+| Apple - II [NIB] | 88 | 86 | 83 |
 | Apple - II [PO] | 10 | 9 | 0 |
-| Apple - II [WOZ] | 5 | 5 | 0 |
+| Apple - II [WOZ] | 85 | 85 | 80 |
 | Atari - 8bit [ATR] | 10 | 10 | 10 |
 | Atari - 8bit [XFD] | 1 | 1 | 1 |
 | Atari - Atari 2600 | 10 | 10 | 10 |
@@ -151,12 +156,44 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 **Misdetections, grouped:**
 
 - Atari - Atari 7800 (BIN): **8** detected as UNKNOWN / unknown / None — no known signature  (e.g. `Commando (USA) (Beta) (1988-04-29).bin`)
+- Apple - II [NIB]: **2** detected as UNKNOWN / unknown / None — no known signature  (e.g. `Bubble Bobble (1988)(Taito America)(Side A).nib`)
 - Casio - Loopy (BigEndian): **2** detected as UNKNOWN / unknown / None — no known signature  (e.g. `[BIOS] Internal Thermal Printer (Japan).bin`)
 - Casio - Loopy (LittleEndian): **2** detected as UNKNOWN / unknown / None — no known signature  (e.g. `[BIOS] Internal Thermal Printer (Japan).bin`)
+- Apple - II [DSK]: **1** detected as UNKNOWN / unknown / None — no known signature  (e.g. `Bard's Tale III, The - The Thief of Fate (1988)(Electronic Arts)(II+)(Disk 1 of 2 Side A)(Boot)[64K].dsk`)
 - Apple - II [PO]: **1** detected as UNKNOWN / unknown / None — no known signature  (e.g. `8-bit Apple II Game Compilation - 32 Games in Total (1991)(cvxmelody)[b].po`)
 - Casio - Loopy (LittleEndian): **1** detected as LOOPY / BIN / big-endian — Casio Loopy cartridge, big-endian  (e.g. `Chakrakun no Omajinai Paradise (Japan).bin`)
 
-## Failures (10)
+## Failures (15)
+
+### `amiga:dms->adf` — convert — 1 file(s)
+
+> ConversionError: xdms-rs.exe exited 1: error: packed-data CRC mismatch on track 35
+
+- `alayout3.dms` · source DAT: none · tool verify: no (None)
+
+### `amiga:dms->adf` — convert — 1 file(s)
+
+> ConversionError: xdms-rs.exe exited 1: error: packed-data CRC mismatch on track 31
+
+- `rkm-sp79.dms` · source DAT: none · tool verify: no (None)
+
+### `amiga:dms->adf` — convert — 1 file(s)
+
+> ConversionError: xdms-rs.exe exited 1: error: truncated header or track
+
+- `rkm-sp80.dms` · source DAT: none · tool verify: no (None)
+
+### `amiga:dms->adf` — convert — 1 file(s)
+
+> ConversionError: xdms-rs.exe exited 1: error: checksum mismatch on track 10
+
+- `trsi-dp1.dms` · source DAT: none · tool verify: no (None)
+
+### `apple:do->po` — convert — 1 file(s)
+
+> ConversionError: 143,358 bytes is not a whole number of 4096-byte tracks, so the sector order cannot be remapped safely
+
+- `Bard's Tale III, The - The Thief of Fate (1988)(Electronic Arts)(II+)(Disk 1 of 2 Side A)(Boot)[64K].dsk` · source DAT: Apple II - Games - [DSK] · tool verify: no (None)
 
 ### `chd:cd->chd` — verify — 1 file(s)
 
@@ -195,11 +232,17 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 
 ## Notes
 
+- `amiga:dms->adf` ×134: output not in Amiga Warez (soft check: that set is often a different dump of the same title)
+- `amiga:dms->adf` ×78: output matched Unrenamed Amiga Warez - Non-TOSEC - [ADF]
 - `nes:unif->nes` ×72: output not in Entertainment System (Headered) (soft check: that set is often a different dump of the same title)
+- `apple:woz->dsk` ×25: output matched Apple II - Games - [DSK]
+- `apple:nib->dsk` ×23: output not in - [DSK] (soft check: that set is often a different dump of the same title)
+- `apple:woz->dsk` ×23: output not in - [DSK] (soft check: that set is often a different dump of the same title)
 - `nes:unif->nes` ×18: output matched Nintendo - Nintendo Entertainment System (Headered)
 - `fds:fds->qd` ×13: output not in Disk System (QD) (soft check: that set is often a different dump of the same title)
 - `fds:qd->fds` ×13: output not in Disk System (FDS) (soft check: that set is often a different dump of the same title)
 - `cia:cia->cdn` ×12: 3 of 4 companion files are in a DAT (Nintendo - Nintendo 3DS (Digital) (CDN))
+- `apple:nib->dsk` ×10: output matched Apple II - Games - [DSK]
 - `zx:scl->trd` ×10: output not in ZX Spectrum (soft check: that set is often a different dump of the same title)
 - `zx:tap->tzx` ×10: output not in ZX Spectrum (soft check: that set is often a different dump of the same title)
 - `psp:pkg->decrypted` ×9: 1 of 8 companion files are in a DAT (Unofficial - Sony - PlayStation 3 (PSN) (Decrypted))
@@ -250,7 +293,7 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 - `vita:pkg->nonpdrm` ×1: 5 of 1270 companion files are in a DAT (Unofficial - Sony - PlayStation Vita (NoNpDrm), IBM - PC and Compatibles (Tiger Electronics - Net Jet), Sony - PlayStation Vita (PSN) (Content))
 - `wiiu:wux->wud` ×1: output matched Nintendo - Wii U
 
-## Registered conversions with NO test files yet (35)
+## Registered conversions with NO test files yet (31)
 
 - `n64:little-endian->big-endian` — N64: little-endian -> big-endian
 - `n64:little-endian->byteswapped` — N64: little-endian -> byteswapped
@@ -277,19 +320,18 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 - `pce:headered->headerless` — PC Engine: strip header
 - `apple:raw->2mg` — Apple II 2IMG: add header  *(unavailable: The original header bytes are needed; they cannot be derived from the ROM body. Strip and re-add in one run, or supply a DAT match.)*
 - `apple:po->do` — Apple II: ProDOS order -> DOS order
-- `amiga:dms->adf` — Amiga: DMS -> ADF (decompress)
 - `cia:decrypted->encrypted` — 3DS CIA: encrypt (keys matched to a DAT when loaded)
 - `cia:cdn->cia` — 3DS CDN files (tmd + cetk + contents) -> CIA
 - `psp:edat->decrypted` — PSP: EDAT -> decrypted payload
 - `st:msa->st` — Atari ST: MSA -> ST
 - `zx:trd->scl` — ZX Spectrum: TRD -> SCL (files only; lossy for unused sectors)
 - `ps3:deciso->iso` — PS3: decrypted ISO -> Redump ISO (disc key)
-- `apple:nib->dsk` — Apple II: NIB nibble image -> DSK sectors (lossy)
-- `apple:woz->dsk` — Apple II: WOZ bit-stream image -> DSK sectors (lossy)
-- `apple:dsk->nib` — Apple II: DSK sectors -> NIB nibble image (standard format)
 
 ## Recent runs
 
+- `20260915-095315` code `cb14c6383b` · 35 tests · args `--only Apple - II [WOZ] --retry-failed` · finished 2026-09-15T09:54:56.309593 · log `logs/run-20260915-095315.log`
+- `20260915-094759` code `38f3f6ad14` · 216 tests · args `--only Amiga DMS` · finished 2026-09-15T09:48:30.057778 · log `logs/run-20260915-094759.log`
+- `20260915-094425` code `38f3f6ad14` · 362 tests · args `--only Apple - II` · finished 2026-09-15T09:47:57.799991 · log `logs/run-20260915-094425.log`
 - `20260913-211049` code `38f3f6ad14` · 1 tests · args `--only Sony - PlayStation 3 --conv zso --limit 1 --retry-failed` · finished 2026-09-13T21:23:17.285473 · log `logs/run-20260913-211049.log`
 - `20260913-211033` code `38f3f6ad14` · 0 tests · args `--only Sony - PlayStation 3 --conv zso --limit 1` · finished 2026-09-13T21:10:38.224746 · log `logs/run-20260913-211033.log`
 - `20260913-201416` code `38f3f6ad14` · 2 tests · args `--only Vita (PSN) (Content)` · finished 2026-09-13T20:15:20.840109 · log `logs/run-20260913-201416.log`
@@ -297,6 +339,3 @@ Generated 2026-09-13 21:23  ·  rom_tools.py `38f3f6ad14`  ·  database `B:\User
 - `20260913-194101` code `46fedd0eb9` · 5 tests · args `--only PS one Classics` · finished 2026-09-13T19:55:29.356387 · log `logs/run-20260913-194101.log`
 - `20260913-191158` code `7aa604fe3a` · 3 tests · args `--only PlayStation 3 (PSN)` · finished 2026-09-13T19:12:08.571825 · log `logs/run-20260913-191158.log`
 - `20260913-181525` code `d02dd3fb76` · 2 tests · args `--only SNK - Neo Geo CD --redo` · finished 2026-09-13T18:15:42.359025 · log `logs/run-20260913-181525.log`
-- `20260913-181326` code `ba1811571c` · 2 tests · args `--only 3DO --redo` · finished 2026-09-13T18:14:19.835532 · log `logs/run-20260913-181326.log`
-- `20260913-181305` code `ba1811571c` · 2 tests · args `--only PC Engine CD --redo` · finished 2026-09-13T18:13:25.130541 · log `logs/run-20260913-181305.log`
-- `20260913-181248` code `ba1811571c` · 2 tests · args `--only SNK - Neo Geo CD --redo` · finished 2026-09-13T18:13:04.878928 · log `logs/run-20260913-181248.log`

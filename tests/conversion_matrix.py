@@ -96,6 +96,8 @@ EXPECT = {
     'NEC - PC Engine SuperGrafx': ('PCE', 'headerless', {
         'pce:headerless->headered': None}),
     'Commodore - Amiga [ADF]': ('AMIGA', None, {}),
+    # loose scene DMS files; their ADFs are in the Non-TOSEC Amiga Warez DAT
+    'Amiga DMS': ('AMIGA', None, {'amiga:dms->adf': '~Amiga Warez'}),
     'Commodore - C64 [CRT]': ('C64', None, {}),
     'Commodore - C64 [D64]': ('C64', None, {'c64:d64->files': '~C64'}),
     'Commodore - C64 [P00]': ('C64', None, {'c64:p00->prg': None}),
@@ -111,8 +113,8 @@ EXPECT = {
     'Apple - II [DSK]': ('APPLE2', None, {'apple:do->po': None}),
     'Apple - II [PO]': ('APPLE2', None, {}),
     'Apple - II [2MG]': ('APPLE2', None, {'apple:2mg->raw': None}),
-    'Apple - II [WOZ]': ('APPLE2', None, {'apple:woz->dsk': '~[DSK]'}),
-    'Apple - II [NIB]': ('APPLE2', None, {'apple:nib->dsk': '~[DSK]'}),
+    'Apple - II [WOZ]': ('APPLE2', None, {'apple:woz->dsk': '~- [DSK]'}),
+    'Apple - II [NIB]': ('APPLE2', None, {'apple:nib->dsk': '~- [DSK]'}),
     'Apple - II [EDD]': ('APPLE2', None, {}),
     'Apple - II [HDV]': ('APPLE2', None, {}),
     'Apple - II [A2R]': ('APPLE2', None, {}),
@@ -256,7 +258,7 @@ class Log:
 # The RomVault DAT tree is ~13 GB (MAME, media, arcade...). Only the sources a
 # ROM conversion can be proven against are indexed; TOSEC only for systems the
 # matrix has files for.
-INDEX_DIRS = ['NoIntro', 'ReDump/ReDump', 'ReDumpPlus', 'IBM-NoIntro', 'N-Library',
+INDEX_DIRS = ['Tosec/TOSEC/Apple/II', 'Others/Non-TOSEC/Amiga Warez', 'NoIntro', 'ReDump/ReDump', 'ReDumpPlus', 'IBM-NoIntro', 'N-Library',
               'Tosec/TOSEC/Sinclair/ZX Spectrum', 'Tosec/TOSEC/Commodore/C64',
               'Tosec/TOSEC/Atari/8bit', 'Tosec/TOSEC/Atari/ST',
               'Tosec/TOSEC/IBM/PC Compatibles']
