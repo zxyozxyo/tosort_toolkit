@@ -5692,13 +5692,26 @@ class RsrToolAPI:
             probe_cmds = self._pack_cmds_extra(
                 cmds, (f"-v{probe_vol}b", "-vn"))
         if prefix and cmds and len(cmds) == 1 and (vol_args or synthetic):
-            head = wdir / "probe.rar"
+            # By VOLUME INDEX, never by name. Under new numbering rar writes
+            # probe.part1.rar and no probe.rar exists: the old test ("any file
+            # not called probe.rar") fired the moment volume ONE appeared, and
+            # the verdict then read a file that was never there -- no end
+            # block, so every combo was "the end block did not match". Not one
+            # RAR4 .partN multi-volume set was captured between this probe
+            # going in (2026-09-04) and this fix; 15 had been before it.
+            # RC_Helicopter_USA_PS1-NOITAMI, which rar300 reproduces, is one.
+            def _vols():
+                try:
+                    return [q for q in wdir.iterdir()
+                            if _classify_volume(q.name)]
+                except OSError:
+                    return []
 
             def _closed():
                 # rar has opened volume two, so volume one is complete and
                 # flushed. Safer than watching volume one's size, which sits
                 # at its final value for a moment before the file is closed.
-                return any(q.name != "probe.rar" for q in wdir.iterdir())
+                return len(_vols()) >= 2
 
             if not self._run_until(probe_cmds[0], _closed, timeout=900,
                                    heartbeat=f"probe -mt{n} "
@@ -5706,6 +5719,7 @@ class RsrToolAPI:
                                    cwd=base):
                 self._tally_reject("the probe pack never produced volume two")
                 return False
+            head = self._probe_head(wdir) or wdir / "probe.rar"
             verdict = self._prefix_verdict(head, prefix)
             bad = (verdict is False
                    or (not synthetic and end_sig is not None
@@ -5747,8 +5761,13 @@ class RsrToolAPI:
         # match but which cannot split where the original splits did not make
         # this archive -- see the module note on RAR 2.x and 15,000,000 B.
         if vol_args and want_vols > 1:
+            # By volume base name, not head.stem: for probe.part1.rar the stem
+            # is "probe.part1" and only the head matched it, so every .partN
+            # set "split into 1 volume(s)" (the same naming trap as the probe).
+            base_name = (_classify_volume(head.name) or (head.stem,))[0]
             made = sorted(q for q in wdir.iterdir()
-                          if q.is_file() and q.name.startswith(head.stem + "."))
+                          if q.is_file() and (_classify_volume(q.name) or
+                                              ("",))[0] == base_name)
             if len(made) != want_vols:
                 self._tally_reject(f"the pack split into {len(made)} volume(s), "
                                    f"not {want_vols}")
