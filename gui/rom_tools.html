@@ -133,6 +133,14 @@ td.size{font-family:var(--mono);color:var(--text3);text-align:right;white-space:
 .flag{font-size:9px;font-family:var(--mono);padding:0 5px;border-radius:8px;border:1px solid var(--warn);color:var(--warn);margin-left:4px}
 .flag.rev{border-color:var(--border);color:var(--text2)}
 .cnote{font-size:10px;color:var(--text3);margin-top:2px;line-height:1.4}
+.ev{display:inline-block;font-family:var(--mono);font-size:9px;padding:0 6px;border-radius:8px;border:1px solid var(--border);white-space:nowrap;margin-bottom:2px}
+.ev.proven{border-color:var(--acc);color:var(--acc)}
+.ev.roundtrip{border-color:var(--info);color:var(--info)}
+.ev.partial{border-color:var(--warn);color:var(--warn)}
+.ev.synthetic{border-color:#b07af0;color:#b07af0}
+.ev.untested{color:var(--text3)}
+.evtxt{font-size:10px;color:var(--text2);line-height:1.4}
+.evsum{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 2px}
 
 .bar{height:3px;background:var(--bg3);border-radius:2px;overflow:hidden}
 .bar > div{height:100%;background:var(--acc);width:0;transition:width .2s}
@@ -199,7 +207,7 @@ td.size{font-family:var(--mono);color:var(--text3);text-align:right;white-space:
         <span class="chevron" id="chev-sys">▸</span>
       </div>
       <div class="panel-body collapsed" id="body-sys">
-        <div class="hint">Pick a system to see which conversions it has, the file types each one starts from, how the result is checked, and anything that has to be placed in the apps folder first. Files are recognised by their contents, so the file types are a guide rather than a rule.</div>
+        <div class="hint">Pick a system to see which conversions it has, the file types each one starts from, how the result is checked, how far it has been tested on real files, and anything that has to be placed in the apps folder first. Files are recognised by their contents, so the file types are a guide rather than a rule.</div>
         <div class="sysinfo">
           <div class="syslist">
             <input class="txt" id="sysfilter" placeholder="filter: name or file type, e.g. .woz" oninput="renderSysList()" style="flex:none;min-width:0">
@@ -406,6 +414,9 @@ function renderSysDetail(){
   let h = `<h3>${esc(s.name)}</h3><div class="about">${esc(s.about)}</div>`;
   h += `<div class="hint">${s.ready} of ${s.total} conversions ready on this PC` +
        (s.planned ? ` · ${s.planned} not implemented yet` : '') + '.</div>';
+  const lv = CATALOG.evidence_levels || {};
+  h += '<div class="evsum">' + Object.keys(lv).filter(k => s.tested && s.tested[k])
+        .map(k => `<span class="ev ${k}" title="${esc(lv[k])}">${s.tested[k]} × ${esc(lv[k])}</span>`).join('') + '</div>';
 
   h += '<h4>What it needs</h4>';
   h += s.needs.length
@@ -417,7 +428,7 @@ function renderSysDetail(){
          `<span class="hint">Point it at a headered set (loose files or RomVault zips). Headers are stored by the ROM's SHA-1, so adding one back is exact.</span></div>`;
   }
   h += '<h4>Conversions</h4><div class="tblwrap" style="max-height:none"><table><thead><tr>' +
-       '<th>From</th><th>To</th><th>Conversion</th><th>How the result is checked</th><th>Status</th>' +
+       '<th>From</th><th>To</th><th>Conversion</th><th>How the result is checked</th><th>Tested on real files</th><th>Status</th>' +
        '</tr></thead><tbody>';
   for(const c of s.conversions){
     const from = c.from.length ? c.from.map(f => `<span class="ext">${esc(f)}</span>`).join('') : '—';
@@ -433,6 +444,8 @@ function renderSysDetail(){
         ${needs.length ? `<div class="cnote">needs: ${needs.map(esc).join(', ')}</div>` : ''}
         ${c.note ? `<div class="cnote">${esc(c.note)}</div>` : ''}</td>
       <td class="cnote" style="font-size:10px">${esc(c.verify)}</td>
+      <td style="min-width:170px"><span class="ev ${esc(c.tested)}">${esc(c.tested_label)}</span>
+        <div class="evtxt">${esc(c.evidence)}</div></td>
       <td><span class="cstat ${stat}" title="${esc(c.reason)}">${statTxt}</span></td>
     </tr>`;
   }

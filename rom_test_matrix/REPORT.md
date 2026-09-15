@@ -1,6 +1,6 @@
 # ROM conversion test matrix
 
-Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User\ClaudeCode\tosort_toolkit\rom_test_matrix\matrix.db`
+Generated 2026-09-15 16:28  ·  rom_tools.py `c51efc7631`  ·  database `B:\User\ClaudeCode\tosort_toolkit\rom_test_matrix\matrix.db`
 
 **Status meanings:** PASS = output matched the expected DAT and/or converted back byte-exact · FAIL = crashed, wrong DAT, or round trip differs · UNVERIFIED = ran, but nothing could prove it right · UNAVAILABLE = engine not implemented or key/tool missing · N/A = file already in the target state.
 
@@ -20,7 +20,7 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 | `a78:headered->headerless` | 8 | 8 | 0 | 0 | 0 | 8/8 | 8/8 | 0 | d15202fe81 |
 | `a8:atr->xfd` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | 7ea1b35567 |
 | `a8:xfd->atr` | 1 | 1 | 0 | 0 | 0 | None/0 | 1/1 | 0 | 7ea1b35567 |
-| `apple:2mg->raw` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | d15202fe81 |
+| `apple:2mg->raw` | 20 | 20 | 0 | 0 | 0 | None/0 | 20/20 | 0 | d15202fe81,b9f3d55b03 |
 | `apple:dsk->nib` | 99 | 99 | 0 | 0 | 0 | None/0 | 99/99 | 0 | 38f3f6ad14 |
 | `apple:nib->dsk` | 83 | 10 | 0 | 23 | 50 | 10/10 | None/0 | 0 | 38f3f6ad14 |
 | `apple:woz->dsk` | 80 | 25 | 0 | 23 | 32 | 25/25 | None/0 | 0 | 38f3f6ad14,cb14c6383b |
@@ -61,7 +61,9 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 | `pc:td0->img` | 18 | 6 | 0 | 3 | 9 | 6/6 | None/0 | 0 | e6cef9b724 |
 | `pce:headerless->headered` | 25 | 25 | 0 | 0 | 0 | None/0 | 25/25 | 0 | d15202fe81 |
 | `psp:iso->cso` | 8 | 8 | 0 | 0 | 0 | None/0 | 8/8 | 0 | bf7f5382c2 |
+| `psp:pbp->iso` | 7 | 7 | 0 | 0 | 0 | 7/7 | None/0 | 0 | c51efc7631 |
 | `psp:pkg->decrypted` | 44 | 43 | 0 | 1 | 0 | 43/43 | None/0 | 0 | 4e8421a87a,7aa604fe3a,46fedd0eb9,041567de78 |
+| `psx:pbp->bin` | 5 | 3 | 0 | 2 | 0 | 3/3 | None/0 | 0 | 4407c76a27,febff0597b,c51efc7631 |
 | `snes:headerless->headered` | 34 | 34 | 0 | 0 | 0 | None/0 | 34/34 | 0 | bf7f5382c2 |
 | `st:st->msa` | 10 | 10 | 0 | 0 | 0 | None/0 | 10/10 | 0 | dadf150eb3 |
 | `vita:pkg->decrypted` | 1 | 1 | 0 | 0 | 0 | 1/1 | None/0 | 0 | 38f3f6ad14 |
@@ -77,7 +79,7 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 |---|---|---|---|
 | 3DO Interactive Multiplayer | 2 | 2 | 2 |
 | Amiga DMS | 216 | 216 | 0 |
-| Apple - II [2MG] | 10 | 10 | 0 |
+| Apple - II [2MG] | 20 | 20 | 10 |
 | Apple - II [A2R] | 2 | 2 | 1 |
 | Apple - II [DSK] | 110 | 109 | 100 |
 | Apple - II [EDD] | 3 | 3 | 0 |
@@ -146,11 +148,13 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 | Sinclair - ZX Spectrum [Z80] | 10 | 10 | 10 |
 | Sony - PlayStation | 3 | 3 | 3 |
 | Sony - PlayStation (PS one Classics) (PSN) | 5 | 5 | 5 |
+| Sony - PlayStation (PS one Classics) [EBOOT] | 5 | 5 | 0 |
 | Sony - PlayStation 2 | 1 | 1 | 1 |
 | Sony - PlayStation 3 | 7 | 7 | 7 |
 | Sony - PlayStation 3 (PSN) | 3 | 3 | 3 |
 | Sony - PlayStation Portable (PSN) (Decrypted) | 8 | 8 | 8 |
 | Sony - PlayStation Portable (PSN) (Encrypted) | 36 | 36 | 36 |
+| Sony - PlayStation Portable (PSN) [EBOOT] | 7 | 7 | 0 |
 | Sony - PlayStation Vita (PSN) (Content) | 1 | 1 | 1 |
 
 **Misdetections, grouped:**
@@ -251,6 +255,7 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 - `c64:d64->files` ×7: output matched Commodore C64 - Games - Arcade - [PRG]
 - `fds:fds->qd` ×7: output matched Nintendo - Family Computer Disk System (QD)
 - `fds:qd->fds` ×7: output matched Nintendo - Family Computer Disk System (FDS)
+- `psp:pbp->iso` ×7: output matched Sony - PlayStation Portable (PSN) (Decrypted)
 - `pc:td0->img` ×6: output matched IBM PC Compatibles - Games - [IMG]
 - `zx:tzx->tap` ×6: output not in ZX Spectrum (soft check: that set is often a different dump of the same title)
 - `nes:unif->nes` ×5: output matched Nintendo - Nintendo Entertainment System (Headered) (Aftermarket)
@@ -263,10 +268,12 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 - `pc:td0->img` ×3: output not in IBM PC Compatibles (soft check: that set is often a different dump of the same title)
 - `psp:pkg->decrypted` ×3: 1 of 8 companion files are in a DAT (Unofficial - Sony - PlayStation 3 (PSN) (Decrypted))
 - `psp:pkg->decrypted` ×3: 4 of 9 companion files are in a DAT (Unofficial - Sony - PlayStation 3 (PSN) (Decrypted), Sony - PlayStation Portable (PSN) (Decrypted))
+- `psx:pbp->bin` ×3: 0 of 1 companion files are in a DAT
 - `c64:d81->files` ×2: 0 of 41 companion files are in a DAT
 - `c64:t64->prg` ×2: output not in C64 (soft check: that set is often a different dump of the same title)
 - `psp:pkg->decrypted` ×2: 1 of 7 companion files are in a DAT (Unofficial - Sony - PlayStation 3 (PSN) (Decrypted))
 - `psp:pkg->decrypted` ×2: 3 of 8 companion files are in a DAT (Unofficial - Sony - PlayStation 3 (PSN) (Decrypted), Sony - PlayStation Portable (PSN) (Decrypted))
+- `psx:pbp->bin` ×2: 0 of 1 companion files are in a DAT
 - `c64:d81->files` ×1: 0 of 12 companion files are in a DAT
 - `c64:d81->files` ×1: 0 of 17 companion files are in a DAT
 - `c64:d81->files` ×1: 0 of 18 companion files are in a DAT
@@ -293,14 +300,11 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 - `vita:pkg->nonpdrm` ×1: 5 of 1270 companion files are in a DAT (Unofficial - Sony - PlayStation Vita (NoNpDrm), IBM - PC and Compatibles (Tiger Electronics - Net Jet), Sony - PlayStation Vita (PSN) (Content))
 - `wiiu:wux->wud` ×1: output matched Nintendo - Wii U
 
-## Registered conversions with NO test files yet (31)
+## Registered conversions with NO test files yet (35)
 
 - `n64:little-endian->big-endian` — N64: little-endian -> big-endian
 - `n64:little-endian->byteswapped` — N64: little-endian -> byteswapped
 - `psp:cso->iso` — PSP: CSO -> ISO (decompress)
-- `psp:pbp->iso` — PSP: EBOOT.PBP -> ISO  *(unavailable: PSN content decryption is not implemented yet.)*
-- `psp:dax->iso` — PSP: DAX -> ISO  *(unavailable: PSN content decryption is not implemented yet.)*
-- `psp:jso->iso` — PSP: JSO -> ISO  *(unavailable: PSN content decryption is not implemented yet.)*
 - `disc:gc:ciso->iso` — GC: CISO -> ISO
 - `disc:gc:ciso->rvz` — GC: CISO -> RVZ
 - `disc:gc:rvz->rvz` — GC: recompress to zstd-19-128k
@@ -311,14 +315,14 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 - `chd:chd->dvd` — CHD: CHD -> ISO (DVD)
 - `chd:chd->raw` — CHD: CHD -> ISO (extract raw)
 - `snes:headered->headerless` — SNES: strip header
-- `a78:headerless->headered` — Atari 7800: add header  *(unavailable: The original header bytes are needed; they cannot be derived from the ROM body. Strip and re-add in one run, or supply a DAT match.)*
-- `lnx:headerless->headered` — Atari Lynx: add header  *(unavailable: The original header bytes are needed; they cannot be derived from the ROM body. Strip and re-add in one run, or supply a DAT match.)*
+- `a78:headerless->headered` — Atari 7800: add header
+- `lnx:headerless->headered` — Atari Lynx: add header
 - `nes:fds-headered->headerless` — FDS: strip header
 - `md:smd->bin` — Mega Drive: SMD -> BIN (deinterleave)
 - `iso:zso->iso` — PSP/PS2: ZSO -> ISO
 - `wiiu:wud->wux` — Wii U: WUD -> WUX (compress)
 - `pce:headered->headerless` — PC Engine: strip header
-- `apple:raw->2mg` — Apple II 2IMG: add header  *(unavailable: The original header bytes are needed; they cannot be derived from the ROM body. Strip and re-add in one run, or supply a DAT match.)*
+- `apple:raw->2mg` — Apple II 2IMG: add header
 - `apple:po->do` — Apple II: ProDOS order -> DOS order
 - `cia:decrypted->encrypted` — 3DS CIA: encrypt (keys matched to a DAT when loaded)
 - `cia:cdn->cia` — 3DS CDN files (tmd + cetk + contents) -> CIA
@@ -326,16 +330,23 @@ Generated 2026-09-15 09:54  ·  rom_tools.py `cb14c6383b`  ·  database `B:\User
 - `st:msa->st` — Atari ST: MSA -> ST
 - `zx:trd->scl` — ZX Spectrum: TRD -> SCL (files only; lossy for unused sectors)
 - `ps3:deciso->iso` — PS3: decrypted ISO -> Redump ISO (disc key)
+- `psp:dax->iso` — PSP: DAX -> ISO (decompress)
+- `psp:jso->iso` — PSP: JSO -> ISO (decompress)
+- `cd:ecm->bin` — CD: ECM -> BIN (rebuild EDC/ECC)
+- `cd:bin->ecm` — CD: BIN -> ECM (drop recomputable EDC/ECC)
+- `patch:apply` — Patch: apply to its base ROM (IPS / UPS / BPS / xdelta)
+- `cue:split->merged` — CUE/BIN: merge track files into one BIN
+- `cue:merged->split` — CUE/BIN: split one BIN into Redump-style track files
 
 ## Recent runs
 
+- `20260915-161054` code `c51efc7631` · 7 tests · args `--only (PSN) [EBOOT] --retry-failed` · finished 2026-09-15T16:28:08.363364 · log `logs/run-20260915-161054.log`
+- `20260915-152102` code `b9f3d55b03` · 5 tests · args `--only PS one Classics) [EBOOT] --retry-failed` · finished 2026-09-15T16:10:52.414269 · log `logs/run-20260915-152102.log`
+- `20260915-152054` code `b9f3d55b03` · 10 tests · args `--only II [2MG] --retry-failed` · finished 2026-09-15T15:21:00.689589 · log `logs/run-20260915-152054.log`
+- `20260915-152046` code `b9f3d55b03` · 0 tests · args `--only Atari Lynx (LNX) --retry-failed` · finished 2026-09-15T15:20:52.572982 · log `logs/run-20260915-152046.log`
+- `20260915-152038` code `b9f3d55b03` · 0 tests · args `--only Atari 7800 (A78) --retry-failed` · finished 2026-09-15T15:20:44.876408 · log `logs/run-20260915-152038.log`
 - `20260915-095315` code `cb14c6383b` · 35 tests · args `--only Apple - II [WOZ] --retry-failed` · finished 2026-09-15T09:54:56.309593 · log `logs/run-20260915-095315.log`
 - `20260915-094759` code `38f3f6ad14` · 216 tests · args `--only Amiga DMS` · finished 2026-09-15T09:48:30.057778 · log `logs/run-20260915-094759.log`
 - `20260915-094425` code `38f3f6ad14` · 362 tests · args `--only Apple - II` · finished 2026-09-15T09:47:57.799991 · log `logs/run-20260915-094425.log`
 - `20260913-211049` code `38f3f6ad14` · 1 tests · args `--only Sony - PlayStation 3 --conv zso --limit 1 --retry-failed` · finished 2026-09-13T21:23:17.285473 · log `logs/run-20260913-211049.log`
 - `20260913-211033` code `38f3f6ad14` · 0 tests · args `--only Sony - PlayStation 3 --conv zso --limit 1` · finished 2026-09-13T21:10:38.224746 · log `logs/run-20260913-211033.log`
-- `20260913-201416` code `38f3f6ad14` · 2 tests · args `--only Vita (PSN) (Content)` · finished 2026-09-13T20:15:20.840109 · log `logs/run-20260913-201416.log`
-- `20260913-195530` code `041567de78` · 21 tests · args `--only Sony - PlayStation 3` · finished 2026-09-13T21:10:15.210407 · log `logs/run-20260913-195530.log`
-- `20260913-194101` code `46fedd0eb9` · 5 tests · args `--only PS one Classics` · finished 2026-09-13T19:55:29.356387 · log `logs/run-20260913-194101.log`
-- `20260913-191158` code `7aa604fe3a` · 3 tests · args `--only PlayStation 3 (PSN)` · finished 2026-09-13T19:12:08.571825 · log `logs/run-20260913-191158.log`
-- `20260913-181525` code `d02dd3fb76` · 2 tests · args `--only SNK - Neo Geo CD --redo` · finished 2026-09-13T18:15:42.359025 · log `logs/run-20260913-181525.log`

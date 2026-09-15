@@ -191,6 +191,7 @@ with tempfile.TemporaryDirectory() as tmp:
     twomg[0:4] = b'2IMG'
     twomg[4:8] = b'WOOF'
     disk = os.urandom(143360)
+    struct.pack_into('<II', twomg, 0x18, 64, len(disk))
     sets = tmp / 'headered set'
     sets.mkdir()
     with zipfile.ZipFile(sets / 'Lynx Hit (World).zip', 'w', zipfile.ZIP_DEFLATED) as z:

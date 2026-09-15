@@ -43,6 +43,14 @@ unlisted = [cid for cid in keyed
             if rt.CONVERSIONS[cid]['requires'] not in {n for n, _, _ in rt.CONVERSION_NEEDS.get(cid, [])}]
 check('keyed conversions name their key file', not unlisted, ', '.join(unlisted))
 
+no_evidence = sorted(set(rt.CONVERSIONS) - set(rt.TEST_EVIDENCE))
+check('every conversion says how far it has been tested on real files', not no_evidence,
+      ', '.join(no_evidence))
+bad_level = sorted(k for k, (lvl, _) in rt.TEST_EVIDENCE.items() if lvl not in rt.EVIDENCE_LEVELS)
+check('test-evidence levels are all known', not bad_level, ', '.join(bad_level))
+stale = sorted(set(rt.TEST_EVIDENCE) - set(rt.CONVERSIONS))
+check('no test evidence for conversions that no longer exist', not stale, ', '.join(stale))
+
 planned = [c['id'] for c in convs if c['status'] == 'planned']
 check('unbuilt engines show as planned, never ready',
       all(rt.CONVERSIONS[cid].get('fn') is None for cid in planned) and

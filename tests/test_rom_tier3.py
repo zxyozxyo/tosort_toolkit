@@ -89,8 +89,18 @@ hdr = bytearray(rt.TWOMG_HEADER)
 hdr[0:4] = b'2IMG'
 hdr[4:8] = b'XGS!'
 struct.pack_into('<I', hdr, 0x0C, 1)          # ProDOS order
+struct.pack_into('<II', hdr, 0x18, rt.TWOMG_HEADER, rt.APPLE_DISK)   # where the disk data sits
 two = TMP / 'disk.2mg'
 two.write_bytes(bytes(hdr) + noise(rt.APPLE_DISK, 'twomg'))
+check_comment = TMP / 'comment.2mg'
+cmt = bytearray(hdr)
+struct.pack_into('<II', cmt, 0x20, rt.TWOMG_HEADER + rt.APPLE_DISK, 11)
+check_comment.write_bytes(bytes(cmt) + noise(rt.APPLE_DISK, 'twomg') + b'hello there')
+meta = rt.strip_2mg_header(check_comment, TMP / 'comment.po')
+rt.add_2mg_header(TMP / 'comment.po', TMP / 'comment_back.2mg', meta)
+check('2IMG with a comment after the disk data: data alone stripped, comment restored',
+      (TMP / 'comment.po').stat().st_size == rt.APPLE_DISK and
+      (TMP / 'comment_back.2mg').read_bytes() == check_comment.read_bytes())
 r = rt.identify(two)
 check('Apple II 2IMG detected', (r['system'], r['format']) == ('APPLE2', '2MG'),
       r['detail'])

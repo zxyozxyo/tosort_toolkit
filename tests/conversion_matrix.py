@@ -159,6 +159,11 @@ EXPECT = {
     # Vita PSN package (+ work.bin) -> files with the PFS layer removed
     'Sony - PlayStation Vita (PSN) (Content)': ('VITA', 'encrypted', {
         'vita:pkg->decrypted': '~Vita (NoNpDrm)', 'vita:pkg->nonpdrm': None}),
+    # standalone EBOOT.PBP files pulled out of PSN packages (tests/stage_wip.py)
+    'Sony - PlayStation (PS one Classics) [EBOOT]': ('PSX', 'encrypted', {
+        'psx:pbp->bin': '~Sony - PlayStation'}),
+    'Sony - PlayStation Portable (PSN) [EBOOT]': ('PSP', 'encrypted', {
+        'psp:pbp->iso': '~PlayStation Portable (PSN)'}),
     'Nintendo 3DS CIA': ('3DS', 'encrypted', {
         'cia:encrypted->decrypted': None,
         'cia:cia->cdn': '~Nintendo 3DS (Digital) (CDN)'}),
@@ -258,7 +263,7 @@ class Log:
 # The RomVault DAT tree is ~13 GB (MAME, media, arcade...). Only the sources a
 # ROM conversion can be proven against are indexed; TOSEC only for systems the
 # matrix has files for.
-INDEX_DIRS = ['Tosec/TOSEC/Apple/II', 'Others/Non-TOSEC/Amiga Warez', 'NoIntro', 'ReDump/ReDump', 'ReDumpPlus', 'IBM-NoIntro', 'N-Library',
+INDEX_DIRS = ['Tosec/TOSEC-ISO/Sega/Dreamcast', 'Tosec/TOSEC/Apple/II', 'Others/Non-TOSEC/Amiga Warez', 'NoIntro', 'ReDump/ReDump', 'ReDumpPlus', 'IBM-NoIntro', 'N-Library',
               'Tosec/TOSEC/Sinclair/ZX Spectrum', 'Tosec/TOSEC/Commodore/C64',
               'Tosec/TOSEC/Atari/8bit', 'Tosec/TOSEC/Atari/ST',
               'Tosec/TOSEC/IBM/PC Compatibles']

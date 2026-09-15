@@ -32,6 +32,9 @@ SETS = [
      ('Atari', '[ST]', 'Atari - ST [ST]', 10), ('Sinclair', '[SCL]', 'Sinclair - ZX Spectrum [SCL]', 10),
      ('Commodore', '[D81]', 'Commodore - C64 [D81]', 10),
      ('IBM PC Compatibles', '[TD0]', 'IBM - PC [TD0]', 15),
+     ('Atari - Atari 7800 (A78)', None, 'Atari - Atari 7800 (A78)', 99),
+     ('Atari - Atari Lynx (LNX)', None, 'Atari - Atari Lynx (LNX)', 99),
+     ('Apple II', '[2MG]', 'Apple - II [2MG]', 99),
      ('IBM PC Compatibles', '[IMD]', 'IBM - PC [IMD]', 6),
      ('Nintendo - Nintendo DSi (Encrypted)', None, 'Nintendo - Nintendo DSi (Encrypted)', 17),
      ('Nintendo - Nintendo DSi (Decrypted)', None, 'Nintendo - Nintendo DSi (Decrypted)', 15),
@@ -60,6 +63,13 @@ PAIRS = [
 APPLE_LEVELS = [
     ('Apple II', '[NIB]', 'Apple - II [NIB]', 999, 40),
     ('Apple II', '[WOZ]', 'Apple - II [WOZ]', 60, 20),
+]
+
+# PSN packages whose EBOOT.PBP is staged ON ITS OWN (the package is not kept),
+# so the standalone EBOOT.PBP conversions are tested on real files
+PBP_FROM_PKG = [
+    ('Sony - PlayStation (PS one Classics) (PSN)', 'Sony - PlayStation (PS one Classics) [EBOOT]'),
+    ('Sony - PlayStation Portable (PSN) (Encrypted)', 'Sony - PlayStation Portable (PSN) [EBOOT]'),
 ]
 
 # optical discs: smallest N zips, one sub-folder per game (cue sheets need it)
@@ -140,15 +150,51 @@ def main():
         for stem in extra:
             extract(lvl[stem], STAGED / name)
         print(f'{name:<45} {len(shared)} titles with a [DSK] + {len(extra)} without')
-    if args.only:
-        return
+
+    for folder, name in PBP_FROM_PKG:
+        if not want(name):
+            continue
+        import shutil, sys
+        sys.path.insert(0, str(WIP.parent))
+        import rom_tools as rt
+        dest = STAGED / name
+        dest.mkdir(parents=True, exist_ok=True)
+        tmp = STAGED / '_pkgtmp'
+        done = 0
+        for z in sorted(zips_under(folder)):
+            target = dest / (z.stem + '.PBP')
+            if target.exists():
+                continue
+            shutil.rmtree(tmp, ignore_errors=True)
+            extract(z, tmp)
+            for pkg_path in tmp.glob('*.pkg'):
+                pkg = rt._Pkg(pkg_path)
+                try:
+                    it = next((i for i in pkg.items
+                               if i['name'].replace(chr(92), '/').upper() == 'USRDIR/CONTENT/EBOOT.PBP'), None)
+                    if it:
+                        with open(target, 'wb') as fo:
+                            off = 0
+                            while off < it['size']:
+                                n = min(1 << 24, it['size'] - off)
+                                fo.write(pkg.item_bytes(it, off, n))
+                                off += n
+                        done += 1
+                finally:
+                    pkg.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+        print(f'{name:<45} {done} EBOOT.PBP staged')
 
     for folder, sub, name, n in SETS:
+        if not want(name):
+            continue
         zs = zips_under(folder, sub)
         pick = spread(zs, n)
         written = sum(extract(z, STAGED / name) for z in pick)
         print(f'{name:<45} {len(pick):>3} of {len(zs):>6} zips  ({written} new files)')
 
+    if args.only:
+        return
     folder, games = PSN_PKG
     zs = zips_under(folder)
     small = [z for z in zs if z.stat().st_size < 50 * 2**20]

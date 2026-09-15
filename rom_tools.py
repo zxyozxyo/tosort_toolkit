@@ -1387,9 +1387,14 @@ def output_path(src, conv_id, src_root, out_root):
         rel = src.relative_to(src_root)
     except ValueError:
         rel = Path(src.name)
-    ext = (CONVERSIONS.get(conv_id) or {}).get('ext')
+    spec = CONVERSIONS.get(conv_id) or {}
+    ext = spec['ext_fn'](src) if spec.get('ext_fn') else spec.get('ext')
     dest = out_root / rel
-    if ext:
+    if spec.get('strip_ext') and Path(dest.stem).suffix:
+        dest = dest.with_suffix('')                  # game.bin.ecm -> game.bin
+    elif spec.get('append_ext'):
+        dest = dest.with_name(dest.name + ext)       # game.bin -> game.bin.ecm
+    elif ext:
         dest = dest.with_suffix(ext)
     if dest.resolve() == src.resolve():
         dest = dest.with_name(dest.stem + '_converted' + dest.suffix)
@@ -1651,7 +1656,7 @@ class RomToolsAPI:
     def system_catalog(self):
         """The information view: every system, what it converts, what it needs."""
         try:
-            return {'ok': True, 'systems': system_catalog(),
+            return {'ok': True, 'systems': system_catalog(), 'evidence_levels': EVIDENCE_LEVELS,
                     'apps_dir': str(HERE / 'apps'), 'keys_dir': str(KEYS_DIR)}
         except Exception as e:
             return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
@@ -2115,9 +2120,23 @@ def _detect_cd_sheet(buf, path, fh):
     if ext == '.gdi' and not GDI_HINT.search(head):
         return None
     kind = {'cue': 'CUE sheet', 'gdi': 'GDI (Dreamcast)', 'toc': 'TOC sheet'}[ext[1:]]
+    convs = ['chd:cd->chd']
+    detail = f'{kind} - track listing for a disc image'
+    if ext == '.cue':
+        text = bytes(head).decode('utf-8', 'replace')
+        files, tracks = _cue_file_count(text)
+        if 'HIGH-DENSITY AREA' in text.upper():
+            convs.append('dc:cue->gdi')
+        if files > 1:
+            convs.append('cue:split->merged')
+        elif files == 1 and tracks > 1:
+            convs.append('cue:merged->split')
+        detail = f'{kind} - {tracks} track(s) in {files} file(s)'
+    if ext == '.gdi':
+        convs.append('dc:gdi->cue')
     return _result('CD', kind, 'uncompressed', confidence='high',
-                   detail=f'{kind} - track listing for a disc image',
-                   conversions=['chd:cd->chd'],
+                   detail=detail,
+                   conversions=convs,
                    notes=['The referenced track files are read alongside it.'])
 
 
@@ -3825,8 +3844,34 @@ def _reorder_apple(src, dst, progress=None):
     return dst
 
 
-strip_2mg_header = _strip_fixed(TWOMG_HEADER)
-add_2mg_header = _add_fixed(TWOMG_HEADER, lambda h: h[0:4] == TWOMG_MAGIC)
+def _split_2mg(data):
+    """(header + trailing blocks, disk data). The header says where the data
+    sits; anything after it (comment, creator data) belongs with the header."""
+    if len(data) < TWOMG_HEADER or data[:4] != TWOMG_MAGIC:
+        raise ConversionError('not a 2IMG file')
+    off, length = struct.unpack_from('<II', data, 0x18)
+    if off < TWOMG_HEADER or off + length > len(data):
+        raise ConversionError(f'2IMG header puts the disk data at {off:,}+{length:,}, '
+                              f'outside the {len(data):,}-byte file')
+    return bytes(data[:off]) + bytes(data[off + length:]), bytes(data[off:off + length])
+
+
+def strip_2mg_header(src, dst, progress=None):
+    meta, disk = _split_2mg(Path(src).read_bytes())
+    Path(dst).write_bytes(disk)
+    return meta
+
+
+def add_2mg_header(src, dst, meta=None, progress=None):
+    if not meta or meta[:4] != TWOMG_MAGIC:
+        raise ConversionError('refusing to write a 2IMG header that is missing or unsigned')
+    off, length = struct.unpack_from('<II', meta, 0x18)
+    disk = Path(src).read_bytes()
+    if len(disk) != length:
+        raise ConversionError(f'this header describes {length:,} bytes of disk data, '
+                              f'the image is {len(disk):,}')
+    Path(dst).write_bytes(bytes(meta[:off]) + disk + bytes(meta[off:]))
+    return dst
 
 
 # ── Amiga DMS ─────────────────────────────────────────────────────────────────
@@ -7883,7 +7928,7 @@ CONVERSIONS['psp:jso->iso'] = {
     'label': 'PSP: JSO -> ISO (decompress)', 'engine': ENGINE_NATIVE,
     'system': 'PSP', 'ext': '.iso', 'fn': lambda s, d, p=None: jso_to_iso(s, d, p),
     'inverse': None, 'verify_mode': 'verifier', 'verifier': _jso_md5_verifier,
-    'note': 'LZO or deflate blocks. Not yet tested on a real JSO file.',
+    'note': 'LZO or deflate blocks; the MD5 in the JSO header is checked when present.',
 }
 
 
@@ -7904,8 +7949,17 @@ HEADER_KINDS = {
     # kind: (library file, header size, signature check, system, label)
     'a78': ('a78.tsv', A78_HEADER, lambda h: h[1:10] == b'ATARI7800', 'A7800', 'Atari 7800'),
     'lnx': ('lnx.tsv', LNX_HEADER, lambda h: h[0:4] == b'LYNX', 'LYNX', 'Atari Lynx'),
-    '2mg': ('2mg.tsv', TWOMG_HEADER, lambda h: h[0:4] == TWOMG_MAGIC, 'APPLE2', 'Apple II 2IMG'),
+    # 2IMG entries also carry any comment / creator block that follows the data
+    '2mg': ('2mg.tsv', None, lambda h: h[0:4] == TWOMG_MAGIC, 'APPLE2', 'Apple II 2IMG'),
 }
+
+
+def _split_headered(kind, data):
+    """(what the library stores, the headerless ROM) for one headered dump."""
+    if kind == '2mg':
+        return _split_2mg(data)
+    size = HEADER_KINDS[kind][1]
+    return bytes(data[:size]), bytes(data[size:])
 for _kind, (_file, _size, _chk, _sys, _label) in HEADER_KINDS.items():
     KEY_FILES[f'{_kind}_headers'] = (HEADER_LIBRARY_DIR / _file,
                                      f'{_label} - header library ({_file}); learned from a headered '
@@ -7935,7 +7989,8 @@ def header_library(kind):
 
 def _header_kind_of(header):
     for kind, (_f, size, check, _s, _l) in HEADER_KINDS.items():
-        if len(header) >= size and check(bytes(header[:size])):
+        need = size or 4
+        if len(header) >= need and check(bytes(header[:need])):
             return kind
     return None
 
@@ -7943,8 +7998,8 @@ def _header_kind_of(header):
 def learn_header(kind, header, body_sha1, name=''):
     """Record one header; returns True when it was new."""
     _f, size, check, _s, _l = HEADER_KINDS[kind]
-    header = bytes(header[:size])
-    if len(header) != size or not check(header):
+    header = bytes(header if size is None else header[:size])
+    if (size is not None and len(header) != size) or not check(header):
         return False
     table = header_library(kind)
     if table.get(body_sha1) == header:
@@ -7971,10 +8026,12 @@ def learn_headers_from_folder(folder, progress=None, should_stop=None):
         kind = _header_kind_of(data[:128])
         if not kind:
             return
-        size = HEADER_KINDS[kind][1]
+        try:
+            meta, body = _split_headered(kind, data)
+        except ConversionError:
+            return
         counts[kind]['seen'] += 1
-        counts[kind]['new'] += learn_header(kind, data[:size],
-                                           hashlib.sha1(data[size:]).hexdigest(), name)
+        counts[kind]['new'] += learn_header(kind, meta, hashlib.sha1(body).hexdigest(), name)
 
     for n, q in enumerate(files):
         if should_stop and should_stop():
@@ -8038,6 +8095,1353 @@ for _kind, (_strip_id, _add_id, _strip_fn, _add_fn) in {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ECM  -  Error Code Modeler (Neill Corlett) <-> raw CD image
+#
+#  ECM drops the parts of each CD sector a drive can recompute (sync, EDC, ECC,
+#  the mode 2 subheader copy) and keeps the rest; the file ends with an EDC of
+#  the whole original image, which the decode must reproduce. One blind spot is
+#  the format's own: damage inside a mode 2 form 2 sector (XA audio / video) is
+#  invisible to that EDC, since the sector's EDC is rebuilt from the same data
+#  and form 2 has no ECC - ecm-tools cannot see it either. Encoding follows
+#  ecm-tools' ecm.c run for run, so a disc encodes to the same .ecm the
+#  reference tool writes.
+#
+#  Speed, in pure Python: the EDC reads 16 bits a step; ECC is linear over
+#  GF(2^8), so each parity row is one bytes.translate; and a sector that ends in
+#  its own EDC leaves the whole-file CRC merely advanced, which precomputed
+#  tables apply in four lookups.
+# ══════════════════════════════════════════════════════════════════════════════
+
+CD_SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
+_FAST = {}
+
+
+def _fast_tables():
+    if _FAST:
+        return _FAST
+    import operator
+    e16 = [0] * 65536
+    for i in range(65536):
+        e = i
+        for _ in range(16):
+            e = (e >> 1) ^ (0xD8018001 if e & 1 else 0)
+        e16[i] = e
+    _FAST['e8'], _FAST['e16'] = list(_CD_EDC), e16
+
+    def gf_mul(a, b):
+        r = 0
+        while b:
+            if b & 1:
+                r ^= a
+            a = _CD_F[a]
+            b >>= 1
+        return r
+
+    def plan(major_count, minor_count, major_mult, minor_inc):
+        size = major_count * minor_count
+        cols = []
+        for major in range(major_count):
+            index, col = (major >> 1) * major_mult + (major & 1), []
+            for _ in range(minor_count):
+                col.append(index)
+                index += minor_inc
+                if index >= size:
+                    index -= size
+            cols.append(col)
+        getters = [operator.itemgetter(*[cols[mj][m] for mj in range(major_count)])
+                   for m in range(minor_count)]
+        inv = next(x for x in range(256) if gf_mul(x, 3) == 1)       # 1 / (1 + alpha)
+        t1, t2 = [], []
+        for m in range(minor_count):
+            p = 1
+            for _ in range(minor_count - m + 1):
+                p = gf_mul(p, 2)
+            c = gf_mul(p ^ 1, inv)
+            t1.append(bytes(gf_mul(x, c) for x in range(256)))
+            t2.append(bytes(gf_mul(x, c ^ 1) for x in range(256)))
+        return getters, t1, t2, major_count
+
+    _FAST['P'], _FAST['Q'] = plan(86, 24, 2, 86), plan(52, 43, 86, 88)
+
+    def shift(n):
+        zeros = bytes(n)
+        return [[cd_edc_fast(zeros, v << (8 * k)) for v in range(256)] for k in range(4)]
+
+    _FAST['sh814'], _FAST['sh80c'], _FAST['sh920'] = shift(0x814), shift(0x80C), shift(0x920)
+    return _FAST
+
+
+def cd_edc_fast(data, e=0):
+    t = _FAST['e16'] if _FAST else _fast_tables()['e16']
+    mv = memoryview(data).cast('B')
+    if len(mv) & 1:
+        e = (e >> 8) ^ _FAST['e8'][(e ^ mv[0]) & 0xFF]
+        mv = mv[1:]
+    if len(mv):
+        for w in mv.cast('H'):
+            e = (e >> 16) ^ t[(e ^ w) & 0xFFFF]
+    return e
+
+
+def _ecc_rows(src, plan):
+    getters, t1, t2, majors = plan
+    o1 = o2 = 0
+    for get, a, b in zip(getters, t1, t2):
+        row = bytes(get(src))
+        o1 ^= int.from_bytes(row.translate(a), 'little')
+        o2 ^= int.from_bytes(row.translate(b), 'little')
+    return o1.to_bytes(majors, 'little') + o2.to_bytes(majors, 'little')
+
+
+def cd_ecc_fast(sector, address):
+    """Write P (0x81C) and Q (0x8C8) parity into a 2352-byte sector, computed over
+    `address` (4 bytes) and the sector body - identical to the byte-wise coder."""
+    f = _FAST or _fast_tables()
+    buf = bytearray(address) + sector[0x10:0x8C8]
+    p = _ecc_rows(buf, f['P'])
+    sector[0x81C:0x8C8] = p
+    buf[0x810:0x8BC] = p
+    sector[0x8C8:0x930] = _ecc_rows(buf, f['Q'])
+
+
+def _ecc_ok(sector, address):
+    s = bytearray(sector)
+    cd_ecc_fast(s, address)
+    return s[0x81C:0x930] == sector[0x81C:0x930]
+
+
+def _crc_advance(e, tables):
+    t0, t1, t2, t3 = tables
+    return t0[e & 0xFF] ^ t1[(e >> 8) & 0xFF] ^ t2[(e >> 16) & 0xFF] ^ t3[e >> 24]
+
+
+def _ecm_detect(buf, pos, avail):
+    """ecm.c detect_sector: 1 mode 1, 2 mode 2 form 1, 3 mode 2 form 2, 0 none."""
+    if (avail >= 2352 and buf[pos:pos + 12] == CD_SYNC and buf[pos + 0xF] == 1
+            and buf[pos + 0x814:pos + 0x81C] == bytes(8)):
+        s = buf[pos:pos + 2352]
+        if _ecc_ok(s, s[0xC:0x10]) and cd_edc_fast(s[:0x810]) == int.from_bytes(s[0x810:0x814], 'little'):
+            return 1
+        return 0
+    if avail >= 2336 and buf[pos:pos + 4] == buf[pos + 4:pos + 8]:
+        s = buf[pos:pos + 2336]
+        if _ecc_ok(bytes(0x10) + s, bytes(4)) and \
+                cd_edc_fast(s[:0x808]) == int.from_bytes(s[0x808:0x80C], 'little'):
+            return 2
+        if cd_edc_fast(s[:0x91C]) == int.from_bytes(s[0x91C:0x920], 'little'):
+            return 3
+    return 0
+
+
+def _ecm_runs(data, progress=None):
+    """[(type, count, start)] exactly as ecm.c groups them."""
+    n = len(data)
+    runs, pos, curtype, literal_skip = [], 0, -1, 0
+    size = (1, 2352, 2336, 2336)
+    zero4 = bytes(4)
+
+    def next_candidate(p):
+        # a sector can only be detected at a sync, or where 4 bytes repeat
+        best = data.find(CD_SYNC, p)
+        best = n if best < 0 else best
+        s = p
+        while s < best:
+            e = min(best + 8, s + (1 << 20), n)
+            a, b = data[s:e - 4], data[s + 4:e]
+            k = len(b)
+            if k <= 0:
+                break
+            x = (int.from_bytes(a[:k], 'big') ^ int.from_bytes(b, 'big')).to_bytes(k, 'big')
+            z = x.find(zero4)
+            if z >= 0:
+                return min(best, s + z)
+            if e >= min(best + 8, n):
+                break
+            s = e - 7
+        return best
+
+    last = 0
+    while pos < n:
+        avail = n - pos
+        if literal_skip:
+            literal_skip -= 1
+            t, span = 0, 1
+        elif curtype >= 2 and avail >= 0x10 and data[pos:pos + 12] == CD_SYNC and data[pos + 0xF] == 2:
+            t, span, literal_skip = 0, 1, 15
+        else:
+            t = _ecm_detect(data, pos, avail)
+            span = max(1, next_candidate(pos + 1) - pos) if t == 0 else 1
+        if t == curtype:
+            runs[-1][1] += span
+        else:
+            runs.append([t, span, pos])
+            curtype = t
+        pos += span if t == 0 else size[t]
+        if progress and pos - last >= 1 << 24:
+            last = pos
+            progress(pos, n, 'analysing sectors')
+    return runs
+
+
+def bin_to_ecm(src, dst, progress=None):
+    import mmap
+    with open(src, 'rb') as fi:
+        if os.path.getsize(src) == 0:
+            raise ConversionError('empty file')
+        data = mmap.mmap(fi.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            runs = _ecm_runs(data, progress)
+            f = _fast_tables()
+            e = 0
+            with open(dst, 'wb') as fo:
+                fo.write(b'ECM\x00')
+                for n, (t, count, start) in enumerate(runs):
+                    head, c = bytearray(), count - 1
+                    head.append(((c >= 32) << 7) | ((c & 31) << 2) | t)
+                    c >>= 5
+                    while c:
+                        head.append(((c >= 128) << 7) | (c & 127))
+                        c >>= 7
+                    fo.write(head)
+                    if t == 0:
+                        chunk = data[start:start + count]
+                        fo.write(chunk)
+                        e = cd_edc_fast(chunk, e)
+                        continue
+                    p = start
+                    for _ in range(count):
+                        if t == 1:
+                            fo.write(data[p + 0xC:p + 0xF])
+                            fo.write(data[p + 0x10:p + 0x810])
+                            e = cd_edc_fast(data[p + 0x814:p + 2352], _crc_advance(e, f['sh814']))
+                            p += 2352
+                        elif t == 2:
+                            fo.write(data[p + 4:p + 0x808])
+                            e = cd_edc_fast(data[p + 0x80C:p + 2336], _crc_advance(e, f['sh80c']))
+                            p += 2336
+                        else:
+                            fo.write(data[p + 4:p + 0x91C])
+                            e = _crc_advance(e, f['sh920'])
+                            p += 2336
+                    if progress and n % 64 == 0:
+                        progress(p, len(data), 'writing ECM')
+                fo.write(b'\xfc\xff\xff\xff\x3f' + e.to_bytes(4, 'little'))
+        finally:
+            data.close()
+    return {'runs': len(runs)}
+
+
+def ecm_to_bin(src, dst, progress=None):
+    import mmap
+    f = _fast_tables()
+    total = os.path.getsize(src)
+    with open(src, 'rb') as fi:
+        if fi.read(4) != b'ECM\x00':
+            raise ConversionError('not an ECM file (no ECM header)')
+        mv = mmap.mmap(fi.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
+        pos, e, sector = 4, 0, bytearray(2352)
+        out = bytearray()
+        with open(dst, 'wb') as fo:
+            while True:
+                if pos >= total:
+                    raise ConversionError('ECM file ends before its end marker')
+                c = mv[pos]
+                pos += 1
+                typ, num, bits = c & 3, (c >> 2) & 0x1F, 5
+                while c & 0x80:
+                    c = mv[pos]
+                    pos += 1
+                    if bits > 31 or (c & 0x7F) >= (0x80000000 >> (bits - 1)):
+                        raise ConversionError('ECM run length is corrupt')
+                    num |= (c & 0x7F) << bits
+                    bits += 7
+                if num == 0xFFFFFFFF:
+                    break
+                num += 1
+                if typ == 0:
+                    chunk = mv[pos:pos + num]
+                    if len(chunk) != num:
+                        raise ConversionError('ECM file is truncated')
+                    out += chunk
+                    e = cd_edc_fast(chunk, e)
+                    pos += num
+                else:
+                    need = {1: 0x803, 2: 0x804, 3: 0x918}[typ]
+                    if pos + need * num > total:
+                        raise ConversionError('ECM file is truncated')
+                    for _ in range(num):
+                        sector[0:12] = CD_SYNC
+                        if typ == 1:
+                            sector[0xC:0xF] = mv[pos:pos + 3]
+                            sector[0x10:0x810] = mv[pos + 3:pos + 0x803]
+                            pos += 0x803
+                            sector[0xF] = 1
+                            sector[0x814:0x81C] = bytes(8)
+                            sector[0x810:0x814] = cd_edc_fast(sector[:0x810]).to_bytes(4, 'little')
+                            cd_ecc_fast(sector, sector[0xC:0x10])
+                            out += sector
+                            e = cd_edc_fast(memoryview(sector)[0x814:], _crc_advance(e, f['sh814']))
+                        else:
+                            sector[0xF] = 2
+                            if typ == 2:
+                                sector[0x14:0x818] = mv[pos:pos + 0x804]
+                                pos += 0x804
+                                sector[0x10:0x14] = sector[0x14:0x18]
+                                sector[0x818:0x81C] = cd_edc_fast(memoryview(sector)[0x10:0x818]).to_bytes(4, 'little')
+                                cd_ecc_fast(sector, bytes(4))
+                                e = cd_edc_fast(memoryview(sector)[0x81C:], _crc_advance(e, f['sh80c']))
+                            else:
+                                sector[0x14:0x92C] = mv[pos:pos + 0x918]
+                                pos += 0x918
+                                sector[0x10:0x14] = sector[0x14:0x18]
+                                sector[0x92C:0x930] = cd_edc_fast(memoryview(sector)[0x10:0x92C]).to_bytes(4, 'little')
+                                e = _crc_advance(e, f['sh920'])
+                            out += memoryview(sector)[0x10:]
+                if len(out) >= 1 << 23:
+                    fo.write(out)
+                    out.clear()
+                    if progress:
+                        progress(pos, total, 'rebuilding sectors')
+            fo.write(out)
+        want = int.from_bytes(mv[pos:pos + 4], 'little')
+        if pos + 4 > total:
+            raise ConversionError('ECM file has no checksum at the end')
+    finally:
+        mv.close()
+    if want != e:
+        raise ConversionError(f'decoded image fails the checksum stored in the ECM '
+                              f'({e:08x}, ECM says {want:08x}) - the ECM file is damaged')
+    return {'edc': f'{e:08x}'}
+
+
+def _ecm_checked(src, out, progress=None):
+    # ecm_to_bin raises on a checksum mismatch, so reaching here means it matched
+    return True, 'decoded image matches the checksum stored in the ECM file'
+
+
+def _detect_ecm(buf, path, fh):
+    if _at(buf, 0, 4) != b'ECM\x00':
+        return None
+    inner = path.stem if path.suffix.lower() == '.ecm' else path.name
+    return _result('CD', 'ECM', 'compressed', confidence='high',
+                   detail=f'ECM-compressed CD image ({inner})',
+                   conversions=['cd:ecm->bin'])
+
+
+def _detect_raw_cd_track(buf, path, fh):
+    """A raw 2352-byte data track (.bin/.img): sync at sector 0. Audio tracks carry
+    no sync and are left alone - ECM gains nothing on them."""
+    if path.suffix.lower() not in ('.bin', '.img', '.raw') or fh['size'] % 2352 or fh['size'] < 2352:
+        return None
+    if _at(buf, 0, 12) != CD_SYNC or _at(buf, 15, 1) not in (b'\x01', b'\x02'):
+        return None
+    mode = _at(buf, 15, 1)[0]
+    return _result('CD', 'BIN', 'raw', confidence='medium',
+                   detail=f'raw CD data track, mode {mode}, {fh["size"] // 2352:,} sectors',
+                   conversions=['cd:bin->ecm'])
+
+
+CONVERSIONS['cd:ecm->bin'] = {
+    'label': 'CD: ECM -> BIN (rebuild EDC/ECC)', 'engine': ENGINE_NATIVE,
+    'system': 'CD', 'ext': '.bin', 'strip_ext': True, 'fn': lambda s, d, p=None: ecm_to_bin(s, d, p),
+    'inverse': 'cd:bin->ecm', 'verify_mode': 'verifier', 'verifier': _ecm_checked,
+    'note': 'Checked against the whole-image checksum stored in the ECM file (which, by the '
+            "format's design, cannot see damage inside mode 2 form 2 sectors).",
+}
+CONVERSIONS['cd:bin->ecm'] = {
+    'label': 'CD: BIN -> ECM (drop recomputable EDC/ECC)', 'engine': ENGINE_NATIVE,
+    'system': 'CD', 'ext': '.ecm', 'append_ext': True,
+    'fn': lambda s, d, p=None: bin_to_ecm(s, d, p), 'inverse': 'cd:ecm->bin',
+    'note': 'Encodes run for run like ecm-tools, so the same image gives the same .ecm file.',
+}
+DETECTORS.insert(0, _detect_ecm)
+DETECTORS.append(_detect_raw_cd_track)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROM PATCHES  -  IPS, UPS, BPS, xdelta3 (VCDIFF)
+#
+#  A patch is converted by applying it to its base ROM, found next to it:
+#    BPS / UPS  carry the CRC32 and size of the ROM they were made from, so the
+#               base is FOUND by checksum (also with a 512-byte copier header
+#               removed) and the result is proven by the target CRC32 inside;
+#    xdelta     the base named in its application header, else the same-named
+#               or only ROM in the folder; each window carries an Adler-32;
+#    IPS        no checksums at all: the same-named ROM, or the only one there;
+#               a DAT is the only proof.
+#  The output keeps the patch's name with the base ROM's extension.
+# ══════════════════════════════════════════════════════════════════════════════
+
+PATCH_EXTS = ('.ips', '.ups', '.bps', '.xdelta', '.vcdiff', '.delta', '.xd3')
+VCDIFF_MAGIC = b'\xd6\xc3\xc4\x00'
+
+
+def _patch_kind(head):
+    if head[:5] == b'PATCH':
+        return 'IPS'
+    if head[:4] == b'UPS1':
+        return 'UPS'
+    if head[:4] == b'BPS1':
+        return 'BPS'
+    if head[:4] == VCDIFF_MAGIC:
+        return 'XDELTA'
+    return None
+
+
+def _beat_number(data, pos):
+    """byuu's variable-length integer (UPS / BPS)."""
+    value, shift = 0, 1
+    while True:
+        if pos >= len(data):
+            raise ConversionError('patch is truncated')
+        x = data[pos]
+        pos += 1
+        value += (x & 0x7F) * shift
+        if x & 0x80:
+            return value, pos
+        shift <<= 7
+        value += shift
+
+
+def _crc32(data):
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def apply_ips(patch, source):
+    if patch[:5] != b'PATCH':
+        raise ConversionError('not an IPS patch')
+    out, pos = bytearray(source), 5
+    while True:
+        if pos + 3 > len(patch):
+            raise ConversionError('IPS patch ends without its EOF marker')
+        rec = patch[pos:pos + 3]
+        pos += 3
+        if rec == b'EOF':
+            if len(patch) - pos == 3:                          # optional truncation
+                del out[int.from_bytes(patch[pos:pos + 3], 'big'):]
+            elif len(patch) != pos:
+                raise ConversionError(f'{len(patch) - pos} unexpected bytes after IPS EOF')
+            return bytes(out)
+        offset = int.from_bytes(rec, 'big')
+        size = int.from_bytes(patch[pos:pos + 2], 'big')
+        pos += 2
+        if size:
+            chunk = patch[pos:pos + size]
+            pos += size
+        else:
+            run = int.from_bytes(patch[pos:pos + 2], 'big')
+            chunk = patch[pos + 2:pos + 3] * run
+            pos += 3
+        if len(out) < offset + len(chunk):
+            out.extend(bytes(offset + len(chunk) - len(out)))
+        out[offset:offset + len(chunk)] = chunk
+
+
+def _beat_footer(patch):
+    if len(patch) < 16:
+        raise ConversionError('patch is too short')
+    src_crc, dst_crc, patch_crc = struct.unpack_from('<III', patch, len(patch) - 12)
+    if _crc32(patch[:-4]) != patch_crc:
+        raise ConversionError('the patch file is damaged (its own CRC32 does not match)')
+    return src_crc, dst_crc
+
+
+def apply_ups(patch, source):
+    if patch[:4] != b'UPS1':
+        raise ConversionError('not a UPS patch')
+    src_crc, dst_crc = _beat_footer(patch)
+    src_size, pos = _beat_number(patch, 4)
+    dst_size, pos = _beat_number(patch, pos)
+    if _crc32(source) == dst_crc and len(source) == dst_size and _crc32(source) != src_crc:
+        # UPS is reversible: given the patched ROM it gives back the original
+        src_size, dst_size, src_crc, dst_crc = dst_size, src_size, dst_crc, src_crc
+    if len(source) != src_size or _crc32(source) != src_crc:
+        raise ConversionError('this is not the ROM the UPS patch was made for (size / CRC32 differ)')
+    out = bytearray(source[:dst_size]) + bytes(max(0, dst_size - len(source)))
+    end, rel = len(patch) - 12, 0
+    while pos < end:
+        skip, pos = _beat_number(patch, pos)
+        rel += skip
+        while True:
+            if pos >= end:
+                raise ConversionError('UPS patch is truncated')
+            x = patch[pos]
+            pos += 1
+            if rel < dst_size:
+                out[rel] ^= x
+            rel += 1
+            if x == 0:
+                break
+    if _crc32(out) != dst_crc:
+        raise ConversionError('patched ROM fails the target CRC32 stored in the UPS patch')
+    return bytes(out)
+
+
+def apply_bps(patch, source):
+    if patch[:4] != b'BPS1':
+        raise ConversionError('not a BPS patch')
+    src_crc, dst_crc = _beat_footer(patch)
+    src_size, pos = _beat_number(patch, 4)
+    dst_size, pos = _beat_number(patch, pos)
+    meta, pos = _beat_number(patch, pos)
+    pos += meta
+    if len(source) != src_size or _crc32(source) != src_crc:
+        raise ConversionError('this is not the ROM the BPS patch was made for (size / CRC32 differ)')
+    out = bytearray(dst_size)
+    end, op, src_rel, dst_rel = len(patch) - 12, 0, 0, 0
+    while pos < end:
+        data, pos = _beat_number(patch, pos)
+        cmd, length = data & 3, (data >> 2) + 1
+        if op + length > dst_size:
+            raise ConversionError('BPS patch writes past the end of its target')
+        if cmd == 0:                                            # SourceRead
+            out[op:op + length] = source[op:op + length]
+        elif cmd == 1:                                          # TargetRead
+            out[op:op + length] = patch[pos:pos + length]
+            pos += length
+        else:
+            d, pos = _beat_number(patch, pos)
+            delta = -(d >> 1) if d & 1 else d >> 1
+            if cmd == 2:                                        # SourceCopy
+                src_rel += delta
+                out[op:op + length] = source[src_rel:src_rel + length]
+                src_rel += length
+            else:                                               # TargetCopy
+                dst_rel += delta
+                if dst_rel + length <= op:
+                    out[op:op + length] = out[dst_rel:dst_rel + length]
+                else:
+                    for k in range(length):
+                        out[op + k] = out[dst_rel + k]
+                dst_rel += length
+        op += length
+    if _crc32(out) != dst_crc:
+        raise ConversionError('patched ROM fails the target CRC32 stored in the BPS patch')
+    return bytes(out)
+
+
+# ── VCDIFF (RFC 3284) as xdelta3 writes it ────────────────────────────────────
+_VCD_TABLE = None
+
+
+def _vcdiff_code_table():
+    global _VCD_TABLE
+    if _VCD_TABLE:
+        return _VCD_TABLE
+    NOOP, ADD, RUN, COPY = 0, 1, 2, 3
+    t = [(RUN, 0, 0, NOOP, 0, 0)]
+    t += [(ADD, s, 0, NOOP, 0, 0) for s in range(18)]
+    for mode in range(9):
+        t.append((COPY, 0, mode, NOOP, 0, 0))
+        t += [(COPY, s, mode, NOOP, 0, 0) for s in range(4, 19)]
+    for mode in range(6):
+        for add in range(1, 5):
+            t += [(ADD, add, 0, COPY, s, mode) for s in range(4, 7)]
+    for mode in range(6, 9):
+        t += [(ADD, add, 0, COPY, 4, mode) for add in range(1, 5)]
+    t += [(COPY, 4, mode, ADD, 1, 0) for mode in range(9)]
+    assert len(t) == 256
+    _VCD_TABLE = t
+    return t
+
+
+def _vcd_int(data, pos):
+    value = 0
+    while True:
+        if pos >= len(data):
+            raise ConversionError('xdelta patch is truncated')
+        b = data[pos]
+        pos += 1
+        value = (value << 7) | (b & 0x7F)
+        if not b & 0x80:
+            return value, pos
+
+
+def _xdelta_appheader(patch):
+    if patch[:4] != VCDIFF_MAGIC:
+        return None
+    ind, pos = patch[4], 5
+    if ind & 0x01:
+        pos += 1
+    if ind & 0x02:
+        return None
+    if ind & 0x04:
+        n, pos = _vcd_int(patch, pos)
+        return patch[pos:pos + n].decode('utf-8', 'replace')
+    return None
+
+
+def apply_xdelta(patch, source):
+    if patch[:4] != VCDIFF_MAGIC:
+        raise ConversionError('not a VCDIFF / xdelta3 patch')
+    ind, pos = patch[4], 5
+    secondary = None
+    if ind & 0x01:
+        secondary = patch[pos]
+        pos += 1
+    if ind & 0x02:
+        raise ConversionError('xdelta patch uses a custom code table, which is not supported')
+    if ind & 0x04:
+        n, pos = _vcd_int(patch, pos)
+        pos += n
+    table = _vcdiff_code_table()
+    out = bytearray()
+    checked = windows = 0
+    while pos < len(patch):
+        win = patch[pos]
+        pos += 1
+        seg, seg_len = None, 0
+        if win & 0x03:
+            seg_len, pos = _vcd_int(patch, pos)
+            seg_pos, pos = _vcd_int(patch, pos)
+            if win & 0x01:
+                if seg_pos + seg_len > len(source):
+                    raise ConversionError('xdelta patch reads past the end of the base ROM - wrong base?')
+                seg = source[seg_pos:seg_pos + seg_len]
+            else:
+                seg = bytes(out[seg_pos:seg_pos + seg_len])
+        _enc_len, pos = _vcd_int(patch, pos)
+        tgt_len, pos = _vcd_int(patch, pos)
+        delta_ind = patch[pos]
+        pos += 1
+        data_len, pos = _vcd_int(patch, pos)
+        inst_len, pos = _vcd_int(patch, pos)
+        addr_len, pos = _vcd_int(patch, pos)
+        adler = None
+        if win & 0x04:
+            adler = int.from_bytes(patch[pos:pos + 4], 'big')
+            pos += 4
+        sections = []
+        for n, flag in ((data_len, 1), (inst_len, 2), (addr_len, 4)):
+            raw = patch[pos:pos + n]
+            pos += n
+            if delta_ind & flag:
+                raw = _xdelta_secondary(secondary, raw)
+            sections.append(raw)
+        data, inst, addr = sections
+        target = bytearray()
+        dp = ip = ap = 0
+        near, near_slot, same = [0] * 4, 0, [0] * (3 * 256)
+        while ip < len(inst):
+            code = inst[ip]
+            ip += 1
+            e = table[code]
+            for typ, size, mode in ((e[0], e[1], e[2]), (e[3], e[4], e[5])):
+                if typ == 0:
+                    continue
+                if size == 0:
+                    size, ip = _vcd_int(inst, ip)
+                if typ == 1:                                    # ADD
+                    target += data[dp:dp + size]
+                    dp += size
+                elif typ == 2:                                  # RUN
+                    target += data[dp:dp + 1] * size
+                    dp += 1
+                else:                                           # COPY
+                    here = seg_len + len(target)
+                    if mode == 0:
+                        a, ap = _vcd_int(addr, ap)
+                    elif mode == 1:
+                        v, ap = _vcd_int(addr, ap)
+                        a = here - v
+                    elif mode < 6:
+                        v, ap = _vcd_int(addr, ap)
+                        a = near[mode - 2] + v
+                    else:
+                        a = same[(mode - 6) * 256 + addr[ap]]
+                        ap += 1
+                    near[near_slot] = a
+                    near_slot = (near_slot + 1) % 4
+                    same[a % (3 * 256)] = a
+                    if a < seg_len:
+                        take = min(size, seg_len - a)
+                        target += seg[a:a + take]
+                        rest, a2 = size - take, 0
+                    else:
+                        rest, a2 = size, a - seg_len
+                    for k in range(rest):
+                        target.append(target[a2 + k])
+        if len(target) != tgt_len:
+            raise ConversionError(f'xdelta window decoded to {len(target):,} bytes, expected {tgt_len:,}')
+        if adler is not None:
+            if zlib.adler32(bytes(target)) & 0xFFFFFFFF != adler:
+                raise ConversionError('patched data fails the Adler-32 in the xdelta patch - wrong base ROM?')
+            checked += 1
+        windows += 1
+        out += target
+    return bytes(out), checked, windows
+
+
+def _xdelta_secondary(kind, raw):
+    if kind == 2:                                              # LZMA (xz stream)
+        import lzma
+        size, p = _vcd_int(raw, 0)
+        try:
+            data = lzma.decompress(raw[p:])
+        except lzma.LZMAError as e:
+            raise ConversionError(f'xdelta LZMA section does not decompress: {e}')
+        if len(data) != size:
+            raise ConversionError('xdelta LZMA section has the wrong size')
+        return data
+    name = {1: 'DJW', 16: 'FGK'}.get(kind, f'#{kind}')
+    raise ConversionError(f'xdelta secondary compression {name} is not supported')
+
+
+# ── finding the base ROM ──────────────────────────────────────────────────────
+def _patch_neighbours(patch_path):
+    folder = Path(patch_path).parent
+    return [p for p in sorted(folder.iterdir())
+            if p.is_file() and p.suffix.lower() not in PATCH_EXTS
+            and p.suffix.lower() not in ('.txt', '.nfo', '.md', '.htm', '.html', '.png', '.jpg',
+                                         '.part', '.diz', '.pdf', '.zip', '.7z', '.rar')
+            and _patch_kind(_head_bytes(p, 5)) is None]
+
+
+def _head_bytes(path, n):
+    with open(path, 'rb') as f:
+        return f.read(n)
+
+
+def _read_base(path, strip_header=False):
+    data = Path(path).read_bytes()
+    return data[512:] if strip_header else data
+
+
+def find_patch_base(patch_path):
+    """(base path, strip 512-byte header?, how it was found)."""
+    patch_path = Path(patch_path)
+    head = patch_path.read_bytes()
+    kind = _patch_kind(head[:5])
+    cands = _patch_neighbours(patch_path)
+    if kind in ('BPS', 'UPS'):
+        src_size = _beat_number(head, 4)[0]
+        src_crc = struct.unpack_from('<I', head, len(head) - 12)[0]
+        dst_size = _beat_number(head, _beat_number(head, 4)[1])[0]
+        dst_crc = struct.unpack_from('<I', head, len(head) - 8)[0]
+        for c in cands:
+            size = c.stat().st_size
+            for strip in (False, True):
+                if strip and size <= 512:
+                    continue
+                if size - (512 if strip else 0) in (src_size, dst_size if kind == 'UPS' else -1):
+                    crc = _crc32(_read_base(c, strip))
+                    if crc == src_crc or (kind == 'UPS' and crc == dst_crc):
+                        return c, strip, 'matched by the CRC32 stored in the patch' + \
+                            (' (after removing a 512-byte copier header)' if strip else '')
+        raise ConversionError(f'no ROM next to the patch has the size ({src_size:,} B) and CRC32 '
+                              f'({src_crc:08X}) this {kind} patch needs')
+    if kind == 'XDELTA':
+        app = _xdelta_appheader(head) or ''
+        names = [n for n in app.split('/') if n]
+        for c in cands:
+            if c.name in names:
+                return c, False, 'named in the xdelta patch header'
+    same = [c for c in cands if c.stem.lower() == patch_path.stem.lower()]
+    if len(same) == 1:
+        return same[0], False, 'same name as the patch'
+    if len(cands) == 1:
+        return cands[0], False, 'the only ROM in the folder'
+    raise ConversionError('cannot tell which ROM this patch is for - put the base ROM next to it '
+                          'with the same name as the patch')
+
+
+def apply_patch_file(src, dst, progress=None):
+    patch = Path(src).read_bytes()
+    kind = _patch_kind(patch[:5])
+    base, strip, how = find_patch_base(src)
+    source = _read_base(base, strip)
+    info = {'kind': kind, 'base': str(base), 'base_found': how, 'checked': False}
+    if kind == 'IPS':
+        out = apply_ips(patch, source)
+    elif kind == 'UPS':
+        out = apply_ups(patch, source)
+        info['checked'] = True
+    elif kind == 'BPS':
+        out = apply_bps(patch, source)
+        info['checked'] = True
+    elif kind == 'XDELTA':
+        out, checked, windows = apply_xdelta(patch, source)
+        info['checked'] = bool(windows) and checked == windows
+    else:
+        raise ConversionError('not a recognised patch')
+    Path(dst).write_bytes(out)
+    return info
+
+
+def _patch_ext(src):
+    try:
+        return find_patch_base(src)[0].suffix or '.bin'
+    except (ConversionError, OSError):
+        return '.bin'
+
+
+def _patch_verifier(src, out, progress=None):
+    kind = _patch_kind(Path(src).read_bytes()[:5])
+    if kind in ('BPS', 'UPS'):
+        return True, f'result matches the target CRC32 stored in the {kind} patch'
+    if kind == 'XDELTA':
+        base, strip, _how = find_patch_base(src)
+        _out, checked, windows = apply_xdelta(Path(src).read_bytes(), _read_base(base, strip))
+        if windows and checked == windows:
+            return True, f'all {windows} xdelta window(s) match their Adler-32 checksums'
+        return None, 'this xdelta patch carries no checksums - compare the result against a DAT'
+    return None, 'IPS patches carry no checksum - compare the result against a DAT'
+
+
+def _detect_patch(buf, path, fh):
+    kind = _patch_kind(bytes(_at(buf, 0, 5)))
+    if not kind:
+        return None
+    if kind == 'IPS' and path.suffix.lower() not in PATCH_EXTS:
+        return None                               # "PATCH" alone is too common to trust
+    detail = {'IPS': 'IPS patch (no checksums)', 'UPS': 'UPS patch (CRC32-checked)',
+              'BPS': 'BPS patch (CRC32-checked)', 'XDELTA': 'xdelta3 / VCDIFF patch'}[kind]
+    return _result('PATCH', kind, None, confidence='high', detail=detail,
+                   conversions=['patch:apply'])
+
+
+CONVERSIONS['patch:apply'] = {
+    'label': 'Patch: apply to its base ROM (IPS / UPS / BPS / xdelta)', 'engine': ENGINE_NATIVE,
+    'system': 'PATCH', 'ext': '.bin', 'ext_fn': _patch_ext,
+    'fn': lambda s, d, p=None: apply_patch_file(s, d, p), 'inverse': None,
+    'verify_mode': 'verifier', 'verifier': _patch_verifier,
+    'note': 'The base ROM is found next to the patch: by the CRC32 inside BPS / UPS patches, '
+            'else by name. The patched file takes the patch\'s name.',
+}
+DETECTORS.insert(0, _detect_patch)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CUE/BIN  -  merge a multi-file disc into one BIN, or split one back per track
+#
+#  Redump keeps one file per track: a track's file starts at its INDEX 00 (the
+#  pregap) when it has one, and each INDEX is relative to its own file. A merged
+#  image is the same sectors end to end with absolute INDEX times. Every other
+#  line (CATALOG, REM, FLAGS, PREGAP, ISRC ...) is carried across unchanged, and
+#  the line-ending style of the sheet is kept, so a merge followed by a split
+#  gives back the original sheet and bins byte for byte.
+# ══════════════════════════════════════════════════════════════════════════════
+
+CD_FRAME = 2352
+
+
+def _msf_to_frames(msf):
+    m, s, f = (int(x) for x in msf.split(':'))
+    return (m * 60 + s) * 75 + f
+
+
+def _frames_to_msf(n):
+    return f'{n // 4500:02d}:{(n // 75) % 60:02d}:{n % 75:02d}'
+
+
+def parse_cue(path):
+    """{'nl', 'header': [lines], 'tracks': [{'num','type','file','lines','indexes'}]}.
+    Track lines keep their order; INDEX lines are held apart as (n, frames)."""
+    raw = Path(path).read_bytes()
+    nl = '\r\n' if b'\r\n' in raw else '\n'
+    text = raw.decode('utf-8', errors='replace')
+    header, tracks, cur_file, pending = [], [], None, []
+    for line in text.splitlines():
+        s = line.strip()
+        up = s.upper()
+        if not s:
+            continue
+        if up.startswith('FILE '):
+            m = re.match(r'FILE\s+"(.*)"\s+(\S+)\s*$', s, re.I) or re.match(r'FILE\s+(\S+)\s+(\S+)\s*$', s, re.I)
+            if not m:
+                raise ConversionError(f'cannot read cue line: {s}')
+            if m.group(2).upper() != 'BINARY':
+                raise ConversionError(f'only BINARY track files are supported, not {m.group(2)}')
+            cur_file = m.group(1)
+            continue
+        if up.startswith('TRACK '):
+            parts = s.split()
+            if cur_file is None:
+                raise ConversionError('cue has a TRACK before any FILE')
+            tracks.append({'num': int(parts[1]), 'type': parts[2], 'file': cur_file,
+                           'lines': [], 'indexes': [], 'pre': pending})
+            pending = []
+            continue
+        if up.startswith('INDEX '):
+            parts = s.split()
+            if not tracks:
+                raise ConversionError('cue has an INDEX before any TRACK')
+            tracks[-1]['indexes'].append((int(parts[1]), _msf_to_frames(parts[2])))
+            tracks[-1]['lines'].append(('INDEX', int(parts[1])))
+            continue
+        if tracks:
+            tracks[-1]['lines'].append(('RAW', line))
+        else:
+            header.append(line)
+    if not tracks:
+        raise ConversionError('cue sheet lists no tracks')
+    return {'nl': nl, 'header': header, 'tracks': tracks}
+
+
+def _track_lines(t, index_frames, nl):
+    out = [f'  TRACK {t["num"]:02d} {t["type"]}']
+    idx = dict(index_frames)
+    for kind, val in t['lines']:
+        if kind == 'INDEX':
+            out.append(f'    INDEX {val:02d} {_frames_to_msf(idx[val])}')
+        else:
+            out.append(val)
+    return out
+
+
+def cue_merge(src, dst, progress=None):
+    cue = parse_cue(src)
+    folder = Path(src).parent
+    files = list(dict.fromkeys(t['file'] for t in cue['tracks']))
+    if len(files) < 2:
+        raise ConversionError('already a single-file image - nothing to merge')
+    starts, pos = {}, 0
+    for name in files:
+        p = folder / name
+        if not p.exists():
+            raise ConversionError(f'track file missing: {name}')
+        size = p.stat().st_size
+        if size % CD_FRAME:
+            raise ConversionError(f'{name} is not a whole number of 2352-byte sectors')
+        starts[name] = pos
+        pos += size // CD_FRAME
+    dst = Path(dst)
+    final = dst.with_suffix('') if dst.suffix == '.part' else dst
+    if final.with_suffix('.cue').resolve() == Path(src).resolve():
+        raise ConversionError('the merged cue sheet would overwrite the source - choose a '
+                              'different output folder')
+    with open(dst, 'wb') as fo:
+        done = 0
+        for name in files:
+            with open(folder / name, 'rb') as fi:
+                shutil.copyfileobj(fi, fo, CHUNK)
+            done += 1
+            if progress:
+                progress(done, len(files), 'merging tracks')
+    lines = list(cue['header'])
+    lines.append(f'FILE "{final.name}" BINARY')
+    for t in cue['tracks']:
+        lines += _track_lines(t, [(n, starts[t['file']] + f) for n, f in t['indexes']], cue['nl'])
+    sheet = final.with_suffix('.cue')
+    sheet.write_bytes((cue['nl'].join(lines) + cue['nl']).encode('utf-8'))
+    return {'sidecars': [str(sheet)], 'tracks': len(cue['tracks'])}
+
+
+def cue_split(src, dst, progress=None):
+    cue = parse_cue(src)
+    folder = Path(src).parent
+    files = list(dict.fromkeys(t['file'] for t in cue['tracks']))
+    if len(files) != 1:
+        raise ConversionError('already one file per track - nothing to split')
+    image = folder / files[0]
+    if not image.exists():
+        raise ConversionError(f'image missing: {files[0]}')
+    total = image.stat().st_size // CD_FRAME
+    tracks = cue['tracks']
+    bounds = []
+    for t in tracks:
+        idx = dict(t['indexes'])
+        if 1 not in idx:
+            raise ConversionError(f'track {t["num"]} has no INDEX 01')
+        bounds.append(idx.get(0, idx[1]))
+    bounds.append(total)
+    dst = Path(dst)
+    final = dst.with_suffix('') if dst.suffix == '.part' else dst
+    stem = final.stem
+    names = [f'{stem}.bin'] if len(tracks) == 1 else [f'{stem} (Track {t["num"]}).bin' for t in tracks]
+    lines, written = list(cue['header']), []
+    with open(image, 'rb') as fi:
+        for n, (t, name) in enumerate(zip(tracks, names)):
+            start, end = bounds[n], bounds[n + 1]
+            if end < start:
+                raise ConversionError(f'track {t["num"]} INDEX times go backwards')
+            target = final.with_name(name)
+            fi.seek(start * CD_FRAME)
+            with open(target, 'wb') as fo:
+                left = (end - start) * CD_FRAME
+                while left:
+                    chunk = fi.read(min(CHUNK, left))
+                    if not chunk:
+                        raise ConversionError('image is shorter than its cue sheet says')
+                    fo.write(chunk)
+                    left -= len(chunk)
+            written.append(str(target))
+            lines.append(f'FILE "{name}" BINARY')
+            lines += _track_lines(t, [(i, f - start) for i, f in t['indexes']], cue['nl'])
+            if progress:
+                progress(n + 1, len(tracks), 'splitting tracks')
+    Path(dst).write_bytes((cue['nl'].join(lines) + cue['nl']).encode('utf-8'))
+    return {'sidecars': written, 'tracks': len(tracks)}
+
+
+def _cue_merge_verifier(src, out, progress=None):
+    """Split the merged image again and demand the original bins (and sheet) back."""
+    import tempfile
+    work = Path(tempfile.mkdtemp(prefix='cueverify_'))
+    try:
+        merged_cue = out.with_suffix('') if out.suffix == '.part' else out
+        sheet = Path(str(merged_cue)).with_suffix('.cue')
+        # the merged sheet names the final .bin; stage both under that name
+        staged_bin = work / merged_cue.name
+        shutil.copyfile(out, staged_bin)
+        shutil.copyfile(sheet, work / sheet.name)
+        back = work / 'split' / (Path(src).stem + '.cue')
+        back.parent.mkdir()
+        cue_split(work / sheet.name, back, progress)
+        orig = parse_cue(src)
+        folder = Path(src).parent
+        same_bins = all(
+            _sha1_file(folder / name) == _sha1_file(back.parent / name)
+            for name in dict.fromkeys(t['file'] for t in orig['tracks'])
+            if (back.parent / name).exists()) and all(
+            (back.parent / name).exists() for name in dict.fromkeys(t['file'] for t in orig['tracks']))
+        same_sheet = back.read_bytes() == Path(src).read_bytes()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if not same_bins:
+        return False, 'splitting the merged image did not give the original track files back'
+    return True, ('split back to the original track files and cue sheet, byte for byte' if same_sheet
+                  else 'split back to the original track files byte for byte (cue sheet wording differs)')
+
+
+def _cue_split_verifier(src, out, progress=None):
+    """Merge the split tracks again and demand the original image (and sheet) back."""
+    import tempfile
+    work = Path(tempfile.mkdtemp(prefix='cueverify_'))
+    try:
+        sheet = work / 'split.cue'
+        shutil.copyfile(out, sheet)
+        for t in parse_cue(sheet)['tracks']:
+            shutil.copyfile(Path(out).with_name(t['file']), work / t['file'])
+        orig = parse_cue(src)
+        image_name = orig['tracks'][0]['file']
+        back = work / 'merged' / image_name
+        back.parent.mkdir()
+        cue_merge(sheet, back, progress)
+        same_bin = _sha1_file(back) == _sha1_file(Path(src).parent / image_name)
+        same_sheet = back.with_suffix('.cue').read_bytes() == Path(src).read_bytes()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if not same_bin:
+        return False, 'merging the split tracks did not give the original image back'
+    return True, ('merges back to the original image and cue sheet, byte for byte' if same_sheet
+                  else 'merges back to the original image byte for byte (cue sheet wording differs)')
+
+
+def _cue_file_count(text):
+    return len(re.findall(r'^\s*FILE\s', text, re.M | re.I)), len(re.findall(r'^\s*TRACK\s', text, re.M | re.I))
+
+
+CONVERSIONS['cue:split->merged'] = {
+    'label': 'CUE/BIN: merge track files into one BIN', 'engine': ENGINE_NATIVE,
+    'system': 'CD', 'ext': '.bin', 'fn': lambda s, d, p=None: cue_merge(s, d, p),
+    'inverse': None, 'verify_mode': 'verifier', 'verifier': _cue_merge_verifier,
+    'note': 'Checked by splitting the result again and comparing every track file.',
+}
+CONVERSIONS['cue:merged->split'] = {
+    'label': 'CUE/BIN: split one BIN into Redump-style track files', 'engine': ENGINE_NATIVE,
+    'system': 'CD', 'ext': '.cue', 'fn': lambda s, d, p=None: cue_split(s, d, p),
+    'inverse': None, 'verify_mode': 'verifier', 'verifier': _cue_split_verifier,
+    'note': 'Each track file starts at its pregap (INDEX 00), as Redump cuts them; compare the '
+            'tracks against a Redump DAT.',
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DREAMCAST  -  TOSEC GDI <-> Redump CUE/BIN
+#
+#  Measured on real discs against both DATs. The two sets hold the same sectors,
+#  cut and aligned differently:
+#    * a GDI track's LBA is Redump's INDEX 01; a Redump file starts at its pregap
+#      (150 sectors before an audio track, 225 before a data track that follows
+#      audio) and every GDI audio file runs on to the next track's INDEX 01;
+#    * audio is offset: TOSEC's samples sit AUDIO_SHIFT bytes later. 2,788 bytes
+#      (697 samples) on most TOSEC dumps measured, but not all (one USA dump uses
+#      2,520) - so when DATs are loaded the offset is FOUND by matching track 2
+#      against them, otherwise 2,788 is assumed and the result says so;
+#    * the last 150 sectors of a data track's pregap are empty Mode 1 sectors
+#      Redump keeps and TOSEC does not; they are rebuilt (address, EDC, ECC).
+#  Data tracks are identical in both sets.
+# ══════════════════════════════════════════════════════════════════════════════
+
+DC_HD_START = 45000
+DC_SHIFT_DEFAULT = 2788
+DC_SHIFT_KNOWN = (2788, 2520)          # offsets seen on real TOSEC dumps
+DC_SHIFT_SWEEP = 2048                  # bytes searched either side of those when a DAT can decide
+_DC_SHIFT_USED = {}                    # output path -> offset, so verification undoes the same one
+
+
+def read_gdi(path):
+    rows = []
+    lines = Path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+    for line in lines[1:]:
+        m = re.match(r'\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+("[^"]*"|\S+)\s+(-?\d+)', line)
+        if m:
+            rows.append({'num': int(m.group(1)), 'lba': int(m.group(2)), 'audio': m.group(3) == '0',
+                         'sector': int(m.group(4)), 'file': m.group(5).strip('"')})
+    if not rows or any(r['sector'] != CD_FRAME for r in rows):
+        raise ConversionError('GDI sheet is empty or not 2352-byte sectors')
+    return rows
+
+
+class _SparseImage:
+    """Absolute-byte view over track files; anything between them reads as zeros."""
+
+    def __init__(self):
+        self.parts = []
+
+    def add(self, start, path):
+        self.parts.append((start, Path(path), Path(path).stat().st_size))
+
+    def read(self, pos, n):
+        out = bytearray(n)
+        for start, path, size in self.parts:
+            a, b = max(pos, start), min(pos + n, start + size)
+            if a < b:
+                with open(path, 'rb') as f:
+                    f.seek(a - start)
+                    out[a - pos:b - pos] = f.read(b - a)
+        return bytes(out)
+
+
+def _bcd(v):
+    return (v // 10) << 4 | (v % 10)
+
+
+def _empty_mode1(lba):
+    a = lba + 150
+    s = bytearray(CD_FRAME)
+    s[0:12] = CD_SYNC
+    s[12:16] = bytes([_bcd(a // 4500), _bcd((a // 75) % 60), _bcd(a % 75), 1])
+    s[0x810:0x814] = cd_edc_fast(s[:0x810]).to_bytes(4, 'little')
+    cd_ecc_fast(s, s[12:16])
+    return bytes(s)
+
+
+def _gdi_layout(rows, folder):
+    tracks = []
+    for i, r in enumerate(rows):
+        hd = r['lba'] >= DC_HD_START
+        same_area = i > 0 and (rows[i - 1]['lba'] >= DC_HD_START) == hd
+        pregap = (150 if r['audio'] else 225) if same_area else (150 if r['audio'] else 0)
+        tracks.append(dict(r, hd=hd, pregap=pregap, start=r['lba'] - pregap,
+                           size=(Path(folder) / r['file']).stat().st_size // CD_FRAME))
+    for i, t in enumerate(tracks):
+        nxt = tracks[i + 1] if i + 1 < len(tracks) else None
+        t['end'] = nxt['start'] if nxt is not None and nxt['hd'] == t['hd'] else t['lba'] + t['size']
+    return tracks
+
+
+def _stream(fo, img, lo, hi, shift):
+    pos, end = lo * CD_FRAME, hi * CD_FRAME
+    while pos < end:
+        n = min(CHUNK, end - pos)
+        fo.write(img.read(pos + shift, n))
+        pos += n
+
+
+def _dc_find_shift(probes):
+    """(offset, certainty) whose audio tracks are in a loaded DAT, else (None, '').
+
+    Track 2 is often the same generic audio on many discs, so one hit can be
+    another game's track. With two audio tracks, both must hit the SAME DAT game;
+    a disc with a single audio track can only be matched on that one."""
+    dats = REFERENCE_DATS
+    if dats is None or not hasattr(dats, 'by_sha1') or not probes:
+        return None, ''
+    probes = probes[:2]
+
+    def hits(shift):
+        recs = [dats.by_sha1.get(hashlib.sha1(fn(shift)).hexdigest()) for fn, _size in probes]
+        if not all(recs):
+            return False
+        return len({(r['dat'], r['game']) for r in recs}) == 1
+
+    order = list(DC_SHIFT_KNOWN)
+    if sum(size for _fn, size in probes) <= 32 * 1024 * 1024:       # sweep only when cheap
+        for base in DC_SHIFT_KNOWN:
+            order += [s for d in range(4, DC_SHIFT_SWEEP + 1, 4) for s in (base + d, base - d)]
+    for shift in dict.fromkeys(order):
+        if hits(shift):
+            return shift, ('two audio tracks agree' if len(probes) == 2 else
+                           'only one audio track to match (generic track 2 may be shared by other games)')
+    return None, ''
+
+
+def _dc_pick_shift(shift, probes):
+    if shift is not None:
+        return shift, 'given'
+    found, why = _dc_find_shift(probes)
+    if found is not None:
+        return found, f'matched against a loaded DAT - {why}'
+    return DC_SHIFT_DEFAULT, 'assumed (no DAT to confirm it)'
+
+
+def gdi_to_cue(src, dst, progress=None, shift=None):
+    src, dst = Path(src), Path(dst)
+    folder = src.parent
+    rows = read_gdi(src)
+    for r in rows:
+        if not (folder / r['file']).exists():
+            raise ConversionError(f'track file missing: {r["file"]}')
+    tracks = _gdi_layout(rows, folder)
+    img = _SparseImage()
+    for r in rows:
+        img.add(r['lba'] * CD_FRAME, folder / r['file'])
+    final = dst.with_suffix('') if dst.suffix == '.part' else dst
+    stem = final.stem
+    # track 2 plus the smallest other audio track: the pair identifies the game
+    audio = [t for t in tracks if t['audio']]
+    picks = audio[:1] + sorted(audio[1:], key=lambda t: t['end'] - t['start'])[:1]
+    probes = [((lambda sh, t=t: img.read(t['start'] * CD_FRAME + sh, (t['end'] - t['start']) * CD_FRAME)),
+               (t['end'] - t['start']) * CD_FRAME) for t in picks]
+    shift, how = _dc_pick_shift(shift, probes)
+    width = 2 if len(tracks) >= 10 else 1
+    lines, written = [], []
+    for i, t in enumerate(tracks):
+        if i == 0:
+            lines.append('REM SINGLE-DENSITY AREA')
+        elif t['hd'] and not tracks[i - 1]['hd']:
+            lines.append('REM HIGH-DENSITY AREA')
+        name = f'{stem} (Track {t["num"]:0{width}d}).bin'
+        lines.append(f'FILE "{name}" BINARY')
+        lines.append(f'  TRACK {t["num"]:02d} {"AUDIO" if t["audio"] else "MODE1/2352"}')
+        if t['pregap']:
+            lines.append('    INDEX 00 00:00:00')
+            lines.append(f'    INDEX 01 00:{t["pregap"] // 75:02d}:{t["pregap"] % 75:02d}')
+        else:
+            lines.append('    INDEX 01 00:00:00')
+        target = final.with_name(name)
+        with open(target, 'wb') as fo:
+            if t['audio']:
+                _stream(fo, img, t['start'], t['end'], shift)
+            elif t['pregap'] == 225:                          # audio run-out, then empty sectors
+                _stream(fo, img, t['start'], t['start'] + 75, shift)
+                for lba in range(t['start'] + 75, t['lba']):
+                    fo.write(_empty_mode1(lba))
+                _stream(fo, img, t['lba'], t['end'], 0)
+            else:
+                _stream(fo, img, t['start'], t['end'], 0)
+        written.append(str(target))
+        if progress:
+            progress(i + 1, len(tracks), 'writing Redump tracks')
+    dst.write_bytes(('\r\n'.join(lines) + '\r\n').encode('utf-8'))
+    _DC_SHIFT_USED[str(dst)] = shift
+    return {'sidecars': written, 'audio_offset': shift, 'offset_from': how}
+
+
+def _dc_cue_tracks(path):
+    tracks, cur = [], None
+    for line in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        s = line.strip()
+        if s.upper().startswith('FILE'):
+            m = re.match(r'FILE\s+"(.*)"', s, re.I)
+            if not m:
+                raise ConversionError(f'cannot read cue line: {s}')
+            cur = m.group(1)
+        elif s.upper().startswith('TRACK'):
+            p = s.split()
+            tracks.append({'num': int(p[1]), 'audio': p[2].upper() == 'AUDIO', 'file': cur, 'idx': {}})
+        elif s.upper().startswith('INDEX') and tracks:
+            p = s.split()
+            tracks[-1]['idx'][int(p[1])] = _msf_to_frames(p[2])
+    if len(tracks) < 3:
+        raise ConversionError('not a Dreamcast GD-ROM cue (fewer than 3 tracks)')
+    return tracks
+
+
+def cue_to_gdi(src, dst, progress=None, shift=None):
+    src, dst = Path(src), Path(dst)
+    folder = src.parent
+    tracks = _dc_cue_tracks(src)
+    img, lba = _SparseImage(), 0
+    for t in tracks:
+        if t['num'] == 3:
+            lba = DC_HD_START
+        p = folder / t['file']
+        if not p.exists():
+            raise ConversionError(f'track file missing: {t["file"]}')
+        t['size'] = p.stat().st_size // CD_FRAME
+        img.add(lba * CD_FRAME, p)
+        t['start'], t['lba'], t['hd'] = lba, lba + t['idx'].get(1, 0), t['num'] >= 3
+        lba += t['size']
+    final = dst.with_suffix('') if dst.suffix == '.part' else dst
+    for t in tracks:
+        clash = final.with_name(f'track{t["num"]:02d}.{"raw" if t["audio"] else "bin"}')
+        if clash.exists():
+            raise ConversionError(f'{clash.name} already exists in the output folder - GDI track '
+                                  'files have fixed names, so each disc needs its own folder')
+    for i, t in enumerate(tracks):
+        nxt = tracks[i + 1] if i + 1 < len(tracks) else None
+        t['end'] = t['start'] + t['size']
+        if t['audio'] and nxt is not None and nxt['hd'] == t['hd']:
+            t['end'] = nxt['lba'] if nxt['audio'] else nxt['lba'] - 150
+    audio = [t for t in tracks if t['audio']]
+    picks = audio[:1] + sorted(audio[1:], key=lambda t: t['end'] - t['lba'])[:1]
+    probes = [((lambda sh, t=t: img.read(t['lba'] * CD_FRAME - sh, (t['end'] - t['lba']) * CD_FRAME)),
+               (t['end'] - t['lba']) * CD_FRAME) for t in picks]
+    shift, how = _dc_pick_shift(shift, probes)
+    rows, written = [], []
+    for i, t in enumerate(tracks):
+        name = f'track{t["num"]:02d}.{"raw" if t["audio"] else "bin"}'
+        target = final.with_name(name)
+        with open(target, 'wb') as fo:
+            _stream(fo, img, t['lba'], t['end'], -shift if t['audio'] else 0)
+        written.append(str(target))
+        rows.append(f'{t["num"]} {t["lba"]} {0 if t["audio"] else 4} 2352 {name} 0')
+        if progress:
+            progress(i + 1, len(tracks), 'writing GDI tracks')
+    dst.write_bytes(('\r\n'.join([str(len(tracks))] + rows) + '\r\n').encode('utf-8'))
+    _DC_SHIFT_USED[str(dst)] = shift
+    return {'sidecars': written, 'audio_offset': shift, 'offset_from': how}
+
+
+def _dc_roundtrip_verifier(backward, compare_names):
+    def verify(src, out, progress=None):
+        import tempfile
+        work = Path(tempfile.mkdtemp(prefix='dcverify_'))
+        try:
+            # the new sheet (still named .part) finds its tracks beside it; convert it
+            # back with the SAME audio offset and demand the source tracks
+            backward(Path(out), work / Path(src).name, None, _DC_SHIFT_USED.get(str(out)))
+            folder = Path(src).parent
+            same = all(_sha1_file(folder / n) == _sha1_file(work / n) for n in compare_names(Path(src)))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return (True, 'converts back to the original track files byte for byte') if same else \
+            (False, 'converting back does not give the original track files')
+    return verify
+
+
+def _gdi_names(p):
+    return [r['file'] for r in read_gdi(p)]
+
+
+def _dc_cue_names(p):
+    return list(dict.fromkeys(t['file'] for t in _dc_cue_tracks(p)))
+
+
+CONVERSIONS['dc:gdi->cue'] = {
+    'label': 'Dreamcast: TOSEC GDI -> Redump CUE/BIN', 'engine': ENGINE_NATIVE,
+    'system': 'CD', 'ext': '.cue', 'fn': lambda s, d, p=None: gdi_to_cue(s, d, p), 'inverse': None,
+    'verify_mode': 'verifier',
+    'verifier': _dc_roundtrip_verifier(cue_to_gdi, _gdi_names),
+    'note': 'Tracks match Redump when the audio offset is right: it is found from loaded DATs, '
+            'otherwise the usual TOSEC offset is assumed. Name the GDI as the Redump title for the '
+            'cue sheet to match too.',
+}
+CONVERSIONS['dc:cue->gdi'] = {
+    'label': 'Dreamcast: Redump CUE/BIN -> TOSEC GDI', 'engine': ENGINE_NATIVE,
+    'system': 'CD', 'ext': '.gdi', 'fn': lambda s, d, p=None: cue_to_gdi(s, d, p), 'inverse': None,
+    'verify_mode': 'verifier',
+    'verifier': _dc_roundtrip_verifier(gdi_to_cue, _dc_cue_names),
+    'note': 'TOSEC dumps differ in audio offset; it is found from loaded DATs, otherwise the usual '
+            'offset is assumed. Each disc needs its own output folder (GDI track names are fixed).',
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CATALOGUE  -  what each system can do, and what it needs (for the GUI)
 #
 #  The conversion registry says HOW to convert; this says what a person needs to
@@ -8074,8 +9478,9 @@ SYSTEM_NAMES = {
     'PS3': ('PlayStation 3', 'Redump disc encryption.'),
     'PSX': ('PlayStation (PS one Classics)', 'PSN EBOOT.PBP files to Redump-style bin/cue.'),
     'VITA': ('PlayStation Vita', 'PSN packages to NoNpDrm / decrypted folders.'),
-    'CD': ('CD images (CHD)', 'Any cue/bin CD image: PlayStation, Saturn, Sega CD, '
-           'Dreamcast, PC Engine CD, Neo Geo CD, 3DO ...'),
+    'CD': ('CD images (CHD, ECM, CUE/BIN)', 'Any cue/bin CD image: PlayStation, Saturn, Sega CD, '
+           'Dreamcast, PC Engine CD, Neo Geo CD, 3DO ... - CHD, ECM, merging or splitting '
+           'track files, and Dreamcast TOSEC GDI <-> Redump.'),
     'CHD': ('DVD / ISO images (CHD)', 'Plain ISO images in and out of CHD.'),
     'MD': ('Sega Mega Drive / Genesis', 'SMD interleaved copier dumps.'),
     'PCE': ('PC Engine / TurboGrafx-16', 'Copier headers.'),
@@ -8089,6 +9494,8 @@ SYSTEM_NAMES = {
     'ZX': ('ZX Spectrum', 'Tape (TAP/TZX) and TR-DOS disk (TRD/SCL) images.'),
     'APPLE2': ('Apple II', 'Sector order, 2IMG headers, nibble (NIB) and flux-level (WOZ) images.'),
     'LOOPY': ('Casio Loopy', 'Cartridge byte order.'),
+    'PATCH': ('ROM patches', 'IPS, UPS, BPS and xdelta patches applied to their base ROM, which is '
+              'found next to the patch.'),
     'PCFLOPPY': ('IBM PC floppy', 'ImageDisk (IMD) and Teledisk (TD0) to raw images.'),
 }
 
@@ -8143,6 +9550,10 @@ CONVERSION_INPUTS = {
     'nes:fds-headered->headerless': ('.fds',), 'nes:fds-headerless->headered': ('.fds',),
     'fds:qd->fds': ('.qd',), 'fds:fds->qd': ('.fds',),
     'pc:imd->img': ('.imd',), 'pc:td0->img': ('.td0',),
+    'cd:ecm->bin': ('.ecm', '.bin.ecm'), 'cd:bin->ecm': ('.bin', '.img'),
+    'cue:split->merged': ('.cue',), 'cue:merged->split': ('.cue',),
+    'dc:gdi->cue': ('.gdi',), 'dc:cue->gdi': ('.cue',),
+    'patch:apply': ('.ips', '.ups', '.bps', '.xdelta'),
 }
 for _cid in CONVERSIONS:
     if _cid.startswith('n64:'):
@@ -8201,6 +9612,126 @@ _VERIFY_TEXT = {
 }
 
 
+# ── how far each conversion has been tested on REAL files ────────────────────
+# Taken from the real-file test matrix (tests/conversion_matrix.py, results in
+# rom_test_matrix/) and the one-off real-file checks recorded with it.
+#   proven     output byte-exact against a DAT (or IRD) on real files
+#   roundtrip  real files converted and back byte-exact; no DAT lists the output
+#   partial    works on real files, with limits spelled out in the text
+#   synthetic  only test files built for the purpose - no real sample yet
+#   untested   not run on a real file yet
+EVIDENCE_LEVELS = {
+    'proven': 'Proven on real files (DAT-exact)',
+    'roundtrip': 'Real files, round trip byte-exact',
+    'partial': 'Real files, with limits',
+    'synthetic': 'Built-for-purpose test files only',
+    'untested': 'Not yet run on a real file',
+}
+TEST_EVIDENCE = {
+    'n64:big-endian->byteswapped': ('proven', '24 of 24 N64 / Aleck64 ROMs DAT-exact against the No-Intro ByteSwapped sets, and back byte-exact.'),
+    'n64:byteswapped->big-endian': ('proven', '24 of 24 ROMs DAT-exact against the No-Intro BigEndian sets, and back byte-exact.'),
+    'n64:big-endian->little-endian': ('roundtrip', '24 of 24 real ROMs converted and back byte-exact (No-Intro keeps no little-endian set).'),
+    'n64:byteswapped->little-endian': ('roundtrip', '24 of 24 real ROMs converted and back byte-exact.'),
+    'n64:little-endian->big-endian': ('roundtrip', 'Run as the way back for 24 real ROMs, byte-exact.'),
+    'n64:little-endian->byteswapped': ('roundtrip', 'Run as the way back for 24 real ROMs, byte-exact.'),
+    'loopy:big-endian->little-endian': ('proven', '11 of 13 real Loopy ROMs DAT-exact; 1 is a known mismatch between the two No-Intro sets.'),
+    'loopy:little-endian->big-endian': ('proven', '11 of 12 real ROMs DAT-exact; 1 is a known mismatch between the two No-Intro sets.'),
+    'nes:headered->headerless': ('proven', '1,274 of 1,274 real headered NES ROMs: stripped ROM DAT-exact and header restored byte-exact.'),
+    'nes:headerless->headered': ('proven', '181 of 181 headerless No-Intro NES ROMs given a header that is DAT-exact against No-Intro (Headered).'),
+    'nes:unif->nes': ('partial', '161 real UNIF files: 26 DAT-exact, 72 converted with an nes20db header no DAT lists, 63 unknown multicarts refused.'),
+    'nes:fds-headerless->headered': ('roundtrip', '20 of 20 real FDS disks: header computed, and removed again byte-exact.'),
+    'nes:fds-headered->headerless': ('roundtrip', 'Run as the way back for 20 real FDS disks, byte-exact.'),
+    'fds:qd->fds': ('proven', '20 of 20 real QD disks round trip byte-exact; 7 DAT-exact against No-Intro FDS (the rest are different dumps in the two sets).'),
+    'fds:fds->qd': ('proven', '20 of 20 real FDS disks round trip byte-exact; 7 DAT-exact against No-Intro QD.'),
+    'snes:headerless->headered': ('roundtrip', '34 of 34 real SNES ROMs given a copier header and stripped back byte-exact.'),
+    'snes:headered->headerless': ('roundtrip', 'Run as the way back for 34 real ROMs, byte-exact.'),
+    'md:bin->smd': ('roundtrip', '13 of 13 real Mega Drive ROMs interleaved and back byte-exact.'),
+    'md:smd->bin': ('roundtrip', 'Run as the way back for 13 real ROMs, byte-exact.'),
+    'pce:headerless->headered': ('roundtrip', '25 of 25 real PC Engine ROMs given a header and stripped back byte-exact.'),
+    'pce:headered->headerless': ('roundtrip', 'Run as the way back for 25 real ROMs, byte-exact.'),
+    'nds:encrypted->decrypted': ('proven', '9 real carts DAT-exact against No-Intro DS (Decrypted); 18 more were already decrypted.'),
+    'nds:decrypted->encrypted': ('proven', '19 real DS / DSi carts DAT-exact against No-Intro (Encrypted).'),
+    'nds:untrimmed->trimmed': ('roundtrip', '50 of 50 real carts trimmed and padded back byte-exact.'),
+    'nds:trimmed->untrimmed': ('roundtrip', '2 real trimmed carts, plus the way back for 50 more, byte-exact.'),
+    '3ds:encrypted->decrypted': ('proven', '10 of 10 real carts DAT-exact against No-Intro 3DS (Decrypted).'),
+    '3ds:decrypted->encrypted': ('proven', '9 of 9 real carts DAT-exact against No-Intro 3DS (Encrypted).'),
+    'cia:encrypted->decrypted': ('roundtrip', '13 of 13 real CIAs (including seeded eShop titles) decrypted, then re-encrypted with the same keys byte-identical to the original.'),
+    'cia:decrypted->encrypted': ('partial', 'Its encryption core re-encrypted 13 real CIAs byte-exact as part of the decrypt check; not run on its own.'),
+    'cia:cia->cdn': ('proven', '13 of 13 real CIAs split into CDN files that are DAT-exact against No-Intro 3DS (Digital) (CDN).'),
+    'cia:cdn->cia': ('roundtrip', 'Rebuilt all 13 real CIAs byte-exact from their CDN files.'),
+    'psp:iso->cso': ('roundtrip', '8 of 8 real PSP ISOs compressed and back byte-exact.'),
+    'psp:cso->iso': ('roundtrip', 'Run as the way back for 8 real ISOs, byte-exact.'),
+    'iso:iso->zso': ('roundtrip', '10 real ISOs byte-exact. Images over 4 GB crashed until fixed; re-proven on a 4 GB+ PS3 disc.'),
+    'iso:zso->iso': ('roundtrip', 'Run as the way back for the ZSO tests, byte-exact.'),
+    'psp:pkg->decrypted': ('proven', '43 of 44 real PSN packages DAT-exact: PSP games, Minis, themes, DLC, and PS one Classics (4 of 5 Redump-exact; games with CD audio cannot match).'),
+    'psp:edat->decrypted': ('proven', 'All 15 EDATs in real PSN DLC packages byte-exact against PSN (Decrypted), decrypted during package extraction.'),
+    'psp:pbp->iso': ('proven', '7 of 7 real standalone EBOOT.PBP files (up to 1.2 GB) decrypted to ISOs DAT-exact against PSP (PSN) (Decrypted).'),
+    'psx:pbp->bin': ('proven', '5 real standalone EBOOT.PBP files: 3 Redump-exact; the other 2 have CD audio, which is stored lossy and cannot match.'),
+    'psp:dax->iso': ('synthetic', 'No real DAX file could be found. Tested on DAX files built to maxcso\'s layout, including stored (NC) frames.'),
+    'psp:jso->iso': ('synthetic', 'No real JSO file could be found. Tested on JSO files built to ARK-4\'s layout; its LZO decoder reproduces a real lzop file exactly.'),
+    'ps3:iso->deciso': ('proven', '6 of 7 real Redump PS3 discs: every file matches the disc\'s IRD (up to 4,342 files). The 7th has no key available.'),
+    'ps3:deciso->iso': ('untested', 'The reverse of the proven decrypt, but not run on its own.'),
+    'vita:pkg->decrypted': ('proven', '1,262 of 1,262 files DAT-exact against Unofficial Vita (NoNpDrm) (Final Fantasy X HD Remaster); an update package also decrypted.'),
+    'vita:pkg->nonpdrm': ('partial', 'Run on a real package; the installable pkg2zip layout has no DAT to check against.'),
+    'disc:gc:iso->ciso': ('roundtrip', '2 real GameCube discs converted and back byte-exact.'),
+    'disc:gc:ciso->iso': ('roundtrip', 'Run as the way back for 2 real discs, byte-exact.'),
+    'disc:gc:iso->rvz': ('roundtrip', '2 real GameCube discs: decoded RVZ identical to the ISO.'),
+    'disc:gc:rvz->iso': ('proven', '2 real RVZ discs decoded DAT-exact against Redump GameCube.'),
+    'disc:gc:rvz->ciso': ('roundtrip', '2 real RVZ discs; CISO decodes to identical disc data.'),
+    'disc:gc:ciso->rvz': ('roundtrip', 'Run as the way back for 2 real discs.'),
+    'disc:gc:rvz->rvz': ('untested', 'Recompression not run on a real file yet.'),
+    'disc:wii:iso->wbfs': ('proven', '1 real Wii disc DAT-exact against Wii NKit WBFS (lossless).'),
+    'disc:wii:wbfs->iso': ('roundtrip', 'Run as the way back for a real disc, byte-exact.'),
+    'disc:wii:iso->rvz': ('roundtrip', '1 real Wii disc: decoded RVZ identical to the ISO.'),
+    'disc:wii:rvz->iso': ('proven', '1 real RVZ disc decoded DAT-exact against Redump Wii.'),
+    'disc:wii:rvz->wbfs': ('proven', '1 real RVZ disc to a WBFS DAT-exact against Wii NKit WBFS.'),
+    'disc:wii:wbfs->rvz': ('roundtrip', 'Run as the way back for a real disc.'),
+    'disc:wii:rvz->rvz': ('untested', 'Recompression not run on a real file yet.'),
+    'wiiu:wux->wud': ('proven', '1 real Wii U WUX expanded DAT-exact against Redump Wii U.'),
+    'wiiu:wud->wux': ('untested', 'Only the reverse (WUX -> WUD) has been run on a real disc.'),
+    'chd:cd->chd': ('partial', '15 real CDs (PlayStation, Saturn, Sega CD, Dreamcast, Neo Geo CD, PC Engine CD, 3DO): 14 back byte-exact including the cue; 1 loses an INDEX 02 marker CHD cannot store.'),
+    'chd:chd->cd': ('partial', 'Run as the way back for 15 real CDs; see CD -> CHD for the one limit.'),
+    'chd:iso->chd': ('roundtrip', '16 real ISOs compressed and back byte-exact.'),
+    'chd:chd->dvd': ('roundtrip', 'Run as the way back for 16 real ISOs, byte-exact.'),
+    'chd:chd->raw': ('untested', 'Not run on a real file yet.'),
+    'a78:headered->headerless': ('proven', '8 of 8 real No-Intro A78 files: stripped ROM DAT-exact against Atari 7800 (BIN), header restored byte-exact.'),
+    'lnx:headered->headerless': ('proven', '18 of 18 real No-Intro LNX files: stripped ROM DAT-exact against Atari Lynx (LYX), header restored byte-exact.'),
+    'a78:headerless->headered': ('proven', '8 of 8 real A78 headers learned from the No-Intro set and added back DAT-exact. Only ROMs the library has learned can be headered.'),
+    'lnx:headerless->headered': ('proven', '18 of 18 real LNX headers learned from the No-Intro set and added back DAT-exact. Only ROMs the library has learned can be headered.'),
+    'jag:j64->rom': ('proven', '12 of 12 real J64 files DAT-exact against Atari Jaguar (ROM).'),
+    'jag:rom->j64': ('partial', '12 real ROMs: 2 DAT-exact; 10 refused because their original header is not the common one.'),
+    'a8:atr->xfd': ('roundtrip', '10 of 10 real ATR disks converted and back byte-exact.'),
+    'a8:xfd->atr': ('roundtrip', '1 real XFD disk converted and back byte-exact.'),
+    'st:st->msa': ('roundtrip', '10 of 10 real Atari ST disks packed and back byte-exact.'),
+    'st:msa->st': ('roundtrip', 'Run as the way back for 10 real disks, byte-exact.'),
+    'amiga:dms->adf': ('proven', '212 of 216 real scene DMS files unpacked; 78 ADFs DAT-exact against Amiga Warez [ADF]. 4 damaged archives refused.'),
+    'c64:p00->prg': ('roundtrip', '10 of 10 real P00 files converted and back byte-exact.'),
+    'c64:t64->prg': ('partial', '10 real T64 tapes: 8 DAT-exact against TOSEC C64 [PRG].'),
+    'c64:d64->files': ('partial', '10 real D64 disks: 7 extracted DAT-exact against TOSEC C64 [PRG]; the rest are not in that DAT.'),
+    'c64:d81->files': ('partial', '10 real D81 disks: 1 DAT-exact against TOSEC; the rest are not in the DAT.'),
+    'zx:tap->tzx': ('roundtrip', '10 of 10 real TAP tapes converted and back byte-exact.'),
+    'zx:tzx->tap': ('partial', '10 real TZX tapes: 4 DAT-exact against TOSEC [TAP]; turbo / custom-timing blocks cannot become TAP.'),
+    'zx:scl->trd': ('roundtrip', '10 of 10 real SCL files converted and back byte-exact.'),
+    'zx:trd->scl': ('roundtrip', 'Run as the way back for 10 real files, byte-exact.'),
+    'apple:do->po': ('roundtrip', '109 of 110 real DSK disks reordered and back byte-exact; 1 TOSEC dump is 2 bytes short and refused.'),
+    'apple:po->do': ('roundtrip', 'Run as the way back for 109 real disks, byte-exact.'),
+    'apple:2mg->raw': ('roundtrip', '10 of 10 real TOSEC 2MG disks: disk data extracted and header (with any trailing comment) restored byte-exact. The bare disks are in no other DAT.'),
+    'apple:raw->2mg': ('proven', '10 of 10 real TOSEC 2MG disks: header (and trailing comment) learned and added back DAT-exact. Only disks the library has learned can be given a header.'),
+    'apple:nib->dsk': ('partial', '83 real NIBs: 10 DAT-exact against TOSEC [DSK]; 23 decoded where the TOSEC DSK is a modified copy; 50 copy-protected disks refused.'),
+    'apple:woz->dsk': ('partial', '80 real WOZ files: 25 DAT-exact against TOSEC [DSK]; 23 decoded where the DSK is a modified copy; 32 copy-protected disks refused.'),
+    'apple:dsk->nib': ('roundtrip', '99 of 99 real DSK disks encoded and decoded back byte-exact.'),
+    'pc:td0->img': ('partial', '18 real Teledisk images: 6 DAT-exact against TOSEC PC [IMG]; 9 copy-protected / irregular disks refused.'),
+    'pc:imd->img': ('partial', '6 real ImageDisk images: 1 DAT-exact against TOSEC PC [IMG]; 4 copy-protected disks refused.'),
+    'cd:ecm->bin': ('roundtrip', 'Decoded the ECMs of 5 real Redump PS1 discs back to the DAT-exact image. No real .ecm file from elsewhere has been tried.'),
+    'cd:bin->ecm': ('roundtrip', '5 real Redump PS1 discs encoded and decoded back byte-exact (about 12% smaller). Not yet compared with a .ecm made by ecm-tools.'),
+    'cue:split->merged': ('proven', 'A real 2-track Redump PS1 disc merged, then split back to tracks and cue that are all DAT-exact.'),
+    'cue:merged->split': ('proven', 'Split a merged real Redump PS1 disc into tracks and cue sheet all DAT-exact against Redump.'),
+    'dc:gdi->cue': ('proven', '5 real TOSEC GDI discs (up to 18 tracks): every track DAT-exact against Redump Dreamcast, and back to the original GDI byte-exact.'),
+    'dc:cue->gdi': ('proven', '6 of 7 real Redump discs give a GDI and every track DAT-exact against TOSEC, including a dump with a different audio offset found automatically; the 7th is not in TOSEC.'),
+    'patch:apply': ('proven', '4 of 4 real known-answer patches give the published result CRC32: IPS (SML2 DX), BPS (Samurai Kid), UPS (Mother 3), xdelta (NSMB Infusion).'),
+}
+
+
 def _requirement(name):
     if name in PYTHON_PACKAGES:
         import importlib.util
@@ -8253,7 +9784,9 @@ def system_catalog():
             reason = 'not implemented yet'
         elif status == 'missing':
             reason = st['reason'] or 'a required file is missing'
+        level, evidence = TEST_EVIDENCE.get(cid, ('untested', 'Not yet run on a real file.'))
         sysd['conversions'].append({
+            'tested': level, 'tested_label': EVIDENCE_LEVELS[level], 'evidence': evidence,
             'id': cid, 'label': spec['label'].split(': ', 1)[-1],
             'from': list(CONVERSION_INPUTS.get(cid, ())), 'to': spec['ext'],
             'engine': spec['engine'], 'status': status, 'reason': reason,
@@ -8269,5 +9802,6 @@ def system_catalog():
         sysd['ready'] = sum(c['status'] == 'ready' for c in convs)
         sysd['planned'] = sum(c['status'] == 'planned' for c in convs)
         sysd['total'] = len(convs)
+        sysd['tested'] = {lvl: sum(c['tested'] == lvl for c in convs) for lvl in EVIDENCE_LEVELS}
         out.append(sysd)
     return sorted(out, key=lambda s: s['name'].lower())
