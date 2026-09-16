@@ -2563,6 +2563,9 @@ class RsrToolAPI:
 
     # ── the DOS line (see the module note on _try_dos_combo) ───────────────
     DOS_MARK = "__DOS__"
+    # How many DOSBox packs may run at once (see the width calculation in
+    # _sweep_recipe). Each is one core and its own directory.
+    DOS_PARALLEL = 8
     # The prefix probe's rejection. It compares volume one's compressed BYTES;
     # it was labelled "volume one's header did not match", which pointed at the
     # archive layout when the cause was compression (see _log_best_partial).
@@ -6280,9 +6283,23 @@ class RsrToolAPI:
                     else:
                         self._log(f"    {mins:,.0f} min of budget left for "
                                   f"{left} DOS combo(s).", "dim")
-            width = 1 if (len(cur) > 2 and cur[2] and cur[2][0] == self.DOS_MARK) \
-                else max(1, min(budget // max(1, combos[idx][1]),
-                                len(combos) - idx))
+            if len(cur) > 2 and cur[2] and cur[2][0] == self.DOS_MARK:
+                # DOSBox is single-threaded, so N instances cost one core each
+                # and the whole DOS leg was running ONE at a time on a machine
+                # with 32. Measured on Liberogrande_International-KALISTO
+                # (236 MB of source): one pack 235 s; four at once 238 s
+                # (3.9x); eight at once 250 s (7.5x). Every combo already packs
+                # in its own directory, which is what makes this safe.
+                run = 0
+                for c in combos[idx:idx + self.DOS_PARALLEL]:
+                    if len(c) > 2 and c[2] and c[2][0] == self.DOS_MARK:
+                        run += 1
+                    else:
+                        break                 # never mix DOS and Windows
+                width = max(1, min(run, max(1, budget // 4)))
+            else:
+                width = max(1, min(budget // max(1, combos[idx][1]),
+                                   len(combos) - idx))
             chunk = combos[idx:idx + width]
             results: list = [None] * len(chunk)
 
