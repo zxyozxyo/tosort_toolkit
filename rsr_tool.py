@@ -1236,6 +1236,14 @@ def deflate_with(data: bytes, recipe: dict) -> bytes | None:
     return None                                  # tool recipes: see _tool_stream
 
 
+END_UNKNOWN = "?"          # no reading taken; anything else is a real answer
+
+# Bumped whenever a change makes the sweep JUDGE combos differently. It feeds
+# _order_sig, so parked releases start over instead of resuming past combos
+# that would now be accepted.
+SWEEP_JUDGE_GEN = "2026-09-16 partN-probe + end-block-none"
+
+
 def end_block_sig(vol: Path) -> tuple | None:
     """(flags, header size) of a volume's end-of-archive block, or None.
 
@@ -4723,7 +4731,10 @@ class RsrToolAPI:
         # replay, and saying so is better than sweeping a space with no answer.
         # What the ORIGINAL's first volume ends with. Read before the sweep,
         # because it is one of the sweep's match conditions.
-        want_end = end_block_sig(vols[0])
+        # NO end block is a FACT about this archive, not a missing reading:
+        # RAR 2.x writes none and 3.00+ always does. Read once here and passed
+        # down as-is -- END_UNKNOWN is the only "do not check" value.
+        want_end = end_block_sig(vols[0]) if vols[0].is_file() else END_UNKNOWN
         want_ext = header_exttime(vols[0]) if st["format"] == "RAR4" else None
         # Four bytes of header no build in the pack writes. Worth saying out
         # loud, because in a volumed set it moves every split point and the
@@ -5722,7 +5733,7 @@ class RsrToolAPI:
             head = self._probe_head(wdir) or wdir / "probe.rar"
             verdict = self._prefix_verdict(head, prefix)
             bad = (verdict is False
-                   or (not synthetic and end_sig is not None
+                   or (not synthetic and end_sig != END_UNKNOWN
                        and end_block_sig(head) != end_sig)
                    or (not synthetic and hdr_ext is not None
                        and header_exttime(head) != hdr_ext))
@@ -5735,7 +5746,7 @@ class RsrToolAPI:
                 self._tally_reject(
                     self.PREFIX_DIVERGED if verdict is False
                     else "the end block did not match"
-                    if (end_sig is not None
+                    if (end_sig != END_UNKNOWN
                         and end_block_sig(head) != end_sig)
                     else "the header timestamp did not match")
                 return False
@@ -5775,7 +5786,12 @@ class RsrToolAPI:
             if vol_first and head.stat().st_size != vol_first:
                 self._tally_reject("volume one came out a different size")
                 return False
-        if end_sig is not None and end_block_sig(head) != end_sig:
+        if end_sig != END_UNKNOWN and end_block_sig(head) != end_sig:
+            # Including end_sig None: the original has no end-of-volume block,
+            # so a build that writes one cannot have made it. Evolution.Global
+            # .Pal.Mult4.PS1-oNePiEcE (RAR 2.0 format, stored) was "captured"
+            # by 4.10 on stream equality alone -- 20 bytes per volume of end
+            # block displaced everything and the replay came back unverified.
             self._tally_reject("the end block did not match")
             return False
         if hdr_ext is not None and header_exttime(head) != hdr_ext:
@@ -5792,7 +5808,7 @@ class RsrToolAPI:
     def _sweep_recipe(self, fmt, exes, level, dict_kb, solid, src_files,
                       targets, work, max_mt, year=0, grp="",
                       deadline=None, rel="", vol_bytes=0,
-                      new_numbering=True, groups=None, end_sig=None,
+                      new_numbering=True, groups=None, end_sig=END_UNKNOWN,
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
                       want_vols=0, unp_max=0, expanded=False,
@@ -8801,8 +8817,17 @@ class RsrToolAPI:
     @staticmethod
     def _order_sig(combos) -> str:
         """Fingerprint of a combo ORDER, so recorded progress is only reused
-        against the sequence it was actually measured in."""
+        against the sequence it was actually measured in.
+
+        The JUDGE is part of that fingerprint. Resuming asserts "these combos
+        were tried and rejected", which holds only while the thing that
+        rejected them is unchanged: the 2026-09-16 fixes (the .partN probe, and
+        enforcing an original that has NO end block) turn rejections into wins,
+        so a position saved before them would skip the combos that now pass.
+        Measured on RC_Helicopter: cleared, it captures around combo 26;
+        resumed from its 2,713-combo park, it walls."""
         h = hashlib.sha256()
+        h.update(SWEEP_JUDGE_GEN.encode())
         for ex, n, *rest in combos:
             sw = ",".join(rest[0]) if rest and rest[0] else ""
             h.update(f"{ex.name}:{n}:{sw}\n".encode())
