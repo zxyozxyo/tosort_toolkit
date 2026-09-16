@@ -2394,6 +2394,8 @@ class RsrToolAPI:
             "dict_ladder": bool(cfg.get("dict_ladder", False)),
             "budget_min": _num(cfg.get("budget_min"), 45, int),
             "retry_walls": bool(cfg.get("retry_walls", False)),
+            # Off by default: it changes what a WALL means (see _sweep_recipe).
+            "dos_host_only": bool(cfg.get("dos_host_only", False)),
             "small_first": bool(cfg.get("small_first", True)),
             # rar THREADS the sweep may use at once; 0 = auto (half the
             # machine, so it stays usable while a scan runs). See _cpu_budget.
@@ -2426,6 +2428,8 @@ class RsrToolAPI:
             "budget_min": max(0, min(1440, _num(s.get("budget_min"),
                                                 cur["budget_min"], int))),
             "retry_walls": bool(s.get("retry_walls", cur["retry_walls"])),
+            "dos_host_only": bool(s.get("dos_host_only",
+                                        cur["dos_host_only"])),
             "small_first": bool(s.get("small_first", cur["small_first"])),
             "workers": max(0, min(256, _num(s.get("workers"),
                                             cur["workers"], int))),
@@ -4900,6 +4904,7 @@ class RsrToolAPI:
                                             and int(f.get("packed_size") or 0)
                                             >= int(f.get("size") or 0)
                                             for f in meta),
+                                        dos_only=bool(s.get("dos_host_only")),
                                         host=rar4_host(vols)
                                         if st["format"] == "RAR4" else -1)
             if recipe:
@@ -5881,7 +5886,7 @@ class RsrToolAPI:
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
                       want_vols=0, unp_max=0, expanded=False,
-                      host=-1, rr_sectors=-1) -> dict | None:
+                      host=-1, rr_sectors=-1, dos_only=False) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -6114,11 +6119,30 @@ class RsrToolAPI:
                     rest = [c for c in combos
                             if not (len(c) > 2 and c[2]
                                     and c[2][0] == self.DOS_MARK)]
-                    combos = head_dos + rest
                     hot = 0
-                    self._log(f"    the header says this was packed on MS-DOS "
-                              f"— leading with the {dcount} DOS combo(s); the "
-                              "Windows sweep follows as a backstop.", "dim")
+                    if dos_only:
+                        # Measured over the corpus: 284 of 284 captured
+                        # DOS-host archives were reproduced by a DOS build and
+                        # none by a Windows one (and 9,071 Windows-host
+                        # archives all went the other way). That is evidence
+                        # from what we have captured, not proof about every
+                        # archive, so this is a per-scan choice and OFF by
+                        # default -- with it on, a wall here means "no DOS
+                        # build matched", which is a weaker statement than the
+                        # sweep's usual one.
+                        combos = head_dos
+                        self._log(f"    the header says this was packed on "
+                                  f"MS-DOS — trying the {dcount} DOS combo(s) "
+                                  f"ONLY ({len(rest):,} Windows combo(s) "
+                                  "skipped by the 'DOS-host archives: DOS "
+                                  "builds only' setting). A wall here means no "
+                                  "DOS build matched.", "dim")
+                    else:
+                        combos = head_dos + rest
+                        self._log(f"    the header says this was packed on "
+                                  f"MS-DOS — leading with the {dcount} DOS "
+                                  "combo(s); the Windows sweep follows as a "
+                                  "backstop.", "dim")
                 else:
                     self._log(f"    {len(dos)} DOS RAR build(s) queued behind "
                               "the Windows sweep — a different compressor, "

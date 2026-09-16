@@ -226,6 +226,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <span class="hint">(never helped: 7,541 of 7,541)</span></label>
           <label class="chk-row"><input type="checkbox" id="retry_walls">
             Retry releases already swept to exhaustion</label>
+          <label class="chk-row" title="Of 284 captured DOS-host archives, 284 were reproduced by a DOS build and none by a Windows build. With this on, a DOS-host archive is swept with the DOS builds only and a wall means no DOS build matched."><input type="checkbox" id="dos_host_only">
+            DOS-host archives: DOS builds only (skip the Windows backstop)</label>
           <label class="chk-row"><input type="checkbox" id="small_first" checked>
             Smallest releases first (learn recipes cheaply)</label>
           <div class="cpu-row" title="rar threads the sweep may use at once. Takes effect immediately, even mid-scan.">
@@ -434,6 +436,7 @@ window.addEventListener('pywebviewready', async () => {
   $('dict_ladder').checked = s.dict_ladder;
   $('budget_min').value = s.budget_min;
   $('retry_walls').checked = s.retry_walls;
+  $('dos_host_only').checked = s.dos_host_only;
   $('small_first').checked = s.small_first;
   CPU_CORES = s.cores || 0;
   // Allow up to twice the core count. `rar -mtN` does not actually keep N
@@ -539,6 +542,7 @@ function cfg() {
     dict_ladder: $('dict_ladder').checked,
     budget_min: $('budget_min').value,
     retry_walls: $('retry_walls').checked,
+    dos_host_only: $('dos_host_only').checked,
     small_first: $('small_first').checked,
     workers: $('workers').value,
     jobs: $('jobs').value,
