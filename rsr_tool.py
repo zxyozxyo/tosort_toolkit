@@ -7955,6 +7955,8 @@ class RsrToolAPI:
                 attrs = f["attrs"]
             _set_win_attrs(dst, attrs)
             srcs.append(dst)
+        # kept only so a header mismatch can report what was actually staged
+        self._staged, self._staged_files = srcs, st["files"]
 
         comment = None
         if st.get("comment_b64"):
@@ -8024,8 +8026,14 @@ class RsrToolAPI:
             if v.get("delta"):
                 data = apply_delta(data, z.read(v["delta"]))
             if _sha256(data) != v["sha256"]:
+                why = self._mismatch_hint(data, v)
+                more = ""
+                if "header block differs" in why:
+                    more = self._header_evidence(
+                        data, out / v.get("folder", "") / v["name"],
+                        getattr(self, "_staged", []), getattr(self, "_staged_files", []))
                 return (f"    ✗ {v['name']}: hash mismatch after replay "
-                        f"({self._mismatch_hint(data, v)}).")
+                        f"({why})." + (f" [{more}]" if more else ""))
             dst = out / v.get("folder", "") / v["name"]
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(data)
@@ -8256,6 +8264,45 @@ class RsrToolAPI:
         if vol.get("head_sha") and _sha256(data[:4096]) != vol["head_sha"]:
             return "header block differs — timestamp/attribute not restored"
         return "header matches, compressed payload differs"
+
+    @staticmethod
+    def _header_evidence(data: bytes, dst: Path, srcs, files) -> str:
+        """What a header mismatch ACTUALLY is, so the next one needs no guess.
+
+        POCKET_DIGIMON_WORLD_COOL-HOOLiGANS failed three times in the operator's
+        session as "timestamp/attribute not restored" and rebuilt byte-exact
+        four times here — same .rsr, same content file, same code. An
+        unreproducible failure that names no bytes cannot be chased, so this
+        prints the differing offsets and what the staged sources actually carry
+        against what the capture recorded."""
+        try:
+            old = dst.read_bytes() if dst.is_file() else b""
+        except OSError:
+            old = b""
+        bits = []
+        if old and len(old) == len(data):
+            diff = [i for i in range(min(len(old), 4096)) if old[i] != data[i]]
+            if diff:
+                bits.append("differs from the copy already in the output at "
+                            + ", ".join(f"0x{i:x}" for i in diff[:8])
+                            + (" …" if len(diff) > 8 else ""))
+        for sp, f in zip(srcs, sorted(files, key=lambda x: x["order"])):
+            try:
+                st = sp.stat()
+            except OSError:
+                continue
+            want_mt = f.get("mtime_ns")
+            got_at = _win_attrs(sp)
+            want_at = f.get("attrs") if str(f.get("host_os", "")).lower()\
+                .startswith("win") and f.get("attrs") else f.get("win_attrs")
+            if want_mt and st.st_mtime_ns != want_mt:
+                bits.append(f"{sp.name} mtime {st.st_mtime_ns} != captured "
+                            f"{want_mt}")
+            if want_at is not None and got_at is not None and \
+                    (got_at & _SETTABLE_ATTRS) != (int(want_at) & _SETTABLE_ATTRS):
+                bits.append(f"{sp.name} attrs 0x{got_at:x} != captured "
+                            f"0x{int(want_at):x}")
+        return "; ".join(bits)
 
     # ══════════════════════════════════════════════════════════════════
     #  Index
