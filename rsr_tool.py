@@ -393,6 +393,21 @@ def _supports_mt(fname: str) -> bool:
     return _exe_number(fname) >= 360
 
 
+def _writes_rar4(fname: str) -> bool:
+    """Can this build still CREATE a RAR4 archive?
+
+    RAR 7.00 dropped `-ma[4|5]` -- it writes RAR5 only, and asking for -ma4
+    gets "ERROR: Unknown option: ma4" (measured on 7.00 beta 1 and 7.23; 6.24
+    still lists `ma[4|5]` in its own help). Without this every RAR4 release
+    would burn a combo per 7.x build per thread count on an option error, which
+    is precisely the waste _supports_mt and _rejects_mt0 exist to prevent.
+
+    They are still worth having in the pack: a RAR5-format original can only be
+    reproduced by a build that writes RAR5, and 7.x is the only line that has
+    written it since 2023."""
+    return _exe_number(fname) < 700
+
+
 def _rejects_mt0(fname: str) -> bool:
     """Does this build refuse `-mt0` outright?
 
@@ -5065,6 +5080,8 @@ class RsrToolAPI:
             return [str(ex), "a", f"-m{level}", "-ma5", f"-md{dict_kb}k",
                     f"-mt{mt}"]
         if is_r5:
+            if not _writes_rar4(ex.name):
+                return None              # 7.x cannot write RAR4 at all
             # A RAR5 binary still emits RAR4 with -ma4 — and it is the only
             # way a RAR4 archive can carry -mt above 16.
             return [str(ex), "a", f"-m{level}", "-ma4", f"-md{dict_kb}k",
