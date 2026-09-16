@@ -427,6 +427,43 @@ def _rejects_mt0(fname: str) -> bool:
     return _exe_number(fname) >= 420
 
 
+def _oem_name(info, flags: int) -> str | None:
+    """The name rar itself will write for a RAR4 entry with no Unicode flag.
+
+    rarfile decodes such a name by TRYING encodings -- `TRY_ENCODINGS =
+    ("utf8", "utf-16le")` -- and utf-16le SUCCEEDS on any even-length byte
+    string, so one non-UTF8 byte turns the name into CJK mojibake. Measured on
+    Worlds_Scariest_Police_Chases_Pal_PS1-DrastiC: the header holds
+    b"World\xefs_Scariest_Police_Chases.cue" with the Unicode flag clear, and
+    rarfile returned '\u6f57\u6c72...'. rar.exe extracts it as "World\xb4s_..."
+    -- the byte read in the OEM code page (0xEF is U+00B4 in cp850).
+
+    A wrong name is not cosmetic: it is the key the extraction check and the
+    sweep's stream lookup both use, so the release failed as "extraction
+    incomplete -- wrong size" for a file that was on disk under its real name.
+
+    ASCII names decode identically everywhere and are left alone."""
+    raw = getattr(info, "orig_filename", None)
+    if not raw or flags & 0x200:          # 0x200 = the Unicode-name flag
+        return None
+    try:
+        if raw.decode("ascii", "strict"):
+            return None                   # pure ASCII: nothing to correct
+    except UnicodeDecodeError:
+        pass
+    import ctypes
+    try:
+        cp = int(ctypes.windll.kernel32.GetOEMCP()) if os.name == "nt" else 850
+    except Exception:
+        cp = 850
+    for enc in (f"cp{cp}", "cp850", "cp437"):
+        try:
+            return raw.decode(enc).replace("\\", "/").rstrip("/")
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
 def _win_attrs(path: Path) -> int | None:
     """Windows file attribute mask, or None off Windows. RAR stores it in the
     file header, so a rebuild that ignores it can differ by a byte."""
@@ -934,7 +971,11 @@ def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
             pass
         if not h.filename:
             return
-        blocks.setdefault(h.filename, []).append(
+        # Same correction as _read_files: rarfile can mis-decode a RAR4 name
+        # that has no Unicode flag, and this dict is keyed on the name the
+        # sweep looks its streams up by, so the two must agree exactly.
+        name = _oem_name(h, int(getattr(h, "flags", 0) or 0)) or h.filename
+        blocks.setdefault(name, []).append(
             (str(h.volume_file), int(h.data_offset), int(h.add_size)))
 
     rf = _open_rar(head, cb)
@@ -5001,9 +5042,17 @@ class RsrToolAPI:
                     mtime = i.mtime.isoformat()
                 except Exception:
                     mtime = None
+            name = i.filename
+            if fmt == "RAR4":
+                fixed = _oem_name(i, flags)
+                if fixed and fixed != name:
+                    self._log(f"    {fixed}: the name is stored in the OEM "
+                              f"code page, not Unicode — rarfile read it as "
+                              f"{name!r}", "dim")
+                    name = fixed
             out.append({
                 "order": idx,
-                "name": i.filename,
+                "name": name,
                 "size": int(i.file_size or 0),
                 "packed_size": int(i.compress_size or 0),
                 "crc32": int(i.CRC or 0) & 0xFFFFFFFF,
