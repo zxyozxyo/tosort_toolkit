@@ -4046,7 +4046,23 @@ class RsrToolAPI:
                 big = ((e["size"] or 0) >= biggest
                        or (cap_b and (e["size"] or 0) >= cap_b))
                 stored = e["method"] in LHA_STORED
-                loose = big and stored and derivable
+                # Handing the biggest member back "loose" assumes it can be
+                # SUPPLIED again at rebuild. That holds for a PS1 .bin, which
+                # comes from a DAT; it is false for a 40 KB screenshot that
+                # exists nowhere but this release. Measured: rebuilding
+                # Twisted_Metal_Screens_DOX_PS1-PSX with an empty content
+                # folder produced NOTHING -- "missing source:
+                # TwistedMetal/TWISTED1.JPG (40,806 B)" -- because that member
+                # was externalised for being the largest of sixteen tiny files.
+                #
+                # So externalise only what is genuinely too big to carry. Over
+                # the whole index that is 43 of 268 LHA releases and 9.5 MB of
+                # content, which makes every one of them rebuild standalone.
+                # The same rule would cost 3 TB on RAR4, which is why it is
+                # applied HERE and not to archives the format exists to avoid
+                # carrying.
+                carryable = bool(cap_b) and (e["size"] or 0) <= cap_b
+                loose = big and stored and derivable and not carryable
                 rec["source"] = "content" if loose else "extra"
                 # A stored member IS its file, so its CRC32 is computable
                 # and the index gets a real one. A compressed member's is not,
@@ -4093,8 +4109,15 @@ class RsrToolAPI:
                 return {"ok": False,
                         "error": f"{ap.name}: capture larger than the archive"}
             n_extra = sum(1 for f in files if f["source"] == "extra")
+            n_loose = sum(1 for f in files if f["source"] == "content")
             pct = total / max(len(raw), 1) * 100
-            if derivable:
+            if derivable and not n_loose:
+                # Nothing has to be found again: the whole archive is in here.
+                self._log(f"    SELF-CONTAINED — all {n_extra} member(s) "
+                          f"carried, nothing to supply at rebuild: "
+                          f"{total:,} B against a {len(raw):,} B archive "
+                          f"({pct:.0f}%).", "ok")
+            elif derivable:
                 self._log(f"    RECIPE — {n_extra} member(s) carried, content "
                           f"supplied at rebuild: {total:,} B against a "
                           f"{len(raw):,} B archive ({pct:.0f}%).", "ok")
