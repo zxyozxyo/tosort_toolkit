@@ -3205,9 +3205,31 @@ class RsrToolAPI:
                 # archives when it is nothing but archive. Nothing here is
                 # broken and nothing is missing; the format is simply outside
                 # what this tool packs.
+                # Outside what this tool PACKS, but not outside what it can
+                # keep. LHA proved the point: 286 of those releases are carried
+                # verbatim rather than derived, and all 329 rebuild
+                # byte-identical. These are the same shape — tiny 1990s DOX
+                # releases, the .lzx one is 348 KB — so carry the archive as a
+                # stored sidecar and the release is complete rather than a
+                # permanent miss. Over the embed cap it is refused exactly as
+                # before: carrying a big archive verbatim is what a .rsr exists
+                # to avoid.
+                cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+                big = [p for p in files if p.stat().st_size > cap] if cap else files
+                if not big:
+                    total = sum(p.stat().st_size for p in files)
+                    return self._capture_metadata(
+                        folder, store, s, rel, files,
+                        why=f"  {', '.join(foreign)} archive — outside the "
+                            f"RAR, ZIP and LHA formats this tool packs, so "
+                            f"there is no recipe to look for. Carrying the "
+                            f"{len(files)} file(s) verbatim ({total:,} B) so "
+                            f"the release rebuilds byte-exact.")
                 self._log(f"  {', '.join(foreign)} archive — outside the "
-                          f"RAR, ZIP and LHA formats this tool reads. Not a "
-                          f"miss: there is no recipe to look for.", "warn")
+                          f"RAR, ZIP and LHA formats this tool reads, and "
+                          f"{len(big)} file(s) are over the {cap:,} B embed "
+                          f"cap to carry verbatim. Not a miss: there is no "
+                          f"recipe to look for.", "warn")
                 return {"ok": False,
                         "error": f"unsupported archive format "
                                  f"({', '.join(foreign)})"}
@@ -4334,7 +4356,7 @@ class RsrToolAPI:
             _rmtree(work)
 
     def _capture_metadata(self, folder: Path, store: Path, s: dict, rel: str,
-                          files: list) -> dict:
+                          files: list, why: str = "") -> dict:
         """Capture a release that is metadata only — a DIRFIX, NFOFIX and the
         like, where the nfo IS the release and there never was an archive.
 
@@ -4344,9 +4366,10 @@ class RsrToolAPI:
         folder exactly, because sidecar restoration is already set-independent.
         """
         tag = _fix_tag(rel)
-        self._log(f"  Metadata-only release{f' ({tag})' if tag else ''} — "
-                  f"{len(files)} file(s), no archive. Capturing the files and "
-                  "recording it as complete.", "info")
+        self._log(why or
+                  (f"  Metadata-only release{f' ({tag})' if tag else ''} — "
+                   f"{len(files)} file(s), no archive. Capturing the files and "
+                   "recording it as complete."), "info")
         manifest = {
             "rsr_version": RSR_VERSION,
             "magic": RSR_MAGIC,
