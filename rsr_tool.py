@@ -6331,7 +6331,12 @@ class RsrToolAPI:
                         run += 1
                     else:
                         break                 # never mix DOS and Windows
-                width = max(1, min(run, max(1, budget // 4)))
+                # budget // 2, not // 4: with 4 releases in flight the old
+                # split gave each 2 instances, 8 across the machine. Measured
+                # again at 16 (Liberogrande, 236 MB): wall 365 s against 235 s
+                # for one alone = 10.3x, where 8 gave 7.5x. Diminishing but
+                # real, and DOSBox is the slowest thing in the sweep.
+                width = max(1, min(run, max(1, budget // 2)))
             else:
                 width = max(1, min(budget // max(1, combos[idx][1]),
                                    len(combos) - idx))
