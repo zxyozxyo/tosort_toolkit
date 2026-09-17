@@ -1798,6 +1798,95 @@ def diff_bytes(produced: bytes, original: bytes) -> bytes | None:
     return alt if cand is None or len(alt) < len(cand) else cand
 
 
+def _diff_ranges(a: bytes, b: bytes) -> list[tuple[int, int]]:
+    """Where two byte strings differ, as maximal (offset, length) runs.
+
+    Compared a block at a time so the equal stretches -- which is nearly all of
+    a 20 MB volume -- cost one memcmp rather than a Python loop per byte."""
+    out: list[tuple[int, int]] = []
+    n = min(len(a), len(b))
+    step = 1 << 16
+    for start in range(0, n, step):
+        stop = min(start + step, n)
+        if a[start:stop] == b[start:stop]:
+            continue
+        i = start
+        while i < stop:
+            if a[i] == b[i]:
+                i += 1
+                continue
+            j = i
+            while j < stop and a[j] != b[j]:
+                j += 1
+            if out and out[-1][0] + out[-1][1] == i:
+                out[-1] = (out[-1][0], j - out[-1][0])
+            else:
+                out.append((i, j - i))
+            i = j
+    if len(a) != len(b):
+        out.append((n, max(len(a), len(b)) - n))
+    return out
+
+
+def _clip_ranges(ranges: list[tuple[int, int]],
+                 size: int) -> list[tuple[int, int]]:
+    """`ranges` as they apply to a volume of `size` bytes."""
+    out = []
+    for off, ln in ranges:
+        ln = min(ln, max(0, size - off))
+        if ln:
+            out.append((off, ln))
+    return out
+
+
+def _patch_from_ranges(original: bytes,
+                       ranges: list[tuple[int, int]]) -> bytes | None:
+    """A plain patch writing `original`'s own bytes over each range.
+
+    Clipped to the volume's length, because the last volume of a set is shorter
+    than its siblings and the union is taken across all of them."""
+    out = bytearray()
+    for off, ln in ranges:
+        ln = min(ln, max(0, len(original) - off))
+        if not ln:
+            continue
+        out += off.to_bytes(8, "little") + ln.to_bytes(4, "little")
+        out += original[off:off + ln]
+        if len(out) > DELTA_MAX_BYTES:
+            return None
+    return bytes(out) or None
+
+
+def _union_patch(a: bytes, b: bytes, original: bytes) -> bytes | None:
+    """A patch that turns EITHER `a` or `b` into `original`.
+
+    Both are replays of the same recipe; where a recovery record makes them
+    differ, the union of the two difference maps covers the volatile bytes.
+    Same wire format as _diff_simple: <u64 offset><u32 len><original bytes>."""
+    if not (len(a) == len(b) == len(original)):
+        return None
+    marks = bytearray(len(original))
+    for src in (a, b):
+        for i, (x, y) in enumerate(zip(src, original)):
+            if x != y:
+                marks[i] = 1
+    out = bytearray()
+    i, n = 0, len(original)
+    while i < n:
+        if not marks[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and marks[j]:
+            j += 1
+        out += i.to_bytes(8, "little") + (j - i).to_bytes(4, "little")
+        out += original[i:j]
+        i = j
+        if len(out) > DELTA_MAX_BYTES:
+            return None
+    return bytes(out)
+
+
 def _diff_simple(produced: bytes, original: bytes) -> bytes | None:
     """A patch turning `produced` into `original`, or None if too big to be a
     header residual. Format: repeated <u64 offset><u32 len><original bytes>.
@@ -6951,9 +7040,12 @@ class RsrToolAPI:
             return "none", volmeta, {}
 
         verdict = "exact"
+        rr_maps: dict[int, list] = {}
         for idx, (p, v) in enumerate(zip(produced, vols)):
             orig = v.read_bytes()
             got = p.read_bytes()
+            if recipe.get("rr_pct"):
+                rr_maps[idx] = _diff_ranges(got, orig)
             rec = {"name": v.name, "size": len(orig),
                    "sha256": _sha256(orig),
                    "head_sha": _sha256(orig[:4096]), "delta": None}
@@ -6968,7 +7060,135 @@ class RsrToolAPI:
                 rec["delta"] = key
                 verdict = "delta"
             volmeta.append(rec)
+        if verdict == "delta" and recipe.get("rr_pct"):
+            if len(vols) >= 3:
+                self._widen_across_volumes(produced, vols, volmeta, deltas,
+                                           rr_maps, si)
+            else:
+                self._stabilise_deltas(recipe, src_files, work, comment, st,
+                                       base, vols, volmeta, deltas, produced,
+                                       si)
         return verdict, volmeta, deltas
+
+    def _widen_across_volumes(self, produced, vols, volmeta, deltas, rr_maps,
+                              si) -> None:
+        """Let the siblings cover for the volume that got lucky.
+
+        A pack carrying a RECOVERY RECORD is not deterministic: measured on
+        Ultraman_Zearth_JAP_PS1_READNFO-XSide, two packs of the same sources
+        seconds apart differ by three bytes, at the same offset inside every
+        volume (0x12e249d). The delta is built from ONE replay, so whether it
+        covers those bytes is a coin toss -- and part05's replay happened to
+        MATCH the original there, so its patch began one byte late: 103 bytes
+        where its eight siblings had 104. It verified at capture and failed at
+        rebuild with "header matches, compressed payload differs".
+
+        The record's volatile window sits at the same offset in every volume of
+        a set, so the siblings already show where it is. Widening every patch
+        to the union of the set's difference maps costs no extra packing, and
+        widening is always safe: the patch writes the volume's OWN original
+        bytes, so a replay that already matched is simply written back. Under
+        that rule the lucky volume is covered by the eight that were not.
+
+        Measured on the reconstructed failure: patches 104 -> 309 B, and 9 of 9
+        then rebuild from two replays they were not built from. A set of fewer
+        than three volumes has no useful vote and goes to _stabilise_deltas
+        instead."""
+        merged: list[tuple[int, int]] = []
+        for off, ln in sorted(r for m in rr_maps.values() for r in m):
+            if merged and off <= merged[-1][0] + merged[-1][1]:
+                end = max(merged[-1][0] + merged[-1][1], off + ln)
+                merged[-1] = (merged[-1][0], end - merged[-1][0])
+            else:
+                merged.append((off, ln))
+        if not merged:
+            return
+        grew = 0
+        for idx, (p, v) in enumerate(zip(produced, vols)):
+            # Clipped to THIS volume, because the last one of a set is shorter
+            # than its siblings and the union is taken across all of them. A
+            # volume already covering its share is left exactly as measured:
+            # rewriting it would trade a compact patch (Ganba_No_Bouken's are
+            # 184 KB of copy/insert script) for a plain one no better.
+            want = _clip_ranges(merged, v.stat().st_size)
+            if rr_maps.get(idx) == want:
+                continue
+            orig = v.read_bytes()
+            wide = _patch_from_ranges(orig, merged)
+            if wide is None:
+                continue
+            # The window this protects against is tens of bytes: 53 on
+            # Ultraman_Zearth, 33 on Sentou_Mecha_Xabungle. A union that comes
+            # out big is not that window -- it is one sibling's large region
+            # (a recovery record no build reproduces puts 184 KB in a patch)
+            # being copied into every other volume, which would multiply the
+            # .rsr for no protection at all. Leave those as measured.
+            old = deltas.get(volmeta[idx].get("delta") or "", b"")
+            if len(wide) > max(8192, len(old)):
+                continue
+            key = volmeta[idx].get("delta") or f"deltas/{si}_{idx:04d}.bin"
+            if apply_delta(p.read_bytes(), wide) != orig:
+                self._log(f"    ⚠ {v.name}: could not widen the header "
+                          "patch over the recovery record's volatile window "
+                          "— leaving it as measured.", "warn")
+                continue
+            deltas[key] = wide
+            volmeta[idx]["delta"] = key
+            grew += 1
+        if grew:
+            span = sum(ln for _, ln in merged)
+            self._log(f"    {grew} header patch(es) widened to the {span} B "
+                      f"the whole set disagreed on — a pack with -rr is "
+                      f"not byte-identical twice, and the volume that happens "
+                      f"to match is the one that fails at rebuild.", "dim")
+
+    def _stabilise_deltas(self, recipe, src_files, work, comment, st, base,
+                          vols, volmeta, deltas, produced, si) -> None:
+        """Make each delta survive a replay it was not built from.
+
+        A pack carrying a RECOVERY RECORD is not deterministic. Measured on
+        Ultraman_Zearth_JAP_PS1_READNFO-XSide (rar300 -m5 -s, -rr): two packs of
+        the same sources seconds apart differ by 3-4 bytes inside the record,
+        at the same place every time (0x12e249d..0x12e24b2 of each 20 MB
+        volume). The delta is built from ONE replay, so whether it covers those
+        bytes is luck: eight of that release's nine volumes patched clean and
+        part05's patch began one byte late, leaving 0x12e249d wrong. It
+        verified at capture and failed at rebuild.
+
+        So replay once more and hold every delta to the second copy too. Where
+        one falls short, rebuild it from the union of both differences, which
+        covers the volatile window whichever run supplied it. Only for archives
+        WITH a record -- the only run-dependent thing measured -- so an ordinary
+        capture pays nothing."""
+        again = self._replay(recipe, src_files, work / "stab", comment,
+                             st["format"], base=base)
+        if not again or len(again) != len(vols):
+            self._log("    (could not re-replay to stabilise the header "
+                      "patches — leaving them as measured)", "dim")
+            return
+        fixed = 0
+        for idx, (p2, v) in enumerate(zip(again, vols)):
+            key = volmeta[idx].get("delta")
+            if not key:
+                continue
+            orig = v.read_bytes()
+            got2 = p2.read_bytes()
+            if apply_delta(got2, deltas[key]) == orig:
+                continue                      # already survives another run
+            merged = _union_patch(produced[idx].read_bytes(), got2, orig)
+            if merged is None or apply_delta(got2, merged) != orig \
+                    or apply_delta(produced[idx].read_bytes(),
+                                   merged) != orig:
+                self._log(f"    ⚠ {v.name}: the header patch does not survive a "
+                          "second replay and could not be widened — this "
+                          "release may not rebuild.", "warn")
+                continue
+            deltas[key] = merged
+            fixed += 1
+        if fixed:
+            self._log(f"    {fixed} header patch(es) widened to cover the "
+                      "recovery record's run-to-run bytes — a pack with -rr is "
+                      "not byte-identical twice.", "dim")
 
     # ── legacy .srr ───────────────────────────────────────────────────────
 
