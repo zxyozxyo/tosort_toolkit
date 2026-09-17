@@ -705,6 +705,19 @@ def group_archive_sets(base: Path) -> list[dict]:
     decided by the RAR marker block, and a `.001` family whose later parts have
     NO marker is recognised as a plain byte-split instead."""
     families: dict[tuple, list[tuple[int, Path]]] = {}
+    # Keyed case-INSENSITIVELY. Radikal_Bikers_FINAL_PAL_NTSC_SELECTABLE-KALISTO
+    # ships `kal-rbf.001`, `Kal-rbf.002`, `kal-rbf.003`… -- and its own .sfv
+    # lists that capital K, so the release really was distributed that way and
+    # renaming it would diverge from the original. Keyed on the exact spelling
+    # it split into two families, `Kal-rbf` holding only .002 and `kal-rbf`
+    # missing it, so BOTH were refused as partial sets and the release could
+    # never capture. The filesystem this runs on cannot hold two sets that
+    # differ only by case, so folding them can never merge two real sets, and
+    # for every release whose volumes share one spelling the grouping and the
+    # stem come out exactly as before.
+    # The set's name follows its FIRST volume -- the one whose spelling the
+    # sidecars follow too (kal-rbf.sfv, kal-rbf.nfo).
+    spelling: dict[tuple, tuple[int, str]] = {}
     for p in sorted(base.rglob("*")):
         if not p.is_file():
             continue
@@ -712,7 +725,10 @@ def group_archive_sets(base: Path) -> list[dict]:
         if not cls:
             continue
         stem, scheme, idx = cls
-        families.setdefault((str(p.parent), stem, scheme), []).append((idx, p))
+        key = (str(p.parent), stem.lower(), scheme)
+        families.setdefault(key, []).append((idx, p))
+        if key not in spelling or idx < spelling[key][0]:
+            spelling[key] = (idx, stem)
 
     # A file whose name says nothing and whose first bytes say RAR. SCZ shipped
     # the Unou_no_Tatsujin repack as SCZ-TSMMr.zip holding a RAR archive, so
@@ -726,7 +742,10 @@ def group_archive_sets(base: Path) -> list[dict]:
             families[(str(p.parent), p.stem, "lone")] = [(0, p)]
 
     sets = []
-    for (parent, stem, scheme), vols in families.items():
+    for key, vols in families.items():
+        parent, stem, scheme = key
+        # Report the spelling the release actually uses, not the folded key.
+        stem = spelling.get(key, (0, stem))[1]
         vols.sort()
         paths = [p for _, p in vols]
         fmt = _rar_format(paths[0])
