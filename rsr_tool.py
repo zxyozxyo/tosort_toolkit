@@ -5036,6 +5036,13 @@ class RsrToolAPI:
                 # log exactly like a real wall.
                 self._log("    ▪ stopped by hand before the sweep finished — "
                           "no verdict on this release.", "dim")
+            elif getattr(self._tl, "dos_only_skipped", 0):
+                self._log(f"    ✗ no DOS build reproduces these streams. This "
+                          f"is NOT a verdict on the pack: "
+                          f"{self._tl.dos_only_skipped:,} Windows combo(s) "
+                          f"were skipped by the 'DOS-host archives: DOS builds "
+                          f"only' setting. Untick it to sweep them.", "err")
+                self._log_best_partial(targets)
             else:
                 self._log("    ✗ no build × -mt reproduces these streams — the "
                           "exact build is outside the pack.", "err")
@@ -6013,6 +6020,8 @@ class RsrToolAPI:
         The sweep returns the moment a combo matches — it never runs to
         completion once it has its answer. Ordering is therefore the whole
         game, and _order_combos does that ordering."""
+        self._tl.dos_only_skipped = 0
+        self._tl.dos_only_builds = 0
         mts = [n for n in (*MT_ORDER, *range(9, max_mt + 1)) if n <= max_mt]
         # RAR4 archives are most likely from RAR4-era builds — try those first,
         # but never DROP the RAR5 binaries (they reach -mt>16 via -ma4).
@@ -6232,6 +6241,7 @@ class RsrToolAPI:
                             if not (len(c) > 2 and c[2]
                                     and c[2][0] == self.DOS_MARK)]
                     hot = 0
+                    self._tl.dos_only_builds = dcount
                     if dos_only:
                         # Measured over the corpus: 284 of 284 captured
                         # DOS-host archives were reproduced by a DOS build and
@@ -6243,6 +6253,7 @@ class RsrToolAPI:
                         # build matched", which is a weaker statement than the
                         # sweep's usual one.
                         combos = head_dos
+                        self._tl.dos_only_skipped = len(rest)
                         self._log(f"    the header says this was packed on "
                                   f"MS-DOS — trying the {dcount} DOS combo(s) "
                                   f"ONLY ({len(rest):,} Windows combo(s) "
@@ -6555,9 +6566,12 @@ class RsrToolAPI:
                 # "core(s)" was wrong -- this is the chunk width, i.e. how
                 # many combos run together, and it is pinned to 1 for DOS.
                 msg = (f"    ~{per:,.2f}s per combo at this size, "
-                       f"{len(chunk)} at a time — {win_worst:,} Windows "
-                       f"combo(s) would take {win_worst * per / 3600:,.1f}h")
-                if rungs > 1:
+                       f"{len(chunk)} at a time"
+                       + (f" — {win_worst:,} Windows combo(s) would take "
+                          f"{win_worst * per / 3600:,.1f}h" if win_worst
+                          else " (no Windows combo(s) to price — this sweep is "
+                               "DOS builds only)"))
+                if rungs > 1 and win_worst:
                     msg += (f" ({total - dos_n:,} per dictionary × {rungs} on "
                             f"the ladder)")
                 if allows is not None:
@@ -6595,10 +6609,21 @@ class RsrToolAPI:
         # whole space is now covered — which is exactly what makes the wall
         # that follows trustworthy.
         self._tl.sweep_max_mt = max_mt
-        self._log(f"    swept {start + tried:,} combo(s) across {len(exes)} "
-                  f"build(s) × -mt 0–{max_mt}"
-                  + (f" ({tried:,} this run, {start:,} carried over)"
-                     if start else "") + ".", "dim")
+        skipped_ = getattr(self._tl, "dos_only_skipped", 0)
+        if skipped_:
+            # Under the DOS-only setting the Windows builds were never run, so
+            # naming all 253 of them and the whole -mt ladder describes a
+            # search that did not happen.
+            self._log(f"    swept {start + tried:,} DOS combo(s) across "
+                      f"{getattr(self._tl, 'dos_only_builds', 0)} DOS build(s)"
+                      f" — the {skipped_:,} Windows combo(s) were not tried"
+                      + (f" ({tried:,} this run, {start:,} carried over)"
+                         if start else "") + ".", "dim")
+        else:
+            self._log(f"    swept {start + tried:,} combo(s) across {len(exes)} "
+                      f"build(s) × -mt 0–{max_mt}"
+                      + (f" ({tried:,} this run, {start:,} carried over)"
+                         if start else "") + ".", "dim")
         return None
 
     @staticmethod
