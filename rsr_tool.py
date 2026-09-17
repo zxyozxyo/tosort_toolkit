@@ -7370,8 +7370,19 @@ class RsrToolAPI:
         them silently drops the rest on the floor."""
         if not self._db_path.is_file():
             return {"ok": False, "error": "no index yet"}
-        size = p.stat().st_size
-        crc = _file_crc32(p)
+        try:
+            size = p.stat().st_size
+            crc = _file_crc32(p)
+        except OSError as e:
+            # The batch walks the content folder once and then works through
+            # the list, and the file can be gone by the time its turn comes:
+            # DELETE SOURCES removes a rebuilt release's content as it goes,
+            # and a scan may be moving the same tree. Measured 2026-09-17 --
+            # one vanished dfc-rcre(17).bin raised FileNotFoundError out of
+            # _match_all and killed the WHOLE batch rebuild, abandoning every
+            # release still queued behind it. One missing file is not a reason
+            # to stop; it is a reason to skip that file.
+            return {"ok": False, "error": f"gone before it could be read ({e})"}
         con = self._db()
         try:
             rows = con.execute(
@@ -7508,7 +7519,15 @@ class RsrToolAPI:
             if not p.is_file() or p.suffix.lower() == ".rsr":
                 continue
             looked += 1
-            if p.stat().st_size in sizes:
+            try:
+                hit_size = p.stat().st_size in sizes
+            except OSError:
+                # Same race as in _match_all: rglob listed it, something
+                # removed it before we asked its size. Skip the file, never
+                # the batch.
+                skipped_size += 1
+                continue
+            if hit_size:
                 cands.append(p)
             else:
                 skipped_size += 1
