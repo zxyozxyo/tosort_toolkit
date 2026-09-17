@@ -6242,8 +6242,19 @@ class RsrToolAPI:
             # sweep position.
             budget = self._cpu_budget()
             if budget != last_budget and last_budget:
-                self._log(f"    core budget changed to {budget} thread(s) — "
-                          f"applies from this chunk on.", "dim")
+                # It reads as "the operator moved the slider", and most of the
+                # time it is not: the budget is the Cores setting divided by
+                # the captures in flight, so it moves on its own whenever a
+                # release finishes or starts. Seen at 04:20 on the overnight
+                # run — 32 threads across 3 live jobs = 10 — with nobody at
+                # the keyboard. Say which of the two it was.
+                live = max(1, getattr(self, "_live_jobs", 1))
+                want = _num(self.get_settings().get("workers"), 0, int)
+                whole = (max(1, min(want, 256)) if want > 0
+                         else max(1, (os.cpu_count() or 4) // 2))
+                self._log(f"    core budget now {budget} thread(s) — "
+                          f"{whole} shared across {live} release(s) in "
+                          f"flight; applies from this chunk on.", "dim")
             last_budget = budget
             if self._stop.is_set() or self._skip.is_set():
                 return None
