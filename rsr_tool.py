@@ -7713,8 +7713,18 @@ class RsrToolAPI:
         systems = {_release_system(rel) for rel in matched}
         con = self._db()
         try:
+            # The test is "has it nothing to match on", not "is it an nfo".
+            # kind='metadata' was only ever a proxy for that, and it missed a
+            # whole class: an LHA release carried verbatim has no content file
+            # either, so 286 of them matched nothing, were enumerated by
+            # nothing, and could never come out of a batch rebuild despite
+            # capturing and verifying perfectly. Asking the files table
+            # directly also covers whatever carried kind comes next.
             rows = con.execute(
-                "SELECT name, rsr_path FROM releases WHERE kind='metadata'"
+                "SELECT r.name, r.rsr_path FROM releases r "
+                "WHERE r.rsr_path IS NOT NULL AND NOT EXISTS ("
+                "  SELECT 1 FROM files f "
+                "  WHERE f.release = r.name AND f.source = 'content')"
             ).fetchall()
         finally:
             con.close()
@@ -7725,9 +7735,11 @@ class RsrToolAPI:
         if not todo:
             return 0
         self._log("", "")
-        self._log(f"══ {len(todo)} nfo-only release(s) ══", "info")
-        self._log("  no content to match on, so these are written straight "
-                  "from the store.", "dim")
+        self._log(f"══ {len(todo)} release(s) with no content to match ══",
+                  "info")
+        self._log("  an nfo-only fix, or an archive carried whole — nothing "
+                  "of theirs is ever loose in the content folder, so these "
+                  "are written straight from the store.", "dim")
         n = skipped_meta = 0
         for rel, rp in sorted(todo):
             if self._stop.is_set():
@@ -7750,7 +7762,7 @@ class RsrToolAPI:
             if res.get("ok"):
                 n += 1
                 self._emit("row", {"name": rel, "status": "done",
-                                   "recipe": "nfo only", "kind": "ok"})
+                                   "recipe": "carried whole", "kind": "ok"})
         self._log(f"  ✓ {n} of {len(todo)} written"
                   + (f", {skipped_meta} already in the output folder"
                      if skipped_meta else "") + ".",
