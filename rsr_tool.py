@@ -2697,6 +2697,27 @@ class RsrToolAPI:
         pack = self._app_dir / "apps" / "winrar_pack-4.20"
         return sorted(pack.glob("*_rar*.exe")) if pack.is_dir() else []
 
+    def _pack_ignored(self) -> list[str]:
+        """Executables sitting in the build pack that `_pack_exes` cannot see.
+
+        The glob wants `_rar` in the name, which the naming convention
+        `YYYY-MM-DD_rarNNN.exe` supplies. Anything else is skipped in complete
+        silence -- and that silence has already cost this project real work:
+        58 builds harvested as `rar39b1.exe` (WinRAR 3.90 beta 1, written the
+        way the download names it) sat unused for a day, and were found by
+        accident rather than by the tool saying so. A build the sweep cannot
+        see is indistinguishable from a build that does not exist, which is
+        exactly how a false wall gets manufactured.
+
+        Reported, never acted on: the pack legitimately holds SFX installers
+        the builds were extracted FROM, and those are not builds."""
+        pack = self._app_dir / "apps" / "winrar_pack-4.20"
+        if not pack.is_dir():
+            return []
+        seen = {p.name for p in self._pack_exes()}
+        return sorted(q.name for q in pack.glob("*.exe")
+                      if q.is_file() and q.name not in seen)
+
     # ── the DOS line (see the module note on _try_dos_combo) ───────────────
     DOS_MARK = "__DOS__"
     # How many DOSBox packs may run at once (see the width calculation in
@@ -2972,6 +2993,12 @@ class RsrToolAPI:
             self._log("WinRAR pack not found (apps/winrar_pack-4.20/*.exe) — "
                       "capture needs the build pack.", "err")
             return
+        ignored = self._pack_ignored()
+        if ignored:
+            self._log(f"{len(exes)} build(s) in the pack; {len(ignored)} other "
+                      f"executable(s) there are NOT swept — a build is only "
+                      f"seen when it is named YYYY-MM-DD_rarNNN.exe "
+                      f"(e.g. {ignored[0]}).", "warn")
         try:
             import rarfile  # noqa: F401
         except ImportError as e:
