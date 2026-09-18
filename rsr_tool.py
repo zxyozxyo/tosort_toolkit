@@ -5937,6 +5937,25 @@ class RsrToolAPI:
         if synthetic:
             probe_cmds = self._pack_cmds_extra(
                 cmds, (f"-v{probe_vol}b", "-vn"))
+        # How long this candidate may take, from the SIZE of the job rather
+        # than a flat guess. Measured 2026-09-18 on
+        # Metal_Gear_Solid_3D_Snake_Eater_USA_3DS-VENOM: its 4 GB source takes
+        # 2004-07-20 rar330 1,717 s to pack, where a 2012 build takes 24-114 s.
+        # rar330 is the build that MADE it -- its volume-one stream reproduces
+        # 100.00% and its end block matches -- but every one of its combos was
+        # killed at the flat 900 s and tallied as "the pack command itself
+        # failed to run", which the wall line itself calls "a gap in the sweep,
+        # not a wall". A size-blind timeout silently discards the slow old
+        # builds on exactly the big releases where they are the answer.
+        #
+        # One second per MB, floored at the old 900 s and capped so a genuinely
+        # hung build still cannot run away: 4 GB buys 4,096 s against the
+        # 1,717 s needed, and every release under 900 MB is unchanged.
+        try:
+            _src_mb = sum(Path(s).stat().st_size for s in srcs) / (1 << 20)
+        except OSError:
+            _src_mb = 0
+        pack_timeout = max(900, min(4 * 3600, int(_src_mb)))
         if prefix and cmds and len(cmds) == 1 and (vol_args or synthetic):
             # By VOLUME INDEX, never by name. Under new numbering rar writes
             # probe.part1.rar and no probe.rar exists: the old test ("any file
@@ -5959,7 +5978,8 @@ class RsrToolAPI:
                 # at its final value for a moment before the file is closed.
                 return len(_vols()) >= 2
 
-            if not self._run_until(probe_cmds[0], _closed, timeout=900,
+            if not self._run_until(probe_cmds[0], _closed,
+                                   timeout=pack_timeout,
                                    heartbeat=f"probe -mt{n} "
                                              f"{_exe_label(ex.name)}",
                                    cwd=base):
@@ -5986,7 +6006,7 @@ class RsrToolAPI:
                     else "the header timestamp did not match")
                 return False
 
-        if not all(self._run(c, timeout=900,
+        if not all(self._run(c, timeout=pack_timeout,
                              heartbeat=f"sweep -mt{n} {_exe_label(ex.name)}",
                              cwd=base)
                    for c in cmds):
