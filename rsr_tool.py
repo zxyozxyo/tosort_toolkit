@@ -6629,7 +6629,25 @@ class RsrToolAPI:
                 said_dos = True
                 left = sum(1 for c in combos[idx:]
                            if len(c) > 2 and c[2] and c[2][0] == self.DOS_MARK)
-                self._log(f"    ▶ no Windows build matched — now trying the "
+                # Whether a Windows sweep actually PRECEDED this changes what
+                # is true to say. A DOS-host archive puts its DOS combos
+                # FIRST, so this fires at idx 0 with nothing ruled out yet --
+                # and "no Windows build matched" then claims a sweep that
+                # never ran. On Patriotic_Pinball_USA_PS1-CSiSO the tool said
+                # "leading with the 52 DOS combo(s)" and, one second later on
+                # a 228 MB source costing ~29 s per combo, "no Windows build
+                # matched": 11,226 Windows combos supposedly cleared in a
+                # second. It reads as a routing bug to anyone who knows the
+                # release, and the routing was right -- only the sentence was
+                # wrong. combos[0] is the discriminator: if the run LED with
+                # DOS, nothing Windows can have come first.
+                first = combos[0]
+                dos_led = (len(first) > 2 and first[2]
+                           and first[2][0] == self.DOS_MARK)
+                lead = ("the header says MS-DOS, so leading with the"
+                        if dos_led else
+                        "no Windows build matched — now trying the")
+                self._log(f"    ▶ {lead} "
                           f"{left} DOS RAR build(s) through DOSBox. These are "
                           "slower (a full pack each, no prefix probe) and run "
                           "with no window.", "info")
