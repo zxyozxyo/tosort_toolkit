@@ -230,6 +230,18 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             DOS-host archives: DOS builds only (skip the Windows backstop)</label>
           <label class="chk-row"><input type="checkbox" id="small_first" checked>
             Smallest releases first (learn recipes cheaply)</label>
+          <div class="cpu-row" title="Sweep only builds released up to this many years BEFORE the release, and skip older ones. A build older than the release is the normal case: measured over 9,485 captures, -10/+3 sweeps 77 of 403 builds and misses 0.07%; -8/+2 sweeps 56 and misses 0.15%; -6/+3 misses 1.87%; -5/+3 misses 2.46%. 0 on both = sweep everything. A wall found inside a window says so in the log.">
+            <div class="lbl" style="min-width:auto">Years before</div>
+            <input type="range" id="year_before" min="0" max="20" step="1" value="0"
+                   oninput="yearWindowPreview()">
+            <div class="val" id="year_before_val">off</div>
+          </div>
+          <div class="cpu-row" title="Sweep only builds released up to this many years AFTER the release. A build NEWER than the release cannot have made it, so this side can be small: the 31% of captures recorded against a newer build are byte-identical twins the sweep reached first. +3 is ample, +2 costs almost nothing more.">
+            <div class="lbl" style="min-width:auto">Years after</div>
+            <input type="range" id="year_after" min="0" max="20" step="1" value="0"
+                   oninput="yearWindowPreview()">
+            <div class="val" id="year_after_val">off</div>
+          </div>
           <div class="cpu-row" title="rar threads the sweep may use at once. Takes effect immediately, even mid-scan.">
             <div class="lbl" style="min-width:auto">Cores</div>
             <input type="range" id="workers" min="0" max="64" step="1" value="0"
@@ -438,6 +450,9 @@ window.addEventListener('pywebviewready', async () => {
   $('retry_walls').checked = s.retry_walls;
   $('dos_host_only').checked = s.dos_host_only;
   $('small_first').checked = s.small_first;
+  $('year_before').value = s.year_before || 0;
+  $('year_after').value = s.year_after || 0;
+  yearWindowPreview();
   CPU_CORES = s.cores || 0;
   // Allow up to twice the core count. `rar -mtN` does not actually keep N
   // cores busy — measured at 71% of a 32-core machine with a full 32-thread
@@ -544,6 +559,8 @@ function cfg() {
     retry_walls: $('retry_walls').checked,
     dos_host_only: $('dos_host_only').checked,
     small_first: $('small_first').checked,
+    year_before: +$('year_before').value,
+    year_after: +$('year_after').value,
     workers: $('workers').value,
     jobs: $('jobs').value,
   };
@@ -576,6 +593,22 @@ function setBusy(on) {
 }
 
 let CPU_CORES = 0;
+
+function yearWindowPreview() {
+  // Figures measured over 9,485 captures, keyed on whether any build of the
+  // winner's own output CLASS survives the window -- see scratchpad/
+  // year_window.py. The two sides are not symmetric: a build newer than the
+  // release cannot have made it.
+  const b = +$('year_before').value, a = +$('year_after').value;
+  const MISS = {'10/3':'0.07%', '10/2':'0.11%', '8/3':'0.12%', '8/2':'0.15%',
+                '6/3':'1.9%', '6/2':'1.9%', '5/3':'2.5%', '5/2':'2.5%',
+                '4/2':'3.5%', '3/1':'7.0%', '10/5':'0.06%', '8/5':'0.11%'};
+  const off = (b === 0 && a === 0);
+  $('year_before_val').textContent = off ? 'off' : `−${b} yr`;
+  $('year_after_val').textContent  = off ? 'off' : `+${a} yr`;
+  const m = MISS[`${b}/${a}`];
+  if (!off && m) $('year_after_val').textContent += ` – ${m} miss`;
+}
 
 function workersPreview(){
   // Label only — nothing is applied until the drag ends, so scrubbing the

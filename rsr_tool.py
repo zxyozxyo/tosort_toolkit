@@ -2504,6 +2504,26 @@ class RsrToolAPI:
             "retry_walls": bool(cfg.get("retry_walls", False)),
             # Off by default: it changes what a WALL means (see _sweep_recipe).
             "dos_host_only": bool(cfg.get("dos_host_only", False)),
+            # How many years BEFORE and AFTER the release to sweep; both 0
+            # means no window at all.
+            # Measured over 9,485 captures (2026-09-18). Every output class in
+            # the pack is a contiguous ERA (class 8 is 1996-1998, class 6 is
+            # 2000-2001, class 0 is 2013-2016), so what matters is not whether
+            # the RECORDED build is inside the window but whether any build of
+            # its class is. The two sides are wildly asymmetric: a build NEWER
+            # than the release is historically impossible, and the 31% of
+            # captures recorded against one are byte-identical twins the sweep
+            # happened to reach first. So "after" can be tiny where "before"
+            # cannot:
+            #     -10/+3 -> 77 of 403 builds swept, 0.07% miss
+            #     -8 /+2 -> 56 of 403,              0.15% miss
+            #     -6 /+3 -> 77 of 403,              1.87% miss
+            #     -5 /+3 ->                         2.46% miss
+            # against a symmetric +/-8 costing 254 builds for 0.06%. Default
+            # off, because a wall is a claim about the pack and a window makes
+            # that claim smaller -- which is why it forces a log line saying so.
+            "year_before": _num(cfg.get("year_before"), 0, int),
+            "year_after": _num(cfg.get("year_after"), 0, int),
             "small_first": bool(cfg.get("small_first", True)),
             # rar THREADS the sweep may use at once; 0 = auto (half the
             # machine, so it stays usable while a scan runs). See _cpu_budget.
@@ -2538,6 +2558,10 @@ class RsrToolAPI:
             "retry_walls": bool(s.get("retry_walls", cur["retry_walls"])),
             "dos_host_only": bool(s.get("dos_host_only",
                                         cur["dos_host_only"])),
+            "year_before": max(0, min(40, _num(s.get("year_before"),
+                                              cur["year_before"], int))),
+            "year_after": max(0, min(40, _num(s.get("year_after"),
+                                             cur["year_after"], int))),
             "small_first": bool(s.get("small_first", cur["small_first"])),
             "workers": max(0, min(256, _num(s.get("workers"),
                                             cur["workers"], int))),
@@ -5059,6 +5083,10 @@ class RsrToolAPI:
                                             >= int(f.get("size") or 0)
                                             for f in meta),
                                         dos_only=bool(s.get("dos_host_only")),
+                                        year_before=int(
+                                            s.get("year_before") or 0),
+                                        year_after=int(
+                                            s.get("year_after") or 0),
                                         host=rar4_host(vols)
                                         if st["format"] == "RAR4" else -1)
             if recipe:
@@ -5084,6 +5112,15 @@ class RsrToolAPI:
                           f"{self._tl.dos_only_skipped:,} Windows combo(s) "
                           f"were skipped by the 'DOS-host archives: DOS builds "
                           f"only' setting. Untick it to sweep them.", "err")
+                self._log_best_partial(targets)
+            elif getattr(self._tl, "year_window_skipped", 0):
+                self._log(f"    ✗ no build × -mt within the year window "
+                          f"{getattr(self._tl, 'year_window', '')} "
+                          f"reproduces these streams. This is NOT a verdict on "
+                          f"the pack: "
+                          f"{self._tl.year_window_skipped:,} build(s) outside "
+                          f"the year window were skipped. Widen it or set it to "
+                          f"0 to sweep them.", "err")
                 self._log_best_partial(targets)
             else:
                 self._log("    ✗ no build × -mt reproduces these streams — the "
@@ -6124,7 +6161,8 @@ class RsrToolAPI:
                       hdr_ext=None, rung=0, rungs=1,
                       base=None, prefix=None, probe_vol=0,
                       want_vols=0, unp_max=0, expanded=False,
-                      host=-1, rr_sectors=-1, dos_only=False) -> dict | None:
+                      host=-1, rr_sectors=-1, dos_only=False,
+                      year_before=0, year_after=0) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -6154,6 +6192,27 @@ class RsrToolAPI:
                 self._log("    no RAR5-capable build in the pack.", "err")
                 return None
 
+        # The year window, when the operator has set one. Builds outside it are
+        # DROPPED, not deferred -- that is the point of the setting, and it is
+        # why the wall line below has to say so: a wall found inside a window is
+        # a claim about the window, not about the pack. Same lesson as the
+        # DOS-only tick.
+        self._tl.year_window_skipped = 0
+        self._tl.year_window = ""
+        if (year_before or year_after) and year:
+            lo, hi = year - year_before, year + year_after
+            inside = [e for e in exes
+                      if not _exe_year(e.name)
+                      or lo <= _exe_year(e.name) <= hi]
+            if inside and len(inside) < len(exes):
+                self._tl.year_window_skipped = len(exes) - len(inside)
+                self._tl.year_window = f"-{year_before}/+{year_after}"
+                self._log(f"    year window -{year_before}/+{year_after}: "
+                          f"sweeping the {len(inside)} build(s) from {lo} to "
+                          f"{hi} and skipping {len(exes) - len(inside):,}. A "
+                          f"wall here is a verdict on the window, not the "
+                          f"pack.", "dim")
+                exes = inside
         combos, hot = self._order_combos(exes, mts, fmt, level, grp, year,
                                          unp_max)
         # A compressed file that came out no smaller than its input is a file
