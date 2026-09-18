@@ -6543,7 +6543,12 @@ class RsrToolAPI:
         # one; it is the difference between a guess and a next step.
         self._reject = {}
         said_dos = False
-        said_revised = False
+        # The last per-combo rate actually reported, and when. The estimate is
+        # re-emitted whenever reality moves 1.5x away from what was last said,
+        # not once -- see the note at the revision site.
+        per_said = 0.0
+        said_tried = 0
+        said_t = 0.0
         per_first = 0.0
         said_lift = False
         self._budget_enter(rel)
@@ -6736,11 +6741,27 @@ class RsrToolAPI:
             # 0.62s, seventeen times faster. That figure is what the user reads
             # before deciding whether to press "Finish this one", so being
             # wrong by 17x in the pessimistic direction is not harmless.
-            if (not said_revised and not rung and per_first
-                    and tried >= 200 and now - t0 > 60):
-                said_revised = True
+            # ... and revised AGAIN every time reality moves away from what was
+            # last said. Firing once was not enough, because a sweep's cost is
+            # PHASED, not noisy: the builds that can write the archive's format
+            # lead and each costs a full pack, then the backstop builds are
+            # rejected by the prefix probe inside the first MB. The revision
+            # fired ~200 combos in, while the expensive phase was still
+            # running, and then went quiet for good.
+            #
+            # Measured on Striker_Pro_2000-KALISTO: first estimate 14.38s per
+            # combo (116.9h), revised once to 3.91s (31.8h) -- and it then
+            # swept all 29,323 combos in 93 MINUTES. Twenty times faster than
+            # the last figure the user was given, and that figure is what they
+            # read before deciding whether to abandon the release or lift the
+            # budget for it. Each re-emission needs another 1.5x move, so the
+            # count is bounded however long the sweep runs.
+            if (not rung and per_first and tried >= said_tried + 200
+                    and now - said_t > 60):
                 per_now = (now - t0) / max(tried, 1)
-                if per_now < per_first / 1.5 or per_now > per_first * 1.5:
+                ref = per_said or per_first
+                if per_now < ref / 1.5 or per_now > ref * 1.5:
+                    per_said, said_tried, said_t = per_now, tried, now
                     # Windows-only, for the same reason as the first estimate:
                     # this revision fires ~200 combos in, long before the DOS
                     # tail, so per_now describes Windows packs too.
