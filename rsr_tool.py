@@ -1548,6 +1548,88 @@ def rar4_reserved_data_offset(path: Path, name: str):
     return off
 
 
+def rar4_rr_volatile(vol: Path) -> list[tuple[int, int]]:
+    """Byte ranges of one volume that a -rr pack rewrites from the WALL CLOCK.
+
+    A pack carrying a recovery record is not byte-identical twice, and this is
+    exactly why. Measured (rar300 -m5 -s -rr -v100000b, one source, three packs
+    seconds apart): 3 bytes move per volume, always in the same place, and the
+    record's DATA is identical every time -- it is a pure function of the bytes
+    before it. The movement is entirely in the record's sub-block HEADER:
+
+        offsets 0-1    HEAD_CRC   (changes because the header changed)
+        offsets 20-23  FTIME      0x5D328BEE = 17:31:28 vs ...EF = 17:31:30
+
+    So the volatile window is not a mystery to be discovered by comparing
+    sibling volumes -- it is 6 bytes at a computable offset. Deriving it here
+    means a single-volume set is covered too, where there is no sibling to
+    compare against and the empirical method has nothing to work from.
+
+    Only the RAR3+ record (0x7A, "Protect+") carries a timestamp. The 2.x one
+    (0x78, "Protect!") is u32 size, u8 20, u16 count, u32 sectors, tag -- no
+    clock anywhere, and measured deterministic: two 2.70 packs of a four-volume
+    set differ by ZERO bytes. Those need no widening at all."""
+    try:
+        d = Path(vol).read_bytes()
+    except OSError:
+        return []
+    i = d.find(RAR4_SIG)
+    if i < 0:
+        return []
+    i += 7
+    while i + 11 <= len(d):
+        typ = d[i + 2]
+        flags = int.from_bytes(d[i + 3:i + 5], "little")
+        hsize = int.from_bytes(d[i + 5:i + 7], "little")
+        if hsize < 7:
+            break
+        add = (int.from_bytes(d[i + 7:i + 11], "little")
+               if flags & 0x8000 else 0)
+        # The RAR3 record is a SUB block whose name is "RR" and whose body
+        # carries "Protect+". Match on the tag rather than the type alone --
+        # 0x7A is also an ordinary subblock (NTFS streams, ACLs, and the AV
+        # block bADkARMA ships), and widening a delta over one of those would
+        # be pasting the original's bytes over something the replay got right.
+        if typ == 0x7A and b"Protect+" in d[i:i + hsize]:
+            return [(i, 2), (i + 20, 4)]
+        i += hsize + add
+    return []
+
+
+def _forced_patch(produced: bytes, original: bytes,
+                  forced: list[tuple[int, int]]) -> bytes | None:
+    """A patch turning `produced` into `original`, always covering `forced`.
+
+    Same wire format as _diff_simple / _union_patch: repeated
+    <u64 offset><u32 len><original bytes>. The forced ranges are included even
+    where the two copies happen to agree, which is the whole point: this run's
+    clock may coincide with the original's, and the NEXT replay's will not."""
+    if len(produced) != len(original):
+        return None
+    marks = bytearray(len(original))
+    for i, (x, y) in enumerate(zip(produced, original)):
+        if x != y:
+            marks[i] = 1
+    for start, ln in forced:
+        for i in range(max(0, start), min(len(marks), start + ln)):
+            marks[i] = 1
+    out = bytearray()
+    i, n = 0, len(original)
+    while i < n:
+        if not marks[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and marks[j]:
+            j += 1
+        out += i.to_bytes(8, "little") + (j - i).to_bytes(4, "little")
+        out += original[i:j]
+        i = j
+        if len(out) > DELTA_MAX_BYTES:
+            return None
+    return bytes(out)
+
+
 def rar4_rr_sectors(vol: Path) -> int:
     """N, the recovery-sector count, of one RAR4 volume -- 0 if it has none.
 
@@ -7330,14 +7412,65 @@ class RsrToolAPI:
                 verdict = "delta"
             volmeta.append(rec)
         if verdict == "delta" and recipe.get("rr_pct"):
-            if len(vols) >= 3:
-                self._widen_across_volumes(produced, vols, volmeta, deltas,
-                                           rr_maps, si)
-            else:
-                self._stabilise_deltas(recipe, src_files, work, comment, st,
-                                       base, vols, volmeta, deltas, produced,
-                                       si)
+            # Cover the record's clock window from the BLOCK LAYOUT first. It
+            # needs no second replay and no sibling to compare against, so it
+            # works on a one-volume set too. The two empirical methods below
+            # discover the same window by comparison and remain the fallback
+            # for a record this cannot locate.
+            if not self._cover_rr_window(produced, vols, volmeta, deltas, si):
+                if len(vols) >= 3:
+                    self._widen_across_volumes(produced, vols, volmeta, deltas,
+                                               rr_maps, si)
+                else:
+                    self._stabilise_deltas(recipe, src_files, work, comment,
+                                           st, base, vols, volmeta, deltas,
+                                           produced, si)
         return verdict, volmeta, deltas
+
+    def _cover_rr_window(self, produced, vols, volmeta, deltas, si) -> bool:
+        """Widen every delta over the recovery record's wall-clock bytes.
+
+        Returns False when no RAR3 record could be located, so the caller can
+        fall back to the methods that discover the window by comparison.
+
+        Two things this gets that they do not. A volume whose replay HAPPENED
+        to match the original keeps no delta at all under the old code -- and
+        that is precisely the volume that fails at rebuild, because the next
+        replay's clock will not match either. Here it gets one. And a set of
+        one or two volumes has no siblings to widen from, which is why the
+        second-replay path existed; the layout does not care how many volumes
+        there are."""
+        windows = {i: rar4_rr_volatile(v) for i, v in enumerate(vols)}
+        windows = {i: w for i, w in windows.items() if w}
+        if not windows:
+            return False
+        grew = made = 0
+        for idx, forced in windows.items():
+            orig = Path(vols[idx]).read_bytes()
+            got = produced[idx].read_bytes()
+            wide = _forced_patch(got, orig, forced)
+            if wide is None or apply_delta(got, wide) != orig:
+                self._log(f"    ⚠ {Path(vols[idx]).name}: could not widen the "
+                          "header patch over the recovery record's clock "
+                          "bytes — leaving it as measured.", "warn")
+                continue
+            key = volmeta[idx].get("delta")
+            if key is None:
+                key = f"deltas/{si}_{idx:04d}.bin"
+                volmeta[idx]["delta"] = key
+                made += 1
+            else:
+                grew += 1
+            deltas[key] = wide
+        if grew or made:
+            span = sum(ln for w in windows.values() for _, ln in w)
+            self._log(f"    {grew + made} header patch(es) pinned over the "
+                      f"recovery record's {span} B of wall-clock bytes "
+                      f"(FTIME + HEAD_CRC)"
+                      + (f", {made} on volume(s) whose replay happened to "
+                         "match" if made else "")
+                      + " — a -rr pack is not byte-identical twice.", "dim")
+        return True
 
     def _widen_across_volumes(self, produced, vols, volmeta, deltas, rr_maps,
                               si) -> None:
