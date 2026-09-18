@@ -259,7 +259,47 @@ def sfv_check(folder: Path, paths) -> list[dict]:
     return bad
 
 
-def volume_gap(folder: Path, vols: list) -> str:
+_SRRDB_API = "https://www.srrdb.com/api/details/"
+_srrdb_cache: dict = {}
+
+
+def srrdb_files(release: str) -> dict | None:
+    """{lowercase name: (size, crc)} for a release on srrdb, or None.
+
+    The srrdb HTML pages sit behind an anti-bot wall — a plain fetch of
+    /release/details/<name> returns "Making sure you're not a bot!" — but the
+    API at /api/details/<name> does NOT, and answers with plain JSON and no
+    login. That difference is the whole reason this is worth calling.
+
+    None means "could not ask" (offline, timeout, unknown release) and must
+    never be read as "not in the release": every caller has to keep working
+    with no network at all. Cached per process; only the volume-gap path calls
+    it, which is a handful of releases in a whole scan."""
+    key = release.lower()
+    if key in _srrdb_cache:
+        return _srrdb_cache[key]
+    out = None
+    try:
+        import json as _json
+        import urllib.parse
+        import urllib.request
+        req = urllib.request.Request(
+            _SRRDB_API + urllib.parse.quote(release),
+            headers={"User-Agent": "rsr_tool"})
+        with urllib.request.urlopen(req, timeout=15) as fh:
+            data = _json.loads(fh.read().decode("utf-8", "replace"))
+        files = data.get("files") or []
+        if files:
+            out = {f["name"].lower(): (int(f.get("size") or 0),
+                                       str(f.get("crc") or "").upper())
+                   for f in files if f.get("name")}
+    except Exception:
+        out = None
+    _srrdb_cache[key] = out
+    return out
+
+
+def volume_gap(folder: Path, vols: list, release: str = "") -> str:
     """A hole in a volume sequence that the release's own .sfv also has, or "".
 
     Street_Football-EXiMiUS ships .rar and .r01 through .r04 — no .r00 — and
@@ -267,7 +307,17 @@ def volume_gap(folder: Path, vols: list) -> str:
     the copy: a volume was never released, which is presumably why the release
     was nuked. rar cannot extract past the hole, and "extraction incomplete"
     reads as a bad download and invites a pointless re-fetch. Say which volume
-    the release itself never had."""
+    the release itself never had.
+
+    But "the .sfv does not list it either" only means the volume was never
+    released if the .sfv is the SCENE's. A regenerated one lists whatever was
+    in the folder when it was written, so it agrees with the hole by
+    construction and the two artefacts corroborate each other while both come
+    from the same incomplete copy. Barbie_Horse_Adventures_Riding_Camp_EUR_NDS-
+    LiTE is exactly that: no .r00 on disk, none in its 494-byte .sfv, and the
+    real release has one — 5,000,192 B, CRC B3E334F0, with a 2,012-byte .sfv.
+    The archives said so themselves (.rar is volnum 0, .r01 is volnum 2), and
+    srrdb confirms it. So ask srrdb before making the strong claim."""
     idx = [_classify_volume(p.name) for p in vols]
     nums = sorted(c[2] for c in idx if c)
     if not nums:
@@ -283,9 +333,34 @@ def volume_gap(folder: Path, vols: list) -> str:
     if listed:
         return (f"{', '.join(listed)} is in the .sfv but not on disk — that "
                 f"volume is missing from your copy")
+    known = srrdb_files(release) if release else None
+    if known:
+        real = [n for n in named if n.lower() in known]
+        if real:
+            want = ", ".join(
+                f"{n} ({known[n.lower()][0]:,} B, CRC {known[n.lower()][1]})"
+                for n in real)
+            # Say the .sfv is not the release's when srrdb can prove it, since
+            # that is WHY the local one agreed with the hole.
+            sfv = next((p for p in folder.glob("*.sfv")), None)
+            note = ""
+            if sfv is not None:
+                exp = known.get(sfv.name.lower())
+                if exp and exp[0] and sfv.stat().st_size != exp[0]:
+                    note = (f"; your {sfv.name} is {sfv.stat().st_size:,} B "
+                            f"against the release's {exp[0]:,} B, so it was "
+                            f"regenerated locally and lists only what you have")
+            return (f"srrdb lists {want} in this release and it is not on "
+                    f"disk — that volume is missing from your copy{note}")
+        return (f"the set jumps straight past {', '.join(named)}; srrdb's file "
+                f"list for this release does not have it either, so it was "
+                f"never released and this archive cannot be extracted by "
+                f"anyone")
     return (f"the set jumps straight past {', '.join(named)}, and the "
-            f"release's own .sfv does not list it either — a volume was never "
-            f"released, so this archive cannot be extracted by anyone")
+            f"release's own .sfv does not list it either — a volume was "
+            f"probably never released. NOT confirmed against srrdb (no answer "
+            f"for this release), and a locally regenerated .sfv would agree "
+            f"with the hole by construction")
 
 
 def _no_window() -> dict:
@@ -4911,7 +4986,7 @@ class RsrToolAPI:
                       if short else "extract did not finish")
             # Before blaming the download: a hole in the volume numbering that
             # the release's own .sfv shares is not our problem and never was.
-            gap = volume_gap(folder, vols)
+            gap = volume_gap(folder, vols, _release_name(folder))
             if gap:
                 self._log(f"    ✗ {gap}.", "err")
                 return {"ok": False, "error": f"incomplete release: {gap}"}
