@@ -6625,6 +6625,7 @@ class RsrToolAPI:
                                   f"tail with {_exe_label(lead.name)} on the "
                                   "corpus-wide prior.", "dim")
                 skipped_vol = []
+                dos_mmf: list = []
                 for ex in dos:
                     c = caps.get(ex.name) or {}
                     # 1.51/1.52/1.53/1.40 do not understand -v<N>b, and do not
@@ -6650,6 +6651,34 @@ class RsrToolAPI:
                             combos.append((ex, 1, (self.DOS_MARK, "-s1",
                                                    "-ds") + mm))
                         combos.append((ex, 1, (self.DOS_MARK,) + mm))
+                    # -mmf, the FORCED multimedia coder, behind everything
+                    # else. The Windows sweep has asked for both since the -mm
+                    # axis landed; the DOS line only ever asked for -mm, so a
+                    # DOS-host archive packed with -mmf was unreachable at
+                    # every build -- the same shape of miss -mm itself was.
+                    #
+                    # It is a real coder on this line, not a synonym. Measured,
+                    # dosrar206 on 8 MB of a PSX .BIN:
+                    #
+                    #     plain 3,250,037   -mm 3,235,866   -mmf 5,220,194
+                    #
+                    # and the 2.00 manual is explicit that it "always compress
+                    # files as multimedia independent of the multimedia
+                    # analysis results. Usually this leads to a worse
+                    # compression ratio" -- which is the direction an archive
+                    # BIGGER than every ordinary build would have to come from.
+                    # Last, because it is the rarest and DOS combos are the
+                    # expensive ones: a full pack each through DOSBox at
+                    # ~0.5 MB/s, with no prefix probe to cut it short.
+                    dos_mmf.append((ex, 1, (self.DOS_MARK, "-mmf")))
+                    if expanded and c.get("s1", True):
+                        dos_mmf.append(
+                            (ex, 1, (self.DOS_MARK, "-s1", "-ds", "-mmf")))
+                if dos_mmf:
+                    combos += dos_mmf
+                    self._log(f"    {len(dos_mmf):,} DOS -mmf (forced "
+                              f"multimedia) combo(s) queued last — a coder the "
+                              f"DOS line has never been asked for.", "dim")
                 if skipped_vol:
                     self._log(f"    {len(skipped_vol)} DOS build(s) skipped — "
                               "they predate -v<N>b and would mis-split this "
