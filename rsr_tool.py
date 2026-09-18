@@ -5490,6 +5490,22 @@ class RsrToolAPI:
                 if year else []
             rest = [e for e in tier if e not in set(older)]
             groups += [older, rest] if (older and rest) else [tier]
+        # Within each group, lead with one build per OUTPUT class before trying
+        # a second build of a class already covered. Measured 2026-09-18: the
+        # 403 builds in the pack produce only ELEVEN distinct compressed
+        # streams for a fixed sample -- 127 of them are one class. Sweeping
+        # them in version order therefore spends its first hundred combos
+        # re-running the same compressor under different filenames.
+        #
+        # The classes match reality where reality is known: on
+        # Metal_Gear_Solid_3D-VENOM, rar330 reproduced the stream exactly and
+        # 393/400/410/411/420/521 did not, and the classes separate rar330
+        # (class 4) from all of those (classes 0/2/9).
+        #
+        # This REORDERS and never skips -- two builds identical on the sample
+        # can still differ on real data, which is exactly how a false wall
+        # would be manufactured. The set swept is unchanged.
+        groups = [self._class_rounds(g) for g in groups]
         for group in groups:
             for mt in mts[:2]:
                 for ex in group:
@@ -5502,6 +5518,47 @@ class RsrToolAPI:
                     seen.add((ex.name, mt))
                     order.append((ex, mt, ()))
         return order, hot
+
+    def _build_classes(self) -> dict:
+        """{build name: output-equivalence class}, or {} when unmeasured.
+
+        Written by the pack's `_classes.json`: each build packs one fixed
+        sample at -m1/-m3/-m5/-m5 -mm and the COMPRESSED STREAM is hashed, so
+        builds that differ only in the headers they write still share a class.
+        Absent file means no reordering at all, which is exactly the old
+        behaviour."""
+        if getattr(self, "_classes_cache", None) is not None:
+            return self._classes_cache
+        out = {}
+        try:
+            p = self._app_dir / "apps" / "winrar_pack-4.20" / "_classes.json"
+            if p.is_file():
+                out = json.loads(p.read_text(encoding="utf-8")).get("classes", {})
+        except Exception:
+            out = {}
+        self._classes_cache = out
+        return out
+
+    def _class_rounds(self, builds: list) -> list:
+        """The same builds, reordered so each round holds at most one per class.
+
+        Round one is a representative of every distinct compressor in the
+        group; round two is the second member of each class, and so on. Order
+        WITHIN a class is preserved, so the existing rank (priors, era) still
+        decides which member represents it. Unmeasured builds keep their place
+        by falling into their own class."""
+        classes = self._build_classes()
+        if not classes:
+            return builds
+        buckets: dict = {}
+        for e in builds:
+            buckets.setdefault(classes.get(e.name, f"?{e.name}"), []).append(e)
+        out, n = [], max((len(v) for v in buckets.values()), default=0)
+        for i in range(n):
+            for key in buckets:
+                if i < len(buckets[key]):
+                    out.append(buckets[key][i])
+        return out
 
     def _mt_order(self, mts: list[int]) -> list[int]:
         """Thread counts in the order they actually win HERE.
