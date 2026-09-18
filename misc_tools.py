@@ -572,16 +572,36 @@ class MiscToolsAPI:
             L("rarfile library not installed — pip install rarfile", "err")
             return {"ok": False, "error": "rarfile not installed"}
 
-        # Set heads: every .rar that is not a .partN (N>1) continuation volume
-        heads = [
-            p for p in sorted(base.rglob("*.rar"))
-            if not re.search(r"\.part0*(?!1\b)\d+\.rar$", p.name, re.IGNORECASE)
-            or re.search(r"\.part0*1\.rar$", p.name, re.IGNORECASE)
-        ]
+        # Set heads, found by the RAR MARKER rather than by extension.
+        #
+        # This used to glob "*.rar", which cannot see a `.001`/`.002` set at
+        # all -- and it did not fail, it reported "No .rar / .zip / .7z files
+        # found", which is the worst kind of miss. The old-style numeric naming
+        # is what the 1998 GAMEiSO rules mandated ("All RAR's will be listed as
+        # '.001 -> .0xx'"), so it is most of the early PSX/ISO era, and a group
+        # shipping its own scheme (INTENSE's .int/.iNN) was invisible too.
+        #
+        # group_archive_sets decides membership from the marker block, groups
+        # the volumes into one set, and hands back the head -- the same
+        # grouping the capture tool uses, so the Inspector and the scanner
+        # agree about what a set IS.
+        try:
+            from rsr_tool import group_archive_sets
+            heads = [Path(s["volumes"][0]) for s in group_archive_sets(base)]
+        except Exception as e:
+            L(f"  (falling back to *.rar globbing: {e})", "warn")
+            heads = [
+                p for p in sorted(base.rglob("*.rar"))
+                if not re.search(r"\.part0*(?!1\b)\d+\.rar$", p.name,
+                                 re.IGNORECASE)
+                or re.search(r"\.part0*1\.rar$", p.name, re.IGNORECASE)
+            ]
         zips = sorted(base.rglob("*.zip"))
         sevens = sorted(base.rglob("*.7z"))
         if not heads and not zips and not sevens:
-            L("No .rar / .zip / .7z files found under this folder.", "warn")
+            L("No RAR / ZIP / 7z archives found under this folder. RAR sets "
+              "are found by their marker block, so naming is not the reason — "
+              "`.001`, `.rNN` and a group's own scheme all count.", "warn")
             return {"ok": True, "sets": 0}
 
         L(f"Found {len(heads)} RAR set(s), {len(zips)} ZIP(s), "
