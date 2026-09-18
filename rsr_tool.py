@@ -1623,6 +1623,60 @@ def rar4_reserved_data_offset(path: Path, name: str):
     return off
 
 
+def rar4_av_owner(vol: Path) -> str | None:
+    """The licence name in an AV (authenticity verification) block, or None.
+
+    `rar a -av` is "registered versions only" on every build that still has the
+    switch, and 7.x dropped it entirely -- so the block is proof the packer ran
+    a REGISTERED rar, and reproducing it byte-exactly would need that licence
+    holder's own key. That is the entire design intent of authenticity
+    verification, and it is why no build in the pack can make one.
+
+    Measured: every AV-bearing release in this corpus is a wall. Two licences
+    so far, eighteen years apart -- "CHiCNCREAM TEAM 2005" on both 2006 Moebius
+    PSX releases, "Danny Smolders" on both 2024 bADkARMA ones. And the barrier
+    is not only the block: packed without -av, every official build from 3.00
+    to 7.23 produces a stream SMALLER than the original (Yopaz: 36,876,928
+    against 36,880,575), diverging at byte 3. See the AV memory before spending
+    a sweep on one.
+
+    Returns "" when the block is there but the name cannot be read, so a caller
+    can still tell "has an AV block" from "has none"."""
+    try:
+        d = Path(vol).read_bytes()
+    except OSError:
+        return None
+    i = d.find(RAR4_SIG)
+    if i < 0:
+        return None
+    i += 7
+    while i + 11 <= len(d):
+        typ = d[i + 2]
+        flags = int.from_bytes(d[i + 3:i + 5], "little")
+        hsize = int.from_bytes(d[i + 5:i + 7], "little")
+        if hsize < 7:
+            break
+        add = (int.from_bytes(d[i + 7:i + 11], "little")
+               if flags & 0x8000 else 0)
+        blk = d[i:i + hsize]
+        # An 0x7A subblock is also how a recovery record and an NTFS stream
+        # ride along; the "AV" tag is what makes this one authenticity data.
+        if typ == 0x7A and b"Protect+" not in blk and b"AV" in blk:
+            # Layout after the "AV" tag is <archive name> then <licence name>,
+            # each a printable run between non-printable padding:
+            #   AV..bk-yopaz_icestar_update_ps1.rar....Danny Smolders..=`
+            after = blk[blk.find(b"AV") + 2:]
+            runs = [r.decode("ascii", "replace").strip()
+                    for r in re.findall(rb"[\x20-\x7e]{5,64}", after)]
+            runs = [r for r in runs if not r.lower().endswith(".rar")]
+            # The signature that follows is high-entropy, so require something
+            # name-shaped: a space, or all letters.
+            return next((r for r in runs
+                         if " " in r or r.replace(".", "").isalpha()), "")
+        i += hsize + add
+    return None
+
+
 def rar4_rr_volatile(vol: Path) -> list[tuple[int, int]]:
     """Byte ranges of one volume that a -rr pack rewrites from the WALL CLOCK.
 
@@ -5283,6 +5337,20 @@ class RsrToolAPI:
                         "set": {"stem": st["stem"], "format": st["format"],
                                 "files": meta, "parked": True}}
             aborted = self._skip.is_set() or self._stop.is_set()
+            # Say this BEFORE any of the verdicts below. Each of them names one
+            # true reason -- the DOS-only setting, the year window, the pack --
+            # and invites the operator to spend a sweep lifting it. On an
+            # AV-bearing archive every one of those invitations is wasted: the
+            # block needs the packer's own registration key, which no build has
+            # and 7.x cannot even write. Both Moebius PSX releases asked for a
+            # 234-build year-window sweep that could never have worked.
+            av = rar4_av_owner(vols[0]) if vols and vols[0].is_file() else None
+            if av is not None and not aborted:
+                who = f' registered to "{av}"' if av else ""
+                self._log(f"    ▪ this archive carries an AV authenticity "
+                          f"block{who} — `-av` is registered-versions-only and "
+                          f"7.x dropped it, so NO build in the pack can write "
+                          f"one. Widening a window will not reach it.", "warn")
             if aborted:
                 # Nothing was swept to exhaustion — someone pressed a button.
                 # Saying "the exact build is outside the pack" here is a claim
