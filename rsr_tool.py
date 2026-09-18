@@ -6527,15 +6527,38 @@ class RsrToolAPI:
             # above) but the build still decides the OTHER streams and the
             # headers, so it is paired the same way -mm is. -mm leads, because
             # it is the one with 26 wins behind it.
-            mm = [(e, n, x + ("-mm",)) for e, n, x in fit]
-            mmf = [(e, n, x + ("-mmf",)) for e, n, x in fit]
+            # ...and only for builds BELOW 3.00, because that is where the
+            # switches stop doing anything. RAR 3 replaced -mm/-mmf with the
+            # -mc<module> family and kept the old spellings as accepted no-ops:
+            # rar prints no warning, packs happily, and writes a byte-identical
+            # archive. Measured on one 188 KB jpg at -m5 -md1024k:
+            #
+            #     2.06   plain 170,215   -mm 169,348   -mmf 187,011
+            #     2.70   plain 170,186   -mm 169,384   -mmf 185,883
+            #     2.80   plain 170,186   -mm 169,384       REAL
+            #     2.90   plain 170,186   -mm 169,384       REAL
+            #     3.00b2 plain 169,548   -mm 169,548       NO-OP
+            #     3.20 / 3.60 / 3.90 / 4.20                NO-OP
+            #
+            # The line is exactly 3.00 -- the same one _fmt_fits uses. Pairing
+            # them above it queued two EXACT DUPLICATES of every ordinary combo
+            # and called them a multimedia axis: on Fast_Food_Panic, a RAR3
+            # release, that was 2,774 + 2,774 of 14,412 leading combos, all of
+            # them re-packing bytes the sweep had already judged.
+            mmfit = [c for c in fit if _exe_number(c[0].name) < 300]
+            mm = [(e, n, x + ("-mm",)) for e, n, x in mmfit]
+            mmf = [(e, n, x + ("-mmf",)) for e, n, x in mmfit]
             if mm:
                 combos = combos + mm + mmf
+                skipped_mm = len(fit) - len(mmfit)
                 self._log(f"    {len(mm):,} -mm and {len(mmf):,} -mmf "
                           f"(multimedia) combo(s) queued behind the ordinary "
                           f"sweep — RAR 2.x chooses the multimedia coder per "
-                          f"file, and -mmf forces it; the sweep has never "
-                          f"asked for either.", "dim")
+                          f"file, and -mmf forces it."
+                          + (f" {skipped_mm:,} combo(s) on 3.00+ builds were "
+                             f"NOT paired: the switches are accepted no-ops "
+                             f"there, so they would only duplicate the "
+                             f"ordinary form." if skipped_mm else ""), "dim")
         # Order by CAPABILITY, not just lead with it.
         #
         # The stamp gate already put the builds that can write this format at
