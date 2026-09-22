@@ -698,7 +698,26 @@ def _release_system(rel: str) -> str:
     Tokens only. A release is `Name_REGION_LANG_PLATFORM-GROUP`, so splitting on
     the scene separators and looking each token up is exact and cheap. First hit
     wins: the platform sits at the end of the name, before the group, and the
-    only tag that follows it is a qualifier of it (`NDS_DSi`)."""
+    only tag that follows it is a qualifier of it (`NDS_DSi`).
+
+    Dreamcast is checked FIRST and POSITIONALLY, because `DC` is the one tag
+    that is also an ordinary word in a title -- DC Comics. Measured over every
+    name in the store and the scan queue: 1,290 carry a bare `DC` token, and
+    adding it to _PLAT_LOOKUP like any other tag misfiles 18 of them, because
+    first-hit meets the wrong DC first in `LEGO_Batman_2_DC_Super_Heroes_USA_
+    NDS-EXiMiUS` and `Scribblenauts_Unmasked_A_DC_Comics_Adventure_3DS-VENOM`.
+    Switching the whole function to last-hit instead costs far more: 191
+    regressions, because `Fire_Emblem…JPN_GBA_VC_3DS-Kirin` is a GBA game on
+    3DS Virtual Console and `Mortal_Kombat_PSX_News_DOX_PS1-NIGHTFALL` is PSX.
+    First-hit is right; DC just needs to be pinned where the scene puts a
+    platform -- the last token before the group. That reads 1,251 Dreamcast
+    releases that were all filing as Unknown, and the only six names it moves
+    off a known platform it moves CORRECTLY (Dreamcast Linux, a DC release of
+    PC classics, a DC swap disc)."""
+    base = rel.rsplit("-", 1)[0] if "-" in rel else rel
+    toks = [t for t in re.split(r"[._\-]+", base) if t]
+    if toks and toks[-1].upper() in ("DC", "DREAMCAST"):
+        return "DC"
     for t in re.split(r"[._\-]+", rel):
         hit = _PLAT_LOOKUP.get(t.upper())
         if hit:
