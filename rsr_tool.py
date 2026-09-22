@@ -215,6 +215,17 @@ def _exe_number(fname: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _dos32_number(fname: str) -> int:
+    """'2004-01-22_dosrar32-330.exe' → 330. 0 when the name says nothing.
+
+    Deliberately separate from _exe_number, which anchors on `_rar` and so
+    reads 0 for every DOS build -- including these. The DOS32 line spans 2.90
+    to 3.93 and the 3.x ones are the only DOS builds that can stamp unp_ver
+    29, so the sweep has to be able to tell them apart by version."""
+    m = re.match(r"\d{4}-\d{2}-\d{2}_dosrar32-(\d{3})", fname)
+    return int(m.group(1)) if m else 0
+
+
 def sfv_expected(folder: Path) -> dict[str, int]:
     """{filename: crc32} from every .sfv in the release folder.
 
@@ -2946,7 +2957,13 @@ class RsrToolAPI:
         OS/2 builds are excluded. The SFX installers these were extracted from
         carried both, and 8 of the 24 turned out to be OS/2 -- each one a
         DOSBox boot that gets as far as "This program must be run under OS/2"
-        and dies."""
+        and dies.
+
+        RAR/DOS32 builds ARE included, via _is_dos32_exe. They are 16-bit
+        DOS's successor and the line did not stop at 2.50: rarx260 through
+        rarx393 are DOS builds too, they just need a DPMI extender, which
+        _run_dos_pack supplies. Keeping them out was costing the whole
+        dictionary axis on the DOS side -- see _is_dos32_exe."""
         if not self._dosbox_exe():
             return []
         pack = self._app_dir / "apps" / "dosrar_pack"
@@ -2955,13 +2972,38 @@ class RsrToolAPI:
         caps = self._dos_caps()
         out = []
         for e in sorted(pack.glob("*_dosrar*.exe")):
-            if not self._is_dos_exe(e):
+            if not (self._is_dos_exe(e) or self._is_dos32_exe(e)):
                 continue
             c = caps.get(e.name) or {}
             if c.get("hang") or (c and not c.get("alive", True)):
                 continue          # measured: never answers, burns the timeout
             out.append(e)
         return out
+
+    @staticmethod
+    def _is_dos32_exe(p: Path) -> bool:
+        """True for RAR/DOS32 -- the 32-bit DOS build, run via a DPMI extender.
+
+        These are LX images, exactly like the OS/2 builds `_is_dos_exe` throws
+        out, so the header alone cannot tell them apart. The MZ STUB can: the
+        OS/2 ones carry a stub whose whole job is to print "This program must
+        be run under OS/2", while RAR/DOS32 is built by the EMX C compiler and
+        its stub is the EMX/RSX loader -- the string "emx 0.9d-ac -s65536
+        -Rs1024" sits in plain sight in the first block.
+
+        Worth having because it is a DIFFERENT COMPRESSOR from the 16-bit DOS
+        line, not just a newer build of it. From its own readme: "Unlike 16-bit
+        RAR/DOS it is able to create archives using dictionaries larger than
+        64KB." Measured on one input: rarx290 honours -md1024 and writes
+        dict=4 (1024KB) where dosrar206 and dosrar250 both write dict=0 (64KB)
+        and cannot do otherwise. Every DOS-host archive declaring a dictionary
+        above 64 KB was unreachable while only the 16-bit line existed."""
+        try:
+            with open(p, "rb") as fh:
+                head = fh.read(512)
+        except OSError:
+            return False
+        return head[:2] == b"MZ" and b"emx" in head.lower()
 
     @staticmethod
     def _is_dos_exe(p: Path) -> bool:
@@ -3002,7 +3044,10 @@ class RsrToolAPI:
             caps = {}
         changed = False
         for ex in sorted(pack.glob("*_dosrar*.exe")):
-            if not self._is_dos_exe(ex):
+            # DOS32 too -- _dos_exes hands them to the sweep, so they have to
+            # be probed like everything else. Left out, they would carry no
+            # caps row at all and the `hang` guard could never exclude one.
+            if not (self._is_dos_exe(ex) or self._is_dos32_exe(ex)):
                 continue
             try:
                 size = ex.stat().st_size
@@ -6035,6 +6080,18 @@ class RsrToolAPI:
                 _rmtree(wdir)
             wdir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ex, wdir / "RAR.EXE")
+            # RAR/DOS32 is an LX image whose MZ stub is the EMX/RSX loader, so
+            # it needs its DPMI extender beside it or DOSBox gets as far as the
+            # stub and stops. They are three small files kept once in
+            # apps/dosrar_pack/_dos32 and copied in per combo, the same way
+            # RAR.EXE is -- the work dir has to be self-contained because every
+            # combo gets its own mount.
+            if self._is_dos32_exe(ex):
+                helpers = self._app_dir / "apps" / "dosrar_pack" / "_dos32"
+                for h in ("emx.exe", "emx.dll", "rsx.exe"):
+                    src_h = helpers / h
+                    if src_h.is_file():
+                        shutil.copy2(src_h, wdir / h.upper())
             # Mount the sources rather than copying them. DOSBox needs to SEE
             # them, not own them, and copying cost a full duplicate of the set
             # per combo -- ~14 GB across the DOS tail of one 600 MB release.
@@ -6066,6 +6123,18 @@ class RsrToolAPI:
                 args.append("-rr" if not rr_sectors else f"-rr{rr_sectors}")
             if vol_bytes:
                 args.append(f"-v{vol_bytes}b")
+                # RAR/DOS32 from 3.00 needs -vn to split AT ALL. Left to
+                # itself a 3.x build wants new-style volume names --
+                # PROBE.PART01.RAR -- which is not an 8.3 name, and on the
+                # DOSBox mount it cannot write one, so it silently produces a
+                # single archive instead. Measured on dosrar32-300 with a
+                # 300 KB source and -v200000b: -v200000b, -v195k, -v200000 and
+                # -v200k all give ONE file; -v200000b -vn gives PROBE.RAR +
+                # PROBE.R00. The 16-bit line and DOS32 2.90 write old-style
+                # names already and must NOT be given it -- there -vn breaks
+                # -v, which is what the note above records.
+                if self._is_dos32_exe(ex) and _dos32_number(ex.name) >= 300:
+                    args.append("-vn")
             bat = ("@echo off\r\n"
                    "RAR.EXE a " + " ".join(args) + " PROBE.RAR "
                    + " ".join(names) + " > RARLOG.TXT\r\n"
@@ -6616,12 +6685,28 @@ class RsrToolAPI:
         # compressor from WinRAR of the same version, and until now the sweep
         # had only ever searched the Windows line -- see _run_dos_pack.
         dos = self._dos_exes()
+        # A RAR 3.x stamp no longer rules the DOS line out. It used to, on the
+        # premise that "the DOS line ended at 2.50, which writes 2.0" -- and
+        # that premise was wrong: RAR/DOS32 runs from 2.90 to 3.93, and
+        # 2004-01-22_dosrar32-330 stamps unp_ver 29, measured. So for a 3.x
+        # archive keep only the DOS builds that can write 3.x; the 16-bit line
+        # really did stop at 2.50 and those are still a guaranteed miss.
         if dos and fmt == "RAR4" and unp_max >= 29:
-            self._log("    DOS builds skipped: this archive is RAR 3.x format "
-                      f"(unp_ver {unp_max}) and the DOS line ended at 2.50, "
-                      "which writes 2.0 — no DOS build could have made it.",
-                      "dim")
-        elif dos and fmt == "RAR4":
+            dos32 = [e for e in dos if self._is_dos32_exe(e)
+                     and _dos32_number(e.name) >= 300]
+            dropped = len(dos) - len(dos32)
+            dos = dos32
+            if dos:
+                self._log(f"    {dropped} 16-bit DOS build(s) skipped: this "
+                          f"archive is RAR 3.x format (unp_ver {unp_max}) and "
+                          f"that line stopped at 2.50, which writes 2.0. "
+                          f"{len(dos)} RAR/DOS32 build(s) DO write 3.x and are "
+                          f"kept.", "dim")
+            else:
+                self._log("    DOS builds skipped: this archive is RAR 3.x "
+                          f"format (unp_ver {unp_max}) and no DOS build in the "
+                          "pack writes 3.x.", "dim")
+        if dos and fmt == "RAR4":
             names = [Path(s).name for s in src_files]
             if all(self._is_83(x) for x in names):
                 caps = self._dos_caps()
@@ -6669,7 +6754,19 @@ class RsrToolAPI:
                     # with each ordinary variant rather than replacing it,
                     # since it changes nothing for data rar would not have
                     # applied it to.
+                    # RAR/DOS32 is the only DOS build that HAS a dictionary
+                    # switch -- the 16-bit line is fixed at 64 KB and the 2.00
+                    # manual marks -md "OS/2 version only". Left off, a DOS32
+                    # build packs at its own default and can never match an
+                    # archive whose header declares something else, which would
+                    # make the whole line useless for exactly the archives it
+                    # was added to reach. Measured: dosrar32-290 given -md1024
+                    # writes dict=4 (1024KB), dosrar206 writes dict=0 (64KB)
+                    # whatever it is asked for.
+                    dsw = ((f"-md{dict_kb}",)
+                           if self._is_dos32_exe(ex) and dict_kb else ())
                     for mm in ((), ("-mm",)):
+                        mm = dsw + mm
                         if expanded and c.get("s1", True):
                             combos.append((ex, 1, (self.DOS_MARK, "-s1",
                                                    "-ds") + mm))
@@ -6693,10 +6790,11 @@ class RsrToolAPI:
                     # Last, because it is the rarest and DOS combos are the
                     # expensive ones: a full pack each through DOSBox at
                     # ~0.5 MB/s, with no prefix probe to cut it short.
-                    dos_mmf.append((ex, 1, (self.DOS_MARK, "-mmf")))
+                    dos_mmf.append((ex, 1, (self.DOS_MARK,) + dsw + ("-mmf",)))
                     if expanded and c.get("s1", True):
                         dos_mmf.append(
-                            (ex, 1, (self.DOS_MARK, "-s1", "-ds", "-mmf")))
+                            (ex, 1, (self.DOS_MARK, "-s1", "-ds")
+                             + dsw + ("-mmf",)))
                 if dos_mmf:
                     combos += dos_mmf
                     self._log(f"    {len(dos_mmf):,} DOS -mmf (forced "
