@@ -2871,8 +2871,8 @@ class RsrToolAPI:
 
     # ── the WinRAR build pack ─────────────────────────────────────────────
 
-    def _comment_via_rar(self, head: Path) -> str:
-        """The archive comment, read with rar.exe instead of rarfile.
+    def _comment_via_rar(self, head: Path) -> bytes:
+        """The archive comment BYTES, read with rar.exe instead of rarfile.
 
         rarfile needs an unrar binary to decompress a RAR3 comment and there
         is none here; the build pack is rar.exe, the packer. But `rar cw`
@@ -2887,26 +2887,51 @@ class RsrToolAPI:
         down to the recovery record come back as "replay unverified"."""
         exes = self._pack_exes()
         if not exes:
-            return ""
+            return b""
+        # Read with several builds, not just the newest, and keep the BYTES.
+        #
+        # A modern rar TRANSCODES an old comment on the way out. Measured on
+        # The_Misadventure_of_Tron_Bonne_PAL-TRSi: rar 6.24 renders every
+        # \xdc (cp437 lower half block) as "_", flattening 182 of the 369
+        # bytes of the group's logo, while rar 2.70 hands back the same 369
+        # bytes unchanged. Reading with only the newest four builds therefore
+        # captured a comment the archive does not contain, and the replay
+        # could never reproduce it.
+        #
+        # The old build is NOT simply better: a RAR3+ comment is compressed
+        # and 2.70 returns nothing at all for it, which is why the newest
+        # builds were chosen in the first place. So take candidates from both
+        # ends and choose between them.
+        old = [e for e in exes[:6]]
+        new = [e for e in reversed(exes[-4:])]
         work = Path(tempfile.mkdtemp(prefix="rsr-cmt-", dir=self._work_root()))
         try:
-            out = work / "comment.txt"
-            for exe in reversed(exes[-4:]):        # newest first
+            best = b""
+            for n, exe in enumerate(new + old):
+                out = work / f"c{n}.txt"
                 try:
                     subprocess.run([str(exe), "cw", str(head), str(out)],
                                    capture_output=True, timeout=120,
                                    cwd=str(work), **_no_window())
                 except Exception:
                     continue
-                if out.is_file() and out.stat().st_size:
-                    raw = out.read_bytes()
-                    for enc in ("utf-8", "cp437", "latin-1"):
-                        try:
-                            return raw.decode(enc)
-                        except UnicodeDecodeError:
-                            continue
-                    return raw.decode("utf-8", "replace")
-            return ""
+                if not (out.is_file() and out.stat().st_size):
+                    continue
+                raw = out.read_bytes()
+                if not best:
+                    best = raw
+                    continue
+                # A longer read saw more of the comment. Between reads of the
+                # SAME length, prefer the one carrying more non-ASCII: going
+                # from block characters to "_" throws information away, and
+                # that never happens in reverse, so the high-byte read is the
+                # one that has not been transcoded.
+                if (len(raw) > len(best)
+                        or (len(raw) == len(best)
+                            and sum(c > 0x7F for c in raw)
+                            > sum(c > 0x7F for c in best))):
+                    best = raw
+            return best
         finally:
             _rmtree(work)
 
@@ -5024,12 +5049,31 @@ class RsrToolAPI:
             stubbed = getattr(rf, "_rsr_comment_stubbed", False)
         finally:
             rf.close()
+        # The comment is carried as BYTES from here on. rarfile hands back a
+        # str it has already decoded, and re-encoding that str is where the
+        # original byte sequence — and usually its LENGTH — was lost, which
+        # shifts every following byte of the replayed archive.
         if stubbed and not comment:
             comment = self._comment_via_rar(head)
             if comment:
                 self._log(f"    archive comment recovered with rar.exe "
-                          f"({len(comment)} chars) — rarfile could not read it "
+                          f"({len(comment)} bytes) — rarfile could not read it "
                           f"without an unrar binary.", "dim")
+        elif isinstance(comment, str) and comment:
+            # rarfile could read it, but only as text. Ask rar for the bytes;
+            # fall back to the encoding that round-trips this str.
+            raw = self._comment_via_rar(head)
+            if raw:
+                comment = raw
+            else:
+                for enc in ("cp437", "latin-1", "utf-8"):
+                    try:
+                        comment = comment.encode(enc)
+                        break
+                    except UnicodeEncodeError:
+                        continue
+                else:
+                    comment = comment.encode("utf-8", "replace")
         if ends and ends[-1] & 0x0001:
             return {"ok": False, "partial": True,
                     "error": "partial set: the archive continues into a "
@@ -5577,8 +5621,8 @@ class RsrToolAPI:
                 "scheme": st["scheme"],
                 "byte_split": st["byte_split"],
                 "solid": solid,
-                "comment_b64": base64.b64encode(comment.encode("utf-8", "replace")
-                                                ).decode() if comment else None,
+                "comment_b64": (base64.b64encode(comment).decode()
+                                if comment else None),
                 "recipe": recipe,
                 "verify": verify,
                 "order": order,
@@ -7524,13 +7568,15 @@ class RsrToolAPI:
         cfile = None
         if comment:
             cfile = work / "comment.txt"
-            # newline="" or Python translates the line endings on the way
-            # out, and a comment that already holds CRLF — WinRAR's own
-            # default one does — goes to disk as CR CR LF. Two extra bytes a
-            # line is enough to move every byte of a 50 MB eleven-volume set
-            # and lose the whole thing as "replay unverified".
-            cfile.write_text(comment, encoding="utf-8", errors="replace",
-                             newline="")
+            # write_BYTES, verbatim. This used to be write_text(utf-8), which
+            # needed newline="" to stop Python turning a comment's existing
+            # CRLF into CR CR LF -- two extra bytes a line, enough to move
+            # every byte of a 50 MB eleven-volume set and lose the whole thing
+            # as "replay unverified". Carrying bytes removes that hazard and
+            # the encoding one together: whatever the archive held is exactly
+            # what rar is handed back.
+            cfile.write_bytes(comment if isinstance(comment, bytes)
+                              else comment.encode("utf-8", "replace"))
         # A DOS recipe is not a command line we can run: it is a 16-bit
         # binary living in apps/dosrar_pack, driven through DOSBox. Without
         # this the rebuild resolved the build against the WINDOWS pack, failed
@@ -9055,7 +9101,7 @@ class RsrToolAPI:
 
         comment = None
         if st.get("comment_b64"):
-            comment = base64.b64decode(st["comment_b64"]).decode("utf-8", "replace")
+            comment = base64.b64decode(st["comment_b64"])
         produced = self._replay(recipe, srcs, setwork, comment,
                                 st["format"],
                                 base=srcdir if keep_paths else None)
