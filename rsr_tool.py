@@ -75,6 +75,10 @@ UI_FINISH_ONE  = "Finish this one"
 # a patch. Anything bigger means the recipe is wrong, not the headers, and we
 # refuse to pretend otherwise.
 DELTA_MAX_BYTES = 2_000_000
+# A ZIP release above this is held in memory two or three times over while it
+# is captured, so only one at a time is allowed through _capture_zip. 64 MB
+# clears every proof/nfo/dox zip in the corpus and catches the disc images.
+ZIP_BIG_BYTES = 64 * 1024 * 1024
 
 # Thread counts in the order they actually win (measured across ~1,200 captured
 # rebuilds: mt8 dominates, then mt1/mt3/mt4). Swept OUTERMOST so the common
@@ -4591,6 +4595,31 @@ class RsrToolAPI:
         embedded: dict[str, bytes] = {}
         cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
         budget = max(0, _num(s.get("budget_min"), 0, int))
+        # One BIG zip release at a time, process-wide.
+        #
+        # This path holds the archive in memory several times over: `raw` is
+        # the whole .zip (zip_skeleton needs it), `rawe` is each entry's packed
+        # bytes, and the sweep then holds the decompressed entry too. That is
+        # 2-3x the archive per release -- fine for a rom, ruinous for a
+        # Dreamcast .cdi, and there was nothing stopping four of them being in
+        # flight together.
+        #
+        # Measured live on the MiRAGE run: python at 7.4 GB RSS (peak 7.8) with
+        # 142-188 HARD PAGE FAULTS PER SECOND, four DC releases in flight all
+        # on .cdi images. The GUI is hosted in this same process, so those
+        # faults are what freezes it -- CPU was only ~51% across the machine,
+        # and python itself was using one core. It was never a CPU problem.
+        #
+        # Small zips are unaffected: the gate is only taken above the
+        # threshold, so a folder of proof jpgs and nfo fixes still runs wide.
+        big_zip = any(p.stat().st_size >= ZIP_BIG_BYTES
+                      for p in zips if p.is_file())
+        gate = getattr(type(self), "_zip_big_gate", None)
+        if gate is None:
+            gate = threading.Semaphore(1)
+            type(self)._zip_big_gate = gate
+        if big_zip:
+            gate.acquire()
         try:
             for zi_no, zp in enumerate(zips):
                 raw = zp.read_bytes()
@@ -4886,6 +4915,8 @@ class RsrToolAPI:
             return {"ok": True, "recipe": "zip", "error": ""}
         finally:
             _rmtree(work)
+            if big_zip:
+                gate.release()
 
     def _capture_metadata(self, folder: Path, store: Path, s: dict, rel: str,
                           files: list, why: str = "") -> dict:
