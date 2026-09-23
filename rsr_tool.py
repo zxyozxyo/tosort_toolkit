@@ -3330,6 +3330,9 @@ class RsrToolAPI:
                       "info")
         self._log(f"Build pack: {len(exes)} exe(s)   ·   store: {store}", "dim")
 
+        # These are all read back out of `counters` after the threads join.
+        # They used to be plain locals incremented from _one, which is why
+        # `broken` crashed: see the damaged branch.
         done = ok = failed = skipped = zips = parked = walls = meta = 0
         partial = broken = 0
         # ── capture, several releases at a time ──────────────────────────
@@ -3347,7 +3350,8 @@ class RsrToolAPI:
         # not each ask for the whole machine.
         lock = threading.Lock()
         counters = {"done": 0, "ok": 0, "failed": 0, "skipped": 0, "zips": 0,
-                    "parked": 0, "walls": 0, "meta": 0, "partial": 0}
+                    "parked": 0, "walls": 0, "meta": 0, "partial": 0,
+                    "damaged": 0}
 
         def _one(i, folder):
             rel_short = _release_name(folder)[:22]
@@ -3435,7 +3439,18 @@ class RsrToolAPI:
                 self._emit("row", {"name": rel, "status": "error",
                                    "recipe": "damaged — fails its .sfv",
                                    "kind": "damaged"})
-                broken += 1
+                # `broken += 1` here was an UnboundLocalError on EVERY damaged
+                # release: the assignment made `broken` local to _one, so the
+                # read that precedes it had nothing to read. Every other branch
+                # had already been moved to the shared `counters` dict when
+                # capture went multi-threaded; this one was missed, so the
+                # thread died, the release went uncounted, and the summary's
+                # "DAMAGED" figure -- which reads the outer `broken` -- stayed
+                # 0 forever. It is exactly the releases that fail their own
+                # .sfv, which is what a Dreamcast set full of hand-assembled
+                # copies produces.
+                with lock:
+                    counters["damaged"] += 1
                 return
             if res.get("partial"):
                 # Same reasoning: a fix release is complete in itself, it just
@@ -3541,7 +3556,7 @@ class RsrToolAPI:
         failed = counters["failed"]; skipped = counters["skipped"]
         zips = counters["zips"]; parked = counters["parked"]
         walls = counters["walls"]; meta = counters["meta"]
-        partial = counters["partial"]
+        partial = counters["partial"]; broken = counters["damaged"]
 
         self._log("", "")
         self._log(f"Capture complete — {ok} verified, {failed} failed, "
