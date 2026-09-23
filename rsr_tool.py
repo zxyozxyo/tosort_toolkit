@@ -4072,6 +4072,34 @@ class RsrToolAPI:
         -9 mem9 alone account for 137 of the 188 that reproduced. memLevel is
         swept because leaving it at 8 is what made the first survey call 55% of
         the corpus unreproducible when the real figure was 14%."""
+        # Only a couple of these at a time, across the whole process.
+        #
+        # Every other expensive thing in here is a SUBPROCESS -- rar.exe,
+        # DOSBox -- which the OS schedules and which does not hold the GIL.
+        # This one is a 405-iteration zlib loop running IN PROCESS on a capture
+        # thread, and nothing bounded how many ran at once: with jobs at 4-8,
+        # that is 4-8 of them grinding against 32 rar workers and the UI.
+        #
+        # Measured on the overnight DC run (2026-09-23). Ultima_IV_USA_DC-IND's
+        # zlib stage reported "405 setting(s) swept, 0 needed the whole file
+        # (2,885s)" -- with ZERO full-file compressions, so that 2,885s is the
+        # 1 MB probe pass alone. The same 405-setting probe pass on an idle
+        # machine takes 27.8s. A hundredfold. At the same moment
+        # The_Ultimate_Dreamcast was packing at 290s per combo and the core
+        # budget was splitting 32 threads across 8 releases in flight.
+        # Three zip entries took 2.5 hours of a six-hour run between them, all
+        # three ending "no match", and the GUI was unusable throughout.
+        gate = getattr(type(self), "_zip_gate", None)
+        if gate is None:
+            gate = threading.Semaphore(2)
+            type(self)._zip_gate = gate
+        with gate:
+            return self._sweep_zip_entry_inner(data, raw, name, work,
+                                               deadline, grp)
+
+    def _sweep_zip_entry_inner(self, data: bytes, raw: bytes, name: str,
+                               work: Path, deadline=None,
+                               grp: str = "") -> dict | None:
         # Deflate emits complete blocks as it goes, so compressing a PREFIX of
         # the input yields a prefix of the full output. That makes a cheap
         # discriminator: run the 405 settings over the first megabyte, and only
@@ -4106,6 +4134,15 @@ class RsrToolAPI:
                 for mem in ZIP_MEMS:
                     if self._stop.is_set() or self._skip.is_set():
                         return None
+                    # Per SETTING, not per strategy. The check used to sit on
+                    # the outer loop, which is 81 settings apart -- and below
+                    # 4 MB there is no prefix probe, so each of those 81 is a
+                    # full-file compression. A budget that can be overrun by
+                    # 81 full passes is not a budget.
+                    if deadline and time.monotonic() > deadline:
+                        self._log(f"      ⏱ time budget reached after {tried} "
+                                  f"of {total} zlib setting(s).", "warn")
+                        return None
                     tried += 1
                     now = time.monotonic()
                     if now - last > 0.5:
@@ -4125,8 +4162,6 @@ class RsrToolAPI:
                         return {"impl": "zlib", "level": lvl, "mem": mem,
                                 "strategy": strat,
                                 "label": f"zlib -{lvl} mem{mem}{sname}"}
-            if deadline and time.monotonic() > deadline:
-                break
         self._log(f"      zlib: {total} setting(s) swept, {full} needed the "
                   f"whole file ({time.monotonic() - t0:,.0f}s) — no match.",
                   "dim")
