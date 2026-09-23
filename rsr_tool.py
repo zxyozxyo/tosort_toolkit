@@ -9076,10 +9076,33 @@ class RsrToolAPI:
             if f.get("stored"):
                 dst.write_bytes(z.read(f["stored"]))
             else:
+                # A NAME match is a hint, not an answer -- so check it before
+                # believing it. Dreamcast releases almost all ship a self-boot
+                # `unpack.exe`, same name in every release and different bytes
+                # in each, and in batch mode the content tree holds dozens of
+                # them. Taking `content/base`, or `rglob(base)[0]`, meant the
+                # first one on disk was handed to every release that wanted
+                # one: 4_Wheel_Thunder, Airforce_Delta, Aqua_GT, BANG_Gunship
+                # and Bleemcast_Beta all died on "UNPACK.EXE: CRC does not
+                # match what was captured". The bytes were on disk the whole
+                # time; the search simply stopped at the wrong file and never
+                # reached _source_by_hash, which would have found the right
+                # one. Same shape as the basename-keyed extras collision.
+                want_crc = f.get("crc32")
+                want_size = f.get("size")
+
+                def _fits(p) -> bool:
+                    try:
+                        if want_size and Path(p).stat().st_size != want_size:
+                            return False
+                    except OSError:
+                        return False
+                    return want_crc is None or _file_crc32(Path(p)) == want_crc
+
                 found = content / base
-                if not found.is_file():
-                    hits = list(content.rglob(base))
-                    found = hits[0] if hits else None
+                if not (found.is_file() and _fits(found)):
+                    found = next((h for h in content.rglob(base)
+                                  if h.is_file() and _fits(h)), None)
                 if not found or not Path(found).is_file():
                     # Name lookup failed — find it by CONTENT instead. The
                     # packed name is a scene abbreviation (`tg-tg.nds`) and the
