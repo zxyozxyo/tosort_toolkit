@@ -8290,11 +8290,17 @@ class RsrToolAPI:
         # (the single-release path already cleared this; the batch never did).
         self._size_map_cache = {}
         freed = 0
+        tidied_live = 0
         if delete_content:
             self._log("  DELETE SOURCES is ON — an unpacked file will be "
                       "removed once its release has rebuilt and every volume "
                       "has been hash-verified. The rebuilt archives are never "
                       "touched.", "warn")
+        if clean_extras:
+            self._log("  CLEAN LOOSE FILES is ON — a loose .nfo/.sfv/etc is "
+                      "removed as soon as the release it belongs to has "
+                      "rebuilt and verified, and a final sweep at the end "
+                      "catches the backlog from earlier runs.", "warn")
         # Size first, hash second. A stat() is free and a CRC32 is a full read,
         # so pointing this at a whole drive should not mean reading a whole
         # drive: nothing can match unless its size matches a captured content
@@ -8461,6 +8467,30 @@ class RsrToolAPI:
                     self._consumed = keep_all
                     with book:
                         freed += n
+                # Tidy this release's loose files NOW, not at the end of the
+                # batch. Same reasoning as the per-release source delete above,
+                # and the same test: a file goes only once the release it
+                # belongs to has rebuilt AND every volume has hash-verified,
+                # which is exactly what reaching here means. Doing it only at
+                # the end meant a stopped batch cleaned NOTHING -- and the two
+                # batches on 2026-09-23 were both stopped, so the operator saw
+                # a ticked box do nothing at all. The end-of-batch sweep still
+                # runs, and still walks every release already in the output
+                # folder, which is the part this cannot do.
+                if clean_extras:
+                    with book:
+                        prot = self._extras_protector(matched, built, built)
+                    try:
+                        n = self._delete_duplicates(out / rel, root, prot,
+                                                    quiet=True)
+                    except OSError:
+                        n = 0
+                    if n:
+                        with book:
+                            tidied_live += n
+                        self._log(f"    🗑 {n} loose file(s) removed — "
+                                  "byte-identical to what was just rebuilt.",
+                                  "dim")
                 self._emit("row", {"name": rel, "status": "done",
                                    "recipe": "rebuilt", "kind": "ok"})
             else:
@@ -8514,9 +8544,16 @@ class RsrToolAPI:
         if with_meta:
             done += self._rebuild_metadata(matched, out, skip_rebuilt)
 
-        tidied = 0
+        tidied = tidied_live
         if clean_extras and not self._stop.is_set():
-            tidied = self._clean_content_extras(root, out, matched, built)
+            tidied += self._clean_content_extras(root, out, matched, built)
+        elif clean_extras:
+            # Never silently. A ticked box that does nothing and says nothing
+            # is indistinguishable from a broken one, which is exactly how this
+            # was reported.
+            self._log("  clean-up: the end-of-batch sweep was skipped because "
+                      "the run was stopped. Anything already rebuilt has "
+                      "still been tidied as it went.", "warn")
 
         self._log("", "")
         self._log(f"Batch rebuild complete — {done} rebuilt, {failed} failed, "
@@ -8618,12 +8655,32 @@ class RsrToolAPI:
             known = {r[0] for r in con.execute("SELECT name FROM releases")}
         finally:
             con.close()
-        owed = set(matched) - set(built)
         dirs = sorted(d for d in out.iterdir()
                       if d.is_dir() and d.name in known)
         if not dirs:
             return 0
-        finished = set(built) | {d.name for d in dirs}
+        protected = self._extras_protector(
+            matched, built, set(built) | {d.name for d in dirs})
+        self._log("", "")
+        self._log(f"══ tidying the content folder against {len(dirs)} rebuilt "
+                  f"release folder(s) ══", "info")
+        gone = 0
+        for i, d in enumerate(dirs, 1):
+            if self._stop.is_set():
+                break
+            self._progress(f"tidying {i}/{len(dirs)} · {d.name}")
+            gone += self._delete_duplicates(d, root, protected, quiet=True)
+        self._progress("")
+        self._log(f"  🗑 {gone} leftover file(s) removed — each byte-identical "
+                  "to a file in a rebuilt release.", "ok" if gone else "dim")
+        return gone
+
+    def _extras_protector(self, matched, built, finished):
+        """`protected(path)` — may this loose file NOT be removed?
+
+        Shared by the per-release tidy and the end-of-batch sweep so the two
+        can never drift apart on the one question that matters."""
+        owed = set(matched) - set(built)
 
         def protected(p: Path) -> bool:
             # Kept when this run still owes it to a release, or when it is the
@@ -8645,19 +8702,8 @@ class RsrToolAPI:
                 return True
             return any(src == "content" and r not in finished
                        for r, src in rows)
-        self._log("", "")
-        self._log(f"══ tidying the content folder against {len(dirs)} rebuilt "
-                  f"release folder(s) ══", "info")
-        gone = 0
-        for i, d in enumerate(dirs, 1):
-            if self._stop.is_set():
-                break
-            self._progress(f"tidying {i}/{len(dirs)} · {d.name}")
-            gone += self._delete_duplicates(d, root, protected, quiet=True)
-        self._progress("")
-        self._log(f"  🗑 {gone} leftover file(s) removed — each byte-identical "
-                  "to a file in a rebuilt release.", "ok" if gone else "dim")
-        return gone
+
+        return protected
 
     def _already_rebuilt(self, rsr: Path, dest: Path) -> bool:
         """True when `dest` already holds this release as a rebuild writes it.
