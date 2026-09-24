@@ -1810,6 +1810,7 @@ def rar4_rr_sectors(vol: Path) -> int:
         return 0
     i += 7
     rr = prot = 0
+    stated = 0
     while i + 11 <= len(d):
         typ = d[i + 2]
         flags = int.from_bytes(d[i + 3:i + 5], "little")
@@ -1818,7 +1819,28 @@ def rar4_rr_sectors(vol: Path) -> int:
             break
         add = (int.from_bytes(d[i + 7:i + 11], "little")
                if flags & 0x8000 else 0)
-        if typ == 0x78:
+        # The record moved house between format versions. RAR 2.x writes a
+        # bare PROTECT block (0x78) whose sector count is only recoverable
+        # from the arithmetic below. RAR 3.x writes it as a NEWSUB (0x7a)
+        # named "RR", and that one STATES the count in its header:
+        #
+        #     "Protect+"  8 B signature
+        #     RecSectors  u32     <- the -rr value, exactly
+        #     TotalBlocks u32     == ceil(protected / 512)
+        #
+        # Reading only 0x78 meant every 3.x set with a record fell through
+        # to "sector count could not be read", the replay asked for rar's
+        # DEFAULT, and a capture whose every compressed stream was already
+        # byte-exact was refused over a record of the wrong size.
+        if typ == 0x7a and hsize >= 34:
+            nlen = int.from_bytes(d[i + 26:i + 28], "little")
+            tail = d[i + 32 + nlen:i + hsize]
+            if d[i + 32:i + 32 + nlen] == b"RR" and tail[:8] == b"Protect+":
+                rr = add
+                stated = int.from_bytes(tail[8:12], "little")
+            else:
+                prot += hsize + add
+        elif typ == 0x78:
             rr = add
         else:
             prot += hsize + add
@@ -1827,8 +1849,15 @@ def rar4_rr_sectors(vol: Path) -> int:
         i += hsize + add
     if not rr:
         return 0
+    # Both routes are computed and must agree. The stated count is taken as
+    # the answer, but a disagreement means this block is not shaped the way
+    # it is understood here, and guessing at a recovery record is what the
+    # unverified captures were: return 0 and let the replay say so.
     n = (rr - 2 * -(-prot // 512)) / 512
-    return int(n) if n > 0 and n == int(n) else 0
+    derived = int(n) if n > 0 and n == int(n) else 0
+    if stated:
+        return stated if stated == derived else 0
+    return derived
 
 
 def rar4_host(vols) -> int:
