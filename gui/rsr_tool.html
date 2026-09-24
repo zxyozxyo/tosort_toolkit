@@ -794,13 +794,40 @@ async function skipFile() {
   setTimeout(() => { b.disabled = !$('btn-scan').disabled; }, 600);
 }
 
+/* The log pane keeps only the last LOG_KEEP lines.
+ *
+ * It used to keep every one, and that is what made a long scan crawl. Python
+ * emits each line with a BLOCKING evaluate_js, so the capture thread waits for
+ * this function to return -- and `scrollTop = scrollHeight` forces a synchronous
+ * layout whose cost grows with the node count. After an overnight run with four
+ * jobs the pane held hundreds of thousands of divs, so every new line paid for
+ * laying out all of them, and four threads queued behind it. Measured in the
+ * 2026-09-23 DC log: twelve consecutive lines of a file listing, a loop with
+ * nothing in it but log(), arrived TEN SECONDS apart.
+ *
+ * Nothing is lost by trimming: every line is mirrored to rsr_tool.log, which is
+ * the durable record and the one worth reading after the fact.
+ *
+ * Trimmed in BATCHES. Removing one node per line would put the cost straight
+ * back; removing LOG_TRIM at once makes it amortised and imperceptible. */
+const LOG_KEEP = 2000, LOG_TRIM = 500;
+
 function log(msg, cls) {
   const w = $('log');
   const d = document.createElement('div');
   d.className = cls || 'info';
   d.textContent = msg;
+  // Only follow the tail if the operator is already at the bottom, so reading
+  // back through the log does not get yanked away on the next line.
+  const pinned = w.scrollHeight - w.scrollTop - w.clientHeight < 40;
   w.appendChild(d);
-  w.scrollTop = w.scrollHeight;
+  if (w.childElementCount > LOG_KEEP + LOG_TRIM) {
+    const r = document.createRange();
+    r.setStart(w, 0);
+    r.setEnd(w, w.childElementCount - LOG_KEEP);
+    r.deleteContents();
+  }
+  if (pinned) w.scrollTop = w.scrollHeight;
 }
 function clearLog() { $('log').innerHTML = ''; }
 
