@@ -8421,7 +8421,41 @@ class RsrToolAPI:
         skipped = 0
 
         def _rebuild_one(i, rel, p, hit):
-            nonlocal done, failed, freed, skipped
+            nonlocal failed
+            # A thread that raises dies silently: the row it set to "running"
+            # never moves and the release looks stuck forever, while the batch
+            # reports a total that does not add up. That is exactly what an
+            # UnboundLocalError on `tidied_live` did after a SUCCESSFUL
+            # rebuild -- every affected release sat at "running" for the whole
+            # run. The work below is bookkeeping around a rebuild that has
+            # already been verified, so nothing here should be able to take
+            # the release down with it; if it does, say so and move on.
+            try:
+                _rebuild_one_inner(i, rel, p, hit)
+            except Exception as e:
+                self._log(f"  ERROR after rebuilding {rel}: "
+                          f"{type(e).__name__}: {e}", "err")
+                self._log(traceback.format_exc(), "dim")
+                # `built` gains the release in the same locked block as
+                # `done += 1`, so it says whether the rebuild itself got
+                # through. If it did, the release IS built and verified and
+                # is already counted -- counting it again as a failure would
+                # make done + failed exceed the batch. Surface it as needing
+                # a look without lying about either total.
+                with book:
+                    after = rel in built
+                    if not after:
+                        failed += 1
+                        failed_rels.add(rel)
+                self._emit("row", {
+                    "name": rel,
+                    "status": "done" if after else "error",
+                    "recipe": ("rebuilt — post-step failed" if after
+                               else "post-rebuild error"),
+                    "kind": "error"})
+
+        def _rebuild_one_inner(i, rel, p, hit):
+            nonlocal done, failed, freed, skipped, tidied_live
             # Tag this thread's lines so parallel rebuilds stay readable, the
             # same way captures do.
             self._tl.tag = f"[{rel[:24]}] " if self._rebuild_slots() > 1 else ""
