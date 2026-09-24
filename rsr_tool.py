@@ -777,6 +777,9 @@ def _rar_format(path: Path) -> str | None:
     return None
 
 
+# A disc subfolder of a multi-disc release: CD1, CD 2, Disc_3, DISK4.
+_DISC_DIR_RE = re.compile(r"^(cd|disc|disk)[ _-]?\d{1,2}$", re.I)
+
 _VOL_PATTERNS = (
     # (regex on the full name, naming scheme, sort key extractor)
     (re.compile(r"^(?P<stem>.+)\.part(?P<n>\d+)\.rar$", re.I), "part"),
@@ -3255,6 +3258,31 @@ class RsrToolAPI:
             if any(_classify_volume(p.name) for p in kids if p.is_file()):
                 return [d]
             subs = [p for p in kids if p.is_dir()]
+            # A multi-disc release keeps each disc in CD1/, CD2/, CD3/ and can
+            # carry NOTHING loose at the top, so the "loose files mean this is
+            # a release" rule below does not fire and every disc was walked
+            # into and captured as a release of its own. That is how
+            # Skies_Of_Arcadia_Repack_All_3_Disks_USA_DC-RYUCPL became
+            # rsr_store/Unknown/Unknown/CD1/CD1.rsr -- named CD1, system
+            # Unknown, year Unknown, three times over, and the real release
+            # nowhere.
+            #
+            # Capture already understands the layout: it records each volume's
+            # subfolder as v["folder"] = "CD1" and the rebuild puts it back
+            # there. Only the enumeration did not, so the parent is the
+            # release. Decided on the folders that actually HOLD volumes, so a
+            # release shipping CD1/, CD2/ and a Proof/ still resolves.
+            if any(_DISC_DIR_RE.match(p.name) for p in subs):
+                holds = []
+                for p in subs:
+                    try:
+                        if any(_classify_volume(q.name)
+                               for q in p.iterdir() if q.is_file()):
+                            holds.append(p)
+                    except OSError:
+                        continue
+                if holds and all(_DISC_DIR_RE.match(p.name) for p in holds):
+                    return [d]
             # Any loose file at all makes this a release — an nfo-only or
             # sfv-only folder is still a release and must not be descended
             # past. No loose files and no subfolders is an empty folder, which
