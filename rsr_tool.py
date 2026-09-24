@@ -5150,7 +5150,22 @@ class RsrToolAPI:
                         "error": "partial set: the first volume is missing"}
             raise
         try:
-            infos = [i for i in rf.infolist() if i.is_file()]
+            every = rf.infolist()
+            infos = [i for i in every if i.is_file()]
+            # DIRECTORY entries. rar writes one block per directory when the
+            # pack names a directory, and none at all when it is handed only
+            # files -- which is all the sweep ever handed it, so a set with
+            # directories could never come back byte-exact. It cost exactly
+            # the sum of those headers: 706 B over 16 of them for NOUTENKI,
+            # 8,396 over 139 for Xcult, 197 over 4 for TITANIUM. In a VOLUMED
+            # set it costs nothing in length -- the volume is a fixed size --
+            # and instead shifts every boundary, which is why LAILLAS differed
+            # from byte 20, exactly where its first directory entry sits.
+            #
+            # They carry no data, so they stay OUT of `infos`: meta, the
+            # stream lookup and the per-file checks are all keyed on real
+            # files and none of them should learn about this.
+            dirinfos = [i for i in every if not i.is_file()]
             comment = rf.comment
             stubbed = getattr(rf, "_rsr_comment_stubbed", False)
         finally:
@@ -5188,6 +5203,39 @@ class RsrToolAPI:
             return {"ok": False, "error": "no packed files"}
 
         meta = self._read_files(infos, st["format"])
+        # Directory names in archive order, and whether they come BEFORE the
+        # files. Which side they land on is a property of the BUILD, not of
+        # the argument order, so it is worth carrying: 2.00 ignores a named
+        # directory entirely, 2.71 always writes them first, 3.00 follows the
+        # order it was given, and 3.60 and later always write them last. That
+        # makes their position one more thing the right build has to agree
+        # with -- and it tells this to ask in the original's order so the
+        # builds that do follow it are asked correctly.
+        dir_names, dirs_first = [], True
+        if dirinfos and st["format"] == "RAR4":
+            for i in dirinfos:
+                nm = _oem_name(i, i.flags or 0) or i.filename
+                # rarfile hands directory names back with a TRAILING
+                # separator, and rar silently IGNORES an argument shaped that
+                # way -- naming `quake_sw\` adds nothing and the archive
+                # comes back byte-identical to one packed from files alone,
+                # which is exactly how this looked like it was working when
+                # it was not. Strip it.
+                nm = (nm or "").replace("/", os.sep).rstrip(os.sep)
+                if nm:
+                    dir_names.append(nm)
+            first_file = min((i.header_offset for i in infos
+                              if getattr(i, "header_offset", None) is not None),
+                             default=None)
+            first_dir = min((i.header_offset for i in dirinfos
+                             if getattr(i, "header_offset", None) is not None),
+                            default=None)
+            if first_file is not None and first_dir is not None:
+                dirs_first = first_dir < first_file
+            self._log(f"    {len(dir_names)} directory entr(y/ies), written "
+                      f"{'before' if dirs_first else 'after'} the files — the "
+                      f"pack has to name them or they are simply absent.",
+                      "dim")
         mflags = main_flags(head)
         # The main header is the authority on both of these; see main_flags().
         solid = any(f["solid"] for f in meta) or bool(mflags & MHD_SOLID)
@@ -5280,6 +5328,20 @@ class RsrToolAPI:
             return {"ok": False, "error": "skipped"}
         order = [f["name"] for f in meta]
         src_files = [srcdir / n for n in order]
+        # Absolute, like src_files, so _pack_cmds can name them relative to
+        # the base the same way. `x` already recreated the tree, so every one
+        # of these exists; any that does not is dropped rather than handed to
+        # rar as a name it would refuse.
+        dir_files = [srcdir / n for n in dir_names]
+        gone = [p for p in dir_files if not p.is_dir()]
+        if gone:
+            self._log(f"    {len(gone)} directory entr(y/ies) not on disk "
+                      f"after extraction — packing without them: "
+                      f"{', '.join(p.name for p in gone[:3])}", "warn")
+            dir_files = [p for p in dir_files if p.is_dir()]
+        # What rar is actually given: names relative to the source root, which
+        # is the working directory the pack runs in.
+        dir_send = [os.path.relpath(str(p), str(srcdir)) for p in dir_files]
         # Does this archive keep directories in its packed names? The `x`
         # above already extracted them that way, so the sources are laid out
         # correctly on disk; it is the PACK side that has to stop passing -ep.
@@ -5584,6 +5646,8 @@ class RsrToolAPI:
                                             and int(f.get("packed_size") or 0)
                                             >= int(f.get("size") or 0)
                                             for f in meta),
+                                        dirs=dir_send,
+                                        dirs_first=dirs_first,
                                         dos_only=bool(s.get("dos_host_only")),
                                         year_before=int(
                                             s.get("year_before") or 0),
@@ -5886,7 +5950,8 @@ class RsrToolAPI:
 
     def _pack_cmds(self, ex: Path, fmt: str, dict_kb: int, mt: int, solid: bool,
                    groups, srcs: list, target: Path, tail=(),
-                   vol_args=(), base=None) -> list[list[str]] | None:
+                   vol_args=(), base=None, dirs=(),
+                   dirs_first=True) -> list[list[str]] | None:
         """The command SEQUENCE that builds this archive — usually one command.
 
         `groups` is [(level, count)] over `srcs` in archive order. One entry is
@@ -5937,6 +6002,19 @@ class RsrToolAPI:
                     except ValueError:
                         pass
                 names.append(str(q))
+            # The directories go on ONE command -- naming them twice would
+            # write the block twice. Which end depends on where the original
+            # keeps them, and only rar 3.00 actually honours the request;
+            # every other build has its own fixed idea, which is the point
+            # (see the note where dir_names is read). Named relative to the
+            # base for the same reason the files are: -ep is dropped, so rar
+            # stores exactly the name it is given.
+            if dirs:
+                dn = list(dirs)
+                if dirs_first and gi == 0:
+                    names = dn + names
+                elif not dirs_first and gi == len(groups) - 1:
+                    names = names + dn
             cmd += [str(target)] + names
             cmds.append(cmd)
             at += count
@@ -6545,7 +6623,8 @@ class RsrToolAPI:
         else:
             cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
                                    wdir / "probe.rar", vol_args=vol_args,
-                                   base=base)
+                                   base=base, dirs=dirs,
+                                   dirs_first=dirs_first)
             cmds = self._pack_cmds_extra(cmds, extra)
             if cmds is None:
                 return None
@@ -6702,7 +6781,8 @@ class RsrToolAPI:
                       base=None, prefix=None, probe_vol=0,
                       want_vols=0, unp_max=0, expanded=False,
                       host=-1, rr_sectors=-1, dos_only=False,
-                      year_before=0, year_after=0) -> dict | None:
+                      year_before=0, year_after=0,
+                      dirs=(), dirs_first=True) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -7337,6 +7417,11 @@ class RsrToolAPI:
                             # count, says nothing about the coder, and the
                             # replay packs with the default and diverges.
                             "mc": list(extra_) if extra_ else [],
+                            # Directory entries are blocks the replay has to
+                            # be told to write, exactly like the recovery
+                            # record: named, or simply absent.
+                            "dirs": list(dirs),
+                            "dirs_first": bool(dirs_first),
                             "tried": tried + s + 1,
                             # Where this combo's volumes are. The replay can
                             # often use them as they stand instead of packing
@@ -7660,7 +7745,9 @@ class RsrToolAPI:
             tail.append("-k")
         cmds = self._pack_cmds(ex, fmt, recipe["dict_kb"], recipe["mt"],
                                recipe["solid"], groups, srcs, target,
-                               tail=tail, vol_args=vol_args, base=base)
+                               tail=tail, vol_args=vol_args, base=base,
+                               dirs=recipe.get("dirs") or (),
+                               dirs_first=bool(recipe.get("dirs_first", True)))
         return self._pack_cmds_extra(cmds, recipe.get("mc") or ())
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
