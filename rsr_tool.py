@@ -3257,7 +3257,19 @@ class RsrToolAPI:
                 return [d]
             if any(_classify_volume(p.name) for p in kids if p.is_file()):
                 return [d]
-            subs = [p for p in kids if p.is_dir()]
+            # A subfolder holding .rsrignore is not descended into. That is
+            # how releases get put aside for a quieter run -- the big-zip
+            # ones, say -- while still living inside the tree a scan points
+            # at. Filtered here rather than at the top of walk() so the scan
+            # ROOT is never skipped: pointing a scan straight at the
+            # put-aside folder is exactly how that quieter run gets done.
+            #
+            # A marker file rather than a name rule on purpose. This corpus
+            # is full of folders whose names begin with '!' (!RSR,
+            # !NEXT-In-Line, !RSR-NON-SCANNED), so a name rule would refuse
+            # to scan the roots themselves.
+            subs = [p for p in kids
+                    if p.is_dir() and not (p / ".rsrignore").exists()]
             # A multi-disc release keeps each disc in CD1/, CD2/, CD3/ and can
             # carry NOTHING loose at the top, so the "loose files mean this is
             # a release" rule below does not fire and every disc was walked
@@ -3287,7 +3299,13 @@ class RsrToolAPI:
             # sfv-only folder is still a release and must not be descended
             # past. No loose files and no subfolders is an empty folder, which
             # the caller reports as such.
-            if not subs or any(p.is_file() for p in kids) or depth <= 0:
+            #
+            # .rsrignore does not count: it is ours, not the release's, and
+            # letting it count would make a put-aside folder look like a
+            # one-file release the moment a scan was pointed at it.
+            loose = [p for p in kids
+                     if p.is_file() and p.name.lower() != ".rsrignore"]
+            if not subs or loose or depth <= 0:
                 return [d]
             found = []
             for sub in subs:
