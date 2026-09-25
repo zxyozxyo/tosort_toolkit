@@ -3116,6 +3116,12 @@ class RsrToolAPI:
     # it was labelled "volume one's header did not match", which pointed at the
     # archive layout when the cause was compression (see _log_best_partial).
     PREFIX_DIVERGED = "volume one's compressed data diverged"
+    # Split at the SAME requested volume size but into a different
+    # NUMBER of volumes: the pack came out a different total size, so
+    # this is a compression verdict, not a layout one. Kept apart from
+    # the build that cannot split at all, which really is layout.
+    VOL_COUNT_DIVERGED = "the pack split into a different number of volumes"
+    VOL_NO_SPLIT = "this build did not split the archive at all"
 
     def _dos_exes(self) -> list[Path]:
         """RAR for DOS builds, newest-looking last. Empty when DOSBox is not
@@ -6850,8 +6856,20 @@ class RsrToolAPI:
                           if q.is_file() and (_classify_volume(q.name) or
                                               ("",))[0] == base_name)
             if len(made) != want_vols:
-                self._tally_reject(f"the pack split into {len(made)} volume(s), "
-                                   f"not {want_vols}")
+                # One volume when many were asked for means the build ignored
+                # -v -- see the module note on RAR 2.x and 15,000,000 B. That
+                # is the build's doing and no amount of sweeping fixes it.
+                # ANY OTHER count is a size difference: same volume size was
+                # requested, so a different number of them means the pack came
+                # out bigger or smaller, which is compression. 4_Wheel_Thunder
+                # _50-60Hz split into 15 where the original has 14 -- its last
+                # volume is 4.4 MB of a 20 MB slot, so 15.5 MB (5.88%) of
+                # headroom had to be overrun to need another. Telling the
+                # operator "sweeping more builds cannot fix this" was the
+                # opposite of the truth.
+                self._tally_reject(
+                    self.VOL_NO_SPLIT if len(made) <= 1 else
+                    f"{self.VOL_COUNT_DIVERGED} — {len(made)}, not {want_vols}")
                 return False
             if vol_first and head.stat().st_size != vol_first:
                 self._tally_reject("volume one came out a different size")
@@ -10589,7 +10607,8 @@ class RsrToolAPI:
                     # DoukutsuPSX_Cave_Story all 5,232 were this, labelled a
                     # header mismatch, and the answer was -mt32 with a max_mt
                     # of 16.
-                    if top[0][0] == self.PREFIX_DIVERGED:
+                    if (top[0][0] == self.PREFIX_DIVERGED
+                            or top[0][0].startswith(self.VOL_COUNT_DIVERGED)):
                         why = ("that is a COMPRESSION difference — a build, "
                                "thread count or switch the sweep did not try "
                                f"(it went up to -mt{getattr(self._tl, 'sweep_max_mt', '?')}; "
