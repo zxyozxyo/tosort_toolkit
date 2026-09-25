@@ -4516,7 +4516,22 @@ class RsrToolAPI:
         MAX_STEPS = 50_000                       # over the whole walk
 
         def cands(i: int, start: int) -> list:
-            """Where payload i could sit at or after `start`, nearest first."""
+            """Where payload i could sit at or after `start`, nearest first.
+
+            Searches for the WHOLE payload, not a 64 KB probe of its head.
+            The probe was a disaster on exactly the releases it mattered for:
+            it was taken blindly from the front of the payload, and a CD image
+            begins with a run of ZEROS. Strikers_1945_II's 64 KB probe is one
+            distinct byte value and occurs at least 200,000 times in a 309 MB
+            .pcf -- and every occurrence paid for a `pcf[j:j+len(data)]`
+            slice, which COPIES the payload out to compare it. 308 MB a time,
+            that is 56 TiB of copying for two entries, in pure Python, inside
+            no timeout at all. It is why a release whose zlib sweep had
+            already finished in 47 seconds sat in the window "scanning" all
+            night.
+
+            bytes.find does the same job in C, returns only real matches, and
+            copies nothing."""
             out, seen = [], set()
             exp, rawb = payloads[i][1], payloads[i][2]
             forms = [("expanded", exp)]
@@ -4525,13 +4540,12 @@ class RsrToolAPI:
             for form, data in forms:
                 if not data:
                     continue
-                probe = data[:1 << 16]
-                j = pcf.find(probe, start)
+                j = pcf.find(data, start)
                 while j >= 0 and len(out) < MAX_CAND:
-                    if j not in seen and pcf[j:j + len(data)] == data:
+                    if j not in seen:
                         seen.add(j)
                         out.append((j, len(data), form))
-                    j = pcf.find(probe, j + 1)
+                    j = pcf.find(data, j + 1)
             out.sort()
             return out
 
