@@ -973,6 +973,23 @@ window.rsrEvent = function (event, data) {
   else if (event === 'scan_done') { setBusy(false); refreshStats(); dbSearch(); }
 };
 
+/* Python now sends events in BATCHES over one evaluate_js call instead of one
+   call per line. evaluate_js is synchronous on the Python side, so a call per
+   line made every log line a round trip that a capture thread paid for — and
+   worse, it could stall the poll loop that enforces a subprocess timeout. One
+   call per batch keeps the window responsive and the workers free.
+
+   Kept tolerant of a single event so an older Python and this page still talk
+   to each other. */
+window.rsrEvents = function (list) {
+  if (!Array.isArray(list)) return;
+  for (const ev of list) {
+    if (Array.isArray(ev)) {
+      try { window.rsrEvent(ev[0], ev[1] || {}); } catch (e) { /* keep going */ }
+    }
+  }
+};
+
 /* ── release detail popup ─────────────────────────────────────────────── */
 let infoPath = '';
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,

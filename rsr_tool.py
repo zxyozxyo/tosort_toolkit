@@ -45,6 +45,7 @@ import platform
 import threading
 import subprocess
 import traceback
+from collections import deque
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
 
@@ -2351,6 +2352,12 @@ class _LockedConn:
 class RsrToolAPI:
     def __init__(self):
         self._window = None
+        self._ev_q: deque = deque()
+        self._ev_lock = threading.Lock()
+        self._ev_wake = threading.Event()
+        self._ev_prog = None
+        self._ev_dropped = 0
+        self._ev_thread = None
         self._stop = threading.Event()
         self._skip = threading.Event()
         self._running = False
@@ -2455,17 +2462,97 @@ class RsrToolAPI:
 
     def set_window(self, w):
         self._window = w
+        self._ev_start()
+
+    # -- events to the browser ---------------------------------------------
+    # `evaluate_js` is SYNCHRONOUS: it blocks the caller until the browser has
+    # run the script and returned. Called straight from _log, that made every
+    # line a round trip paid for by a capture thread, and with several
+    # captures running they all queue behind the one window.
+    #
+    # It is worse than slow. `_run` enforces its own timeout in a poll loop
+    # that ticks a heartbeat through _progress once a second -- so a congested
+    # window can block the very loop that is meant to kill a runaway child.
+    # That is how Strikers_1945_II sat in the window "scanning" all night: its
+    # zlib sweep finished in 47s at 19:13:39, it went on into preflate, and
+    # then neither the 30-minute release budget nor preflate's own 3600s
+    # timeout ever got the chance to fire.
+    #
+    # ZIPs show it because they log the MOST, not because anything is wrong
+    # with them: a zip sweep logs per ENTRY, and three releases in the awkward
+    # set carry 2,010, 1,061 and 773 compressed entries.
+    #
+    # So worker threads never touch the window now. They append and return;
+    # ONE pump thread drains the queue and makes a single evaluate_js call per
+    # batch.
+    _EV_BATCH = 200          # events per evaluate_js call
+    _EV_MAX = 5000           # queue cap -- see the drop note in _emit
+    _EV_TICK = 0.05          # seconds between batches
+
+    def _ev_start(self):
+        if getattr(self, "_ev_thread", None) or not self._window:
+            return
+        self._ev_thread = threading.Thread(target=self._ev_pump, daemon=True)
+        self._ev_thread.start()
+
+    def _ev_pump(self):
+        bs = chr(92)
+        while True:
+            self._ev_wake.wait(self._EV_TICK)
+            self._ev_wake.clear()
+            batch = []
+            with self._ev_lock:
+                prog, self._ev_prog = self._ev_prog, None
+                dropped, self._ev_dropped = self._ev_dropped, 0
+                while self._ev_q and len(batch) < self._EV_BATCH:
+                    batch.append(self._ev_q.popleft())
+            if dropped:
+                batch.append(("log", {
+                    "msg": f"  ... {dropped:,} line(s) not shown - they "
+                           f"arrived faster than the window could take them, "
+                           f"and are all in rsr_tool.log.", "cls": "dim"}))
+            # Only the NEWEST progress line means anything, so it lives in one
+            # slot rather than the queue, and goes last.
+            if prog is not None:
+                batch.append(("progress", prog))
+            if not batch:
+                continue
+            try:
+                payload = (json.dumps(batch, ensure_ascii=True)
+                           .replace(bs, bs + bs).replace("'", bs + "'"))
+                self._window.evaluate_js(
+                    f"window.rsrEvents(JSON.parse('{payload}'))")
+            except Exception:
+                pass
+
+    def _ev_flush(self, timeout: float = 5.0):
+        """Wait for the queue to drain, so a run that says it has finished has
+        actually put its last lines on the screen."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self._ev_lock:
+                if not self._ev_q and self._ev_prog is None:
+                    return
+            self._ev_wake.set()
+            time.sleep(self._EV_TICK)
 
     def _emit(self, event: str, data: dict):
         if not self._window:
             return
-        try:
-            payload = (json.dumps(data, ensure_ascii=True)
-                       .replace("\\", "\\\\").replace("'", "\\'"))
-            self._window.evaluate_js(
-                f"window.rsrEvent('{event}', JSON.parse('{payload}'))")
-        except Exception:
-            pass
+        with self._ev_lock:
+            if event == "progress":
+                self._ev_prog = data
+            else:
+                # Capped, so a runaway logger cannot turn into unbounded
+                # memory. The OLDEST go: the pane only keeps its tail anyway
+                # and every line is already mirrored to rsr_tool.log, so what
+                # is dropped is the view, never the record. The count is
+                # reported, so a silent hole is impossible.
+                if len(self._ev_q) >= self._EV_MAX:
+                    self._ev_q.popleft()
+                    self._ev_dropped += 1
+                self._ev_q.append((event, data))
+        self._ev_wake.set()
 
     def _log(self, msg: str, cls: str = "info"):
         # With several captures in flight the log interleaves, and a bare
@@ -3257,6 +3344,7 @@ class RsrToolAPI:
             finally:
                 self._running = False
                 self._progress("")
+                self._ev_flush()
                 self._emit("scan_done", {})
 
         threading.Thread(target=_bg, daemon=True).start()
@@ -8292,6 +8380,7 @@ class RsrToolAPI:
             finally:
                 self._running = False
                 self._progress("")
+                self._ev_flush()
                 self._emit("scan_done", {})
 
         threading.Thread(target=_bg, daemon=True).start()
@@ -8427,6 +8516,7 @@ class RsrToolAPI:
             finally:
                 self._running = False
                 self._progress("")
+                self._ev_flush()
                 self._emit("scan_done", {})
 
         threading.Thread(target=_bg, daemon=True).start()
