@@ -405,6 +405,117 @@ def _no_window() -> dict:
                                         "BELOW_NORMAL_PRIORITY_CLASS", 0))}
 
 
+# RAR 2.00b, 2.00 and 2.01 read free disk space as clusters x sectors x bytes
+# in a SIGNED 32-bit imul, so on any modern drive the answer is free space
+# modulo 4 GB -- negative about half the time. At a volume boundary they then
+# print "Disk full. Insert next  Continue/Quit" and wait for a key forever
+# (answering C crashes them). Whether it fires depends on the free space at
+# that moment, which the scan's own temp files swing by gigabytes, so it looked
+# random: Legacy_Of_Kain_Soul_Reaver_German-PARADOX captured on 2.01 and then
+# "replay produced nothing" at the 3600 s timeout on every rebuild, and every
+# sweep combo on these builds could hang to its timeout. Measured 2026-09-26
+# with a ballast file forcing the value negative: exactly these three prompt;
+# 2.02 onward do not. The fix replaces the three instructions with
+# `mov eax, 0x7FFFFFFF` -- "2 GB free" -- which cannot change the output
+# because every pack passes -v<size>b explicitly. Proven: patched output under
+# a negative reading is byte-identical, all 20 volumes, to the original's under
+# a positive one, for all three builds.
+_FREE_SPACE_BUG = frozenset({"1996-03-27_rar200b.exe", "1996-09-02_rar200.exe",
+                             "1997-03-12_rar201.exe"})
+_FREE_SPACE_OLD = bytes.fromhex("83c4088b45f4f76dfcf76df8")
+_FREE_SPACE_NEW = bytes.fromhex("83c408b8ffffff7f90909090")
+_PATCH_LOCK = threading.Lock()
+
+
+def _runnable(cmd: list) -> list:
+    """The command, with a free-space-bug build swapped for its patched twin.
+
+    The recipe keeps naming the original build; only what is EXECUTED changes.
+    The twin is derived from the pack's own file on first use and refused
+    unless the pattern occurs exactly once, so a different binary under the
+    same name is run as it is rather than patched blind."""
+    try:
+        ex = Path(cmd[0])
+        if ex.name not in _FREE_SPACE_BUG:
+            return cmd
+        twin = ex.parent / "_patched" / ex.name
+        with _PATCH_LOCK:
+            if not twin.is_file():
+                raw = ex.read_bytes()
+                if raw.count(_FREE_SPACE_OLD) != 1:
+                    return cmd
+                twin.parent.mkdir(exist_ok=True)
+                tmp = twin.with_suffix(".tmp")
+                tmp.write_bytes(raw.replace(_FREE_SPACE_OLD, _FREE_SPACE_NEW))
+                os.replace(tmp, twin)
+        return [str(twin)] + list(cmd[1:])
+    except Exception:
+        return cmd
+
+
+_JOB = None
+_JOB_LOCK = threading.Lock()
+
+
+def _die_with_us(p) -> None:
+    """Put a child in a job that Windows kills the moment this process ends.
+
+    _run and _run_until kill their child on timeout, stop and skip -- but only
+    while this process is alive to do it. Close the GUI mid-sweep, or lose it
+    to a crash, and every rar.exe and DOSBox in flight is orphaned for good.
+    Found 2026-09-26: sixteen of them, the oldest from 17 Sep, and the eight
+    DOSBoxes each pinning a core at cycles=max (one had 645,000 CPU-seconds)
+    -- a quarter of the machine gone, silently slowing every sweep since.
+    KILL_ON_JOB_CLOSE ties them to the one handle only this process holds."""
+    global _JOB
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int,
+                                                ctypes.c_void_p,
+                                                wintypes.DWORD)
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE,
+                                                 wintypes.HANDLE)
+        with _JOB_LOCK:
+            if _JOB is None:
+                class _Basic(ctypes.Structure):
+                    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                                ("PerJobUserTimeLimit", ctypes.c_int64),
+                                ("LimitFlags", wintypes.DWORD),
+                                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                                ("ActiveProcessLimit", wintypes.DWORD),
+                                ("Affinity", ctypes.c_size_t),
+                                ("PriorityClass", wintypes.DWORD),
+                                ("SchedulingClass", wintypes.DWORD)]
+
+                class _Ext(ctypes.Structure):
+                    _fields_ = [("Basic", _Basic),
+                                ("Io", ctypes.c_uint64 * 6),
+                                ("ProcessMemoryLimit", ctypes.c_size_t),
+                                ("JobMemoryLimit", ctypes.c_size_t),
+                                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+                job = k32.CreateJobObjectW(None, None)
+                if not job:
+                    return
+                info = _Ext()
+                info.Basic.LimitFlags = 0x2000   # KILL_ON_JOB_CLOSE
+                # 9 = JobObjectExtendedLimitInformation
+                if not k32.SetInformationJobObject(job, 9, ctypes.byref(info),
+                                                   ctypes.sizeof(info)):
+                    k32.CloseHandle(job)
+                    return
+                _JOB = job
+        k32.AssignProcessToJobObject(_JOB, int(p._handle))
+    except Exception:
+        pass
+
+
 def _method_groups(meta: list[dict]) -> list[tuple[int, int]]:
     """[(compression level, how many consecutive files)] in archive order.
 
@@ -2746,12 +2857,14 @@ class RsrToolAPI:
         recovers, so everything after volume one is work spent producing
         evidence nobody reads."""
         try:
-            p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+            p = subprocess.Popen(_runnable(cmd), env=env,
+                                 stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL,
                                  cwd=(str(cwd) if cwd else None),
                                  **_no_window())
         except Exception:
             return False
+        _die_with_us(p)
         with self._proc_lock:
             self._procs.add(p)
         try:
@@ -2805,12 +2918,14 @@ class RsrToolAPI:
         # killed it — an hour per release, and it consumed the whole search
         # budget before a single combo had been tried.
         try:
-            p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+            p = subprocess.Popen(_runnable(cmd), env=env,
+                                 stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL,
                                  cwd=(str(cwd) if cwd else None),
                                  **_no_window())
         except Exception:
             return False
+        _die_with_us(p)
         with self._proc_lock:
             self._procs.add(p)
         try:
@@ -6650,7 +6765,7 @@ class RsrToolAPI:
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
                    end_sig, hdr_ext, targets, extra=(), probe_vol=0,
-                   want_vols=0, vol_first=0):
+                   want_vols=0, vol_first=0, dirs=(), dirs_first=True):
         """One (build, -mt) candidate, in its own directory. True if it is the
         recipe, False if not, None if the build cannot run this recipe at all.
 
@@ -6712,6 +6827,7 @@ class RsrToolAPI:
                                       f"{_exe_label(ex.name)}"
                                       f"{' ' + sw_ if sw_ else ''} ruled out "
                                       f"on the first MB.", "dim")
+                            self._tally_reject(self.PREFIX_DIVERGED)
                             return False
                 finally:
                     _rmtree(look)
@@ -6721,11 +6837,14 @@ class RsrToolAPI:
                                           vb, extra=extra[1:],
                                           rr_sectors=rrs,
                                           first_volume_only=True):
+                    self._tally_reject("the probe pack never produced volume two")
                     return False
                 if self._prefix_verdict(wdir / "PROBE.RAR", prefix) is False:
+                    self._tally_reject(self.PREFIX_DIVERGED)
                     return False
             if not self._run_dos_pack(ex, wdir, groups[0][0], solid, srcs,
                                       vb, extra=extra[1:], rr_sectors=rrs):
+                self._tally_reject("the pack command itself failed to run")
                 return False
             cmds = []
         else:
@@ -7496,9 +7615,16 @@ class RsrToolAPI:
                         ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
                         groups, srcs, vol_args, base, prefix, end_sig,
                         hdr_ext, targets, extra_, probe_vol,
-                        want_vols, vol_first)
-                except Exception:
+                        want_vols, vol_first, dirs, dirs_first)
+                except Exception as e:
+                    # Never silent. 83a1ba6 referenced `dirs` here without
+                    # passing it in, every Windows combo raised NameError, and
+                    # this swallowed it: a whole night of DC sweeps "ran" 3,000
+                    # combos a second and reached no stream comparison at all,
+                    # reported as "rejected on volume structure".
                     results[s] = False
+                    self._tally_reject(f"the combo raised "
+                                       f"{type(e).__name__}: {e}")
 
             if len(chunk) == 1:
                 _slot(0)
@@ -10595,7 +10721,8 @@ class RsrToolAPI:
                 # sum as "rejected on structure" asserted the first about both.
                 broke = {w: c for w, c in tally.items()
                          if w in ("the pack command itself failed to run",
-                                  "the pack ran but produced no archive")}
+                                  "the pack ran but produced no archive")
+                         or w.startswith("the combo raised")}
                 struct = {w: c for w, c in tally.items() if w not in broke}
                 n_s, n_b = sum(struct.values()), sum(broke.values())
                 if struct:
