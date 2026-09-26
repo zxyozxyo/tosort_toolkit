@@ -654,6 +654,22 @@ def _oem_name(info, flags: int) -> str | None:
     except UnicodeDecodeError:
         pass
     import ctypes
+    # Exactly what rar.exe does on Windows: OemToChar, then the ANSI code page.
+    # Decoding the OEM bytes straight to Unicode is NOT the same thing --
+    # OemToChar best-fits every character the ANSI page lacks, and rar names
+    # the file on disk with the best-fitted one. Measured on
+    # Mizuiro_Limited_Edition_Music_CD_JAP_DC-IND (Shift-JIS names, Unicode
+    # flag clear): cp850 decodes byte 0xDA as '┌', rar 7.23 wrote '+', so
+    # every one of its 10 files "extracted short" -- the tool was looking for
+    # names that were never on disk. OemToCharBuffA reproduces 11 of 11.
+    if os.name == "nt":
+        try:
+            buf = ctypes.create_string_buffer(len(raw) + 1)
+            if ctypes.windll.user32.OemToCharBuffA(raw, buf, len(raw)):
+                return (buf.raw[:len(raw)].decode("mbcs")
+                        .replace("\\", "/").rstrip("/"))
+        except Exception:
+            pass
     try:
         cp = int(ctypes.windll.kernel32.GetOEMCP()) if os.name == "nt" else 850
     except Exception:
