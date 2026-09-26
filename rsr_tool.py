@@ -3224,6 +3224,10 @@ class RsrToolAPI:
 
     # ── the DOS line (see the module note on _try_dos_combo) ───────────────
     DOS_MARK = "__DOS__"
+    # A pseudo-switch, never handed to rar: run the 16-bit build with this many
+    # KB of conventional memory taken first (DOSBox LOADFIX). See the note on
+    # free conventional memory where the DOS combos are built.
+    LOWMEM = "@LOADFIX64"
     # How many DOSBox packs may run at once (see the width calculation in
     # _sweep_recipe). Each is one core and its own directory.
     DOS_PARALLEL = 8
@@ -6631,6 +6635,10 @@ class RsrToolAPI:
             # A solid switch in `extra` REPLACES the default one -- rar honours
             # the last it sees, so -s1 beside a trailing -s- is cancelled.
             extra = [str(x) for x in extra if str(x) != self.DOS_MARK]
+            loadfix = ""
+            for x in [x for x in extra if x.startswith("@LOADFIX")]:
+                loadfix = f"LOADFIX -{int(x[8:])} "
+                extra.remove(x)
             if not any(x.startswith("-s") and not x.startswith("-se")
                        for x in extra):
                 args.append("-s" if solid else "-s-")
@@ -6656,7 +6664,7 @@ class RsrToolAPI:
                 if self._is_dos32_exe(ex) and _dos32_number(ex.name) >= 300:
                     args.append("-vn")
             bat = ("@echo off\r\n"
-                   "RAR.EXE a " + " ".join(args) + " PROBE.RAR "
+                   + loadfix + "RAR.EXE a " + " ".join(args) + " PROBE.RAR "
                    + " ".join(names) + " > RARLOG.TXT\r\n"
                    "echo RSRDONE >> RARLOG.TXT\r\n")
             (wdir / "GO.BAT").write_bytes(bat.encode("ascii", "replace"))
@@ -7272,6 +7280,7 @@ class RsrToolAPI:
                                   "corpus-wide prior.", "dim")
                 skipped_vol = []
                 dos_mmf: list = []
+                dos_low: list = []
                 for ex in dos:
                     c = caps.get(ex.name) or {}
                     # 1.51/1.52/1.53/1.40 do not understand -v<N>b, and do not
@@ -7309,6 +7318,35 @@ class RsrToolAPI:
                             combos.append((ex, 1, (self.DOS_MARK, "-s1",
                                                    "-ds") + mm))
                         combos.append((ex, 1, (self.DOS_MARK,) + mm))
+                        # FREE CONVENTIONAL MEMORY is a compression input on
+                        # the 16-bit line: RAR 2.x sizes its match finder from
+                        # it. DOSBox leaves 634 KB free; a real DOS/Win9x box
+                        # with drivers loaded had less, and below ~570 KB the
+                        # same build writes a different stream. Measured on
+                        # Skies_Of_Arcadia_PAL_DC-ECHELON 2026-09-26: disc 1
+                        # is byte-exact with memory free and wrong with 64 KB
+                        # taken; disc 2 is the exact opposite (all of volume
+                        # one identical under LOADFIX -64, diverging at byte
+                        # 11,833 without it -- where the original passes up a
+                        # 6-byte match its smaller tables never saw). Every
+                        # 2.00-2.50 build and -mm diverged at that same byte,
+                        # and DOSBox memsize/XMS/EMS changed nothing. Tested
+                        # 0-448 KB taken: exactly two states (0-48 and
+                        # 64-256), and above 256 rar will not start. DOS32
+                        # uses DPMI memory, so the axis does not apply there.
+                        # Queued right beside the build's ordinary form, not
+                        # at the tail: builds are already in prior order, so
+                        # the group's winning build is tried in BOTH memory
+                        # states before anything else is.
+                        if not self._is_dos32_exe(ex):
+                            if expanded and c.get("s1", True):
+                                dos_low.append(1)
+                                combos.append((ex, 1, (self.DOS_MARK, "-s1",
+                                                       "-ds") + mm
+                                               + (self.LOWMEM,)))
+                            dos_low.append(1)
+                            combos.append((ex, 1, (self.DOS_MARK,) + mm
+                                           + (self.LOWMEM,)))
                     # -mmf, the FORCED multimedia coder, behind everything
                     # else. The Windows sweep has asked for both since the -mm
                     # axis landed; the DOS line only ever asked for -mm, so a
@@ -7333,6 +7371,12 @@ class RsrToolAPI:
                         dos_mmf.append(
                             (ex, 1, (self.DOS_MARK, "-s1", "-ds")
                              + dsw + ("-mmf",)))
+                if dos_low:
+                    self._log(f"    {len(dos_low):,} DOS combo(s) also tried "
+                              "with 64 KB less conventional memory — "
+                              "16-bit RAR sizes its match finder from free "
+                              "memory, and DOSBox has more than a real DOS box "
+                              "did.", "dim")
                 if dos_mmf:
                     combos += dos_mmf
                     self._log(f"    {len(dos_mmf):,} DOS -mmf (forced "
