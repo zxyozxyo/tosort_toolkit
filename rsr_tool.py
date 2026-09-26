@@ -1670,6 +1670,233 @@ def rar4_vol_blocks(vol: Path) -> dict[str, tuple[int, int]]:
     return out
 
 
+def _huff15(lengths):
+    """15-bit lookup table for a canonical MSB-first RAR 2.0 Huffman code:
+    index -> (symbol, code length); length 0 marks an invalid prefix."""
+    look = [(0, 0)] * (1 << 15)
+    code = 0
+    for L in range(1, 16):
+        for sym, ln in enumerate(lengths):
+            if ln == L:
+                pre = code << (15 - L)
+                for i in range(1 << (15 - L)):
+                    look[pre | i] = (sym, L)
+                code += 1
+        code <<= 1
+    return look
+
+
+def rar20_blocks(data: bytes, deadline: float = 0.0):
+    """([audio flag per block], complete) for one RAR 2.0 (unp_ver 20) stream.
+
+    Parses the TOKEN STRUCTURE only, after unrar's Unpack20/ReadTables20 -- no
+    window, no output -- and records whether each block is a multimedia
+    (audio) block. That flag is the one thing a packer's -mm/-mmf choice
+    writes into the archive, measured 2026-09-26 on 2.06/2.50/2.70:
+
+      * plain packing never writes an audio block;
+      * -mm writes one only where rar's analysis chose audio, and with none
+        chosen the output is BYTE-IDENTICAL to plain (3 of 3 cases);
+      * -mmf writes an ordinary first block and then EVERY block audio
+        (68 of 69, 367 of 368, 372 of 373).
+
+    Verified against a reference parser that rebuilds 150,085 source bytes
+    exactly: 18 of 18 archives give identical block lists. ~0.7 MB/s."""
+    NC, DC, RC, BC, MC = 298, 48, 28, 19, 257
+    lbits = (0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5)
+    dbits = (0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,
+             12,13,13,14,14,15,15,16,16,16,16,16,16,16,16,16,16,16,16,16,16)
+    sdbits = (2, 2, 3, 4, 5, 6, 6, 6)
+    nbits = len(data) * 8
+    buf = bytes(data) + b"\0\0\0\0\0"
+    frm = int.from_bytes
+    pos = 0
+    old = [0] * (MC * 4)
+    blocks: list[bool] = []
+    st = {"audio": False, "chan": 1, "cur": 0}
+    tab: dict = {}
+
+    def peek(n):
+        i = pos >> 3
+        return (frm(buf[i:i + 4], "big") >> (32 - (pos & 7) - n)) & ((1 << n) - 1)
+
+    def read_tables():
+        nonlocal pos
+        bf = peek(16)
+        audio = bool(bf & 0x8000)
+        if not bf & 0x4000:
+            old[:] = [0] * len(old)
+        pos += 2
+        if audio:
+            st["chan"] = ((bf >> 12) & 3) + 1
+            if st["cur"] >= st["chan"]:
+                st["cur"] = 0
+            pos += 2
+            size = MC * st["chan"]
+        else:
+            size = NC + DC + RC
+        st["audio"] = audio
+        bl = []
+        for _ in range(BC):
+            bl.append(peek(4))
+            pos += 4
+        bd = _huff15(bl)
+        t = [0] * size
+        i = 0
+        while i < size:
+            n, ln = bd[peek(15)]
+            if not ln:
+                raise ValueError("bad table code")
+            pos += ln
+            if n < 16:
+                t[i] = (n + old[i]) & 15
+                i += 1
+            elif n == 16:
+                c = peek(2) + 3
+                pos += 2
+                while c and i < size:
+                    t[i] = t[i - 1]; i += 1; c -= 1
+            else:
+                if n == 17:
+                    c = peek(3) + 3; pos += 3
+                else:
+                    c = peek(7) + 11; pos += 7
+                while c and i < size:
+                    t[i] = 0; i += 1; c -= 1
+        if audio:
+            tab["MD"] = [_huff15(t[k * MC:(k + 1) * MC])
+                         for k in range(st["chan"])]
+        else:
+            tab["LD"] = _huff15(t[:NC])
+            tab["DD"] = _huff15(t[NC:NC + DC])
+            tab["RD"] = _huff15(t[NC + DC:])
+        old[:size] = t
+        blocks.append(audio)
+
+    try:
+        read_tables()
+        ops = 0
+        while pos < nbits - 64:
+            ops += 1
+            if deadline and not ops & 0xFFFF and time.monotonic() > deadline:
+                return blocks, False
+            if st["audio"]:
+                n, ln = tab["MD"][st["cur"]][peek(15)]
+                if not ln:
+                    raise ValueError("bad audio code")
+                pos += ln
+                if n == 256:
+                    read_tables()
+                else:
+                    st["cur"] = (st["cur"] + 1) % st["chan"]
+                continue
+            n, ln = tab["LD"][peek(15)]
+            if not ln:
+                raise ValueError("bad literal code")
+            pos += ln
+            if n < 256 or n == 256:
+                continue
+            if n > 269:
+                pos += lbits[n - 270]
+                dn, ln = tab["DD"][peek(15)]
+                if not ln:
+                    raise ValueError("bad distance code")
+                pos += ln + dbits[dn]
+            elif n == 269:
+                read_tables()
+            elif n < 261:
+                rn, ln = tab["RD"][peek(15)]
+                if not ln:
+                    raise ValueError("bad length code")
+                pos += ln + lbits[rn]
+            else:
+                pos += sdbits[n - 261]
+    except (ValueError, IndexError, KeyError):
+        return blocks, False
+    return blocks, True
+
+
+def _dos_to_rar_epoch(dos: int) -> float:
+    """The file time that makes rar write this DOS timestamp back.
+
+    rar converts with FileTimeToLocalFileTime, which applies the bias in
+    force NOW rather than the one on that date -- so a February timestamp
+    replayed in summer comes out an hour late unless the CURRENT offset is
+    inverted here. Measured: 0x32539463, 0x2b1e7a3c and 0x5d3a9c9d all
+    round-trip exactly through rar 3.30 this way, where a naive local-time
+    conversion gave 0x32539c63 (one hour off)."""
+    import calendar
+    d, t = dos >> 16, dos & 0xFFFF
+    y, mo, da = (d >> 9) + 1980, (d >> 5) & 15, d & 31
+    h, mi, s = t >> 11, (t >> 5) & 63, (t & 31) * 2
+    utc = calendar.timegm((y, mo, da, h, mi, s, 0, 0, 0))
+    bias = -(time.altzone if time.localtime().tm_isdst > 0 else time.timezone)
+    return utc - bias
+
+
+def _ext_mtime_extra(hdr: bytes, flags: int, nlen: int) -> int:
+    """The part of a RAR 3 file header's modification time that DOS time
+    cannot hold, in 100 ns units: the odd second (+1 s) and the fraction.
+
+    Stored only when the header has EXT_TIME (0x1000); rar writes that field
+    exactly when the time is not a whole even second, so leaving it out of a
+    restored time drops the whole field -- 5 bytes shorter on
+    Dreamcast_DC_VCD_Player-THIEVES-HQ. Layout after unrar's ReadExtTime."""
+    if not flags & 0x1000:
+        return 0
+    try:
+        p = 32 + nlen + (8 if flags & 0x400 else 0)
+        if flags & 0x100:                   # LARGE: high sizes come first
+            p += 8
+        ef = struct.unpack_from("<H", hdr, p)[0]
+        p += 2
+        rmode = ef >> 12                    # mtime is the top nibble
+        if not rmode & 8:
+            return 0
+        count = rmode & 3
+        rem = 0
+        for j in range(count):
+            rem |= hdr[p + j] << ((j + 3 - count) * 8)
+        return rem + (10_000_000 if rmode & 4 else 0)
+    except (struct.error, IndexError):
+        return 0
+
+
+def _srr_dir_times(srr: Path) -> dict:
+    """{dir name: [dos time, attributes]} from the RAR4 directory headers
+    an .srr preserves. An .srr stores each volume's headers back to back with
+    no packed data, so every archive inside is walked header by header."""
+    out = {}
+    try:
+        b = srr.read_bytes()
+    except OSError:
+        return out
+    k = 0
+    while True:
+        k = b.find(b"Rar!\x1a\x07\x00", k)
+        if k < 0:
+            break
+        i = k + 7
+        while i + 7 <= len(b):
+            try:
+                _c, typ, flags, size = struct.unpack_from("<HBHH", b, i)
+            except struct.error:
+                break
+            if size < 7 or typ < 0x72 or typ > 0x7b:
+                break
+            if typ == 0x74 and (flags & 0xE0) == 0xE0 and size >= 32:
+                nlen = struct.unpack_from("<H", b, i + 26)[0]
+                raw = b[i + 32:i + 32 + nlen].split(b"\0")[0]
+                name = raw.decode("utf-8", "replace").replace("\\", "/")
+                out[name.rstrip("/")] = [struct.unpack_from("<I", b, i + 20)[0],
+                                         struct.unpack_from("<I", b, i + 28)[0],
+                                         _ext_mtime_extra(b[i:i + size], flags,
+                                                          nlen)]
+            i += size
+        k += 7
+    return out
+
+
 def rar4_unp_max(vols) -> int:
     """Highest unp_ver over the COMPRESSED file headers of a RAR4 set.
 
@@ -5859,6 +6086,25 @@ class RsrToolAPI:
                       "volume — the sweep asks for it too. Sets whose tail "
                       "survives are swept without it, as before.", "dim")
 
+        mm_ev = None
+        unp_here = rar4_unp_max(vols) if st["format"] == "RAR4" else 0
+        if unp_here and unp_here < 29:
+            t_mm = time.monotonic()
+            mm_ev = self._mm_evidence(meta, blocks, solid)
+            if mm_ev is not None:
+                said = ("AUDIO blocks present — the packer used -mm/-mmf, so "
+                        "those lead and no plain combo can match"
+                        if mm_ev["audio"] else
+                        "no audio block anywhere in the stream — -mm would "
+                        "only repeat each plain combo, so -mm/-mmf are "
+                        "not swept" if mm_ev["complete"] else
+                        "no audio block in the part scanned — -mmf is ruled "
+                        "out (its blocks after the first are all audio); "
+                        "-mm stays in the tail" if mm_ev["no_mmf"] else
+                        "not conclusive — -mm/-mmf queued as before")
+                self._log(f"    multimedia check ({time.monotonic() - t_mm:,.0f}s): "
+                          f"{said}.", "dim")
+
         recipe = None
         budget = getattr(self, "_budget_min", 0)
         self._deadline = None if self._budget_override else (
@@ -5881,6 +6127,7 @@ class RsrToolAPI:
                                         prefix=prefix,
                                         probe_vol=probe_vol,
                                         rr_sectors=sweep_rr,
+                                        mm_ev=mm_ev,
                                         want_vols=len(vols),
                                         unp_max=rar4_unp_max(vols)
                                         if st["format"] == "RAR4" else 0,
@@ -5996,6 +6243,49 @@ class RsrToolAPI:
                        "keep_paths": keep_paths,
                        "locked": arch_locked,
                        "comment": bool(comment)})
+        # A directory entry carries the folder's DOS time and attributes, and
+        # the rebuild creates its folders fresh -- so without these they come
+        # back stamped NOW. The capture never saw that: it verified against
+        # the sweep's own pack, packed from a tree `rar x` had just restored
+        # the original times onto. Three releases captured VERIFIED on
+        # 2026-09-26 then failed every rebuild ("compressed payload differs"
+        # -- the directory header sits after the data). See _restore_dir_times.
+        if dir_names and dirinfos:
+            dts = {}
+            for i in dirinfos:
+                nm = (_oem_name(i, i.flags or 0) or i.filename or "")
+                nm = nm.replace("\\", "/").rstrip("/")
+                try:
+                    y, mo, d, h, mi, s = tuple(i.date_time)[:6]
+                    dos = (((y - 1980) << 25) | (mo << 21) | (d << 16)
+                           | (h << 11) | (mi << 5) | (s // 2))
+                except Exception:
+                    continue
+                extra = 0
+                try:
+                    # The raw header, for the fraction rarfile rounds away.
+                    with open(head, "rb") as fh:
+                        fh.seek(int(i.header_offset))
+                        h7 = fh.read(7)
+                        hsz = struct.unpack_from("<H", h7, 5)[0]
+                        fh.seek(int(i.header_offset))
+                        hb = fh.read(hsz)
+                    hfl = struct.unpack_from("<H", hb, 3)[0]
+                    hnl = struct.unpack_from("<H", hb, 26)[0]
+                    # Only trust it if these ARE that directory's bytes: in a
+                    # volume set the entry can live in a later volume than
+                    # `head`, where the same offset means something else.
+                    if (hb[2] == 0x74 and (hfl & 0xE0) == 0xE0
+                            and getattr(i, "orig_filename", b"")[:hnl]
+                            and hb[32:32 + hnl].split(b"\0")[0]
+                            == bytes(i.orig_filename).split(b"\0")[0]):
+                        extra = _ext_mtime_extra(hb, hfl, hnl)
+                except Exception:
+                    extra = 0
+                if nm:
+                    dts[nm] = [dos, int(getattr(i, "mode", 0) or 0x10), extra]
+            if dts:
+                recipe["dir_times"] = dts
         if len(mgroups) > 1:
             # Only when it means something. A single-group recipe replays
             # through the identical code path with no `groups` key at all, so
@@ -7046,7 +7336,7 @@ class RsrToolAPI:
                       want_vols=0, unp_max=0, expanded=False,
                       host=-1, rr_sectors=-1, dos_only=False,
                       year_before=0, year_after=0,
-                      dirs=(), dirs_first=True) -> dict | None:
+                      dirs=(), dirs_first=True, mm_ev=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -7201,6 +7491,30 @@ class RsrToolAPI:
             mmfit = [c for c in fit if _exe_number(c[0].name) < 300]
             mm = [(e, n, x + ("-mm",)) for e, n, x in mmfit]
             mmf = [(e, n, x + ("-mmf",)) for e, n, x in mmfit]
+            # What the original's own stream says (see _mm_evidence). Each
+            # branch rests on a measured property of the coders, not a guess:
+            if mm_ev and mm_ev.get("audio") and mm:
+                # Plain packing never writes an audio block, so a plain combo
+                # cannot match this archive. -mm/-mmf go FIRST -- after the
+                # prior-led head, which already carries any -mm winner -- and
+                # the plain ones stay behind as a backstop.
+                head, rest = combos[:hot], combos[hot:]
+                combos = head + mm + mmf + rest
+                hot = len(head)
+                mm = mmf = []
+            elif mm_ev and mm_ev.get("complete"):
+                # Every stream parsed to the end and none has an audio block:
+                # -mm with no audio chosen is byte-identical to plain, and
+                # -mmf would have made every block after the first audio.
+                self._log(f"    {len(mm) + len(mmf):,} -mm/-mmf combo(s) not "
+                          "swept: the original has no audio block, so each "
+                          "would only repeat its plain twin.", "dim")
+                mm = mmf = []
+            elif mm_ev and mm_ev.get("no_mmf"):
+                self._log(f"    {len(mmf):,} -mmf combo(s) not swept: the "
+                          "original's second block is not audio, and -mmf "
+                          "makes every block after the first audio.", "dim")
+                mmf = []
             if mm:
                 combos = combos + mm + mmf
                 skipped_mm = len(fit) - len(mmfit)
@@ -7351,7 +7665,13 @@ class RsrToolAPI:
                     # whatever it is asked for.
                     dsw = ((f"-md{dict_kb}",)
                            if self._is_dos32_exe(ex) and dict_kb else ())
-                    for mm in ((), ("-mm",)):
+                    # The original's own stream decides -mm here as it does
+                    # on the Windows side (see _mm_evidence): audio blocks
+                    # mean -mm first, none at all means -mm only repeats plain.
+                    mm_axis = ((("-mm",), ()) if mm_ev and mm_ev.get("audio")
+                               else ((),) if mm_ev and mm_ev.get("complete")
+                               else ((), ("-mm",)))
+                    for mm in mm_axis:
                         mm = dsw + mm
                         if expanded and c.get("s1", True):
                             combos.append((ex, 1, (self.DOS_MARK, "-s1",
@@ -7405,6 +7725,8 @@ class RsrToolAPI:
                     # Last, because it is the rarest and DOS combos are the
                     # expensive ones: a full pack each through DOSBox at
                     # ~0.5 MB/s, with no prefix probe to cut it short.
+                    if mm_ev and (mm_ev.get("complete") or mm_ev.get("no_mmf")):
+                        continue            # -mmf ruled out by the stream
                     dos_mmf.append((ex, 1, (self.DOS_MARK,) + dsw + ("-mmf",)))
                     if expanded and c.get("s1", True):
                         dos_mmf.append(
@@ -9573,8 +9895,44 @@ class RsrToolAPI:
                   f"skeleton, hash-exact.", "ok")
         return True
 
+    def _restore_dir_times(self, recipe: dict, srcdir: Path) -> None:
+        """Give the staged folders the time and attributes the ORIGINAL's
+        directory entries carry, so rar writes those entries back unchanged.
+
+        After every file is staged, because copying a file into a folder
+        moves the folder's own time. From the recipe's `dir_times` when the
+        capture recorded them; for a capture older than that, from the
+        directory headers in the release's own .srr, which holds every header
+        of the original. Measured on Dreamcast_DC_VCD_Player-THIEVES-HQ: its
+        folder entry reads 0x32539463 (2005-02-19 18:35:06) in the .srr and
+        came back as today's date."""
+        dts = recipe.get("dir_times") or {}
+        if not dts:
+            rsr = getattr(self._tl, "rebuild_rsr", None)
+            srr = rsr.with_suffix(".srr") if rsr else None
+            if srr and srr.is_file():
+                dts = _srr_dir_times(srr)
+        n = 0
+        for name, v in dts.items():
+            dos, attr = v[0], v[1]
+            extra = int(v[2]) if len(v) > 2 else 0
+            p = srcdir / name.replace("/", os.sep)
+            if not p.is_dir():
+                continue
+            try:
+                ns = int(_dos_to_rar_epoch(int(dos))) * 10**9 + extra * 100
+                os.utime(p, ns=(ns, ns))
+                _set_win_attrs(p, int(attr) or 0x10)
+                n += 1
+            except Exception:
+                continue
+        if n:
+            self._log(f"    {n} folder time(s) restored from the original's "
+                      "directory entr(y/ies).", "dim")
+
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
         manifest, z = self.read_rsr(rsr)
+        self._tl.rebuild_rsr = rsr
         try:
             rel = manifest.get("release", rsr.stem)
             self._log(f"══ REBUILD {rel} ══", "info")
@@ -9725,6 +10083,8 @@ class RsrToolAPI:
             srcs.append(dst)
         # kept only so a header mismatch can report what was actually staged
         self._staged, self._staged_files = srcs, st["files"]
+        if keep_paths and recipe.get("dirs"):
+            self._restore_dir_times(recipe, srcdir)
 
         comment = None
         if st.get("comment_b64"):
@@ -10894,6 +11254,71 @@ class RsrToolAPI:
             return row is not None
         except Exception:
             return False
+
+    # 2 MB, ~3 s. It runs on every RAR 2.0 set, including the two thirds that
+    # hit on combo one, so it has to be cheap. Measured: in both -mm archives
+    # to hand (Metal_Wolf-MUDS, Puyo_Puyo_DA-KALISTO) the first audio block
+    # sits inside the first 1 MB (blocks 47 and 24); 16 MB cost ~21 s a set.
+    MM_SCAN_BYTES = 2 << 20
+    MM_SCAN_SECONDS = 10
+
+    def _mm_evidence(self, meta: list, blocks: dict, solid: bool) -> dict | None:
+        """What the ORIGINAL's own stream says about -mm / -mmf, or None.
+
+        Reads the compressed bytes of the archive's files (across volumes, in
+        archive order) and parses their block headers with rar20_blocks:
+
+          audio     some block is a multimedia block -> the packer used -mm or
+                    -mmf, and NO plain combo can match
+          no_mmf    a stream has a 2nd block and it is NOT audio -> -mmf is
+                    ruled out (-mmf makes every block after the first audio)
+          complete  every compressed stream was parsed to its end; with
+                    audio False that proves -mm made no difference, so each
+                    -mm combo only repeats its plain twin
+
+        Solid sets: only the first file starts with a table, so only it is
+        parsed and `complete` is claimed only when it is the one compressed
+        file. Anything unreadable returns None -- the sweep then behaves
+        exactly as it always did."""
+        comp = [f for f in meta if int(f.get("method") or 0) != 0
+                and blocks.get(f["name"])]
+        if not comp:
+            return None
+        if solid:
+            comp = comp[:1]
+        audio = no_mmf = False
+        complete = True
+        budget = self.MM_SCAN_BYTES
+        deadline = time.monotonic() + self.MM_SCAN_SECONDS
+        try:
+            for f in comp:
+                if budget <= 0:
+                    complete = False
+                    break
+                want = min(int(f.get("packed_size") or 0), budget)
+                data = bytearray()
+                for vol, off, size in blocks[f["name"]]:
+                    if len(data) >= want:
+                        break
+                    with open(vol, "rb") as fh:
+                        fh.seek(off)
+                        data += fh.read(min(size, want - len(data)))
+                budget -= len(data)
+                bl, done = rar20_blocks(bytes(data), deadline)
+                if len(bl) >= 2 and not bl[1]:
+                    no_mmf = True
+                if any(bl):
+                    audio = True
+                    break
+                if not done or len(data) < int(f.get("packed_size") or 0):
+                    complete = False
+            if solid and len(meta) > 1 and sum(
+                    1 for f in meta if int(f.get("method") or 0)) > 1:
+                complete = False
+        except Exception:
+            return None
+        return {"audio": audio, "no_mmf": no_mmf and not audio,
+                "complete": complete and not audio}
 
     def _era_recipes(self, fmt: str, year: int, unp_max: int,
                      limit: int = 40) -> list[tuple]:
