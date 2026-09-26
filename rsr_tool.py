@@ -6305,7 +6305,8 @@ class RsrToolAPI:
         # release that has priors, which is nearly all of them.
         order: list[tuple[Path, int, tuple]] = []
         seen: set[tuple[str, int, tuple]] = set()
-        for exe_name, mt, sw in self._hot_recipes(fmt, level, grp):
+        for exe_name, mt, sw in self._hot_recipes(fmt, level, grp,
+                                                  year, unp_max):
             ex = by_name.get(exe_name)
             if ex is None:
                 continue
@@ -7115,8 +7116,29 @@ class RsrToolAPI:
             # the axis cover the class rather than a sixth of it.
             s1 = [(e, n, ("-s1", "-ds")) for e, n, x in combos if not x]
             if s1:
-                combos = s1 + combos
-                hot = 0
+                # The PRIORS keep the front. This used to be `s1 + combos`,
+                # which put every -s1 form ahead of the prior-led combos and
+                # zeroed `hot` -- so a release carrying this signature never
+                # got its priors early at all. Measured 2026-09-26 on
+                # Bomberman_Fantasy_Race-ODITY (solid, the signature fired off
+                # a jpg): its winner, 2.70 -mm, was 5th in the era ring and
+                # was still found at combo 1,336, behind 3,542 -s1 forms.
+                # Now: the priors' own -s1 forms, the priors as they are, the
+                # rest's -s1 forms, the rest. Same set, reordered.
+                head, rest = combos[:hot], combos[hot:]
+                seen_c = set()
+                lead = []
+                for c in ([(e, n, ("-s1", "-ds")) for e, n, x in head if not x]
+                          + head):
+                    k = (c[0].name, c[1], tuple(c[2]))
+                    if k not in seen_c:
+                        seen_c.add(k)
+                        lead.append(c)
+                tail = [c for c in ([(e, n, ("-s1", "-ds"))
+                                     for e, n, x in rest if not x] + rest)
+                        if (c[0].name, c[1], tuple(c[2])) not in seen_c]
+                combos = lead + tail
+                hot = len(lead)
                 self._log(f"    a compressed file is no smaller than its "
                           f"input — the packer skipped the store fallback "
                           f"(RAR for Unix does not do it), so {len(s1):,} "
@@ -7279,7 +7301,8 @@ class RsrToolAPI:
                 # than on the Windows side: a DOS combo has no prefix probe,
                 # so every build tried ahead of the right one is a full pack
                 # of the whole set through DOSBox.
-                prior = [n for n, _, _ in self._hot_recipes(fmt, level, grp)]
+                prior = [n for n, _, _ in self._hot_recipes(fmt, level, grp,
+                                                            year, unp_max)]
                 rank = {n: i for i, n in enumerate(prior)}
                 if any(e.name in rank for e in dos):
                     dos = sorted(dos, key=lambda e: (rank.get(e.name, 1 << 20),
@@ -10872,7 +10895,51 @@ class RsrToolAPI:
         except Exception:
             return False
 
-    def _hot_recipes(self, fmt: str, level: int, grp: str) -> list[tuple]:
+    def _era_recipes(self, fmt: str, year: int, unp_max: int,
+                     limit: int = 40) -> list[tuple]:
+        """The corpus's winners FROM THIS RELEASE'S ERA, best first.
+
+        The corpus rings in _hot_recipes rank by raw hits, and raw hits are
+        12,000 modern 3DS/NDS captures -- so for a 2000-era release from a
+        group with little history, every corpus prior is a 3.x/5.x build that
+        cannot write its 2.0 format, _fmt_fits drops them all, and the release
+        falls to the full tail. That is the ~1,390-combo cluster in the store:
+        POPO, APHEX, HAUJOBB, HIRAZIO ... each won at combo ~1,390 on a build
+        and switch set (2.50/2.60/2.70 with -s1/-mm) that other groups of the
+        SAME year had already won with dozens of times.
+
+        Here the hits are pooled across groups but only for builds that existed
+        in [year-6, year+1] and can write this archive's format, keyed on the
+        exact (build, -mt, switches). Measured on the 268 recipes that each took
+        300+ combos: 211 of them rank in this list's top 40, and the combos
+        spent on those sets drop from 269,735 to ~33,160 (88%). Ordering only --
+        everything here is also in the exhaustive sweep."""
+        if not year or not self._db_path.is_file():
+            return []
+        agg: dict = {}
+        try:
+            con = self._db()
+            try:
+                rows = con.execute("SELECT exe, mt, sw, hits FROM recipes "
+                                   "WHERE fmt=? AND mt>=0", (fmt,)).fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return []
+        for exe, mt, sw, hits in rows:
+            y = _exe_year(exe)
+            if not y or not (year - 6 <= y <= year + 1):
+                continue
+            if unp_max and not _fmt_fits(exe, unp_max):
+                continue
+            k = (exe, int(mt), sw or "")
+            agg[k] = agg.get(k, 0) + int(hits or 0)
+        ranked = sorted(agg.items(), key=lambda kv: -kv[1])[:limit]
+        return [(e, m, tuple(x for x in s.split(",") if x))
+                for (e, m, s), _h in ranked]
+
+    def _hot_recipes(self, fmt: str, level: int, grp: str,
+                     year: int = 0, unp_max: int = 0) -> list[tuple]:
         """Known-good (exe, mt, switches) triples, best bet first.
 
         Widening rings, sharpest first: this group at this compression level,
@@ -10897,18 +10964,31 @@ class RsrToolAPI:
                       # format is dropped later by _pack_args.
                       ("grp=? AND mt=-1", (grp,))]
         rings += [("fmt=? AND level=?", (fmt, int(level))), ("fmt=?", (fmt,))]
+        n_group = 3 if grp else 0
+
+        def _take(exe, mt, sw):
+            key = (exe, int(mt), ",".join(sw) if isinstance(sw, tuple) else (sw or ""))
+            if key not in seen:
+                seen.add(key)
+                out.append((exe, int(mt),
+                            sw if isinstance(sw, tuple)
+                            else tuple(x for x in (sw or "").split(",") if x)))
         try:
             con = self._db()
             try:
-                for where, args in rings:
+                for i, (where, args) in enumerate(rings):
+                    if i == n_group and year:
+                        # The era ring: after the group's own history, before
+                        # the raw-hits corpus rings that the modern handhelds
+                        # dominate. See _era_recipes.
+                        con.close()
+                        for e, m, s in self._era_recipes(fmt, year, unp_max):
+                            _take(e, m, s)
+                        con = self._db()
                     for exe, mt, sw in con.execute(
                             f"SELECT exe, mt, sw FROM recipes WHERE {where} "
                             "ORDER BY hits DESC, last_used DESC LIMIT 24", args):
-                        if (exe, mt, sw or "") not in seen:
-                            seen.add((exe, mt, sw or ""))
-                            out.append((exe, int(mt),
-                                        tuple(x for x in (sw or "").split(",")
-                                              if x)))
+                        _take(exe, mt, sw)
             finally:
                 con.close()
         except Exception:
