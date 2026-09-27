@@ -2090,19 +2090,42 @@ def rar2_rr_data(prot: bytes, sectors: int) -> tuple[bytes, int]:
     return bytes(table) + b"".join(x.to_bytes(512, "little") for x in par), nb
 
 
+def _newsub_name(b: bytes, off: int) -> bytes:
+    """The name of a RAR 3 NEWSUB (0x7A) block -- "AV", "RR", "CMT" ..."""
+    try:
+        nl = struct.unpack_from("<H", b, off + 26)[0]
+    except struct.error:
+        return b""
+    return bytes(b[off + 32:off + 32 + nl])
+
+
 def rar2_av_block(path) -> bytes | None:
-    """The AV (authenticity, 0x79) block of a RAR 2.x volume, header and all."""
+    """The AV (authenticity) block of a RAR4 volume, header and all: the 0x79
+    block of the 2.x line, or the "AV" NEWSUB (0x7A) that 3.x writes."""
     try:
         b = Path(path).read_bytes()
     except OSError:
         return None
     for off, typ, _f, size, add in _rar4_walk(b):
-        if typ == 0x79:
+        if typ == 0x79 or (typ == 0x7A and _newsub_name(b, off) == b"AV"):
             return b[off:off + size + add]
     return None
 
 
-def rar2_insert_av(vol: bytes, av: bytes) -> bytes:
+def rar4_end_block(path) -> bytes | None:
+    """A RAR4 volume's end-of-archive block, header and all."""
+    try:
+        b = Path(path).read_bytes()
+    except OSError:
+        return None
+    last = None
+    for off, typ, _f, size, add in _rar4_walk(b):
+        if typ == 0x7B:
+            last = b[off:off + size + add]
+    return last
+
+
+def rar2_insert_av(vol: bytes, av: bytes, end: bytes | None = None) -> bytes:
     """Put an original AV block back into a replayed RAR 2.x volume.
 
     An AV block is written only by a REGISTERED rar holding the group's own
@@ -2112,9 +2135,19 @@ def rar2_insert_av(vol: bytes, av: bytes) -> bytes:
     (rar2_rr_data) and its header rewritten. With no record it goes before
     the end block."""
     blocks = list(_rar4_walk(vol))
-    rr = next(((o, sz, ad) for o, t, _f, sz, ad in blocks if t == 0x78), None)
+    rr = next(((o, sz, ad) for o, t, _f, sz, ad in blocks
+               if t == 0x78 or (t == 0x7A and _newsub_name(vol, o) == b"RR")),
+              None)
     at = rr[0] if rr else next((o for o, t, _f, _s, _a in blocks if t == 0x7B),
                                len(vol))
+    if end is not None:
+        # RAR 3's AV writer also pads the END block (106 B on Net_Vs_Hanafuda
+        # -SOULDC, against 7 from an unregistered build). Carried like the
+        # AV block itself; everything after the record is that block.
+        eo = next((o for o, t, _f, _s, _a in reversed(blocks) if t == 0x7B),
+                  None)
+        if eo is not None:
+            vol = vol[:eo] + end
     # The main header points at the AV block (PosAV, u32 at +9 of the 13-byte
     # 2.x main header), so set it and re-checksum that header -- before the
     # record is recomputed, because the record protects it too. Measured on
@@ -2133,10 +2166,22 @@ def rar2_insert_av(vol: bytes, av: bytes) -> bytes:
     off, size, add = rr
     prefix = vol[:off] + av
     hdr = bytearray(vol[off:off + size])
-    sectors = struct.unpack_from("<H", hdr, 12)[0]
-    data, nb = rar2_rr_data(prefix, sectors)
-    struct.pack_into("<I", hdr, 7, len(data))
-    struct.pack_into("<I", hdr, 14, nb)
+    if hdr[2] == 0x7A:
+        # RAR 3's record rides in an "RR" NEWSUB: "Protect+", u32 sectors,
+        # u64 block count, closing the header; the data is the same table +
+        # parity as 2.x (measured byte-identical on Net_Vs_Hanafuda-SOULDC).
+        # Its data CRC and time are left to the delta.
+        sectors = struct.unpack_from("<I", hdr, size - 12)[0]
+        data, nb = rar2_rr_data(prefix, sectors)
+        struct.pack_into("<I", hdr, 7, len(data))
+        struct.pack_into("<I", hdr, 11, len(data))
+        struct.pack_into("<I", hdr, 16, zlib.crc32(data) & 0xFFFFFFFF)
+        struct.pack_into("<Q", hdr, size - 8, nb)
+    else:
+        sectors = struct.unpack_from("<H", hdr, 12)[0]
+        data, nb = rar2_rr_data(prefix, sectors)
+        struct.pack_into("<I", hdr, 7, len(data))
+        struct.pack_into("<I", hdr, 14, nb)
     struct.pack_into("<H", hdr, 0, zlib.crc32(bytes(hdr[2:])) & 0xFFFF)
     return prefix + bytes(hdr) + data + vol[off + size + add:]
 
@@ -6337,6 +6382,13 @@ class RsrToolAPI:
         # RAR 2.x writes none and 3.00+ always does. Read once here and passed
         # down as-is -- END_UNKNOWN is the only "do not check" value.
         want_end = end_block_sig(vols[0]) if vols[0].is_file() else END_UNKNOWN
+        # An AV-signed original's end block is the SIGNER's (RAR 3 pads it to
+        # 106 B on Net_Vs_Hanafuda-SOULDC) -- no unregistered build writes it,
+        # so judging on it rejected the one build that makes the streams,
+        # 3.00b2, before it was ever packed. The verify re-inserts it.
+        if (want_end != END_UNKNOWN and vols[0].is_file()
+                and rar4_av_owner(vols[0]) is not None):
+            want_end = END_UNKNOWN
         want_ext = header_exttime(vols[0]) if st["format"] == "RAR4" else None
         # Four bytes of header no build in the pack writes. Worth saying out
         # loud, because in a volumed set it moves every split point and the
@@ -7750,23 +7802,27 @@ class RsrToolAPI:
                 return False
             head = self._probe_head(wdir) or wdir / "probe.rar"
             verdict = self._prefix_verdict(head, prefix)
-            bad = (verdict is False
-                   or (not synthetic and end_sig != END_UNKNOWN
-                       and end_block_sig(head) != end_sig)
-                   or (not synthetic and hdr_ext is not None
-                       and header_exttime(head) != hdr_ext))
+            # The reason is decided HERE, while the probe is still on disk.
+            # It used to be re-derived after the files below were deleted, so
+            # end_block_sig read nothing and an end-block mismatch was
+            # reported as "the header timestamp did not match" -- which sent
+            # Net_Vs_Hanafuda-SOULDC's diagnosis the wrong way.
+            why = None
+            if verdict is False:
+                why = self.PREFIX_DIVERGED
+            elif (not synthetic and end_sig != END_UNKNOWN
+                    and end_block_sig(head) != end_sig):
+                why = "the end block did not match"
+            elif (not synthetic and hdr_ext is not None
+                    and header_exttime(head) != hdr_ext):
+                why = "the header timestamp did not match"
             for junk in wdir.iterdir():
                 try:
                     junk.unlink()
                 except OSError:
                     pass
-            if bad:
-                self._tally_reject(
-                    self.PREFIX_DIVERGED if verdict is False
-                    else "the end block did not match"
-                    if (end_sig != END_UNKNOWN
-                        and end_block_sig(head) != end_sig)
-                    else "the header timestamp did not match")
+            if why:
+                self._tally_reject(why)
                 return False
 
         if not all(self._run(c, timeout=pack_timeout,
@@ -9024,6 +9080,7 @@ class RsrToolAPI:
         it and compare. Returns ('exact'|'delta'|'none', volume records,
         {path-in-rsr: patch bytes})."""
         produced = None
+        sweep_exe = recipe.get("exe")
         # Record the folder form the sweep packed with, so the rebuild replays
         # the same one -- a recipe with folders and no form replays the old
         # 'given' way, which is what every capture before this was made with.
@@ -9064,7 +9121,15 @@ class RsrToolAPI:
         # to whole sectors — so a set can sit between two percentages. If the
         # lengths come out wrong, walk the neighbours rather than throwing away
         # a recipe whose streams were all byte-exact.
-        if produced and recipe.get("rr_pct") and not st["byte_split"]:
+        # An AV-signed original cannot come out the right SIZE until its
+        # signature blocks are back in, so the recovery-record walk below
+        # would pack up to 14 whole sets hunting a size that is not there
+        # (Net_Vs_Hanafuda-SOULDC: 700 MB each). The AV fallback further
+        # down does its own record handling; go straight to it.
+        av_signed = (st["format"] == "RAR4" and not st["byte_split"]
+                     and bool(vols) and rar2_av_block(vols[0]) is not None)
+        if (produced and recipe.get("rr_pct") and not st["byte_split"]
+                and not av_signed):
             want = sum(v.stat().st_size for v in vols)
             if sum(p.stat().st_size for p in produced) != want:
                 # The sweep matches on STREAMS, and builds of one version
@@ -9252,7 +9317,15 @@ class RsrToolAPI:
                     produced, verdict, volmeta, deltas, rr_maps = \
                         alt, v2, m2, d2, r2
                     break
-        if (verdict == "none" and st["format"] == "RAR4"
+        # On a SIGNED original a plain delta can succeed too -- the patch
+        # simply swallows the signature, the shifted boundaries and every
+        # volume's recovery record: Net_Vs_Hanafuda-SOULDC verified that way
+        # at 3.4 MB (200 KB a volume). So there the AV path competes, and the
+        # smaller patch wins.
+        base_delta = (sum(len(x) for x in deltas.values())
+                      if verdict == "delta" else None)
+        if ((verdict == "none" or (av_signed and verdict == "delta"))
+                and st["format"] == "RAR4"
                 and not st["byte_split"] and not recipe.get("av_size")):
             # AUTHENTICITY blocks. A registered rar with the group's AV key
             # writes a 0x79 block into every volume; no build here can, so
@@ -9262,6 +9335,14 @@ class RsrToolAPI:
             # volumes that much smaller, put the original blocks back and
             # recompute the recovery record they sit under.
             avs = [rar2_av_block(v) for v in vols]
+            # RAR 3 signs with an "AV" NEWSUB and pads the end block too, so
+            # those travel with it; the replay's own end block is smaller by
+            # a build-dependent amount (7 B from 3.00, 20 from a build that
+            # writes the volume number), tried below.
+            ends = ([rar4_end_block(v) for v in vols]
+                    if avs and avs[0] and avs[0][2] == 0x7A else [])
+            if ends and not all(ends):
+                ends = []
             if all(avs) and len({len(a) for a in avs}) == 1:
                 size_av = len(avs[0])
                 self._log(f"    the original carries an AV (authenticity) block "
@@ -9274,6 +9355,11 @@ class RsrToolAPI:
                 # the sweep chose 2.70b4, whose default record is 307
                 # sectors; the original's 237 full / 157 last is 2.80's.
                 builds = [recipe["exe"]]
+                if sweep_exe and sweep_exe != recipe["exe"]:
+                    # The recovery-record walk above may have moved the recipe
+                    # to a sibling while hunting a size the AV block, not the
+                    # record, was throwing off. The sweep's build comes first.
+                    builds.insert(0, sweep_exe)
                 if int(recipe.get("level") or 0) == 0:
                     fams = {}
                     for e in self._pack_exes():
@@ -9284,20 +9370,25 @@ class RsrToolAPI:
                                if b != recipe["exe"]]
                 tries = []
                 for b in builds:
-                    for pad in (2, 0):
-                        tries.append((b, pad, False))
-                        if b == recipe["exe"] and recipe.get("rr_sectors"):
-                            tries.append((b, pad, True))
-                for ti, (b, pad, exact) in enumerate(tries[:16]):
+                    for e_own in ((7, 20) if ends else (None,)):
+                        for pad in (2, 0):
+                            tries.append((b, pad, False, e_own))
+                            if b == recipe["exe"] and recipe.get("rr_sectors"):
+                                tries.append((b, pad, True, e_own))
+                for ti, (b, pad, exact, e_own) in enumerate(tries[:24]):
+                    extra_end = (len(ends[0]) - e_own) if ends else 0
                     cand = dict(recipe, exe=b, version=_exe_label(b),
-                                av_size=size_av, av_pad=pad, rr_exact=exact)
+                                av_size=size_av + extra_end, av_pad=pad,
+                                rr_exact=exact)
                     alt = self._replay(cand, src_files, work / f"av{ti}",
                                        comment, st["format"], base=base)
                     if not alt or len(alt) != len(vols):
                         continue
                     try:
-                        for pa, a in zip(alt, avs):
-                            pa.write_bytes(rar2_insert_av(pa.read_bytes(), a))
+                        for vi, (pa, a) in enumerate(zip(alt, avs)):
+                            pa.write_bytes(rar2_insert_av(
+                                pa.read_bytes(), a,
+                                ends[vi] if ends else None))
                     except Exception:
                         continue
                     if any(pa.stat().st_size != v.stat().st_size
@@ -9306,16 +9397,24 @@ class RsrToolAPI:
                     v2, m2, d2, r2 = _compare(alt)
                     if v2 == "none":
                         continue
+                    if (base_delta is not None
+                            and sum(len(x) for x in d2.values()) >= base_delta):
+                        continue
                     self._log(f"    with the AV blocks restored the replay is "
                               f"{v2} ({_exe_label(b)}, "
                               f"{'-rr' + str(recipe.get('rr_sectors')) if exact else 'default -rr'}).",
                               "ok")
-                    recipe.update(exe=b, version=_exe_label(b), av_size=size_av,
+                    recipe.update(exe=b, version=_exe_label(b),
+                                  av_size=size_av + extra_end,
                                   av_pad=pad, rr_exact=exact)
                     for idx, a in enumerate(avs):
                         key = f"av/{si}_{idx:04d}.bin"
                         d2[key] = a
                         m2[idx]["av"] = key
+                        if ends:
+                            ekey = f"av/{si}_{idx:04d}_end.bin"
+                            d2[ekey] = ends[idx]
+                            m2[idx]["av_end"] = ekey
                     produced, verdict, volmeta, deltas, rr_maps = \
                         alt, v2, m2, d2, r2
                     break
@@ -10858,7 +10957,9 @@ class RsrToolAPI:
         for p, v in zip(produced, vols):
             data = p.read_bytes()
             if v.get("av"):
-                data = rar2_insert_av(data, z.read(v["av"]))
+                data = rar2_insert_av(data, z.read(v["av"]),
+                                      z.read(v["av_end"]) if v.get("av_end")
+                                      else None)
             if v.get("flips"):
                 data = apply_flips(data, v["flips"])
             if v.get("delta"):
