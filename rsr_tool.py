@@ -6394,6 +6394,33 @@ class RsrToolAPI:
         # loud, because in a volumed set it moves every split point and the
         # replay comes back different in every volume for no reason the recipe
         # can show — but it is a DELTA, not a wall, so do not refuse it.
+        # Names this Windows cannot SAY. A pre-Unicode rar opens files by
+        # their ANSI name, and even a Unicode one writes the header's OEM
+        # half in the local code page -- so a name packed on a Japanese
+        # system (Close_To_Inori-IND's folder is "(DC99min)CloseTo～祈りの丘～",
+        # Kaitou_Apricot's mp3s, Mizuiro's music CD) can never be written back
+        # here. Every probe died instantly and it was recorded as a wall.
+        foreign = []
+        for nm in list(order) + list(dir_names):
+            try:
+                str(nm).encode("mbcs", "strict")
+            except UnicodeEncodeError:
+                foreign.append(str(nm))
+            except LookupError:
+                break
+        if foreign and st["format"] == "RAR4":
+            import locale
+            cp = locale.getpreferredencoding(False)
+            self._log(f"    ✗ {len(foreign)} packed name(s) cannot be written in "
+                      f"this system's code page ({cp}) — e.g. "
+                      f"{foreign[0][:60]!r}. They were packed on a system "
+                      "with a different locale (usually Japanese, cp932); no "
+                      "build can reproduce them here. Running the scan under "
+                      "that locale (e.g. Locale Emulator) is the way through.",
+                      "err")
+            return {"ok": False,
+                    "error": f"names need a non-{cp} code page "
+                             f"({len(foreign)} name(s)) — locale, not a wall"}
         uni = unicode_named_ascii(vols[0])
         if uni:
             self._log(f"    {uni[0]} carries the Unicode-name flag for a plain "
