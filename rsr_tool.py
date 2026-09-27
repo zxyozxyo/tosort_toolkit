@@ -1072,6 +1072,71 @@ def new_numbering(head: Path) -> bool:
     return bool(int.from_bytes(data[10:12], "little") & 0x0010)
 
 
+CMDLINE_MAX = 30000
+
+# The most packed data a combo may miss and still be handed to the verifying
+# replay as a near miss (see _near_miss_recipe).
+NEAR_MISS_BYTES = 64 << 10
+
+
+def _inline_dirs(names: list, dirs) -> list:
+    """Each TOP-LEVEL folder named where its first file falls, in place of
+    the files inside it (see _pack_cmds' 'inline' form)."""
+    tops = {Path(d.replace("\\", "/")).parts[0] for d in dirs}
+    seen_t, inl = set(), []
+    for nm in names:
+        parts = Path(str(nm).replace("\\", "/")).parts
+        top = parts[0] if parts else nm
+        if top in tops and len(parts) > 1:
+            if top not in seen_t:
+                seen_t.add(top)
+                inl.append(top)
+        else:
+            inl.append(nm)
+    return inl + sorted(t for t in tops if t not in seen_t)
+
+
+def _names_or_listfile(names: list, lst: Path, used: int) -> list:
+    """The names themselves, or ["@list"] when they would not fit.
+
+    Windows caps a command line at 32,767 characters and CreateProcess simply
+    refuses anything longer -- so an archive of many files under a long
+    folder name could never be packed at all. The_Ultimate_Dreamcast_NFO_
+    Release_File_Collection-bETONGENSBARN: 839 files and 145 folders, each
+    behind a 65-character folder name, about 100 KB of arguments; every one
+    of 3,548 combos "failed before it could be judged" and it was recorded
+    as a wall. A list file names the same things in the same order, and every
+    rar since 1.x reads one. Written in the ANSI code page an old console rar
+    expects; UTF-16 with a BOM only when a name cannot be said in it."""
+    if used + sum(len(str(n)) + 3 for n in names) <= CMDLINE_MAX:
+        return names
+    text = "\r\n".join(str(n) for n in names) + "\r\n"
+    try:
+        data = text.encode("mbcs", errors="strict")
+    except (UnicodeEncodeError, LookupError):
+        data = b"\xff\xfe" + text.encode("utf-16-le")
+    lst.parent.mkdir(parents=True, exist_ok=True)
+    lst.write_bytes(data)
+    return ["@" + str(lst)]
+
+
+def apply_flips(data: bytes, flips) -> bytes:
+    """XOR each [offset, mask] into `data` -- the bits the original's packer
+    flipped in memory (see _heal_source)."""
+    b = bytearray(data)
+    for off, mask in flips:
+        if 0 <= int(off) < len(b):
+            b[int(off)] ^= int(mask)
+    return bytes(b)
+
+
+def shadow_names(count: int, newnum: bool = False) -> list[str]:
+    """The names shadow_set gives a set's volumes, in order."""
+    if newnum:
+        return [f"shadow.part{i:02d}.rar" for i in range(1, count + 1)]
+    return ["shadow.rar"] + [f"shadow.r{i:02d}" for i in range(count - 1)]
+
+
 def shadow_set(volumes: list[Path], work: Path, byte_split: bool,
                newnum: bool = False) -> Path:
     """A read-only stand-in for the set that rarfile can walk.
@@ -1089,11 +1154,7 @@ def shadow_set(volumes: list[Path], work: Path, byte_split: bool,
                 with open(v, "rb") as f:
                     shutil.copyfileobj(f, out, 1 << 20)
         return joined
-    if newnum:
-        names = [f"shadow.part{i:02d}.rar" for i in range(1, len(volumes) + 1)]
-    else:
-        names = ["shadow.rar"] + [f"shadow.r{i:02d}"
-                                  for i in range(len(volumes) - 1)]
+    names = shadow_names(len(volumes), newnum)
     for src, nm in zip(volumes, names):
         dst = work / nm
         if dst.exists():
@@ -1834,6 +1895,32 @@ def _dos_to_rar_epoch(dos: int) -> float:
     return utc - bias
 
 
+def _now_bias_build(exe_name: str) -> bool:
+    """Does this build turn a file's time into a RAR4 DOS time with the
+    daylight-saving offset in force NOW instead of the one on the file's
+    date? Measured 2026-09-27 on every build in the pack, a January and a
+    July file packed in BST: 2.00 through 5.01 write the January one an hour
+    late (13:00 for 12:00); 5.10 and later get both right, and RAR5 stores
+    UTC. So a capture made in summer and a rebuild made in winter disagree
+    about every file from the other half of the year."""
+    n = _exe_number(exe_name)
+    return 0 < n < 510
+
+
+def _now_bias_shift_ns(epoch_ns: int) -> int:
+    """What to add to a file's TRUE time so a _now_bias_build writes the
+    DOS time that date really had: its offset on that date minus the offset
+    now. Zero whenever the two agree."""
+    try:
+        then = time.localtime(epoch_ns / 1e9).tm_isdst > 0
+    except (OverflowError, OSError, ValueError):
+        return 0
+    now = time.localtime().tm_isdst > 0
+    b_then = -(time.altzone if then else time.timezone)
+    b_now = -(time.altzone if now else time.timezone)
+    return (b_then - b_now) * 10**9
+
+
 def _ext_mtime_extra(hdr: bytes, flags: int, nlen: int) -> int:
     """The part of a RAR 3 file header's modification time that DOS time
     cannot hold, in 100 ns units: the odd second (+1 s) and the fraction.
@@ -1910,6 +1997,76 @@ def _rar4_walk(b: bytes):
         add = struct.unpack_from("<I", b, i + 7)[0] if flags & 0x8000 else 0
         yield i, typ, flags, size, add
         i += size + add
+
+
+_CRC_T = []
+for _i in range(256):
+    _c = _i
+    for _k in range(8):
+        _c = (_c >> 1) ^ 0xEDB88320 if _c & 1 else _c >> 1
+    _CRC_T.append(_c)
+_CRC_TOP = {_CRC_T[_i] >> 24: _i for _i in range(256)}
+_CRC_SEED = {_CRC_T[1 << _b]: _b for _b in range(8)}
+
+
+def crc32_single_bit(data: bytes, stored: int):
+    """(byte offset, mask) of the ONE flipped bit that turns crc32(data) into
+    `stored`, "clean" when they already agree, None when no single bit does.
+
+    CRC32 is linear: flipping bit b of the byte n bytes before the end changes
+    the CRC by A^n T[1<<b], A being "one more zero byte". So walk A^-1 from the
+    syndrome and stop on one of the 8 single-bit seeds -- one register step per
+    byte, 20 MB in a few seconds, instead of re-hashing 160 million
+    candidates. A random syndrome lands in range with odds len*8 / 2^32
+    (~4% for 20 MB), so a hit is a CANDIDATE: the caller proves it by
+    extracting."""
+    S = (zlib.crc32(data) ^ stored) & 0xFFFFFFFF
+    if S == 0:
+        return "clean"
+    L = len(data)
+    v = S
+    seed, top, T = _CRC_SEED, _CRC_TOP, _CRC_T
+    for n in range(L):
+        b = seed.get(v)
+        if b is not None:
+            return (L - 1 - n, 1 << b)
+        i = top[v >> 24]
+        v = (((v ^ T[i]) << 8) & 0xFFFFFFFF) | i
+    return None
+
+
+def rar4_part_crcs(vols) -> tuple[int, list]:
+    """(parts that check clean, [(volume index, file offset, mask | None)]).
+
+    A Windows rar writes, into the header of every part of a split file that
+    CONTINUES in the next volume, the CRC32 of that part's packed bytes --
+    which is how unrar can say "packed data checksum error in volume .r09".
+    It does so in the 2.0 format too (Power_Jet_Racing-JADE, unp_ver 20). The
+    DOS line writes 0xFFFFFFFF there instead (Hotspring_Mahjong-HOOLIGANS),
+    which is no checksum and is skipped. The final part carries the whole
+    file's CRC and is not a packed checksum at all."""
+    clean, bad = 0, []
+    for idx, v in enumerate(vols):
+        try:
+            if Path(v).stat().st_size > (512 << 20):
+                continue
+            b = Path(v).read_bytes()
+        except OSError:
+            continue
+        for off, typ, fl, size, add in _rar4_walk(b):
+            if (typ != 0x74 or not fl & 0x02 or fl & 0x100 or not add
+                    or off + 32 > len(b)):
+                continue
+            stored = struct.unpack_from("<I", b, off + 16)[0]
+            if stored == 0xFFFFFFFF:
+                continue
+            r = crc32_single_bit(b[off + size:off + size + add], stored)
+            if r == "clean":
+                clean += 1
+            else:
+                bad.append((idx, off + size + r[0], r[1]) if r else
+                           (idx, None, None))
+    return clean, bad
 
 
 def rar2_rr_data(prot: bytes, sectors: int) -> tuple[bytes, int]:
@@ -5980,6 +6137,25 @@ class RsrToolAPI:
         # non-clean exit as a failure in its own right.
         short = [f["name"] for f, p in zip(meta, src_files)
                  if not p.is_file() or p.stat().st_size != (f["size"] or 0)]
+        healed = None
+        if ((short or not ok_x) and st["format"] == "RAR4"
+                and not st["byte_split"] and len(vols) > 1
+                and not (self._skip.is_set() or self._stop.is_set())):
+            healed = self._heal_source(vols, head, newnum, srcdir, exes, meta)
+            if healed:
+                short = [f["name"] for f, p in zip(meta, src_files)
+                         if not p.is_file() or p.stat().st_size != (f["size"] or 0)]
+                ok_x = not short
+                if healed.get("flips"):
+                    # The shadow volumes now hold the repaired bytes; the
+                    # streams the sweep compares against are read from them.
+                    try:
+                        blocks = packed_blocks(head)
+                        targets = {f["name"]: stream_digest(blocks[f["name"]])
+                                   for f in meta if f["name"] in blocks}
+                    except Exception as e:
+                        return {"ok": False,
+                                "error": f"cannot read packed blocks: {e}"}
         if short or not ok_x:
             if self._skip.is_set() or self._stop.is_set():
                 return {"ok": False, "error": "skipped"}
@@ -6300,6 +6476,9 @@ class RsrToolAPI:
                 break
             if self._budget_hit:
                 break
+        if (not recipe and not self._budget_hit
+                and not (self._skip.is_set() or self._stop.is_set())):
+            recipe = self._near_miss_recipe(meta, targets, dir_send, dirs_first)
         if not recipe:
             if self._budget_hit:
                 return {"ok": False, "error": "time budget exceeded",
@@ -6374,7 +6553,10 @@ class RsrToolAPI:
                   f"{_mt_label(recipe['exe'], recipe['mt'])} "
                   f"(-m{level} -md{recipe['dict_kb']}KB {solid_sw}"
                   + (f" {rest_sw}" if rest_sw else "")
-                  + f") — all {len(targets)} stream(s) byte-exact.", "ok")
+                  + (f") — {len(targets) - recipe['near_miss']} of "
+                     f"{len(targets)} stream(s) byte-exact (near miss)."
+                     if recipe.get("near_miss") else
+                     f") — all {len(targets)} stream(s) byte-exact."), "ok")
 
         # ── replay the whole set and byte-compare every volume ────────────
         # A byte-split set is ONE archive chopped up afterwards, so the replay
@@ -6403,12 +6585,41 @@ class RsrToolAPI:
         # -- the directory header sits after the data). See _restore_dir_times.
         if cap_dts:
             recipe["dir_times"] = cap_dts
+        if healed and healed.get("flips"):
+            recipe["flips"] = [list(x) for x in healed["flips"]]
         if len(mgroups) > 1:
             # Only when it means something. A single-group recipe replays
             # through the identical code path with no `groups` key at all, so
             # every .rsr written before today still rebuilds unchanged.
             recipe["groups"] = [list(g) for g in mgroups]
         packed_dir = recipe.pop("_packed", None)
+        # FILE TIMES, as the recipe's build will read them. `rar x` restored
+        # each file's true time; 2.00-5.01 write it back with today's DST
+        # offset, so in summer every winter-dated file came out an hour late
+        # and the difference went into a delta that only matched in the
+        # season it was made -- The_Ultimate_Dreamcast_NFO-BETONGENSBARN:
+        # 510 of 986 headers, nothing else. Shift them for this build, and
+        # record that the rebuild must do the same.
+        if (st["format"] == "RAR4" and _now_bias_build(recipe.get("exe", ""))
+                and self.DOS_MARK not in [str(x) for x in
+                                          (recipe.get("mc") or [])]):
+            recipe["ftimes"] = "now_bias"
+            moved = 0
+            for f, sp in zip(meta, src_files):
+                mt = f.get("mtime_ns")
+                d = _now_bias_shift_ns(mt) if mt else 0
+                if d:
+                    try:
+                        os.utime(sp, ns=(mt + d, mt + d))
+                        moved += 1
+                    except OSError:
+                        pass
+            if moved:
+                self._log(f"    {moved} file time(s) from the other side of "
+                          f"daylight saving shifted for "
+                          f"{_exe_label(recipe['exe'])}, which converts with "
+                          "the offset in force today.", "dim")
+                packed_dir = None     # the sweep packed the unshifted times
         verify, volmeta, deltas = self._verify_replay(
             recipe, src_files, vols, work, comment, st, si,
             base=srcdir if keep_paths else None, packed=packed_dir)
@@ -6450,6 +6661,127 @@ class RsrToolAPI:
                 "volumes": volmeta,
             },
         }
+
+    def _heal_source(self, vols, head: Path, newnum: bool, srcdir: Path,
+                     exes, meta) -> dict | None:
+        """A set that fails its OWN checksums, though its .sfv agrees -- the
+        damage was shipped. Two shapes can still be captured byte-exact:
+
+        FLIPPED BIT. The packer's machine flipped one bit of the compressed
+        data after rar had checksummed it (bad RAM, 2001). Power_Jet_Racing
+        -JADE: one bit of .r09, and its recovery record agrees with the
+        damage, so `rar r` changes nothing. The per-part CRC pins the bit
+        (crc32_single_bit); the SHADOW copy is repaired -- never the original
+        -- the set then extracts clean, is captured from the true content,
+        and the recipe carries the flip so the rebuild puts it back.
+
+        DAMAGED INPUT. Every per-part packed CRC is intact, yet the file's own
+        CRC fails: rar compressed bytes that were already wrong (Scumm_Classics
+        -ICARUZ, Tomb_Raider_5-SEGAMAX). The stream is a faithful packing of
+        those bytes, so they ARE the content: extract keeping the broken file,
+        and the replay differs only in the CRC field of the last header.
+
+        None when neither applies, or the set gives no evidence either way --
+        a 2.0-format set carries no per-part CRCs, and damaged packed data
+        that is more than one bit cannot be reproduced by any pack."""
+        clean, bad = rar4_part_crcs(vols)
+        if not clean and not bad:
+            return None
+        unsolved = [b for b in bad if b[1] is None]
+        if unsolved:
+            self._log(f"    the packed data of {len(unsolved)} volume(s) "
+                      f"({', '.join(Path(vols[i]).name for i, _o, _m in unsolved[:3])}) "
+                      "fails its own checksum and no single flipped bit "
+                      "explains it — damaged before the .sfv was made, and "
+                      "not reproducible by any pack.", "err")
+            return None
+        flips = [(i, o, m) for i, o, m in bad]
+        out: dict = {"flips": flips}
+        if flips:
+            names = shadow_names(len(vols), newnum)
+            for i, o, m in flips:
+                dst = head.parent / names[i]
+                data = apply_flips(Path(vols[i]).read_bytes(), [[o, m]])
+                try:
+                    dst.unlink()        # a hardlink to the ORIGINAL
+                except OSError:
+                    pass
+                dst.write_bytes(data)
+                self._log(f"    {Path(vols[i]).name}: one bit flipped at byte "
+                          f"{o:,} (mask 0x{m:02X}) — the packed-data CRC pins "
+                          "it; repairing the working copy, the recipe will "
+                          "put it back.", "dim")
+        ok = flips and self._run([str(exes[-1]), "x", "-y", "-o+", str(head),
+                                  str(srcdir) + os.sep], timeout=3600,
+                                 heartbeat="re-extracting the repaired set")
+        if ok and all((srcdir / f["name"]).is_file()
+                      and (srcdir / f["name"]).stat().st_size == (f["size"] or 0)
+                      for f in meta):
+            self._log(f"    ✓ with {len(flips)} bit(s) restored the set extracts "
+                      "clean — capturing from the true content.", "ok")
+            return out
+        # Still failing. Only when the packed data itself is proven intact is
+        # the extracted-with-errors file the real input.
+        ok = self._run([str(exes[-1]), "x", "-y", "-o+", "-kb", str(head),
+                        str(srcdir) + os.sep], timeout=3600,
+                       heartbeat="extracting, keeping the damaged file")
+        if not all((srcdir / f["name"]).is_file()
+                   and (srcdir / f["name"]).stat().st_size == (f["size"] or 0)
+                   for f in meta):
+            return None
+        changed = []
+        for f in meta:
+            got = _file_crc32(srcdir / f["name"])
+            if got != f["crc32"]:
+                f["hdr_crc32"] = f["crc32"]
+                f["crc32"] = got
+                f["damaged"] = True
+                changed.append(f["name"])
+        if not changed:
+            return None
+        self._log(f"    every packed part checks clean, yet {', '.join(changed[:3])} "
+                  "fails its own CRC: rar was handed bytes that were already "
+                  "damaged. Those bytes ARE the content — captured as released "
+                  "(CRC " + ", ".join(f"{f['crc32']:08X}" for f in meta
+                                     if f.get("damaged"))[:60]
+                  + "); extract with keep-broken (-kb) to supply it.", "warn")
+        out["damaged_input"] = changed
+        return out
+
+    NEAR_MISS_BYTES = NEAR_MISS_BYTES
+
+    def _near_miss_recipe(self, meta, targets, dirs, dirs_first) -> dict | None:
+        """The closest combo, as a recipe, when all it missed is a sliver.
+
+        The sweep demands every stream. The_Ultimate_Dreamcast_NFO-
+        BETONGENSBARN: rar 3.30 reproduces 838 of its 839 NFOs byte for byte,
+        and the 839th -- 1,220 packed bytes, same length, decodes to the same
+        CRC -- matches no build or switch in the pack (479 tried). A volume
+        delta carries a difference that size easily, so hand the combo to the
+        verifying replay: it still has to rebuild the archive byte-exact
+        through diff_bytes, or nothing is written. Only when the missed
+        streams are at most 1% of them and NEAR_MISS_BYTES of packed data."""
+        bp = self._best_partial
+        if not bp or len(bp) < 7 or not bp[0]:
+            return None
+        n_ok, label, mt_, sw_, names, exe, dkb = bp[:7]
+        got = set(names)
+        miss = [f for f in meta if f["name"] in targets and f["name"] not in got]
+        if not miss or len(miss) > max(1, len(targets) // 100):
+            return None
+        miss_bytes = sum(int(f.get("packed_size") or 0) for f in miss)
+        if miss_bytes > self.NEAR_MISS_BYTES:
+            return None
+        self._log(f"    ◐ near miss: {label}{'' if mt_ < 0 else f' -mt{mt_}'} "
+                  f"reproduces {n_ok} of {len(targets)} stream(s); the rest "
+                  f"({', '.join(f['name'].split('/')[-1] for f in miss[:3])}, "
+                  f"{miss_bytes:,} packed B) matches no combo. Letting the "
+                  "verifying replay decide whether a delta can carry it.",
+                  "warn")
+        return {"exe": exe, "version": _exe_label(exe), "mt": mt_,
+                "dict_kb": dkb, "mc": list(sw_) if sw_ else [],
+                "dirs": list(dirs), "dirs_first": bool(dirs_first),
+                "tried": 0, "near_miss": len(miss)}
 
     # ── header decode ─────────────────────────────────────────────────────
 
@@ -6645,6 +6977,7 @@ class RsrToolAPI:
                     va = [a for a in va if a != "-vn"]
                 cmd += va + list(tail)
             names = []
+            plain = names       # filled below; the files alone, in order
             for q in srcs[at:at + count]:
                 if base:
                     try:
@@ -6701,24 +7034,29 @@ class RsrToolAPI:
                 # default: 3.00 honours the order it is given and writes its
                 # folder entries inline under this form, which the default
                 # form already gets right for those archives.
-                tops = {Path(d.replace("\\", "/")).parts[0] for d in dirs}
-                seen_t, inl = set(), []
-                for nm in names:
-                    top = Path(nm.replace("\\", "/")).parts[0]
-                    if top in tops and len(Path(nm.replace("\\", "/")).parts) > 1:
-                        if top not in seen_t:
-                            seen_t.add(top)
-                            inl.append(top)
-                    else:
-                        inl.append(nm)
-                names = inl + sorted(t for t in tops if t not in seen_t)
+                names = _inline_dirs(names, dirs)
             elif dirs and dirs_form in (None, "given"):
                 dn = list(dirs)
                 if dirs_first and gi == 0:
                     names = dn + names
                 elif not dirs_first and gi == len(groups) - 1:
                     names = names + dn
-            cmd += [str(target)] + names
+            # From the NAMES alone, never the paths around them: the capture
+            # and the rebuild run in different folders, and the form has to
+            # come out the same in both.
+            used = 2500
+            if (dirs and len(groups) == 1 and dirs_form != "omit"
+                    and used + sum(len(str(n)) + 3 for n in names)
+                    > CMDLINE_MAX):
+                # Too long to name every file. Name the FOLDERS instead: it
+                # is short, and it is how an archive of hundreds of files
+                # under one folder was made in the first place --
+                # BETONGENSBARN's 839 NFOs come back in the original's exact
+                # order, folder entries and all, from rar 3.30 given only
+                # the top folder.
+                names = _inline_dirs(list(plain), dirs)
+            cmd += [str(target)] + _names_or_listfile(
+                names, Path(target).parent / f"_names{gi}.lst", used)
             cmds.append(cmd)
             at += count
         return cmds or None
@@ -8225,7 +8563,7 @@ class RsrToolAPI:
                     ex_, n_, *rest_ = chunk[s]
                     self._best_partial = (len(res), _exe_label(ex_.name), n_,
                                           tuple(rest_[0]) if rest_ else (),
-                                          list(res))
+                                          list(res), ex_.name, dict_kb)
 
             for s, res in enumerate(results):
                 if res is True:
@@ -8505,21 +8843,35 @@ class RsrToolAPI:
         def _size(k):
             return sum(sz for _, _, sz in blocks.get(k, ()))
 
-        matched = []
+        # A miss no longer ends the count outright. Stopping at the first
+        # one made "closest: 294 of 839" out of a combo that matched 838 --
+        # BETONGENSBARN's odd stream is the 295th smallest -- and hid exactly
+        # the near miss _near_miss_recipe exists to catch. So keep going past
+        # small misses, while they stay within that allowance; a big one
+        # still ends it at once, before anything large is hashed.
+        allow_n = max(1, len(targets) // 100)
+        allow_b = NEAR_MISS_BYTES
+        matched, missed_n, missed_b = [], 0, 0
         for name in sorted(targets, key=_size):
             got = blocks.get(name)
-            if not got:
-                break
             tgt = targets[name]
+            ok = bool(got)
             # LENGTH FIRST, and it costs no I/O: packed_blocks already knows
             # every stream's size from the block table, and stream_digest
             # returns (length, sha1). A stream of the wrong size cannot match,
             # so there is no reason to read 383 MB to prove it.
-            if isinstance(tgt, tuple) and tgt and _size(name) != tgt[0]:
+            if ok and isinstance(tgt, tuple) and tgt and _size(name) != tgt[0]:
+                ok = False
+            if ok and stream_digest(got) != tgt:
+                ok = False
+            if ok:
+                matched.append(name)
+                continue
+            missed_n += 1
+            missed_b += (tgt[0] if isinstance(tgt, tuple) and tgt
+                         else _size(name))
+            if missed_n > allow_n or missed_b > allow_b:
                 break
-            if stream_digest(got) != tgt:
-                break
-            matched.append(name)
         return matched
 
     # ── replay + verify ───────────────────────────────────────────────────
@@ -8848,11 +9200,17 @@ class RsrToolAPI:
             for idx, (p, v) in enumerate(zip(produced, vols)):
                 orig = v.read_bytes()
                 got = p.read_bytes()
+                flips = [[o, m] for i, o, m in (recipe.get("flips") or [])
+                         if i == idx]
+                if flips:
+                    got = apply_flips(got, flips)
                 if recipe.get("rr_pct"):
                     rm[idx] = _diff_ranges(got, orig)
                 rec = {"name": v.name, "size": len(orig),
                        "sha256": _sha256(orig),
                        "head_sha": _sha256(orig[:4096]), "delta": None}
+                if flips:
+                    rec["flips"] = flips
                 if got != orig:
                     patch = diff_bytes(got, orig)
                     if patch is None:
@@ -10381,7 +10739,10 @@ class RsrToolAPI:
             # a second of drift is a different archive.
             try:
                 if f.get("mtime_ns"):
-                    os.utime(dst, ns=(f["mtime_ns"], f["mtime_ns"]))
+                    mt = f["mtime_ns"]
+                    if recipe.get("ftimes") == "now_bias":
+                        mt += _now_bias_shift_ns(mt)
+                    os.utime(dst, ns=(mt, mt))
                 elif f.get("mtime"):
                     ts = datetime.fromisoformat(f["mtime"]).timestamp()
                     os.utime(dst, (ts, ts))
@@ -10449,6 +10810,36 @@ class RsrToolAPI:
                               "replayed that instead.", "dim")
                     fail = None
                     break
+        if (fail and not recipe.get("ftimes") and st["format"] == "RAR4"
+                and _now_bias_build(recipe.get("exe", ""))
+                and self.DOS_MARK not in [str(x) for x in
+                                          (recipe.get("mc") or [])]):
+            # Captured before file times were shifted per build (ftimes).
+            # Such a capture's delta holds the DST offset of the season it
+            # was made in; rebuilt in the other season every file is an hour
+            # out. Try the rebuild an hour either way -- the hash check is
+            # the same, so it can only succeed on the true bytes.
+            files_ord = sorted(st["files"], key=lambda x: x["order"])
+            for hour in (3600, -3600):
+                for sp, f in zip(srcs, files_ord):
+                    mt = f.get("mtime_ns")
+                    if mt:
+                        try:
+                            os.utime(sp, ns=(mt + hour * 10**9,
+                                             mt + hour * 10**9))
+                        except OSError:
+                            pass
+                alt = self._replay(recipe, srcs, setwork, comment,
+                                   st["format"],
+                                   base=srcdir if keep_paths else None)
+                if alt and not self._write_replayed(alt, vols, z, out):
+                    self._log(f"    · captured in the other daylight-saving "
+                              f"season — rebuilt with file times "
+                              f"{'+' if hour > 0 else '-'}1 h, as "
+                              f"{_exe_label(recipe['exe'])} saw them then.",
+                              "dim")
+                    fail = None
+                    break
         if fail:
             self._log(fail, "err")
             return False
@@ -10468,6 +10859,8 @@ class RsrToolAPI:
             data = p.read_bytes()
             if v.get("av"):
                 data = rar2_insert_av(data, z.read(v["av"]))
+            if v.get("flips"):
+                data = apply_flips(data, v["flips"])
             if v.get("delta"):
                 data = apply_delta(data, z.read(v["delta"]))
             if _sha256(data) != v["sha256"]:
@@ -11523,7 +11916,7 @@ class RsrToolAPI:
                           "one was rejected on volume structure, end block or "
                           "header first.", "warn")
             return
-        n_ok, label, mt_, sw_, names = bp
+        n_ok, label, mt_, sw_, names = bp[:5]
         # A DOS combo carries DOS_MARK and has no -mt axis at all; printing
         # "-mt1" for one is noise that reads as a real thread count.
         is_dos = bool(sw_) and str(sw_[0]) == self.DOS_MARK
