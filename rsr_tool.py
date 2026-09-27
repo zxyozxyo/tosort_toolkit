@@ -1984,6 +1984,27 @@ def rar2_insert_av(vol: bytes, av: bytes) -> bytes:
     return prefix + bytes(hdr) + data + vol[off + size + add:]
 
 
+def _default_dirs_form(exe_name: str) -> str:
+    """How to name folders for this build when nothing else says so.
+
+    Measured on one mock tree, files listed in archive order:
+      2.00-2.06  no folder entries; named first they recurse in rar's order
+      2.50       no folder entries; naming them scrambles the order
+      2.71-2.90  entries always first; named LAST the listed order stands
+      3.00-5.61  'given' -- the long-standing form (3.00 honours the order)
+      5.70+      a listed file inside a named folder moves to the folder's
+                 position, so name each folder IN PLACE of its files
+    Every one of these keeps the listed -- i.e. the original's -- order."""
+    n = _exe_number(exe_name)
+    if 250 <= n < 260:
+        return "omit"
+    if 0 < n < 300:
+        return "last"
+    if n >= 570:
+        return "inline"
+    return "given"
+
+
 def rar4_unp_max(vols) -> int:
     """Highest unp_ver over the COMPRESSED file headers of a RAR4 set.
 
@@ -6639,6 +6660,12 @@ class RsrToolAPI:
             # (see the note where dir_names is read). Named relative to the
             # base for the same reason the files are: -ep is dropped, so rar
             # stores exactly the name it is given.
+            if dirs and not dirs_form and not dirs_inline:
+                # No recorded form: this build's default (_default_dirs_form).
+                # MSX_Emu-MAZNFXP: folders named first came out 844 of 845
+                # streams at every 2.x build, so the sweep could never reach
+                # the verify-time retry; named last, 845 of 845.
+                dirs_form = _default_dirs_form(ex.name)
             if dirs_form == "omit":
                 # 2.00-2.50 write no folder entry at all, and naming the
                 # folder only makes them recurse into it in their own order.
@@ -6650,6 +6677,7 @@ class RsrToolAPI:
                 names = names + list(dirs)
             elif dirs and len(groups) == 1 and (
                     dirs_inline or dirs_form == "inline"
+                    # (the default for 5.70+ -- _default_dirs_form):
                     # 5.70 and later move every listed file that is inside a
                     # named folder to the FOLDER's position (measured across
                     # 3.42-6.24: 5.61 keeps the listed order, 5.70 does not).
@@ -6660,7 +6688,7 @@ class RsrToolAPI:
                     # volume, so on Xeno_Crisis_CHD-bADkARMA the wrong order
                     # moved the stored PNGs across volume boundaries, they got
                     # compressed, and the release walled at "1 of 5 streams".
-                    or (not dirs_form and _exe_number(ex.name) >= 570)):
+                    ):
                 # Name each TOP-LEVEL folder where its first file falls, in
                 # place of the files inside it. Modern rar (measured 6.20)
                 # adds a file that is both listed and inside a named folder at
@@ -6684,7 +6712,7 @@ class RsrToolAPI:
                     else:
                         inl.append(nm)
                 names = inl + sorted(t for t in tops if t not in seen_t)
-            elif dirs and not dirs_form:
+            elif dirs and dirs_form in (None, "given"):
                 dn = list(dirs)
                 if dirs_first and gi == 0:
                     names = dn + names
@@ -8545,7 +8573,9 @@ class RsrToolAPI:
                                dirs=recipe.get("dirs") or (),
                                dirs_first=bool(recipe.get("dirs_first", True)),
                                dirs_inline=bool(recipe.get("dirs_inline")),
-                               dirs_form=recipe.get("dirs_form"))
+                               dirs_form=recipe.get("dirs_form")
+                               or ("given" if recipe.get("dirs")
+                                   and not recipe.get("dirs_inline") else None))
         return self._pack_cmds_extra(cmds, recipe.get("mc") or ())
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
@@ -8642,6 +8672,12 @@ class RsrToolAPI:
         it and compare. Returns ('exact'|'delta'|'none', volume records,
         {path-in-rsr: patch bytes})."""
         produced = None
+        # Record the folder form the sweep packed with, so the rebuild replays
+        # the same one -- a recipe with folders and no form replays the old
+        # 'given' way, which is what every capture before this was made with.
+        if (recipe.get("dirs") and not recipe.get("dirs_form")
+                and not recipe.get("dirs_inline")):
+            recipe["dirs_form"] = _default_dirs_form(recipe["exe"])
         # The sweep just packed this set to prove its streams. When the replay
         # command is the SAME command — no recovery record, no comment, no
         # lock, the same volume size — it would spend minutes reproducing
@@ -8833,14 +8869,15 @@ class RsrToolAPI:
 
         verdict, volmeta, deltas, rr_maps = _compare(produced)
         if (verdict == "none" and recipe.get("dirs") and base is not None
-                and not recipe.get("dirs_form") and not recipe.get("dirs_inline")
                 and len(recipe.get("groups") or [1]) == 1):
             # Every stream matched, so what differs is the ORDER the files
             # were written in. How a build turns folder names into order is
             # build-specific (measured on 2.00-6.20 -- see _pack_cmds), so try
             # each alternative form and keep the one that verifies; the recipe
             # records it and the rebuild replays the same form.
-            for form in ("last", "inline", "omit"):
+            for form in [f for f in ("last", "inline", "omit", "given")
+                         if f != recipe.get("dirs_form")
+                         and not (f == "inline" and recipe.get("dirs_inline"))]:
                 alt = self._replay(dict(recipe, dirs_form=form), src_files,
                                    work / f"dirs_{form}", comment,
                                    st["format"], base=base)
@@ -10176,7 +10213,22 @@ class RsrToolAPI:
             if srr and srr.is_file():
                 dts = _srr_dir_times(srr)
         n = 0
-        for name, v in dts.items():
+        # Two passes. First make every folder that is missing -- an EMPTY one:
+        # staging only creates folders that hold a file, so without this it is
+        # simply not there and rar has no entry to write (`rar x` recreates it
+        # at capture, which is why the capture verified and the rebuild did
+        # not: MSX_Emu-MAZNFXP's dreammsx02f\cdrom). Then set the times,
+        # DEEPEST first, because making or touching a child moves its
+        # parent's time -- done in one pass, dreammsx02f came back stamped now.
+        for name in dts:
+            p = srcdir / name.replace("/", os.sep)
+            if not p.is_dir():
+                try:
+                    p.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+        for name, v in sorted(dts.items(),
+                              key=lambda kv: -kv[0].replace("\\", "/").count("/")):
             dos, attr = v[0], v[1]
             extra = int(v[2]) if len(v) > 2 else 0
             p = srcdir / name.replace("/", os.sep)
