@@ -5802,6 +5802,49 @@ class RsrToolAPI:
         # the base the same way. `x` already recreated the tree, so every one
         # of these exists; any that does not is dropped rather than handed to
         # rar as a name it would refuse.
+        cap_dts = {}
+        if dir_names and dirinfos:
+            dts = cap_dts
+            for i in dirinfos:
+                nm = (_oem_name(i, i.flags or 0) or i.filename or "")
+                nm = nm.replace("\\", "/").rstrip("/")
+                try:
+                    # NOT `s`: that is the settings dict, still needed below.
+                    dy, dmo, dd, dh, dmi, dsec = tuple(i.date_time)[:6]
+                    dos = (((dy - 1980) << 25) | (dmo << 21) | (dd << 16)
+                           | (dh << 11) | (dmi << 5) | (dsec // 2))
+                except Exception:
+                    continue
+                extra = 0
+                try:
+                    # The raw header, for the fraction rarfile rounds away.
+                    with open(head, "rb") as fh:
+                        fh.seek(int(i.header_offset))
+                        h7 = fh.read(7)
+                        hsz = struct.unpack_from("<H", h7, 5)[0]
+                        fh.seek(int(i.header_offset))
+                        hb = fh.read(hsz)
+                    hfl = struct.unpack_from("<H", hb, 3)[0]
+                    hnl = struct.unpack_from("<H", hb, 26)[0]
+                    # Only trust it if these ARE that directory's bytes: in a
+                    # volume set the entry can live in a later volume than
+                    # `head`, where the same offset means something else.
+                    if (hb[2] == 0x74 and (hfl & 0xE0) == 0xE0
+                            and getattr(i, "orig_filename", b"")[:hnl]
+                            and hb[32:32 + hnl].split(b"\0")[0]
+                            == bytes(i.orig_filename).split(b"\0")[0]):
+                        extra = _ext_mtime_extra(hb, hfl, hnl)
+                except Exception:
+                    extra = 0
+                if nm:
+                    dts[nm] = [dos, int(getattr(i, "mode", 0) or 0x10), extra]
+            # Onto the extracted tree NOW, so the sweep and the capture's
+            # own verify pack from the same folder times the rebuild will
+            # restore. `rar x` does not reliably set them: on
+            # Quake_1-TITANIUM, Ikaruga-JEFFMA and AITD-LAILLAS the
+            # sweep's folder entries carried the time of the scan.
+            if dts:
+                self._restore_dir_times({"dir_times": dts}, srcdir)
         dir_files = [srcdir / n for n in dir_names]
         gone = [p for p in dir_files if not p.is_dir()]
         if gone:
@@ -6250,42 +6293,8 @@ class RsrToolAPI:
         # the original times onto. Three releases captured VERIFIED on
         # 2026-09-26 then failed every rebuild ("compressed payload differs"
         # -- the directory header sits after the data). See _restore_dir_times.
-        if dir_names and dirinfos:
-            dts = {}
-            for i in dirinfos:
-                nm = (_oem_name(i, i.flags or 0) or i.filename or "")
-                nm = nm.replace("\\", "/").rstrip("/")
-                try:
-                    y, mo, d, h, mi, s = tuple(i.date_time)[:6]
-                    dos = (((y - 1980) << 25) | (mo << 21) | (d << 16)
-                           | (h << 11) | (mi << 5) | (s // 2))
-                except Exception:
-                    continue
-                extra = 0
-                try:
-                    # The raw header, for the fraction rarfile rounds away.
-                    with open(head, "rb") as fh:
-                        fh.seek(int(i.header_offset))
-                        h7 = fh.read(7)
-                        hsz = struct.unpack_from("<H", h7, 5)[0]
-                        fh.seek(int(i.header_offset))
-                        hb = fh.read(hsz)
-                    hfl = struct.unpack_from("<H", hb, 3)[0]
-                    hnl = struct.unpack_from("<H", hb, 26)[0]
-                    # Only trust it if these ARE that directory's bytes: in a
-                    # volume set the entry can live in a later volume than
-                    # `head`, where the same offset means something else.
-                    if (hb[2] == 0x74 and (hfl & 0xE0) == 0xE0
-                            and getattr(i, "orig_filename", b"")[:hnl]
-                            and hb[32:32 + hnl].split(b"\0")[0]
-                            == bytes(i.orig_filename).split(b"\0")[0]):
-                        extra = _ext_mtime_extra(hb, hfl, hnl)
-                except Exception:
-                    extra = 0
-                if nm:
-                    dts[nm] = [dos, int(getattr(i, "mode", 0) or 0x10), extra]
-            if dts:
-                recipe["dir_times"] = dts
+        if cap_dts:
+            recipe["dir_times"] = cap_dts
         if len(mgroups) > 1:
             # Only when it means something. A single-group recipe replays
             # through the identical code path with no `groups` key at all, so
@@ -6484,7 +6493,8 @@ class RsrToolAPI:
     def _pack_cmds(self, ex: Path, fmt: str, dict_kb: int, mt: int, solid: bool,
                    groups, srcs: list, target: Path, tail=(),
                    vol_args=(), base=None, dirs=(),
-                   dirs_first=True) -> list[list[str]] | None:
+                   dirs_first=True, dirs_inline=False,
+                   dirs_form=None) -> list[list[str]] | None:
         """The command SEQUENCE that builds this archive — usually one command.
 
         `groups` is [(level, count)] over `srcs` in archive order. One entry is
@@ -6542,7 +6552,40 @@ class RsrToolAPI:
             # (see the note where dir_names is read). Named relative to the
             # base for the same reason the files are: -ep is dropped, so rar
             # stores exactly the name it is given.
-            if dirs:
+            if dirs_form == "omit":
+                # 2.00-2.50 write no folder entry at all, and naming the
+                # folder only makes them recurse into it in their own order.
+                pass
+            elif dirs and dirs_form == "last" and gi == len(groups) - 1:
+                # 2.71-2.90 write every folder entry FIRST whatever the order
+                # given, and named last they leave the listed file order
+                # alone; named first they recurse alphabetically.
+                names = names + list(dirs)
+            elif dirs and (dirs_inline or dirs_form == "inline") and len(groups) == 1:
+                # Name each TOP-LEVEL folder where its first file falls, in
+                # place of the files inside it. Modern rar (measured 6.20)
+                # adds a file that is both listed and inside a named folder at
+                # the FOLDER's position -- so with the folders named last,
+                # every file in a folder moved behind the loose ones:
+                # Xeno_Crisis_GDI-bADkARMA came back as track01.. then Art\..
+                # where the original, packed with `rar a -r .. *`, has Art\..
+                # first. Naming the folder in place gives exactly the -r *
+                # order on 6.20 and 3.60. It is a verify-time fallback, not the
+                # default: 3.00 honours the order it is given and writes its
+                # folder entries inline under this form, which the default
+                # form already gets right for those archives.
+                tops = {Path(d.replace("\\", "/")).parts[0] for d in dirs}
+                seen_t, inl = set(), []
+                for nm in names:
+                    top = Path(nm.replace("\\", "/")).parts[0]
+                    if top in tops and len(Path(nm.replace("\\", "/")).parts) > 1:
+                        if top not in seen_t:
+                            seen_t.add(top)
+                            inl.append(top)
+                    else:
+                        inl.append(nm)
+                names = inl + sorted(t for t in tops if t not in seen_t)
+            elif dirs and not dirs_form:
                 dn = list(dirs)
                 if dirs_first and gi == 0:
                     names = dn + names
@@ -8398,7 +8441,9 @@ class RsrToolAPI:
                                recipe["solid"], groups, srcs, target,
                                tail=tail, vol_args=vol_args, base=base,
                                dirs=recipe.get("dirs") or (),
-                               dirs_first=bool(recipe.get("dirs_first", True)))
+                               dirs_first=bool(recipe.get("dirs_first", True)),
+                               dirs_inline=bool(recipe.get("dirs_inline")),
+                               dirs_form=recipe.get("dirs_form"))
         return self._pack_cmds_extra(cmds, recipe.get("mc") or ())
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
@@ -8634,35 +8679,68 @@ class RsrToolAPI:
             volmeta[0]["delta"] = key
             return "delta", volmeta, deltas
 
-        if len(produced) != len(vols):
-            self._log(f"    ⚠ replay made {len(produced)} volume(s), original "
-                      f"has {len(vols)} — volume size not reproduced.", "warn")
-            for v in vols:
-                volmeta.append({"name": v.name, "size": v.stat().st_size,
-                                "sha256": _file_sha256(v), "delta": None})
-            return "none", volmeta, {}
+        def _compare(produced):
+            """(verdict, volmeta, deltas, rr_maps) for one set of volumes."""
+            vm, dl, rm = [], {}, {}
+            if len(produced) != len(vols):
+                self._log(f"    ⚠ replay made {len(produced)} volume(s), "
+                          f"original has {len(vols)} — volume size not "
+                          "reproduced.", "warn")
+                for v in vols:
+                    vm.append({"name": v.name, "size": v.stat().st_size,
+                               "sha256": _file_sha256(v), "delta": None})
+                return "none", vm, {}, rm
+            verdict_ = "exact"
+            for idx, (p, v) in enumerate(zip(produced, vols)):
+                orig = v.read_bytes()
+                got = p.read_bytes()
+                if recipe.get("rr_pct"):
+                    rm[idx] = _diff_ranges(got, orig)
+                rec = {"name": v.name, "size": len(orig),
+                       "sha256": _sha256(orig),
+                       "head_sha": _sha256(orig[:4096]), "delta": None}
+                if got != orig:
+                    patch = diff_bytes(got, orig)
+                    if patch is None:
+                        self._log(f"      {v.name} {diff_shape(got, orig)}.",
+                                  "dim")
+                        vm.append(rec)
+                        return "none", vm, {}, rm
+                    key = f"deltas/{si}_{idx:04d}.bin"
+                    dl[key] = patch
+                    rec["delta"] = key
+                    verdict_ = "delta"
+                vm.append(rec)
+            return verdict_, vm, dl, rm
 
-        verdict = "exact"
-        rr_maps: dict[int, list] = {}
-        for idx, (p, v) in enumerate(zip(produced, vols)):
-            orig = v.read_bytes()
-            got = p.read_bytes()
-            if recipe.get("rr_pct"):
-                rr_maps[idx] = _diff_ranges(got, orig)
-            rec = {"name": v.name, "size": len(orig),
-                   "sha256": _sha256(orig),
-                   "head_sha": _sha256(orig[:4096]), "delta": None}
-            if got != orig:
-                patch = diff_bytes(got, orig)
-                if patch is None:
-                    self._log(f"      {v.name} {diff_shape(got, orig)}.", "dim")
-                    volmeta.append(rec)
-                    return "none", volmeta, {}
-                key = f"deltas/{si}_{idx:04d}.bin"
-                deltas[key] = patch
-                rec["delta"] = key
-                verdict = "delta"
-            volmeta.append(rec)
+        verdict, volmeta, deltas, rr_maps = _compare(produced)
+        if (verdict == "none" and recipe.get("dirs") and base is not None
+                and not recipe.get("dirs_form") and not recipe.get("dirs_inline")
+                and len(recipe.get("groups") or [1]) == 1):
+            # Every stream matched, so what differs is the ORDER the files
+            # were written in. How a build turns folder names into order is
+            # build-specific (measured on 2.00-6.20 -- see _pack_cmds), so try
+            # each alternative form and keep the one that verifies; the recipe
+            # records it and the rebuild replays the same form.
+            for form in ("last", "inline", "omit"):
+                alt = self._replay(dict(recipe, dirs_form=form), src_files,
+                                   work / f"dirs_{form}", comment,
+                                   st["format"], base=base)
+                if not alt:
+                    continue
+                v2, m2, d2, r2 = _compare(alt)
+                if v2 != "none":
+                    self._log(f"    the files came back in a different order; "
+                              f"with the folders named '{form}' the replay is "
+                              f"{v2}.", "ok")
+                    recipe["dirs_form"] = form
+                    if form == "inline":
+                        recipe["dirs_inline"] = True
+                    produced, verdict, volmeta, deltas, rr_maps = \
+                        alt, v2, m2, d2, r2
+                    break
+        if verdict == "none":
+            return "none", volmeta, {}
         if verdict == "delta" and recipe.get("rr_pct"):
             # Cover the record's clock window from the BLOCK LAYOUT first. It
             # needs no second replay and no sibling to compare against, so it
