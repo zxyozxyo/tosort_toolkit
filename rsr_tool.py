@@ -1897,6 +1897,93 @@ def _srr_dir_times(srr: Path) -> dict:
     return out
 
 
+def _rar4_walk(b: bytes):
+    """(offset, type, flags, header size, add size) for each RAR4 block."""
+    i = 7
+    while i + 7 <= len(b):
+        try:
+            _c, typ, flags, size = struct.unpack_from("<HBHH", b, i)
+        except struct.error:
+            return
+        if size < 7:
+            return
+        add = struct.unpack_from("<I", b, i + 7)[0] if flags & 0x8000 else 0
+        yield i, typ, flags, size, add
+        i += size + add
+
+
+def rar2_rr_data(prot: bytes, sectors: int) -> tuple[bytes, int]:
+    """(record data, block count) of a RAR 2.x recovery record over `prot`.
+
+    A table of ~crc32 & 0xFFFF per 512-byte block, then `sectors` parity
+    sectors, sector k the XOR of every block whose index is k mod sectors;
+    the last block is zero-padded. Measured on MameD-SLEESTAKJAY: recomputed
+    over everything before the PROTECT header it matches the stored record
+    byte for byte, on the original (AV block and all) and on a replay."""
+    nb = (len(prot) + 511) // 512
+    table = bytearray()
+    par = [0] * sectors
+    frm = int.from_bytes
+    for k in range(nb):
+        blk = prot[k * 512:(k + 1) * 512]
+        if len(blk) < 512:
+            blk = blk + bytes(512 - len(blk))
+        table += struct.pack("<H", (~zlib.crc32(blk)) & 0xFFFF)
+        par[k % sectors] ^= frm(blk, "little")
+    return bytes(table) + b"".join(x.to_bytes(512, "little") for x in par), nb
+
+
+def rar2_av_block(path) -> bytes | None:
+    """The AV (authenticity, 0x79) block of a RAR 2.x volume, header and all."""
+    try:
+        b = Path(path).read_bytes()
+    except OSError:
+        return None
+    for off, typ, _f, size, add in _rar4_walk(b):
+        if typ == 0x79:
+            return b[off:off + size + add]
+    return None
+
+
+def rar2_insert_av(vol: bytes, av: bytes) -> bytes:
+    """Put an original AV block back into a replayed RAR 2.x volume.
+
+    An AV block is written only by a REGISTERED rar holding the group's own
+    key, so no build here can make one -- but it is 201 bytes of data that
+    can simply be carried. It sits just before the recovery record, and the
+    record protects it too, so the record is recomputed over the new bytes
+    (rar2_rr_data) and its header rewritten. With no record it goes before
+    the end block."""
+    blocks = list(_rar4_walk(vol))
+    rr = next(((o, sz, ad) for o, t, _f, sz, ad in blocks if t == 0x78), None)
+    at = rr[0] if rr else next((o for o, t, _f, _s, _a in blocks if t == 0x7B),
+                               len(vol))
+    # The main header points at the AV block (PosAV, u32 at +9 of the 13-byte
+    # 2.x main header), so set it and re-checksum that header -- before the
+    # record is recomputed, because the record protects it too. Measured on
+    # MameD: without this every volume differed in exactly these 6 bytes plus
+    # the record's first checksum entry.
+    vol = bytearray(vol)
+    if len(vol) >= 20 and vol[9] == 0x73:
+        msz = struct.unpack_from("<H", vol, 12)[0]
+        if msz >= 13:
+            struct.pack_into("<I", vol, 16, at)
+            struct.pack_into("<H", vol, 7,
+                             zlib.crc32(bytes(vol[9:7 + msz])) & 0xFFFF)
+    vol = bytes(vol)
+    if rr is None:
+        return vol[:at] + av + vol[at:]
+    off, size, add = rr
+    prefix = vol[:off] + av
+    hdr = bytearray(vol[off:off + size])
+    sectors = struct.unpack_from("<H", hdr, 12)[0]
+    data, nb = rar2_rr_data(prefix, sectors)
+    struct.pack_into("<I", hdr, 7, len(data))
+    struct.pack_into("<I", hdr, 14, nb)
+    struct.pack_into("<H", hdr, 0, zlib.crc32(bytes(hdr[2:])) & 0xFFFF)
+    return prefix + bytes(hdr) + data + vol[off + size + add:]
+
+
 def rar4_unp_max(vols) -> int:
     """Highest unp_ver over the COMPRESSED file headers of a RAR4 set.
 
@@ -8415,7 +8502,10 @@ class RsrToolAPI:
             return None                    # recipe and sources disagree
         vol_args = []
         if recipe.get("volume_bytes"):
-            vol_args = [f"-v{recipe['volume_bytes']}b"]
+            # An AV block is re-inserted after the pack (rar2_insert_av), so
+            # each volume is packed that much smaller -- the original's data
+            # per volume, exactly.
+            vol_args = [f"-v{int(recipe['volume_bytes']) - int(recipe.get('av_size') or 0) - int(recipe.get('av_pad') or 0)}b"]
             if not recipe.get("new_numbering"):
                 vol_args.append("-vn")     # .rar/.r00 rather than .partN.rar
         tail = []
@@ -8736,6 +8826,73 @@ class RsrToolAPI:
                     recipe["dirs_form"] = form
                     if form == "inline":
                         recipe["dirs_inline"] = True
+                    produced, verdict, volmeta, deltas, rr_maps = \
+                        alt, v2, m2, d2, r2
+                    break
+        if (verdict == "none" and st["format"] == "RAR4"
+                and not st["byte_split"] and not recipe.get("av_size")):
+            # AUTHENTICITY blocks. A registered rar with the group's AV key
+            # writes a 0x79 block into every volume; no build here can, so
+            # every volume of the replay carried that many more bytes of data
+            # and every boundary after the first shifted. MameD-SLEESTAKJAY:
+            # 201 B per volume, 38 volumes, each block different. Pack the
+            # volumes that much smaller, put the original blocks back and
+            # recompute the recovery record they sit under.
+            avs = [rar2_av_block(v) for v in vols]
+            if all(avs) and len({len(a) for a in avs}) == 1:
+                size_av = len(avs[0])
+                self._log(f"    the original carries an AV (authenticity) block "
+                          f"in every volume ({size_av} B) — only a registered "
+                          "rar with the group's key writes one; re-inserting "
+                          "the original blocks.", "dim")
+                # Which build: the recipe's, then -- for a STORED set, where
+                # every build writes identical data and only the recovery
+                # record tells them apart -- one build per 2.x family. MameD:
+                # the sweep chose 2.70b4, whose default record is 307
+                # sectors; the original's 237 full / 157 last is 2.80's.
+                builds = [recipe["exe"]]
+                if int(recipe.get("level") or 0) == 0:
+                    fams = {}
+                    for e in self._pack_exes():
+                        n = _exe_number(e.name)
+                        if 200 <= n < 300 and n not in fams:
+                            fams[n] = e.name
+                    builds += [b for n, b in sorted(fams.items(), reverse=True)
+                               if b != recipe["exe"]]
+                tries = []
+                for b in builds:
+                    for pad in (2, 0):
+                        tries.append((b, pad, False))
+                        if b == recipe["exe"] and recipe.get("rr_sectors"):
+                            tries.append((b, pad, True))
+                for ti, (b, pad, exact) in enumerate(tries[:16]):
+                    cand = dict(recipe, exe=b, version=_exe_label(b),
+                                av_size=size_av, av_pad=pad, rr_exact=exact)
+                    alt = self._replay(cand, src_files, work / f"av{ti}",
+                                       comment, st["format"], base=base)
+                    if not alt or len(alt) != len(vols):
+                        continue
+                    try:
+                        for pa, a in zip(alt, avs):
+                            pa.write_bytes(rar2_insert_av(pa.read_bytes(), a))
+                    except Exception:
+                        continue
+                    if any(pa.stat().st_size != v.stat().st_size
+                           for pa, v in zip(alt, vols)):
+                        continue
+                    v2, m2, d2, r2 = _compare(alt)
+                    if v2 == "none":
+                        continue
+                    self._log(f"    with the AV blocks restored the replay is "
+                              f"{v2} ({_exe_label(b)}, "
+                              f"{'-rr' + str(recipe.get('rr_sectors')) if exact else 'default -rr'}).",
+                              "ok")
+                    recipe.update(exe=b, version=_exe_label(b), av_size=size_av,
+                                  av_pad=pad, rr_exact=exact)
+                    for idx, a in enumerate(avs):
+                        key = f"av/{si}_{idx:04d}.bin"
+                        d2[key] = a
+                        m2[idx]["av"] = key
                     produced, verdict, volmeta, deltas, rr_maps = \
                         alt, v2, m2, d2, r2
                     break
@@ -10229,6 +10386,8 @@ class RsrToolAPI:
                     f"{len(vols)}.")
         for p, v in zip(produced, vols):
             data = p.read_bytes()
+            if v.get("av"):
+                data = rar2_insert_av(data, z.read(v["av"]))
             if v.get("delta"):
                 data = apply_delta(data, z.read(v["delta"]))
             if _sha256(data) != v["sha256"]:
