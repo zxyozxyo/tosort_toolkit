@@ -6648,7 +6648,19 @@ class RsrToolAPI:
                 # given, and named last they leave the listed file order
                 # alone; named first they recurse alphabetically.
                 names = names + list(dirs)
-            elif dirs and (dirs_inline or dirs_form == "inline") and len(groups) == 1:
+            elif dirs and len(groups) == 1 and (
+                    dirs_inline or dirs_form == "inline"
+                    # 5.70 and later move every listed file that is inside a
+                    # named folder to the FOLDER's position (measured across
+                    # 3.42-6.24: 5.61 keeps the listed order, 5.70 does not).
+                    # In-place naming keeps the listed -- i.e. the original's
+                    # -- order on them, so it is their default, in the sweep
+                    # too. That matters beyond layout: whether rar can fall
+                    # back to STORING a file depends on it fitting inside one
+                    # volume, so on Xeno_Crisis_CHD-bADkARMA the wrong order
+                    # moved the stored PNGs across volume boundaries, they got
+                    # compressed, and the release walled at "1 of 5 streams".
+                    or (not dirs_form and _exe_number(ex.name) >= 570)):
                 # Name each TOP-LEVEL folder where its first file falls, in
                 # place of the files inside it. Modern rar (measured 6.20)
                 # adds a file that is both listed and inside a named folder at
@@ -8677,7 +8689,23 @@ class RsrToolAPI:
                 sibs = [e.name for e in self._pack_exes()
                         if _exe_number(e.name) == fam
                         and e.name != recipe["exe"]]
-                cands = [dict(recipe, exe=name) for name in sibs[:8]]
+                # ...and builds of OTHER versions that write the same streams
+                # (same output class), one per version. The default record is
+                # a property of the version, not the class: 2.70-2.90 are all
+                # class 6, but 2.70 defaults to 307 sectors a 20 MB volume and
+                # 2.80/2.90 to 237 -- Canvas_Motif-IND's 9,065-sector record
+                # and MameD-SLEESTAKJAY's 237/157 are 2.80's, not 2.70's.
+                cls = self._build_classes()
+                mine = cls.get(recipe["exe"])
+                if mine is not None:
+                    fams = {}
+                    for e in self._pack_exes():
+                        n = _exe_number(e.name)
+                        if (n != fam and cls.get(e.name) == mine
+                                and n not in fams):
+                            fams[n] = e.name
+                    sibs = sibs[:8] + [b for _n, b in sorted(fams.items())]
+                cands = [dict(recipe, exe=name) for name in sibs[:14]]
                 # ...and, last, this build asked for the exact recovered
                 # count, for a release that did name a size rather than
                 # taking the default.
