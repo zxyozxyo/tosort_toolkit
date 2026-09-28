@@ -6542,15 +6542,6 @@ class RsrToolAPI:
                         "not conclusive — -mm/-mmf queued as before")
                 self._log(f"    multimedia check ({time.monotonic() - t_mm:,.0f}s): "
                           f"{said}.", "dim")
-        dos_fill = []
-        if unp_here and unp_here < 29:
-            dos_fill = self._dos_fill_evidence(meta, blocks, src_files, solid)
-            if dos_fill:
-                self._log(f"    stale-link check: the stream skips a nearer "
-                          f"match just past 32 KB, the mark of RAR 2.x DOS "
-                          f"reading leftover memory — DOS builds are also "
-                          f"tried with that memory set to {dos_fill[0]}.",
-                          "dim")
 
         recipe = None
         budget = getattr(self, "_budget_min", 0)
@@ -6589,7 +6580,6 @@ class RsrToolAPI:
                                         probe_vol=probe_vol,
                                         rr_sectors=rr_pass,
                                         mm_ev=mm_ev,
-                                        dos_fill=dos_fill,
                                         want_vols=len(vols),
                                         unp_max=rar4_unp_max(vols)
                                         if st["format"] == "RAR4" else 0,
@@ -7749,6 +7739,7 @@ class RsrToolAPI:
         # A DOS build is not driven by a command line we can run directly:
         # it is 16-bit, so it goes through DOSBox and produces its output
         # before the ordinary verification below picks up from _probe_head.
+        filled = ""
         if extra and extra[0] == self.DOS_MARK:
             if len(groups) != 1:
                 return None            # appending under DOS is not modelled
@@ -7784,8 +7775,45 @@ class RsrToolAPI:
                                           extra=extra[1:],
                                           rr_sectors=rrs,
                                           stop_after=(1 << 20) + 4096):
-                        if self._early_verdict(look / "PROBE.RAR", prefix,
-                                               1 << 20) is False:
+                        fv = None
+                        if (self._early_verdict(look / "PROBE.RAR", prefix,
+                                                1 << 20) is False
+                                and not any(str(x).startswith("@FILL")
+                                            for x in extra)
+                                and self._fill_capable(ex)):
+                            fv = self._fill_from_look(look / "PROBE.RAR",
+                                                      prefix)
+                        if fv is not None:
+                            # The stream parted company just past 32 KB, on
+                            # a match the original found through a hash link
+                            # this build never wrote (see dosrar_fill). Look
+                            # again with that link's memory set to where the
+                            # original's walk went.
+                            fextra = tuple(extra) + (f"@FILL{fv}",)
+                            _rmtree(look)
+                            if (self._run_dos_pack(ex, look, groups[0][0],
+                                                   solid, srcs, vb,
+                                                   timeout=600,
+                                                   extra=fextra[1:],
+                                                   rr_sectors=rrs,
+                                                   stop_after=(1 << 20)
+                                                   + 4096)
+                                    and self._early_verdict(
+                                        look / "PROBE.RAR", prefix,
+                                        1 << 20) is not False):
+                                sw_ = " ".join(str(a) for a in extra[1:])
+                                self._log(f"      first look: "
+                                          f"{_exe_label(ex.name)}"
+                                          f"{' ' + sw_ if sw_ else ''} read "
+                                          f"hash links it never wrote — with "
+                                          f"that memory set to {fv} it "
+                                          f"survives the first MB.", "dim")
+                                extra, filled = fextra, f"@FILL{fv}"
+                            else:
+                                fv = None
+                        if not filled and self._early_verdict(
+                                look / "PROBE.RAR", prefix,
+                                1 << 20) is False:
                             # _progress only reaches the GUI, and the log is
                             # the only record an overnight run leaves. Without
                             # a line here there is no way to tell afterwards
@@ -7984,7 +8012,8 @@ class RsrToolAPI:
             return False
         matched = self._streams_match(head, targets)
         if len(matched) == len(targets):
-            return True
+            # a leftover-memory win names its value, so the recipe keeps it
+            return filled or True
         # Not a match, but say how close: the caller keeps the best of these
         # for the wall message. Never `is True`, so the winner test is
         # unaffected, and this is the only caller.
@@ -7999,8 +8028,7 @@ class RsrToolAPI:
                       want_vols=0, unp_max=0, expanded=False,
                       host=-1, rr_sectors=-1, dos_only=False,
                       year_before=0, year_after=0,
-                      dirs=(), dirs_first=True, mm_ev=None,
-                      dos_fill=()) -> dict | None:
+                      dirs=(), dirs_first=True, mm_ev=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -8317,30 +8345,7 @@ class RsrToolAPI:
                 skipped_vol = []
                 dos_mmf: list = []
                 dos_low: list = []
-                dos_fills: list = []
-                # only the builds that carry the 2.x packer take @FILL; 1.5x
-                # and the non-LZEXE repacks would just fail the combo
-                if dos_fill:
-                    fill_ok = set()
-                    known = self.__dict__.setdefault("_fill_ok_cache", {})
-                    try:
-                        import dosrar_fill
-                        for ex_ in dos:
-                            if ex_.name not in known:
-                                try:
-                                    dosrar_fill.fill_exe(ex_.read_bytes(), 0)
-                                    known[ex_.name] = True
-                                except (ValueError, OSError):
-                                    known[ex_.name] = False
-                            if known[ex_.name]:
-                                fill_ok.add(ex_.name)
-                    except ImportError:
-                        pass
                 for ex in dos:
-                    if dos_fill and ex.name not in fill_ok:
-                        fill_here = ()
-                    else:
-                        fill_here = dos_fill
                     c = caps.get(ex.name) or {}
                     # 1.51/1.52/1.53/1.40 do not understand -v<N>b, and do not
                     # fail cleanly -- 1.52 was seen splitting a 74-byte .CUE
@@ -8412,21 +8417,10 @@ class RsrToolAPI:
                             dos_low.append(1)
                             combos.append((ex, 1, (self.DOS_MARK,) + mm
                                            + (self.LOWMEM,)))
-                            # The stale-slot twin: this build with the links
-                            # it never writes pre-set to the value the
-                            # original's own stream points at (see
-                            # _dos_fill_evidence). Beside the ordinary form for
-                            # the same reason as LOADFIX -- the group's build is
-                            # tried both ways before anything else is.
-                            for fv in fill_here:
-                                if expanded and c.get("s1", True):
-                                    dos_fills.append(1)
-                                    combos.append((ex, 1, (self.DOS_MARK,
-                                                           "-s1", "-ds") + mm
-                                                   + (f"@FILL{fv}",)))
-                                dos_fills.append(1)
-                                combos.append((ex, 1, (self.DOS_MARK,) + mm
-                                               + (f"@FILL{fv}",)))
+                        # No leftover-memory twins here: a combo whose first
+                        # look diverges the way a stale hash link does finds
+                        # its own value and retries (_fill_from_look), so the
+                        # axis costs nothing on releases that do not need it.
                     # -mmf, the FORCED multimedia coder, behind everything
                     # else. The Windows sweep has asked for both since the -mm
                     # axis landed; the DOS line only ever asked for -mm, so a
@@ -8459,13 +8453,6 @@ class RsrToolAPI:
                               "16-bit RAR sizes its match finder from free "
                               "memory, and DOSBox has more than a real DOS box "
                               "did.", "dim")
-                if dos_fills:
-                    self._log(f"    {len(dos_fills):,} DOS combo(s) also tried "
-                              f"with the leftover-memory value "
-                              f"{', '.join(str(v) for v in dos_fill)} — the "
-                              "original's stream shows RAR 2.x reading hash "
-                              "links it never wrote, which DOSBox leaves at "
-                              "zero.", "dim")
                 if dos_mmf:
                     combos += dos_mmf
                     self._log(f"    {len(dos_mmf):,} DOS -mmf (forced "
@@ -8786,9 +8773,12 @@ class RsrToolAPI:
                                           list(res), ex_.name, dict_kb)
 
             for s, res in enumerate(results):
-                if res is True:
+                if res is True or isinstance(res, str):
                     ex_, n_, *rest_ = chunk[s]
                     extra_ = rest_[0] if rest_ else ()
+                    if isinstance(res, str):
+                        # the combo found its leftover-memory value itself
+                        extra_ = tuple(extra_) + (res,)
                     return {"exe": ex_.name, "version": _exe_label(ex_.name),
                             "mt": n_, "dict_kb": dict_kb,
                             # The coder switch, when this was a PPM combo.
@@ -8948,6 +8938,68 @@ class RsrToolAPI:
             return min(vols, key=lambda p: _classify_volume(p.name)[2])
         single = probe_dir / "probe.rar"
         return single if single.is_file() else None
+
+    def _fill_capable(self, ex: Path) -> bool:
+        """Whether this DOS build carries the 2.x packer @FILL patches (every
+        LZEXE build from 2.00 to 2.50 does; 1.5x and the repacks do not)."""
+        known = self.__dict__.setdefault("_fill_ok_cache", {})
+        if ex.name not in known:
+            try:
+                import dosrar_fill
+                dosrar_fill.fill_exe(ex.read_bytes(), 0)
+                known[ex.name] = True
+            except Exception:
+                known[ex.name] = False
+        return known[ex.name]
+
+    @staticmethod
+    def _fill_from_look(probe_head: Path, prefix: dict) -> int | None:
+        """The leftover-memory value a failed DOS first look points at, or
+        None when its divergence is not that kind.
+
+        RAR 2.x for DOS leaves some hash links unwritten when a match crosses
+        window position 32768 and reads them on a later walk -- zero under
+        DOSBox, whatever was there on the scene's PC (see dosrar_fill). Until
+        the window wraps at 65536 that is the only way the same build can
+        part company with the original, so a divergence in that range on a
+        match the original made names the value: the match's source position
+        sends the walk to the same place. Measured: 6944 for Puyo_Puyo_DA!,
+        14000 for Rainbow_Cotton. Read from the probe rather than from the
+        original alone because stock RAR skips nearer matches too: on PSX
+        images a static reading flagged spots the stock build reproduces
+        (Scrabble, Gekido, Alien_Resurrection -- all captured stock)."""
+        try:
+            import dosrar_fill
+        except ImportError:
+            return None
+        for nm, (src_vol, src_off, src_len) in prefix.items():
+            off = rar4_reserved_data_offset(probe_head, nm)
+            if off is None:
+                continue
+            try:
+                with open(probe_head, "rb") as a:
+                    a.seek(off)
+                    ours = a.read(1 << 18)
+                with open(src_vol, "rb") as b:
+                    b.seek(src_off)
+                    orig = b.read(min(src_len, 1 << 18))
+            except OSError:
+                continue
+            if len(ours) < 4096 or len(orig) < 4096:
+                continue
+            to = dosrar_fill.rar20_tokens(orig, 70_000)
+            tg = {t[0]: t for t in dosrar_fill.rar20_tokens(ours, 70_000)}
+            at = next((i for i, t in enumerate(to) if tg.get(t[0]) != t), None)
+            if at is None or not 32768 <= to[at][0] < 65536:
+                continue
+            x, kind, det = to[at]
+            # a literal where ours matched: the original's walk found its
+            # match one byte on (the lazy look-ahead), same slot
+            if kind == "L" and at + 1 < len(to) and to[at + 1][1] == "M":
+                x, kind, det = to[at + 1]
+            if kind == "M" and 0 < x - det[1] < 65536:
+                return x - det[1]
+        return None
 
     @staticmethod
     def _early_verdict(probe_head: Path, prefix: dict, min_bytes: int):
@@ -12350,50 +12402,6 @@ class RsrToolAPI:
             return None
         return {"audio": audio, "no_mmf": no_mmf and not audio,
                 "complete": complete and not audio}
-
-    def _dos_fill_evidence(self, meta: list, blocks: dict,
-                           src_files, solid: bool = True) -> list[int]:
-        """Upper-link values for the 16-bit line's stale-slot twin, or [].
-
-        RAR 2.x for DOS leaves some of its hash-chain links unwritten when a
-        match crosses window position 32768, and the next walk through them
-        reads whatever memory held -- zero under DOSBox, leftovers on the
-        scene's PC. The original shows where it happened (a match that skips
-        a nearer copy of the same bytes) and which value sends the walk there.
-        See dosrar_fill for the mechanism and the measurements.
-
-        The file read is the one whose window crosses 32768 and wraps at
-        65536 inside its own data. Solid: only the first -- the window runs
-        on across files. Not solid: every file starts a fresh window, so the
-        first LARGE one (KALISTO's PSX sets put a 74-byte .CUE first and the
-        .BIN second). Only the first candidate is returned -- the ones after
-        it are either the same walk's consequences or ordinary non-nearest
-        choices that stock RAR makes too (both seen on Rainbow_Cotton)."""
-        comp = [f for f in meta if int(f.get("method") or 0) != 0
-                and blocks.get(f["name"])]
-        big = [f for f in comp if int(f.get("size") or 0) >= 65536 + 512]
-        if not big or (solid and big[0] is not comp[0]):
-            return []
-        f = big[0]
-        want = Path(str(f["name"]).replace("\\", "/")).name.lower()
-        src = next((Path(q) for q in src_files
-                    if Path(q).name.lower() == want), None)
-        if src is None:
-            return []
-        try:
-            import dosrar_fill
-            data = bytearray()
-            for vol, off, size in blocks[f["name"]]:
-                if len(data) >= 1 << 18:
-                    break
-                with open(vol, "rb") as fh:
-                    fh.seek(off)
-                    data += fh.read(min(size, (1 << 18) - len(data)))
-            with open(src, "rb") as fh:
-                head = fh.read(65536 + 512)
-            return dosrar_fill.fill_candidates(bytes(data), head)[:1]
-        except Exception:
-            return []
 
     def _era_recipes(self, fmt: str, year: int, unp_max: int,
                      limit: int = 40) -> list[tuple]:

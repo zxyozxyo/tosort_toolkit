@@ -20,11 +20,15 @@ Puyo_Puyo_DA!_JAP_DC-KALISTO: stock dosrar200 -m5 -s -mm reproduced 794
 tokens; the same build with the upper segment pre-set to 6944..9000 is
 byte-identical in all five volumes (90 MB), header times aside.
 
-The garbage itself is unknowable, but it only matters where a walk used it,
-and the original shows where: stock RAR walks its chain nearest-first, so a
-match that skips a NEARER copy of the same bytes was reached through a stale
-slot. Its source position is a value that sends the walk to the same place.
-fill_candidates() finds those; fill_exe() builds the program that uses one.
+The garbage itself is unknowable, but it only matters where a walk used it:
+where a stock probe first parts company with the original between 32768 and
+65536, the original's match there was reached through a stale slot, and its
+source position is a value that sends the walk to the same place. The sweep
+reads it that way (RsrToolAPI._fill_from_look); fill_exe() builds the program
+that uses it. fill_candidates() is the original-only approximation (a match
+that skips a nearer copy of the same bytes) -- right on the Dreamcast sets,
+but stock RAR skips nearer matches too, so on PSX images it also flags spots
+the stock build reproduces. Kept for surveys, not used by the sweep.
 """
 import struct
 
