@@ -6537,11 +6537,25 @@ class RsrToolAPI:
         budget = getattr(self, "_budget_min", 0)
         self._deadline = None if self._budget_override else (
             (time.monotonic() + budget * 60) if budget else None)
-        for di, dkb in enumerate(cands):
+        # When the record has to be asked for during the sweep, the ask is a
+        # plain -rr -- the build's DEFAULT size, which is what most originals
+        # carry. Some asked for a size of their own: Simple_2000_Series_Vol_3
+        # -DOLMEXICA is rar 2.80 -rr5%, 1,799 sectors a volume against the
+        # default 237, so every combo held more data per volume, came out one
+        # volume short and was rejected on structure. A second pass asks for
+        # the original's exact sector count.
+        passes = [(dkb, sweep_rr) for dkb in cands]
+        if sweep_rr == 0 and rr_sectors > 0:
+            passes.append((cands[0], rr_sectors))
+        for di, (dkb, rr_pass) in enumerate(passes):
             if self._stop.is_set() or self._skip.is_set():
                 return {"ok": False,
                         "error": "skipped" if self._skip.is_set() else "stopped"}
-            if di:
+            if di and rr_pass != sweep_rr:
+                self._log(f"    retrying with the original's own record size, "
+                          f"-rr{rr_pass} (the build default did not split "
+                          f"the set the same way)", "dim")
+            elif di:
                 self._log(f"    retrying with -md{dkb}KB "
                           f"(header dictionary didn't reproduce)", "dim")
             recipe = self._sweep_recipe(st["format"], exes, level, dkb, solid,
@@ -6554,7 +6568,7 @@ class RsrToolAPI:
                                         base=srcdir if keep_paths else None,
                                         prefix=prefix,
                                         probe_vol=probe_vol,
-                                        rr_sectors=sweep_rr,
+                                        rr_sectors=rr_pass,
                                         mm_ev=mm_ev,
                                         want_vols=len(vols),
                                         unp_max=rar4_unp_max(vols)
@@ -6574,6 +6588,8 @@ class RsrToolAPI:
                                         host=rar4_host(vols)
                                         if st["format"] == "RAR4" else -1)
             if recipe:
+                if rr_pass != sweep_rr:
+                    recipe["rr_exact"] = True
                 break
             if self._budget_hit:
                 break
