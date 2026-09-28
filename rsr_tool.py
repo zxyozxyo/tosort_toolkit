@@ -9936,6 +9936,7 @@ class RsrToolAPI:
 
         matched, done, failed, miss = {}, 0, 0, 0
         shared = 0
+        present = set()         # (size, crc32) of every file that matched
         for i, p in enumerate(cands, 1):
             if self._stop.is_set():
                 self._log("Stopped.", "warn")
@@ -9955,6 +9956,7 @@ class RsrToolAPI:
             # archive, no nfo and no extras — no output at all, which reads
             # from the outside like a failed rebuild rather than a release
             # that was never attempted.
+            present.add((int(hit["size"]), int(str(hit["crc32"]), 16)))
             if len(hit["releases"]) > 1:
                 shared += 1
             for h in hit["releases"]:
@@ -9967,6 +9969,45 @@ class RsrToolAPI:
                                                 for o in hit["releases"]
                                                 if o["release"] != rel]))
         self._progress("")
+        # A release is only worth queueing when ALL its content is here. One
+        # shared file is enough to match it -- Dreamcast releases nearly all
+        # ship the same self-boot UNPACK.EXE, which is the content of some of
+        # them -- and 2026-09-28's batch queued Stunt_GP_PAL, Unreal_Tournament,
+        # House_Of_The_Dead_2 and nine more on exactly that, each then failing
+        # "missing source" for a CDI that was never in the folder. Every
+        # content file hashes to its release on the way in, so what is present
+        # is already known; the rest is one query.
+        incomplete = {}
+        try:
+            con = self._db()
+            try:
+                for rel in list(matched):
+                    need = con.execute(
+                        "SELECT name, size, crc32 FROM files "
+                        "WHERE release=? AND source='content'", (rel,)).fetchall()
+                    gone = [n for n, sz, cr in need
+                            if (int(sz or 0), int(cr or 0) & 0xFFFFFFFF)
+                            not in present]
+                    if gone:
+                        incomplete[rel] = gone
+            finally:
+                con.close()
+        except Exception as e:
+            self._log(f"  (content completeness check skipped: {e})", "dim")
+            incomplete = {}
+        for rel, gone in incomplete.items():
+            matched.pop(rel, None)
+            self._emit("row", {"name": rel, "status": "skipped",
+                               "recipe": f"content not here: {gone[0]}"
+                                         + (f" +{len(gone) - 1}"
+                                            if len(gone) > 1 else ""),
+                               "kind": "skipped"})
+        if incomplete:
+            self._log(f"  {len(incomplete)} release(s) matched on a shared "
+                      f"file but are missing the rest of their content here — "
+                      f"skipped, not failed: "
+                      f"{', '.join(list(incomplete)[:4])}"
+                      + (" …" if len(incomplete) > 4 else ""), "dim")
         self._log(f"  {len(matched)} release(s) matched, {miss} file(s) with no "
                   "entry in the index.", "ok" if matched else "warn")
         if shared:
