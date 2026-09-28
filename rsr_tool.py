@@ -6398,8 +6398,18 @@ class RsrToolAPI:
         # 106 B on Net_Vs_Hanafuda-SOULDC) -- no unregistered build writes it,
         # so judging on it rejected the one build that makes the streams,
         # 3.00b2, before it was ever packed. The verify re-inserts it.
-        if (want_end != END_UNKNOWN and vols[0].is_file()
-                and rar4_av_owner(vols[0]) is not None):
+        # A SIGNED original was made by the licence holder's own registered
+        # copy, which can be far older than the release: bADkARMA pack their
+        # 2024 releases with rar 4.20 (2012) -mt12 -- Yopaz_Icestar_PAL_JAG's
+        # whole stream, byte for byte -- so a year window around the release
+        # date is exactly the wrong prior. Sweep every build for these.
+        signed_by = (rar4_av_owner(vols[0])
+                     if st["format"] == "RAR4" and vols[0].is_file() else None)
+        if signed_by is not None:
+            self._log(f"    signed (AV) by \"{signed_by}\" — a registered copy "
+                      "can be years older than the release, so the year "
+                      "window is lifted for this one.", "dim")
+        if want_end != END_UNKNOWN and signed_by is not None:
             want_end = END_UNKNOWN
         want_ext = header_exttime(vols[0]) if st["format"] == "RAR4" else None
         # Four bytes of header no build in the pack writes. Worth saying out
@@ -6557,10 +6567,10 @@ class RsrToolAPI:
                                         dirs=dir_send,
                                         dirs_first=dirs_first,
                                         dos_only=bool(s.get("dos_host_only")),
-                                        year_before=int(
-                                            s.get("year_before") or 0),
-                                        year_after=int(
-                                            s.get("year_after") or 0),
+                                        year_before=0 if signed_by is not None
+                                        else int(s.get("year_before") or 0),
+                                        year_after=0 if signed_by is not None
+                                        else int(s.get("year_after") or 0),
                                         host=rar4_host(vols)
                                         if st["format"] == "RAR4" else -1)
             if recipe:
@@ -6583,13 +6593,13 @@ class RsrToolAPI:
             # block needs the packer's own registration key, which no build has
             # and 7.x cannot even write. Both Moebius PSX releases asked for a
             # 234-build year-window sweep that could never have worked.
-            av = rar4_av_owner(vols[0]) if vols and vols[0].is_file() else None
+            av = signed_by
             if av is not None and not aborted:
                 who = f' registered to "{av}"' if av else ""
                 self._log(f"    ▪ this archive carries an AV authenticity "
-                          f"block{who} — `-av` is registered-versions-only and "
-                          f"7.x dropped it, so NO build in the pack can write "
-                          f"one. Widening a window will not reach it.", "warn")
+                          f"block{who}. The block itself is carried and put "
+                          f"back at replay, so it is not the obstacle -- no "
+                          f"build in the pack made these STREAMS.", "warn")
             if aborted:
                 # Nothing was swept to exhaustion — someone pressed a button.
                 # Saying "the exact build is outside the pack" here is a claim
