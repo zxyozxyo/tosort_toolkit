@@ -6126,9 +6126,21 @@ class RsrToolAPI:
                 except Exception:
                     continue
                 extra = 0
+                # The volume that HOLDS this entry. A set's directory entries
+                # are usually written last, so they live in its LAST volume,
+                # and reading `head` at that offset found some other block:
+                # the fraction came out 0 and the rebuild wrote a header 5 B
+                # short (Sonic_Adventure_International-DCRes, part36 of 36).
+                hvol = head
+                try:
+                    vf = getattr(i, "volume_file", None)
+                    if vf and Path(vf).is_file():
+                        hvol = Path(vf)
+                except Exception:
+                    pass
                 try:
                     # The raw header, for the fraction rarfile rounds away.
-                    with open(head, "rb") as fh:
+                    with open(hvol, "rb") as fh:
                         fh.seek(int(i.header_offset))
                         h7 = fh.read(7)
                         hsz = struct.unpack_from("<H", h7, 5)[0]
@@ -10731,12 +10743,23 @@ class RsrToolAPI:
         of the original. Measured on Dreamcast_DC_VCD_Player-THIEVES-HQ: its
         folder entry reads 0x32539463 (2005-02-19 18:35:06) in the .srr and
         came back as today's date."""
-        dts = recipe.get("dir_times") or {}
-        if not dts:
-            rsr = getattr(self._tl, "rebuild_rsr", None)
-            srr = rsr.with_suffix(".srr") if rsr else None
-            if srr and srr.is_file():
-                dts = _srr_dir_times(srr)
+        dts = dict(recipe.get("dir_times") or {})
+        rsr = getattr(self._tl, "rebuild_rsr", None)
+        srr = rsr.with_suffix(".srr") if rsr else None
+        if srr and srr.is_file():
+            from_srr = _srr_dir_times(srr)
+            if not dts:
+                dts = from_srr
+            else:
+                # A capture made before the entry was read from its own volume
+                # recorded the fraction as 0 whenever the entry lived past the
+                # head volume. The .srr holds the real header: take its
+                # fraction when the DOS time agrees.
+                for nm, v in list(dts.items()):
+                    sv = from_srr.get(nm)
+                    if (sv and len(v) > 2 and not int(v[2] or 0)
+                            and int(sv[0]) == int(v[0]) and int(sv[2] or 0)):
+                        dts[nm] = [v[0], v[1], int(sv[2])]
         n = 0
         # Two passes. First make every folder that is missing -- an EMPTY one:
         # staging only creates folders that hold a file, so without this it is
