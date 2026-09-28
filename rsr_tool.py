@@ -2731,6 +2731,16 @@ PPM_ORDERS = (0, 63, 58, 40, 37, 34, 25, 20, 16, 12, 10, 8, 6, 4, 2,
 PPM_MEMS = (64, 16, 4, 128, 256)
 
 
+# RAR 3.x -m2..-m5 runs filters (delta, E8/x86, audio, true-colour, itanium)
+# on the data it recognises; a packer can switch any of them off with -mc?-.
+# The sweep only ever asked for the defaults, so an archive packed with one
+# off matched no build: [DC-DA1] Sonic_Adventure-DAIMON is rar 3.00
+# -m5 -mcD- -- the whole of volume one, byte for byte -- where every default
+# pack parted from it 74,803 bytes in.
+FILTER_OFF_SWITCHES = (("-mcD-",), ("-mcE-",), ("-mcA-",), ("-mcC-",),
+                       ("-mcI-",), ("-mcA-", "-mcC-", "-mcD-", "-mcE-", "-mcI-"))
+
+
 def _ppm_switches() -> list[tuple]:
     """Every -mc variant to try, cheapest and likeliest first."""
     out = [("-mct+",)]
@@ -8196,6 +8206,25 @@ class RsrToolAPI:
                       "RAR 3.0 — no PPM stream can carry a 2.0 stamp.", "dim")
         elif fmt == "RAR4" and level == 5:
             ppm_exes = []
+        if fmt == "RAR4" and level >= 2 and unp_max >= 29:
+            # The filter-off tail: one build per version, each filter off in
+            # turn and all together. Ahead of PPM, which is a longer shot.
+            per_v = {}
+            for ex in exes:
+                v = _exe_number(ex.name)
+                if 300 <= v < 500 and v not in per_v and _R4_EXE.match(ex.name):
+                    per_v[v] = ex
+            n_flt = 0
+            for sw in FILTER_OFF_SWITCHES:
+                for v, ex in sorted(per_v.items()):
+                    for mt in ((0,) if v < 360 else (1, 2, 4, 8)):
+                        combos.append((ex, mt, sw))
+                        n_flt += 1
+            if n_flt:
+                self._log(f"    {n_flt:,} filter-off (-mc?-) combo(s) queued "
+                          "behind the ordinary sweep — a packer can switch "
+                          "RAR 3's delta/E8/audio filters off.", "dim")
+        if fmt == "RAR4" and level == 5 and not (unp_max and unp_max < 29):
             for want in ("_rar5", "_rar4", "_rar3"):
                 hit = next((e for e in exes if want in e.name), None)
                 if hit is not None:
