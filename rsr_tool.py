@@ -11098,16 +11098,8 @@ class RsrToolAPI:
                 # time; the search simply stopped at the wrong file and never
                 # reached _source_by_hash, which would have found the right
                 # one. Same shape as the basename-keyed extras collision.
-                want_crc = f.get("crc32")
-                want_size = f.get("size")
-
                 def _fits(p) -> bool:
-                    try:
-                        if want_size and Path(p).stat().st_size != want_size:
-                            return False
-                    except OSError:
-                        return False
-                    return want_crc is None or _file_crc32(Path(p)) == want_crc
+                    return self._content_is(Path(p), f)
 
                 found = content / base
                 if not (found.is_file() and _fits(found)):
@@ -11336,6 +11328,30 @@ class RsrToolAPI:
                         _exe_label(sibs[-1])))
         return out
 
+    # CRC-32's residue: the CRC of ANY data followed by its own CRC-32. Formats
+    # that end in a self-CRC -- every UPS patch does -- all hash to this, so
+    # for them the CRC names nothing. Nintendo_DS_Header_Fix_Collection_1-5
+    # (2026-09-29): dozens of different .ups files at 220-221 B, all CRC
+    # 2144DF1C, and the rebuild fed BBUPv00.ups's bytes in as BFCXv00.ups,
+    # BOZPv00.ups and C2ZPv00.ups -- four "wrong recipe" failures that were
+    # the wrong SOURCE.
+    CRC32_RESIDUE = 0x2144DF1C
+
+    def _content_is(self, p: Path, f: dict) -> bool:
+        """Whether the file at `p` IS packed file `f`: size and CRC, and the
+        SHA-256 too when the CRC is the residue and so proves nothing."""
+        want_size, want_crc = f.get("size"), f.get("crc32")
+        try:
+            if want_size and p.stat().st_size != want_size:
+                return False
+            if want_crc is not None and _file_crc32(p) != want_crc:
+                return False
+            if want_crc == self.CRC32_RESIDUE and f.get("sha256"):
+                return _file_sha256(p) == f["sha256"]
+        except OSError:
+            return False
+        return True
+
     def _source_by_hash(self, content: Path, f: dict) -> Path | None:
         """The file in `content` whose bytes ARE this packed file, whatever it
         happens to be called.
@@ -11376,11 +11392,8 @@ class RsrToolAPI:
                         continue
                 cache[key] = sizes
             for p in cache[key].get(want_size, []):
-                try:
-                    if _file_crc32(p) == want_crc:
-                        return p
-                except OSError:
-                    continue
+                if self._content_is(p, f):
+                    return p
         return None
 
     def _restore_damaged(self, manifest, z, out: Path):
