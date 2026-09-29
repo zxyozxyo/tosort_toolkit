@@ -8065,11 +8065,50 @@ class RsrToolAPI:
         # DOS-only tick.
         self._tl.year_window_skipped = 0
         self._tl.year_window = ""
+        # An end block only one build family writes names the family, and the
+        # sweep rejects every combo whose end block differs anyway -- so sweep
+        # that family, window or no window. Measured 2026-09-29 over every
+        # 3.x/4.x build in the pack, on the first volume of a volumed set: a
+        # bare 7-byte block with flags 0x4001 is RAR 3.00 and its betas and
+        # nothing else (3.10-3.30 write another form, 3.40-4.20 the 20-byte
+        # one). OldSkool's 2017 3DO sets end that way: packed with a 2002
+        # WinRAR, so a window around the release date dropped the only
+        # builds that could match, and the 8,218 combos it kept ate the
+        # budget before any verdict.
+        fam = []
+        if end_sig == (0x4001, 7) and fmt == "RAR4":
+            fam = [e for e in exes if re.search(r"_rar300(b\d)?\.exe$",
+                                                  e.name, re.I)]
+        if fam:
+            self._log(f"    the first volume ends with RAR 3.00's bare 7-byte "
+                      f"end block — no other build writes it, so the sweep is "
+                      f"its {len(fam)} build(s) only, whatever the release "
+                      f"date.", "dim")
+            exes = fam
+            year_before = year_after = 0
         if (year_before or year_after) and year:
             lo, hi = year - year_before, year + year_after
             inside = [e for e in exes
                       if not _exe_year(e.name)
                       or lo <= _exe_year(e.name) <= hi]
+            # The format stamp outranks the release date. A 2017 set in RAR
+            # 2.0 format (OldSkool's 3DO line) can only have come from a
+            # 1996-2001 build, and a window around 2017 left none of those:
+            # "0 combo(s) from builds that can write 2.0 format lead; the
+            # 7,029 that cannot follow" -- the budget went on combos that
+            # could never match. Keep every build that can write the stamp
+            # whenever the window would leave none.
+            if unp_max and not any(_fmt_fits(e.name, unp_max)
+                                   for e in inside):
+                fits = [e for e in exes if _fmt_fits(e.name, unp_max)
+                        and e not in inside]
+                if fits:
+                    self._log(f"    no build inside the year window can write "
+                              f"this archive's format (unp_ver {unp_max}) — "
+                              f"the {len(fits)} build(s) outside it that can "
+                              f"are swept too, and counted in the line below.",
+                              "dim")
+                    inside = fits + inside
             if inside and len(inside) < len(exes):
                 self._tl.year_window_skipped = len(exes) - len(inside)
                 self._tl.year_window = f"-{year_before}/+{year_after}"
