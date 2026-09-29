@@ -10948,7 +10948,8 @@ class RsrToolAPI:
                   f"skeleton, hash-exact.", "ok")
         return True
 
-    def _restore_dir_times(self, recipe: dict, srcdir: Path) -> None:
+    def _restore_dir_times(self, recipe: dict, srcdir: Path,
+                           srr_fractions: bool = True) -> bool:
         """Give the staged folders the time and attributes the ORIGINAL's
         directory entries carry, so rar writes those entries back unchanged.
 
@@ -10958,15 +10959,19 @@ class RsrToolAPI:
         directory headers in the release's own .srr, which holds every header
         of the original. Measured on Dreamcast_DC_VCD_Player-THIEVES-HQ: its
         folder entry reads 0x32539463 (2005-02-19 18:35:06) in the .srr and
-        came back as today's date."""
+        came back as today's date.
+
+        Returns whether any fraction was taken from the .srr, so a failed
+        rebuild knows a replay WITHOUT them is worth trying (see the caller)."""
         dts = dict(recipe.get("dir_times") or {})
         rsr = getattr(self._tl, "rebuild_rsr", None)
         srr = rsr.with_suffix(".srr") if rsr else None
+        filled = False
         if srr and srr.is_file():
             from_srr = _srr_dir_times(srr)
             if not dts:
                 dts = from_srr
-            else:
+            elif srr_fractions:
                 # A capture made before the entry was read from its own volume
                 # recorded the fraction as 0 whenever the entry lived past the
                 # head volume. The .srr holds the real header: take its
@@ -10976,6 +10981,7 @@ class RsrToolAPI:
                     if (sv and len(v) > 2 and not int(v[2] or 0)
                             and int(sv[0]) == int(v[0]) and int(sv[2] or 0)):
                         dts[nm] = [v[0], v[1], int(sv[2])]
+                        filled = True
         n = 0
         # Two passes. First make every folder that is missing -- an EMPTY one:
         # staging only creates folders that hold a file, so without this it is
@@ -11008,6 +11014,7 @@ class RsrToolAPI:
         if n:
             self._log(f"    {n} folder time(s) restored from the original's "
                       "directory entr(y/ies).", "dim")
+        return filled
 
     def _rebuild_run(self, rsr: Path, content: Path, out: Path) -> dict:
         manifest, z = self.read_rsr(rsr)
@@ -11157,8 +11164,9 @@ class RsrToolAPI:
             srcs.append(dst)
         # kept only so a header mismatch can report what was actually staged
         self._staged, self._staged_files = srcs, st["files"]
+        srr_filled = False
         if keep_paths and recipe.get("dirs"):
-            self._restore_dir_times(recipe, srcdir)
+            srr_filled = self._restore_dir_times(recipe, srcdir)
 
         comment = None
         if st.get("comment_b64"):
@@ -11208,6 +11216,23 @@ class RsrToolAPI:
                               "replayed that instead.", "dim")
                     fail = None
                     break
+        if fail and srr_filled:
+            # The folder fractions taken from the .srr (ac7822f) are what a
+            # capture made BEFORE that fix left out -- and such a capture's
+            # delta put the missing 5 B of each folder header back itself.
+            # Filled at rebuild as well, they arrive twice: Dreamcast_Winice_
+            # SDK_DC-IND (captured 2026-09-27) failed on part02 of 22 with its
+            # deltas inserting exactly those 5 B per folder. Replay once more
+            # the way that capture did; the hash check is the same, so it can
+            # only succeed on the true bytes.
+            self._restore_dir_times(recipe, srcdir, srr_fractions=False)
+            alt = self._replay(recipe, srcs, setwork, comment, st["format"],
+                               base=srcdir if keep_paths else None)
+            if alt and not self._write_replayed(alt, vols, z, out):
+                self._log("    · this capture's deltas already carry the "
+                          "folder time fractions — replayed without adding "
+                          "them from the .srr.", "dim")
+                fail = None
         if (fail and not recipe.get("ftimes") and st["format"] == "RAR4"
                 and _now_bias_build(recipe.get("exe", ""))
                 and self.DOS_MARK not in [str(x) for x in
