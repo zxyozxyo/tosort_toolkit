@@ -182,10 +182,16 @@ _SDDEC = (0, 4, 8, 16, 32, 64, 128, 192)
 _SDBIT = (2, 2, 3, 4, 5, 6, 6, 6)
 
 
-def rar20_tokens(data: bytes, max_out: int):
+def rar20_tokens(data: bytes, max_out: int, blocks: list | None = None,
+                 tokens: bool = True):
     """[(output position, kind, detail)] of a RAR 2.0 stream up to max_out
     bytes of output. kind: L literal, M new match (len, dist), OLD/REP/S the
-    distance-reuse forms, A audio. After unrar's Unpack20; no window needed."""
+    distance-reuse forms, A audio. After unrar's Unpack20; no window needed.
+
+    `blocks`, when given, collects (output position, audio?, channels) at
+    every table read -- where each block starts and what it is. With
+    tokens=False nothing else is kept, which is what a whole CD image needs
+    (hundreds of millions of tokens would not fit in memory)."""
     buf = bytes(data) + b"\0" * 8
     nbits = len(data) * 8
     pos = 0
@@ -267,6 +273,8 @@ def rar20_tokens(data: bytes, max_out: int):
             tab["DD"] = huff(t[298:346])
             tab["RD"] = huff(t[346:])
         old[:size] = t
+        if blocks is not None:
+            blocks.append((out, audio, st["chan"] if audio else 0))
 
     out = 0
     ev = []
@@ -281,13 +289,15 @@ def rar20_tokens(data: bytes, max_out: int):
                 if n == 256:
                     tables()
                     continue
-                ev.append((out, "A", n))
+                if tokens:
+                    ev.append((out, "A", n))
                 out += 1
                 st["cur"] = (st["cur"] + 1) % st["chan"]
                 continue
             n = dec(tab["LD"])
             if n < 256:
-                ev.append((out, "L", n))
+                if tokens:
+                    ev.append((out, "L", n))
                 out += 1
                 continue
             if n == 269:
@@ -314,11 +324,16 @@ def rar20_tokens(data: bytes, max_out: int):
                 d = _SDDEC[n] + 1 + (get(_SDBIT[n]) if _SDBIT[n] else 0)
                 ln = 2
                 kind = "S"
-            if kind != "REP":
-                olds[optr & 3] = d
-                optr += 1
+            # Every copy pushes its distance, the repeat included -- unrar's
+            # CopyString20 does it for all four kinds. Skipping REP here gave
+            # later OLD tokens the wrong distance, hence the wrong length
+            # bonus, and the output position drifted: 11,779 B by 17 MB into
+            # Oni_Zero, which made every block look misplaced.
+            olds[optr & 3] = d
+            optr += 1
             last = (ln, d)
-            ev.append((out, kind, (ln, d)))
+            if tokens:
+                ev.append((out, kind, (ln, d)))
             out += ln
     except (ValueError, IndexError):
         pass

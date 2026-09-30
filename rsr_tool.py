@@ -6668,6 +6668,16 @@ class RsrToolAPI:
                 break
             if self._budget_hit:
                 break
+        # Before the near miss, and even when the budget stopped the sweep:
+        # every wall this fixes parks on the budget, because no build can
+        # ever finish it.
+        if not recipe and not (self._skip.is_set() or self._stop.is_set()):
+            recipe = self._mm_flip_recipe(
+                st, meta, targets, blocks, order, src_files, work, level,
+                solid, mgroups, sweep_vol, head_vol, newnum, dir_send,
+                dirs_first, base=srcdir if keep_paths else None)
+            if recipe:
+                self._budget_hit = False
         if (not recipe and not self._budget_hit
                 and not (self._skip.is_set() or self._stop.is_set())):
             recipe = self._near_miss_recipe(meta, targets, dir_send, dirs_first)
@@ -6978,9 +6988,138 @@ class RsrToolAPI:
                 "dirs": list(dirs), "dirs_first": bool(dirs_first),
                 "tried": 0, "near_miss": len(miss)}
 
+    MMV_MAX_FLIPS = 12
+
+    def _mm_flip_recipe(self, st, meta, targets, blocks, order, src_files,
+                        work, level, solid, groups, vol_bytes, head_vol,
+                        newnum, dirs, dirs_first, base=None) -> dict | None:
+        """The closest -mm combo, with the multimedia verdicts that went the
+        other way on the scene's PC forced (see rar2_mmv) -- or None.
+
+        Only for the shape it was proven on: a RAR 2.0-format, non-solid set
+        where a Windows 2.70/2.71 combo with -mm reproduced every stream but
+        one or two big ones. Oni_Zero_Fukkatsu and FURAIKI (HOOLiGANS) each
+        needed exactly ONE forced call out of ~600,000. Each round is a full
+        traced pack; the original's block starts are decoded once."""
+        bp = self._best_partial
+        if not bp or len(bp) < 7 or st["format"] != "RAR4":
+            return None
+        n_ok, label, mt_, sw_, names, exe, dkb = bp[:7]
+        sw_ = [str(x) for x in (sw_ or ())]
+        if "-mm" not in sw_ or solid or any(f.get("solid") for f in meta):
+            return None
+        if rar4_unp_max(st["volumes"]) >= 29:
+            return None
+        miss = [f["name"] for f in meta
+                if f["name"] in targets and f["name"] not in set(names)]
+        if not miss or len(miss) > 2:
+            return None
+        ex = self._app_dir / "apps" / "winrar_pack-4.20" / exe
+        try:
+            import rar2_mmv
+            import dosrar_fill
+            if not rar2_mmv.supported(ex.read_bytes()):
+                return None
+        except (OSError, ImportError):
+            return None
+        self._log(f"    ◐ {label} -mm reproduces every stream but "
+                  f"{', '.join(n.split('/')[-1] for n in miss)} — trying the "
+                  "multimedia verdicts that can differ between PCs (one full "
+                  "pack per round).", "info")
+        src_of = dict(zip(order, src_files))
+        orig_blocks = {}
+        t0 = time.monotonic()
+        for name in miss:
+            data = bytearray()
+            for vol, off, size in blocks.get(name, ()):
+                with open(vol, "rb") as fh:
+                    fh.seek(off)
+                    data += fh.read(size)
+            bl = []
+            dosrar_fill.rar20_tokens(bytes(data), 1 << 62, blocks=bl,
+                                     tokens=False)
+            del data
+            if not bl:
+                return None
+            orig_blocks[name] = bl
+            if self._stop.is_set() or self._skip.is_set():
+                return None
+        self._log(f"      the original's blocks decoded in "
+                  f"{time.monotonic() - t0:,.0f}s "
+                  f"({sum(len(b) for b in orig_blocks.values()):,} blocks, "
+                  f"{sum(1 for b in orig_blocks.values() for x in b if x[1]):,}"
+                  " audio).", "dim")
+        rec = {"exe": exe, "version": _exe_label(exe), "mt": mt_,
+               "dict_kb": dkb, "level": level, "solid": False,
+               "volume_bytes": vol_bytes, "new_numbering": newnum,
+               "dirs": list(dirs), "dirs_first": bool(dirs_first),
+               "tried": 0}
+        if head_vol:
+            rec["volume_head_bytes"] = head_vol
+        if len(groups) > 1:
+            rec["groups"] = [list(g) for g in groups]
+        trace = work / "mmv_trace.bin"
+        forced: list[tuple[int, int]] = []
+        for rnd in range(self.MMV_MAX_FLIPS + 1):
+            if self._stop.is_set() or self._skip.is_set():
+                return None
+            mc = sw_ + ([rar2_mmv.switch(forced)] if forced else [])
+            try:
+                trace.unlink()
+            except OSError:
+                pass
+            t0 = time.monotonic()
+            made = self._replay(dict(rec, mc=mc, _mm_trace=str(trace)),
+                                src_files, work / "mmv", None, st["format"],
+                                base=base)
+            if not made:
+                self._log("      the traced pack produced nothing.", "warn")
+                return None
+            got = set(self._streams_match(made[0], targets))
+            left = [n for n in miss if n not in got]
+            if len(got) == len(targets):
+                self._log(f"      ✓ every stream reproduces with "
+                          f"{len(forced)} verdict(s) forced "
+                          f"({rar2_mmv.switch(forced)}).", "ok")
+                out = dict(rec, mc=mc)
+                out.pop("volume_head_bytes", None)
+                return out
+            if any(n not in got for n in targets if n not in miss):
+                self._log("      forcing verdicts broke a stream that had "
+                          "matched — giving up.", "warn")
+                return None
+            if rnd == self.MMV_MAX_FLIPS:
+                break
+            try:
+                calls = rar2_mmv.read_trace(trace.read_bytes())
+            except OSError:
+                return None
+            nxt = None
+            for name in left:
+                src = src_of[name].read_bytes()
+                d = rar2_mmv.first_disagreement(
+                    rar2_mmv.place(calls, src), orig_blocks[name])
+                del src
+                if d and (nxt is None or d[0] < nxt[0]):
+                    nxt = d
+            if nxt is None or any(nxt[0] <= n for n, _ in forced):
+                self._log("      no analyser verdict disagrees with the "
+                          "original — the difference is something else.",
+                          "warn")
+                return None
+            forced.append(nxt)
+            self._log(f"      round {rnd + 1} ({time.monotonic() - t0:,.0f}s):"
+                      f" call {nxt[0]:,} answered "
+                      f"{'LZ' if nxt[1] else 'audio'} here and "
+                      f"{'audio' if nxt[1] else 'LZ'} in the original — "
+                      "forcing it.", "dim")
+        self._log(f"      still short after {len(forced)} forced verdicts.",
+                  "warn")
+        return None
+
     # ── header decode ─────────────────────────────────────────────────────
 
-    _RAR4_DICT_BITS = {0: 64, 1: 128, 2: 256, 3: 512,
+    _RAR4_DICT_BITS ={0: 64, 1: 128, 2: 256, 3: 512,
                        4: 1024, 5: 2048, 6: 4096}
 
     def _read_files(self, infos, fmt: str) -> list[dict]:
@@ -9281,6 +9420,24 @@ class RsrToolAPI:
         ex = self._app_dir / "apps" / "winrar_pack-4.20" / recipe["exe"]
         if not ex.is_file():
             return None
+        # @MMV<call>:<verdict>,...: the same build with those multimedia-
+        # analyser answers forced (see rar2_mmv). Patched from the stock
+        # binary every time, beside the output folder rather than in it, so
+        # nothing is shipped and the volume listing never sees it.
+        mc_all = [str(x) for x in (recipe.get("mc") or ())]
+        mmv = [x for x in mc_all if x.startswith("@MMV")]
+        if mmv or recipe.get("_mm_trace"):
+            try:
+                import rar2_mmv
+                pex = target.parent.parent / f"mmv_{recipe['exe']}"
+                pex.write_bytes(rar2_mmv.build(
+                    ex.read_bytes(), rar2_mmv.parse(mmv),
+                    recipe.get("_mm_trace")))
+            except (ValueError, OSError, ImportError) as e:
+                self._log(f"    ✗ {recipe['exe']} cannot take the forced "
+                          f"multimedia verdicts: {e}", "err")
+                return None
+            ex = pex
         groups = [tuple(g) for g in recipe.get("groups") or []]
         if not groups:
             groups = [(recipe["level"], len(srcs))]
@@ -9325,7 +9482,9 @@ class RsrToolAPI:
                                dirs_form=recipe.get("dirs_form")
                                or ("given" if recipe.get("dirs")
                                    and not recipe.get("dirs_inline") else None))
-        return self._pack_cmds_extra(cmds, recipe.get("mc") or ())
+        return self._pack_cmds_extra(
+            cmds, [x for x in (recipe.get("mc") or ())
+                   if not str(x).startswith("@MMV")])
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
                 fmt: str, base=None) -> list[Path] | None:
@@ -12150,9 +12309,11 @@ class RsrToolAPI:
         # @FILL<n> is this release's leftover memory, re-derived for every
         # release from its own stream -- as a prior it would only queue a
         # wrong value elsewhere.
+        # @MMV is the same: call numbers in this release's own pack.
         sw = ",".join(str(x) for x in (recipe.get("mc") or ())
                       if str(x) != self.DOS_MARK
-                      and not str(x).startswith("@FILL"))
+                      and not str(x).startswith("@FILL")
+                      and not str(x).startswith("@MMV"))
         try:
             con = self._db()
             try:
