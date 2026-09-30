@@ -6429,6 +6429,24 @@ class RsrToolAPI:
         # -v — the same rule the replay follows.
         sweep_vol = 0 if st["byte_split"] or len(vols) == 1 \
             else vols[0].stat().st_size
+        # A FIRST VOLUME SMALLER THAN THE REST. Dragon_Ball_GT_Final_Bout_USA
+        # _PS1-AHU: volume one is 19,998,949 B and every later one 20,000,000,
+        # and rar 3.30 reproduces the set byte for byte once asked for exactly
+        # that -- `-v19998949b -v20000000b`, rar's per-volume size list.
+        # Packing every volume at volume one's size made each later one short,
+        # so no combo could ever match. Needs a middle volume to read the
+        # common size off, so three volumes at least.
+        head_vol = 0
+        if sweep_vol and st["format"] == "RAR4" and len(vols) >= 3:
+            try:
+                vsz = [v.stat().st_size for v in vols]
+            except OSError:
+                vsz = []
+            if vsz and vsz[0] < vsz[1] and len(set(vsz[1:-1])) == 1:
+                head_vol, sweep_vol = vsz[0], vsz[1]
+                self._log(f"    volume one is {head_vol:,} B and the rest "
+                          f"{sweep_vol:,} — packing with a size per volume "
+                          f"(-v{head_vol}b -v{sweep_vol}b).", "dim")
         # Files at different methods mean successive `rar a` calls. Appending
         # is impossible once an archive is split, though — rar refuses to modify
         # a volume set — so a mixed-method VOLUMED set is a shape we cannot
@@ -6439,6 +6457,17 @@ class RsrToolAPI:
         # RAR 2.x writes none and 3.00+ always does. Read once here and passed
         # down as-is -- END_UNKNOWN is the only "do not check" value.
         want_end = end_block_sig(vols[0]) if vols[0].is_file() else END_UNKNOWN
+        # Volume one of a SET whose end block says "no next volume". Every
+        # build sets that bit on a volume it continues from, so judging on it
+        # rejected every combo -- 51 of DBGT-AHU's 64 -- before a stream was
+        # compared. It is one header bit; the verify carries it as a delta.
+        if (len(vols) > 1 and isinstance(want_end, tuple)
+                and not want_end[0] & 1):
+            want_end = (want_end[0] | 1, want_end[1])
+            self._log("    volume one's end block lacks the next-volume flag "
+                      "although the set continues — no build writes that; "
+                      "matching on the rest of it and patching the bit.",
+                      "dim")
         # An AV-signed original's end block is the SIGNER's (RAR 3 pads it to
         # 106 B on Net_Vs_Hanafuda-SOULDC) -- no unregistered build writes it,
         # so judging on it rejected the one build that makes the streams,
@@ -6607,6 +6636,7 @@ class RsrToolAPI:
                                         src_files, targets, work, s["max_mt"],
                                         year, grp, self._deadline, rel,
                                         vol_bytes=sweep_vol,
+                                        head_vol=head_vol,
                                         new_numbering=newnum, groups=mgroups,
                                         end_sig=want_end, hdr_ext=want_ext,
                                         rung=di, rungs=len(cands),
@@ -6726,12 +6756,15 @@ class RsrToolAPI:
         # splitter, not of RAR, and are restored from the volume records.
         vol_bytes = 0 if st["byte_split"] or len(vols) == 1 \
             else vols[0].stat().st_size
+        if head_vol:
+            vol_bytes = sweep_vol          # the common size; head_vol leads
         # rr_bytes / rr_pct / rr_sectors were measured BEFORE the sweep, so
         # that the probe could ask for the record as well; the replay reads
         # them off the recipe here. _verify_replay still corrects the ask if
         # the volume lengths come out wrong.
         recipe.update({"level": level, "solid": solid,
                        "volume_bytes": vol_bytes, "naming": st["scheme"],
+                       **({"volume_head_bytes": head_vol} if head_vol else {}),
                        "new_numbering": newnum, "rr_pct": rr_pct,
                        "rr_sectors": rr_sectors,
                        "byte_split": st["byte_split"],
@@ -8063,7 +8096,8 @@ class RsrToolAPI:
                       want_vols=0, unp_max=0, expanded=False,
                       host=-1, rr_sectors=-1, dos_only=False,
                       year_before=0, year_after=0,
-                      dirs=(), dirs_first=True, mm_ev=None) -> dict | None:
+                      dirs=(), dirs_first=True, mm_ev=None,
+                      head_vol=0) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -8618,7 +8652,11 @@ class RsrToolAPI:
         probe_dir = work / "probe"
         vol_args = []
         if vol_bytes:
-            vol_args = [f"-v{vol_bytes}b"] + ([] if new_numbering else ["-vn"])
+            # A smaller volume one leads: rar takes the sizes in order and
+            # repeats the last for every volume after.
+            vol_args = (([f"-v{head_vol}b"] if head_vol else [])
+                        + [f"-v{vol_bytes}b"]
+                        + ([] if new_numbering else ["-vn"]))
             self._log(f"    packing in {vol_bytes:,} B volumes, as the original "
                       "was — rar treats an incompressible file differently when "
                       "it is streaming to volumes.", "dim")
@@ -8631,7 +8669,7 @@ class RsrToolAPI:
             vol_args.append("-rr" if not rr_sectors else f"-rr{rr_sectors}")
         srcs = [str(p) for p in src_files]
         # What the original's volume structure has to come back as.
-        vol_first = vol_bytes if (vol_bytes and want_vols > 1) else 0
+        vol_first = (head_vol or vol_bytes) if (vol_bytes and want_vols > 1)             else 0
         groups = list(groups or [(level, len(src_files))])
         if len(groups) > 1:
             self._log("    this set holds files at "
@@ -9254,6 +9292,9 @@ class RsrToolAPI:
             # each volume is packed that much smaller -- the original's data
             # per volume, exactly.
             vol_args = [f"-v{int(recipe['volume_bytes']) - int(recipe.get('av_size') or 0) - int(recipe.get('av_pad') or 0)}b"]
+            if recipe.get("volume_head_bytes"):
+                # Volume one packed smaller than the rest (see head_vol).
+                vol_args.insert(0, f"-v{int(recipe['volume_head_bytes'])}b")
             if not recipe.get("new_numbering"):
                 vol_args.append("-vn")     # .rar/.r00 rather than .partN.rar
         tail = []
