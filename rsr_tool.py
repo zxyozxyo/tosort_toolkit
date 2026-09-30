@@ -981,6 +981,41 @@ def group_archive_sets(base: Path) -> list[dict]:
         if _rar_format(p):
             families[(str(p.parent), p.stem, "lone")] = [(0, p)]
 
+    # `name01.rar, name02.rar, …`: a .partNN set with the ".part" renamed
+    # away. Each file is its own `.rar` family above, so the set came apart
+    # into one-volume archives that "continue into a volume not in this
+    # folder" -- FIFA_World_Cup_2002 and A2_Racer_Goes_Usa-PARADOX (26 and 16
+    # volumes, every one present) were refused as partial sets. Rejoin
+    # consecutive siblings whose first is a RAR volume, numbered by the digits.
+    runs: dict[tuple, list[tuple[int, tuple]]] = {}
+    for key, vols in families.items():
+        parent, stem, scheme = key
+        m = re.match(r"^(?P<base>.*?)(?P<n>\d{2,3})$", stem)
+        if scheme == "old" and len(vols) == 1 and vols[0][0] == -1 and m:
+            runs.setdefault((parent, m.group("base"), len(m.group("n"))),
+                            []).append((int(m.group("n")), key))
+    for (parent, base, _w), members in runs.items():
+        members.sort()
+        nums = [n for n, _ in members]
+        if (len(members) < 2 or nums[0] not in (0, 1)
+                or nums != list(range(nums[0], nums[0] + len(nums)))):
+            continue
+        first = families[members[0][1]][0][1]
+        try:
+            with open(first, "rb") as fh:
+                head = fh.read(12)
+        except OSError:
+            continue
+        if head[:7] != RAR4_SIG or not int.from_bytes(head[10:12],
+                                                        "little") & 0x0001:
+            continue                       # not a volume: separate archives
+        merged = []
+        for n, key in members:
+            merged.append((n, families.pop(key)[0][1]))
+        stem0 = spelling.get(members[0][1], (0, base))[1]
+        spelling[(parent, base.lower(), "part")] = (nums[0], stem0[:len(base)])
+        families[(parent, base.lower(), "part")] = merged
+
     sets = []
     for key, vols in families.items():
         parent, stem, scheme = key
@@ -8075,15 +8110,25 @@ class RsrToolAPI:
         # WinRAR, so a window around the release date dropped the only
         # builds that could match, and the 8,218 combos it kept ate the
         # budget before any verdict.
-        fam = []
-        if end_sig == (0x4001, 7) and fmt == "RAR4":
-            fam = [e for e in exes if re.search(r"_rar300(b\d)?\.exe$",
-                                                  e.name, re.I)]
+        # A second family measured the same way: 18 B with flags 0x4007 is
+        # 3.10-3.30 and nothing else (Dragon_Ball_GT_Final_Bout-AHU, a single
+        # volume, carries it as 0x4006). Bit 0 only says another volume
+        # follows, so it is masked off: a single-volume or last volume of the
+        # same build writes the same block without it.
+        fam, fam_name = [], ""
+        if fmt == "RAR4" and isinstance(end_sig, tuple):
+            eflags, esize = end_sig[0] & ~1, end_sig[1]
+            if (eflags, esize) == (0x4000, 7):
+                fam_name, pat = "RAR 3.00", r"_rar300(b\d)?\.exe$"
+            elif (eflags, esize) == (0x4006, 18):
+                fam_name, pat = "RAR 3.10-3.30", r"_rar3[123][01](b\d)?\.exe$"
+            if fam_name:
+                fam = [e for e in exes if re.search(pat, e.name, re.I)]
         if fam:
-            self._log(f"    the first volume ends with RAR 3.00's bare 7-byte "
-                      f"end block — no other build writes it, so the sweep is "
-                      f"its {len(fam)} build(s) only, whatever the release "
-                      f"date.", "dim")
+            self._log(f"    the first volume ends with {fam_name}'s "
+                      f"{end_sig[1]}-byte end block — no other build writes "
+                      f"it, so the sweep is its {len(fam)} build(s) only, "
+                      f"whatever the release date.", "dim")
             exes = fam
             year_before = year_after = 0
         if (year_before or year_after) and year:
