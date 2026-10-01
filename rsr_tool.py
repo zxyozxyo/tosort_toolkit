@@ -10475,7 +10475,11 @@ class RsrToolAPI:
                     out = work / f"x{si}"
                     out.mkdir(parents=True, exist_ok=True)
                     unrar = self._app_dir / "apps" / "UnRAR.exe"
-                    names = [files[i]["name"] for i in todo]
+                    # Backslashes: unrar matches a named member only in the
+                    # archive's own separator ("tape/Darkness.tap" finds
+                    # nothing, "tape\Darkness.tap" extracts it).
+                    names = [files[i]["name"].replace("/", "\\")
+                             for i in todo]
                     self._run([str(unrar), "x", "-y", "-o+", "-kb", str(head),
                                *names, str(out) + os.sep], timeout=3600,
                               heartbeat="reading from the original")
@@ -10489,12 +10493,31 @@ class RsrToolAPI:
                                             "byte-exact from the original")
                             continue
                         got[i] = data
+                elif fmt == "LHA":
+                    ap = original / st.get("folder", "") / st.get("name", "")
+                    if not ap.is_file():
+                        problems.append(f"{st.get('name')}: not in the original")
+                        continue
+                    raw = ap.read_bytes()
+                    if _sha256(raw) != st.get("sha256"):
+                        problems.append(f"{ap.name}: original differs from "
+                                        "the captured archive")
+                        continue
+                    for i in todo:
+                        f = files[i]
+                        # Content was only ever a STORED member, whose bytes
+                        # are the file itself -- and the archive hash above
+                        # already proves them.
+                        got[i] = raw[f["data_offset"]:
+                                     f["data_offset"] + f["packed_size"]]
                 else:
-                    continue                      # LHA carries its own way
+                    continue
                 for i, data in got.items():
                     f = files[i]
                     key = f"extras/{st.get('stem')}/carry/{f['name']}"
-                    if st.get("format") == "ZIP" and st.get("method") == "preflate":
+                    if st.get("format") == "LHA":
+                        key = f"lha/{si}/carry{i}.bin"
+                    elif st.get("format") == "ZIP" and st.get("method") == "preflate":
                         key = f"zips/{si}/pf/carry{i}.bin"
                     elif st.get("format") == "ZIP":
                         key = f"zips/{si}/carry{i}.def"
@@ -10510,8 +10533,12 @@ class RsrToolAPI:
                 # some of the files and look fixed.
                 return {"ok": False, "changed": 0, "problems": problems}
             if backup_dir:
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(rsr, backup_dir / rsr.name)
+                # Mirrored YEAR/RELEASE, never flat: Cel_Story_GB-bADkARMA
+                # (2024) and CeL_Story_GB-bADkARMA (2026) differ only by case,
+                # which Windows folds, so a flat folder kept one of the two.
+                bdst = backup_dir / rsr.parent.parent.name / rsr.parent.name
+                bdst.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(rsr, bdst / rsr.name)
             man.setdefault("upgrades", []).append(
                 {"utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                  "carried": changed})
