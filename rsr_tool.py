@@ -1630,6 +1630,10 @@ def zip_assemble(skel: bytes, holes: list, streams: dict) -> bytes:
     out = bytearray()
     pos = 0
     for off, ln in holes:
+        if not ln:
+            # An empty member: nothing to put back, and its offset is shared
+            # with the next hole, whose bytes `streams[off]` holds.
+            continue
         gap = off - (len(out))
         out += skel[pos:pos + gap]
         pos += gap
@@ -4606,6 +4610,19 @@ class RsrToolAPI:
                           "nothing to read the recipe out of.", "warn")
                 return {"ok": False, "error": "incomplete set — head volume "
                                               "missing"}
+            cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+            if loose and cap and all(p.stat().st_size < cap for p in files):
+                # A SMALL unpacked release -- a DOX walkthrough, a cheat-disc
+                # menu: the files ARE the release, and they fit. Carried
+                # verbatim exactly like an nfo fix or a foreign archive, so it
+                # is kept, indexed and rebuilds byte-exact instead of sitting
+                # in the miss list forever.
+                total = sum(p.stat().st_size for p in files)
+                return self._capture_metadata(
+                    folder, store, s, rel, files,
+                    why=f"  Unpacked release — {', '.join(loose)} loose with "
+                        f"no archive. All {len(files)} file(s) fit the embed "
+                        f"cap, so they are carried verbatim ({total:,} B).")
             if loose:
                 # An UNPACKED release: the content is sitting loose and the
                 # archive that carried it is gone. A .rsr is a recipe for
@@ -5181,7 +5198,31 @@ class RsrToolAPI:
         # the archive holds 4, the extras being a GZip and a JPG inside the
         # data. Restricted to ZIP with no recursion it is 4 of 4 and the rom is
         # contiguous again.
-        if not self._run([str(exe), "-cn", "-t+z", "-d0", f"-o{out}", str(zp)],
+        # And not the streams of a zip STORED inside this one. -d0 stops
+        # recursion into what precomp expands, but a stored member is not
+        # expanded -- its bytes sit in the archive verbatim, so precomp meets
+        # the inner zip's own headers at the top level and expands THOSE. The
+        # member then exists in the output in neither form and the cut fails:
+        # C12_Final_Resistance-EEA (stc-c12s.zip), Battlefield_Latro (FLIPS
+        # .zip), Chesters_Big_Ol_Day (three web builds), PSXIMGTS.ZIP. -i at
+        # each inner local header leaves the member as it is.
+        ignore = []
+        try:
+            with open(zp, "rb") as fh:
+                raw = fh.read()
+            for e in zip_entries(zp) or ():
+                if e["method"] != 0 or not e["packed_size"]:
+                    continue
+                a, b = e["data_offset"], e["data_offset"] + e["packed_size"]
+                j = raw.find(b"PK\x03\x04", a, b)
+                while j >= 0 and len(ignore) < 2000:
+                    ignore.append(f"-i{j}")
+                    j = raw.find(b"PK\x03\x04", j + 1, b)
+            del raw
+        except OSError:
+            ignore = []
+        if not self._run([str(exe), "-cn", "-t+z", "-d0", *ignore, f"-o{out}",
+                          str(zp)],
                          timeout=3600, heartbeat=f"preflate {zp.name}"):
             return None
         return out.read_bytes() if out.is_file() else None
@@ -5231,9 +5272,6 @@ class RsrToolAPI:
         anywhere, so the first hit is not always the one that lets the rest of
         the archive resolve."""
         n = len(payloads)
-        for _nm, exp, rawb in payloads:
-            if not exp and not rawb:
-                return None                      # nothing to look for
 
         MAX_CAND = 64                            # per entry
         MAX_STEPS = 50_000                       # over the whole walk
@@ -5257,6 +5295,12 @@ class RsrToolAPI:
             copies nothing."""
             out, seen = [], set()
             exp, rawb = payloads[i][1], payloads[i][2]
+            if not exp and not rawb:
+                # A zero-byte member -- Mr_Driller_2-TRM's "PASSWORT NOT
+                # INCLUDED1one", a CVS/Template, KOF2003's kof2003.unk. It has
+                # no bytes to find, so it sits wherever the walk is. Returning
+                # "nothing to look for" here refused all three archives.
+                return [(start, 0, "expanded")]
             forms = [("expanded", exp)]
             if rawb and rawb != exp:
                 forms.append(("raw", rawb))
@@ -5474,6 +5518,57 @@ class RsrToolAPI:
                   f"({rsr_path.stat().st_size:,} B) — VERIFIED", "ok")
         return {"ok": True, "recipe": "LHA skeleton"}
 
+    def _zip_carry(self, zp: Path, zi_no: int, raw: bytes, ents: list,
+                   embedded: dict, manifest: dict, why: str,
+                   cap: int) -> bool:
+        """Carry every member of a small zip as it is -- the last resort.
+
+        For the zips nothing can DERIVE: preflate 0.3.5 cannot model the
+        1996-99 DOS zipper behind the PARADOX/WACKYISO selector .BLKs and the
+        CYBORG cover paks, or MODE7's Powerpuff rom ("No matches" 1.9 MB into
+        a stream zlib reads perfectly). Small archives like these are worth
+        more kept, verified and indexed than refused, and that is how srrdb
+        treats an nfo fix. Every member becomes a carried extra, so the
+        rebuild needs no content at all -- it is enumerated, not matched (see
+        _rebuild_metadata) -- and the set is labelled `carried` so nothing
+        downstream mistakes it for a recipe. Proven here like everything else:
+        reassembled and byte-compared before it is accepted."""
+        if not cap or len(raw) > cap:
+            self._log(f"    ✗ {why} — and at {len(raw):,} B the archive is "
+                      f"over the {cap:,} B embed cap, so it is not carried "
+                      "whole either.", "err")
+            return False
+        for k in [k for k in embedded if k.startswith(f"zips/{zi_no}/")]:
+            del embedded[k]
+        skel, holes = zip_skeleton(raw, ents)
+        files, check = [], {}
+        for i, e in enumerate(ents):
+            rawe = raw[e["data_offset"]:e["data_offset"] + e["packed_size"]]
+            key = f"zips/{zi_no}/c/{i}.bin"
+            embedded[key] = rawe
+            check[e["data_offset"]] = rawe
+            rec = dict(e)
+            rec["source"] = "extra"
+            rec["stored"] = key
+            rec["recipe"] = {"impl": "verbatim", "label": "carried"}
+            files.append(rec)
+        if zip_assemble(skel, holes, check) != raw:
+            self._log(f"    ✗ {zp.name}: even carried whole it does not "
+                      "reassemble — refusing.", "err")
+            return False
+        skey = f"zips/{zi_no}/skeleton.bin"
+        embedded[skey] = skel
+        manifest["sets"].append({
+            "stem": zp.stem, "format": "ZIP", "name": zp.name,
+            "size": len(raw), "sha256": _sha256(raw), "method": "carried",
+            "skeleton": skey, "holes": holes, "files": files,
+            "verify": "exact",
+        })
+        self._log(f"    ◐ {why}; carrying the archive's {len(ents)} "
+                  f"member(s) as they are ({len(raw):,} B) — verified, but a "
+                  "container, not a recipe.", "warn")
+        return True
+
     def _capture_zip(self, folder: Path, store: Path, s: dict, rel: str,
                      zips: list[Path]) -> dict:
         """Capture a ZIP release: headers verbatim, streams by recipe.
@@ -5591,8 +5686,20 @@ class RsrToolAPI:
                         ok = False
                         break
                     else:
-                        data = (plain if plain is not None
-                                else zlib.decompress(rawe, -15))
+                        try:
+                            data = (plain if plain is not None
+                                    else zlib.decompress(rawe, -15))
+                        except zlib.error as ze:
+                            # Not valid deflate at all -- a damaged copy, not
+                            # an encoder we lack (2_Games_in_1_Monsters_en_Co
+                            # -iND: "invalid stored block lengths"). Never
+                            # carried whole: that would VERIFY the damage.
+                            self._log(f"  ✗ {zp.name}: member {e['name']} is "
+                                      f"corrupt ({ze}) — this copy is damaged; "
+                                      "check it against the DAT.", "err")
+                            return {"ok": False,
+                                    "error": f"{zp.name}: corrupt member "
+                                             f"{e['name']}"}
                         # Say what is about to happen and roughly what it
                         # costs. A ZIP sweep is one long silence per rom
                         # otherwise, which reads exactly like a hang.
@@ -5629,6 +5736,11 @@ class RsrToolAPI:
                     # No setting reproduces the stream — so stop guessing which
                     # zipper wrote it and read the parameters out of the stream.
                     pcf = self._pcf_of(zp, work / "pf")
+                    if pcf is None and self._zip_carry(
+                            zp, zi_no, raw, ents, embedded, manifest,
+                            "no deflate setting reproduces it and preflate "
+                            "could not run", cap):
+                        continue
                     if pcf is None:
                         return {"ok": False,
                                 "error": f"{zp.name}: no deflate setting "
@@ -5647,6 +5759,11 @@ class RsrToolAPI:
                                      e["data_offset"] + e["packed_size"]])
                                 for e in ents]
                     cut = self._pcf_cut(pcf, payloads)
+                    if cut is None and self._zip_carry(
+                            zp, zi_no, raw, ents, embedded, manifest,
+                            "preflate's output cannot be cut back into "
+                            "members", cap):
+                        continue
                     if cut is None:
                         self._log("    ✗ preflate ran, but the content is not "
                                   "a contiguous run in its output — it cannot "
@@ -5667,6 +5784,11 @@ class RsrToolAPI:
                                 for i, h in enumerate(holes)]
                     stuck = [h[2] for i, h in enumerate(holes)
                              if h[3] == "raw" and bigs[i]]
+                    if stuck and self._zip_carry(
+                            zp, zi_no, raw, ents, embedded, manifest,
+                            f"preflate cannot model the content stream "
+                            f"({', '.join(stuck[:3])})", cap):
+                        continue
                     if stuck:
                         self._log(f"    ✗ preflate left the content stream "
                                   f"({', '.join(stuck[:3])}) compressed, so it "
@@ -5686,6 +5808,10 @@ class RsrToolAPI:
                                         {h[0]: pf_bytes[i]
                                          for i, h in enumerate(holes)})
                     restored = self._pcf_restore(back, work / "pf")
+                    if restored != raw and self._zip_carry(
+                            zp, zi_no, raw, ents, embedded, manifest,
+                            "preflate did not restore it byte-exact", cap):
+                        continue
                     if restored != raw:
                         self._log("    ✗ preflate did not restore this archive "
                                   "byte-exact — refusing it.", "err")
@@ -5738,6 +5864,11 @@ class RsrToolAPI:
                     total = sum(len(zlib.compress(v, 9))
                                 for k, v in embedded.items()
                                 if k.startswith(f"zips/{zi_no}/"))
+                    if total >= len(raw) and self._zip_carry(
+                            zp, zi_no, raw, ents, embedded, manifest,
+                            f"preflate would carry {total:,} B for a "
+                            f"{len(raw):,} B archive", cap):
+                        continue
                     if total >= len(raw):
                         # A release of nineteen similar jpgs has no small
                         # extras to carry cheaply — Contact-WTFE is exactly
@@ -6241,7 +6372,7 @@ class RsrToolAPI:
                  if not p.is_file() or p.stat().st_size != (f["size"] or 0)]
         healed = None
         if ((short or not ok_x) and st["format"] == "RAR4"
-                and not st["byte_split"] and len(vols) > 1
+                and not st["byte_split"]
                 and not (self._skip.is_set() or self._stop.is_set())):
             healed = self._heal_source(vols, head, newnum, srcdir, exes, meta)
             if healed:
@@ -6891,7 +7022,15 @@ class RsrToolAPI:
         that is more than one bit cannot be reproduced by any pack."""
         clean, bad = rar4_part_crcs(vols)
         if not clean and not bad:
-            return None
+            # No per-part evidence either way (Hotspring_Mahjong-HOOLIGANS,
+            # Mickeys_Wild_Adventure-INTENSE: every .sfv entry agrees, the
+            # file CRC fails). Damaged INPUT is then a hypothesis, not a
+            # finding -- but a cheap one to test, since the sweep has to
+            # reproduce every stream byte for byte from the -kb bytes before
+            # anything is written. Damage after packing simply walls.
+            self._log("    the set carries no per-part checksums to say where "
+                      "the damage is — trying it as damaged INPUT; only a "
+                      "byte-exact sweep will accept that.", "dim")
         unsolved = [b for b in bad if b[1] is None]
         if unsolved:
             self._log(f"    the packed data of {len(unsolved)} volume(s) "
