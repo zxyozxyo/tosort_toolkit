@@ -3652,6 +3652,10 @@ class RsrToolAPI:
             "max_mt": _num(cfg.get("max_mt"), 16, int),
             "embed_extras": bool(cfg.get("embed_extras", True)),
             "embed_max_mb": _num(cfg.get("embed_max_mb"), 16, int),
+            # A wall (no recipe at any build) up to this size is carried WHOLE
+            # -- no space saving, but kept, indexed and rebuildable. 0 = only
+            # walls under the embed cap, as before.
+            "wall_carry_mb": _num(cfg.get("wall_carry_mb"), 0, int),
             "write_srr": bool(cfg.get("write_srr", True)),
             "skip_done": bool(cfg.get("skip_done", True)),
             # Off by default -- see _dict_candidates: 7,541 of 7,541.
@@ -3706,6 +3710,8 @@ class RsrToolAPI:
             "embed_extras": bool(s.get("embed_extras", cur["embed_extras"])),
             "embed_max_mb": max(0, min(4096, _num(s.get("embed_max_mb"),
                                                   cur["embed_max_mb"], int))),
+            "wall_carry_mb": max(0, min(65536, _num(s.get("wall_carry_mb"),
+                                                    cur["wall_carry_mb"], int))),
             "write_srr": bool(s.get("write_srr", cur["write_srr"])),
             "skip_done": bool(s.get("skip_done", cur["skip_done"])),
             "dict_ladder": bool(s.get("dict_ladder", cur["dict_ladder"])),
@@ -4908,7 +4914,8 @@ class RsrToolAPI:
                 # budget stop, a hand stop, a damaged or incomplete copy or a
                 # locale problem is not one, and carrying a damaged copy would
                 # verify the damage.
-                cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+                cap = max(int(s.get("embed_max_mb", 16) or 0),
+                          int(s.get("wall_carry_mb", 0) or 0)) * 1024 * 1024
                 errs = " ".join(set_errors).lower()
                 not_verdict = ("budget", "stopped", "skipped", "damaged",
                                "truncated", "corrupt", "incomplete release",
@@ -6095,6 +6102,10 @@ class RsrToolAPI:
         for name, data in embedded.items():
             if name.split("/")[0] not in ("extras", "sidecars"):
                 continue
+            if whole and Path(name).suffix.lower() not in _SIDECAR_EXT:
+                # A release carried whole holds its volumes too: a loose copy
+                # of those beside the .rsr would double the store for nothing.
+                continue
             dst = out_dir / name
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(data)
@@ -6157,7 +6168,7 @@ class RsrToolAPI:
                 self._log(f"    (skipping loose {rel} — it is the set's "
                           "content, supplied at rebuild)", "dim")
                 continue
-            if cap and size >= cap:
+            if cap and size >= cap and not whole:
                 self._log(f"    (skipping loose {rel} — {size:,} B is over the "
                           "embed cap, treated as content)", "dim")
                 continue
@@ -10547,6 +10558,21 @@ class RsrToolAPI:
             return {"ok": True, "changed": len(changed), "problems": []}
         finally:
             _rmtree(work)
+
+    def carry_whole_release(self, folder: Path) -> dict:
+        """Capture a release by carrying it WHOLE -- for a wall the operator
+        has decided to keep rather than chase (2026-10-01: the last hard walls
+        of the old sets). Same container and rebuild as an nfo fix; the
+        manifest says carried_whole so nothing reads it as a recipe."""
+        folder = Path(folder)
+        s = self.get_settings()
+        store = Path(s["store"])
+        files = [p for p in folder.rglob("*") if p.is_file()]
+        total = sum(p.stat().st_size for p in files)
+        return self._capture_metadata(
+            folder, store, s, _release_name(folder), files, whole=True,
+            why=f"  Carried whole on request — no recipe reproduces it; "
+                f"{total:,} B in {len(files)} file(s), verbatim.")
 
     @staticmethod
     def read_rsr(path: Path) -> tuple[dict, zipfile.ZipFile]:

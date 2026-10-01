@@ -210,6 +210,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <input class="num" id="embed_max_mb" type="number" min="0" max="4096" value="16">
             <span class="hint">MB — larger packed files count as content</span>
           </div>
+          <div class="row">
+            <div class="lbl">Carry walls up to</div>
+            <input class="num" id="wall_carry_mb" type="number" min="0" max="65536" value="0">
+            <span class="hint">MB — a release no recipe reproduces is kept whole (0 = only under the embed cap)</span>
+          </div>
           <label class="chk-row"><input type="checkbox" id="embed_extras" checked>
             Embed archive-only extras (required to rebuild them)</label>
           <label class="chk-row"><input type="checkbox" id="write_srr" checked>
@@ -442,6 +447,7 @@ window.addEventListener('pywebviewready', async () => {
   checkStore();
   $('max_mt').value = s.max_mt;
   $('embed_max_mb').value = s.embed_max_mb;
+  $('wall_carry_mb').value = s.wall_carry_mb || 0;
   $('embed_extras').checked = s.embed_extras;
   $('write_srr').checked = s.write_srr;
   $('skip_done').checked = s.skip_done;
@@ -551,6 +557,7 @@ function cfg() {
     store: $('store').value.trim(),
     max_mt: $('max_mt').value,
     embed_max_mb: $('embed_max_mb').value,
+    wall_carry_mb: $('wall_carry_mb').value,
     embed_extras: $('embed_extras').checked,
     write_srr: $('write_srr').checked,
     skip_done: $('skip_done').checked,
