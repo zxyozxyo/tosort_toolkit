@@ -912,9 +912,49 @@ _VOL_PATTERNS = (
     # (regex on the full name, naming scheme, sort key extractor)
     (re.compile(r"^(?P<stem>.+)\.part(?P<n>\d+)\.rar$", re.I), "part"),
     (re.compile(r"^(?P<stem>.+)\.r(?P<n>\d{2,3})$",     re.I), "old"),
+    # rar's own old-style naming does not stop at .r99: volume 101 is .s00,
+    # then .s01 ... .s99, .t00 and on. Unrecognised, those parts fell out of
+    # the set and were swept up as SIDECARS -- a 50 MB volume carried as a
+    # loose extra, or a tiny last part like .s01 sitting beside the nfo.
+    (re.compile(r"^(?P<stem>.+)\.(?P<l>[s-z])(?P<n>\d{2})$", re.I), "old"),
     (re.compile(r"^(?P<stem>.+)\.rar$",                 re.I), "old"),
     (re.compile(r"^(?P<stem>.+?)\.(?P<n>\d{3})$",       re.I), "numeric"),
 )
+
+
+# Files a DAT holds: the game itself, whatever its size. A GB rom is 32 KB and
+# a PSX audio track a few hundred, so this cannot be a size rule.
+CONTENT_EXT = frozenset((
+    ".bin", ".iso", ".img", ".cdi", ".gdi", ".mdf", ".nrg", ".chd", ".raw",
+    ".ecm", ".cso", ".wbfs", ".wad", ".nds", ".dsi", ".gba", ".gb", ".gbc",
+    ".3ds", ".cia", ".cci", ".nsp", ".xci", ".vpk", ".pkg", ".n64", ".z64",
+    ".v64", ".sfc", ".smc", ".fig", ".md", ".gen", ".smd", ".sms", ".gg",
+    ".pce", ".a26", ".a78", ".lnx", ".j64", ".nes", ".fds", ".ngp", ".ngc",
+    ".ws", ".wsc", ".vb", ".32x", ".gcm", ".rvz", ".xex", ".pocket"))
+
+
+def content_flags(items, cap: int) -> list[bool]:
+    """Which of [(name, size)] are CONTENT -- supplied at rebuild -- rather
+    than carried in the .rsr.
+
+    It used to be "the largest file, plus anything over the cap". Right for a
+    game, wrong for a release with no game in it: of four cover jpgs the
+    biggest was demanded at rebuild, a file no DAT and no content folder will
+    ever hold, so the release could not come back. Now:
+      * anything at or over the embed cap is content, as before;
+      * a rom / disc image (CONTENT_EXT) is content whatever its size;
+      * with neither, a set that fits under the cap is carried WHOLE;
+      * a bigger set of no-game files keeps the old rule (largest is
+        content), so a 400 MB cover collection is not stuffed into a .rsr."""
+    sizes = [int(sz or 0) for _n, sz in items]
+    big = [bool(cap) and sz >= cap for sz in sizes]
+    game = [Path(str(n)).suffix.lower() in CONTENT_EXT for n, _sz in items]
+    if any(game) or any(big):
+        return [b or g for b, g in zip(big, game)]
+    if cap and sum(sizes) < cap:
+        return [False] * len(items)
+    top = max(sizes) if sizes else 0
+    return [sz >= top for sz in sizes]
 
 
 def _classify_volume(name: str):
@@ -930,6 +970,9 @@ def _classify_volume(name: str):
         if scheme == "old":
             n = m.groupdict().get("n")
             idx = -1 if n is None else int(n)      # `.rar` is volume zero
+            letter = m.groupdict().get("l")
+            if letter:                              # .s00 follows .r99
+                idx += (ord(letter.lower()) - ord("r")) * 100
         else:
             idx = int(m.group("n"))
         return stem, scheme, idx
@@ -975,11 +1018,40 @@ def group_archive_sets(base: Path) -> list[dict]:
     # the release routed to the ZIP path and died there as "unreadable zip" —
     # correctly, since it is not a zip. The marker decides format everywhere
     # else in here; let it decide membership too.
+    lone: dict[tuple, list[Path]] = {}
     for p in sorted(base.rglob("*")):
         if not p.is_file() or _classify_volume(p.name):
             continue
         if _rar_format(p):
-            families[(str(p.parent), p.stem, "lone")] = [(0, p)]
+            lone.setdefault((str(p.parent), p.stem.lower()), []).append(p)
+    # A set with its EXTENSIONS renamed: Mickeys_Wild_Adventure-INTENSE ships
+    # mickeys.int + mickeys.i00 … .i21 for .rar + .r00 … .r21. Every part has
+    # the marker, so each was a "lone" archive under the SAME key and each
+    # overwrote the last: one 20 MB volume of a 453 MB set, reported as
+    # "extraction incomplete". One letters-only extension plus digit-ending
+    # ones, and a head that says it is a volume, is that set -- in order.
+    for (parent, stem), ps in lone.items():
+        head = [p for p in ps if re.fullmatch(r"\.[A-Za-z]+", p.suffix)]
+        rest = [p for p in ps if re.fullmatch(r"\.[A-Za-z]*\d+", p.suffix)]
+        if (len(ps) > 1 and len(head) == 1 and len(rest) == len(ps) - 1):
+            try:
+                with open(head[0], "rb") as fh:
+                    hb = fh.read(12)
+            except OSError:
+                hb = b""
+            if (hb[:7] == RAR4_SIG
+                    and int.from_bytes(hb[10:12], "little") & 0x0001):
+                rest.sort(key=lambda q: int(re.search(r"\d+$", q.suffix)
+                                            .group()))
+                families[(parent, head[0].stem, "lone")] = (
+                    [(0, head[0])] + [(i + 1, q) for i, q in enumerate(rest)])
+                continue
+        for p in ps:
+            # Its own family. Keyed by the stem as it always was (the set's
+            # name in every existing capture), and by the full name only when
+            # two same-stem lone archives would otherwise overwrite each other.
+            families[(parent, p.stem if len(ps) == 1 else p.name,
+                      "lone")] = [(0, p)]
 
     # `name01.rar, name02.rar, …`: a .partNN set with the ".part" renamed
     # away. Each file is its own `.rar` family above, so the set came apart
@@ -1169,7 +1241,10 @@ def shadow_names(count: int, newnum: bool = False) -> list[str]:
     """The names shadow_set gives a set's volumes, in order."""
     if newnum:
         return [f"shadow.part{i:02d}.rar" for i in range(1, count + 1)]
-    return ["shadow.rar"] + [f"shadow.r{i:02d}" for i in range(count - 1)]
+    # .r00-.r99, then .s00 -- rar's own continuation, which is the only
+    # spelling rar and rarfile will look for after .r99.
+    return ["shadow.rar"] + [f"shadow.{chr(ord('r') + i // 100)}{i % 100:02d}"
+                             for i in range(count - 1)]
 
 
 def shadow_set(volumes: list[Path], work: Path, byte_split: bool,
@@ -4824,6 +4899,32 @@ class RsrToolAPI:
             verified = all(x.get("verify") in ("exact", "delta")
                            for x in manifest["sets"] if "recipe" in x)
             if not (all_ok and verified):
+                # A SMALL release no recipe reaches is kept whole instead. The
+                # PLUS3DS trainers (~170 KB, 22 B off), the 1 MB DC cheat and
+                # trainer discs, an nfo collection holding two files of one
+                # name (Dreamcast_NFO_Archive-EEA): worth more kept, indexed
+                # and rebuilding byte-exact than as permanent misses -- the
+                # same call srrdb makes for an nfo fix. Only on a VERDICT: a
+                # budget stop, a hand stop, a damaged or incomplete copy or a
+                # locale problem is not one, and carrying a damaged copy would
+                # verify the damage.
+                cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+                errs = " ".join(set_errors).lower()
+                not_verdict = ("budget", "stopped", "skipped", "damaged",
+                               "truncated", "corrupt", "incomplete release",
+                               "head volume", "code page", "locale")
+                rel_files = [p for p in folder.rglob("*") if p.is_file()]
+                total = sum(p.stat().st_size for p in rel_files)
+                if (cap and total < cap and rel_files
+                        and not (self._skip.is_set() or self._stop.is_set())
+                        and not any(k in errs for k in not_verdict)):
+                    return self._capture_metadata(
+                        folder, store, s, rel, rel_files,
+                        whole=True,
+                        why=f"  No recipe reproduces this release, but it is "
+                            f"small ({total:,} B in {len(rel_files)} file(s)) "
+                            f"— carrying it whole, verbatim: kept and "
+                            f"rebuildable, a container rather than a recipe.")
                 self._log("  ✗ Not every set captured and verified — writing "
                           "NO .rsr, so a re-run still sees this release.", "err")
                 # Say WHICH kind of failure, because the caller records a wall
@@ -5642,18 +5743,15 @@ class RsrToolAPI:
                 # generous enough to hold a proof jpg, and embedding the rom
                 # made the first .rsr TWICE the size of the archive it
                 # describes.
-                biggest = max((e["size"] or 0) for e in ents)
-                bigs = [((e["size"] or 0) >= biggest
-                         or (cap and (e["size"] or 0) >= cap))
-                        for e in ents]
+                bigs = content_flags([(e["name"], e["size"]) for e in ents],
+                                     cap)
                 prefer_pf = self._zip_prefers_preflate(_release_group(rel))
                 for e in ents:
                     with open(zp, "rb") as fh:
                         fh.seek(e["data_offset"])
                         rawe = fh.read(e["packed_size"])
                     rec = dict(e)
-                    big = ((e["size"] or 0) >= biggest
-                           or (cap and (e["size"] or 0) >= cap))
+                    big = bigs[ents.index(e)]
                     rec["source"] = "content" if big else "extra"
                     # A rom is matched back to its release on size+CRC32, and a
                     # collision is settled on SHA-256. A RAR capture records
@@ -5839,8 +5937,7 @@ class RsrToolAPI:
                     files = []
                     for idx, e in enumerate(ents):
                         rec = dict(e)
-                        big = ((e["size"] or 0) >= biggest
-                               or (cap and (e["size"] or 0) >= cap))
+                        big = bigs[idx]
                         rec["source"] = "content" if big else "extra"
                         rec["recipe"] = {"impl": "preflate", "label": "preflate"}
                         if big:
@@ -5950,7 +6047,8 @@ class RsrToolAPI:
                 gate.release()
 
     def _capture_metadata(self, folder: Path, store: Path, s: dict, rel: str,
-                          files: list, why: str = "") -> dict:
+                          files: list, why: str = "",
+                          whole: bool = False) -> dict:
         """Capture a release that is metadata only — a DIRFIX, NFOFIX and the
         like, where the nfo IS the release and there never was an archive.
 
@@ -5982,7 +6080,9 @@ class RsrToolAPI:
         }
         embedded: dict[str, bytes] = {}
         manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
-                                                      manifest)
+                                                      manifest, whole=whole)
+        if whole:
+            manifest["carried_whole"] = True
         if not manifest["sidecars"]:
             self._log("  Nothing could be carried (all files over the embed "
                       "cap?) — not writing a .rsr.", "warn")
@@ -6007,7 +6107,7 @@ class RsrToolAPI:
                 "error": ""}
 
     def _capture_sidecars(self, folder: Path, s: dict, embedded: dict,
-                          manifest: dict) -> list[dict]:
+                          manifest: dict, whole: bool = False) -> list[dict]:
         """Loose files in the release folder that belong to no archive.
 
         The .nfo and .sfv are the obvious ones, but this also picks up a proof
@@ -6039,7 +6139,9 @@ class RsrToolAPI:
                     if st.get("name")}
         out: list[dict] = []
         for p in sorted(folder.rglob("*")):
-            if not p.is_file() or _classify_volume(p.name):
+            # `whole`: a release carried in its entirety, volumes included --
+            # there is no set capture to describe them.
+            if not p.is_file() or (_classify_volume(p.name) and not whole):
                 continue
             if p.name in captured:
                 continue
@@ -6472,14 +6574,15 @@ class RsrToolAPI:
         # What remains is always smaller than what it is proof OF, so embedding
         # it costs kilobytes.
         cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
-        biggest = max((f["size"] or 0) for f in meta) if meta else 0
+        is_content = content_flags([(f["name"], f["size"]) for f in meta],
+                                   cap)
         extras = []
         content_only = []
-        for f, sp in zip(meta, src_files):
+        for (f, sp), want in zip(zip(meta, src_files), is_content):
             loose = folder / Path(f["name"]).name
             f["loose"] = (loose.is_file() and loose.stat().st_size == f["size"]
                           and _file_crc32(loose) == f["crc32"])
-            if (f["size"] or 0) >= biggest or (cap and (f["size"] or 0) >= cap):
+            if want:
                 # Content: recorded in the manifest so the rebuild demands it,
                 # but its bytes stay out of the .rsr. Hash it anyway — that
                 # hash is how a rebuild finds WHICH .rsr a loose rom belongs to,
@@ -10298,6 +10401,119 @@ class RsrToolAPI:
         if path.exists():
             path.unlink()
         tmp.rename(path)
+
+    def upgrade_carry(self, rsr: Path, original: Path,
+                      backup_dir: Path | None = None) -> dict:
+        """Carry, inside an EXISTING .rsr, the non-game files it demands as
+        content -- read from the original release, never re-swept.
+
+        3,422 captures made before content_flags demand a cover jpg, a PPF,
+        a strategy-guide pdf or an nfo at rebuild: files no DAT and no content
+        folder holds, so once the source folder is deleted they cannot come
+        back. The recipe is right; only the source of those bytes is not. So
+        each such file is read from the original (RomVault's copy, opened
+        read-only), checked against the SHA-256 the capture recorded, stored
+        in the container and marked `extra`. A RAR replay takes a stored extra
+        exactly as it took the loose file; a ZIP entry becomes `verbatim`
+        (its original compressed stream) or, under preflate, the expanded
+        bytes the hole already expects. Nothing else in the .rsr changes."""
+        cap = max(0, int(self.get_settings().get("embed_max_mb", 16))) << 20
+        man, z = self.read_rsr(rsr)
+        embedded = {n: z.read(n) for n in z.namelist() if n != "manifest.json"}
+        z.close()
+        work = Path(tempfile.mkdtemp(prefix="rsr-upg-", dir=self._work_root()))
+        changed, problems = [], []
+        try:
+            for si, st in enumerate(man.get("sets") or []):
+                files = st.get("files") or []
+                if not files or st.get("method") == "carried":
+                    continue
+                flags = content_flags([(f.get("name"), f.get("size"))
+                                       for f in files], cap)
+                todo = [i for i, (f, w) in enumerate(zip(files, flags))
+                        if f.get("source") == "content" and not w]
+                if not todo:
+                    continue
+                fmt = st.get("format")
+                got: dict[int, bytes] = {}
+                if fmt == "ZIP":
+                    zp = original / st.get("folder", "") / st.get("name", "")
+                    if not zp.is_file():
+                        problems.append(f"{st.get('name')}: not in the original")
+                        continue
+                    raw = zp.read_bytes()
+                    if _sha256(raw) != st.get("sha256"):
+                        problems.append(f"{zp.name}: original differs from "
+                                        "the captured archive")
+                        continue
+                    for i in todo:
+                        f = files[i]
+                        rawe = raw[f["data_offset"]:
+                                   f["data_offset"] + f["packed_size"]]
+                        plain = (rawe if f.get("method") == 0
+                                 else zlib.decompress(rawe, -15))
+                        if f.get("sha256") and _sha256(plain) != f["sha256"]:
+                            problems.append(f"{f['name']}: hash mismatch")
+                            continue
+                        got[i] = plain if st.get("method") == "preflate" else rawe
+                elif fmt in ("RAR4", "RAR5"):
+                    sets = [x for x in group_archive_sets(original)
+                            if x["stem"].lower() == str(st.get("stem")).lower()]
+                    if not sets:
+                        problems.append(f"{st.get('stem')}: set not in the original")
+                        continue
+                    xs = sets[0]
+                    head = shadow_set(xs["volumes"], work / f"sh{si}",
+                                      xs["byte_split"],
+                                      new_numbering(xs["volumes"][0]))
+                    out = work / f"x{si}"
+                    out.mkdir(parents=True, exist_ok=True)
+                    unrar = self._app_dir / "apps" / "UnRAR.exe"
+                    names = [files[i]["name"] for i in todo]
+                    self._run([str(unrar), "x", "-y", "-o+", "-kb", str(head),
+                               *names, str(out) + os.sep], timeout=3600,
+                              heartbeat="reading from the original")
+                    for i in todo:
+                        f = files[i]
+                        p = out / f["name"]
+                        data = p.read_bytes() if p.is_file() else None
+                        if data is None or (f.get("sha256")
+                                            and _sha256(data) != f["sha256"]):
+                            problems.append(f"{f['name']}: could not be read "
+                                            "byte-exact from the original")
+                            continue
+                        got[i] = data
+                else:
+                    continue                      # LHA carries its own way
+                for i, data in got.items():
+                    f = files[i]
+                    key = f"extras/{st.get('stem')}/carry/{f['name']}"
+                    if st.get("format") == "ZIP" and st.get("method") == "preflate":
+                        key = f"zips/{si}/pf/carry{i}.bin"
+                    elif st.get("format") == "ZIP":
+                        key = f"zips/{si}/carry{i}.def"
+                        f["recipe"] = {"impl": "verbatim", "label": "carried"}
+                    embedded[key] = data
+                    f["stored"] = key
+                    f["source"] = "extra"
+                    changed.append(f["name"])
+            if not changed:
+                return {"ok": not problems, "changed": 0, "problems": problems}
+            if problems:
+                # All or nothing: a half-upgraded .rsr would still demand
+                # some of the files and look fixed.
+                return {"ok": False, "changed": 0, "problems": problems}
+            if backup_dir:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(rsr, backup_dir / rsr.name)
+            man.setdefault("upgrades", []).append(
+                {"utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 "carried": changed})
+            self._write_rsr(rsr, man, embedded)
+            self._db_record(man, rsr)
+            return {"ok": True, "changed": len(changed), "problems": []}
+        finally:
+            _rmtree(work)
 
     @staticmethod
     def read_rsr(path: Path) -> tuple[dict, zipfile.ZipFile]:
