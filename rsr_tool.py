@@ -6137,6 +6137,12 @@ class RsrToolAPI:
         # of the thing it was supposed to replace.
         captured = {st.get("name") for st in manifest.get("sets", [])
                     if st.get("name")}
+        # And every VOLUME a set capture describes, by name -- not just the
+        # names _classify_volume knows. Mickeys_Wild_Adventure-INTENSE's
+        # renamed .i21 (13 MB, under the cap) was carried as a sidecar beside
+        # the recipe that already rebuilds it.
+        captured |= {v.get("name") for st in manifest.get("sets", [])
+                     for v in st.get("volumes") or [] if isinstance(v, dict)}
         out: list[dict] = []
         for p in sorted(folder.rglob("*")):
             # `whole`: a release carried in its entirety, volumes included --
