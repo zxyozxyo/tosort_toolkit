@@ -4807,17 +4807,7 @@ class RsrToolAPI:
                         f"no archive. All {len(files)} file(s) fit the embed "
                         f"cap, so they are carried verbatim ({total:,} B).")
             if loose:
-                # An UNPACKED release: the content is sitting loose and the
-                # archive that carried it is gone. A .rsr is a recipe for
-                # reproducing an archive, and this folder has none, so no
-                # re-run and no bigger build pack will change the answer.
-                self._log(f"  Unpacked release — {', '.join(loose)} sitting "
-                          f"loose with no archive around it. A .rsr describes "
-                          f"how to rebuild an archive, so there is nothing "
-                          f"here to capture; this will not change on a "
-                          f"re-run.", "warn")
-                return {"ok": False, "error": "unpacked — no archive to "
-                                              "reproduce"}
+                return self._capture_loose(folder, store, s, rel, files)
             self._log("  No archive set found in this folder"
                       + (f" (contains: {', '.join(sorted(k for k in kinds if k)[:6])})"
                          if kinds else " — folder is empty") + ".", "warn")
@@ -6220,6 +6210,59 @@ class RsrToolAPI:
         return {"ok": True, "metadata": True,
                 "recipe": f"metadata only{f' ({tag})' if tag else ''}",
                 "error": ""}
+
+    def _capture_loose(self, folder: Path, store: Path, s: dict, rel: str,
+                       files: list) -> dict:
+        """An UNPACKED release: the rom sits loose, no archive around it.
+
+        Pokemon_Pearl_USA_NDS-iND, MLB_Power_Pros_2008-MaxG and friends: a
+        64 MB .nds and an nfo. There is no archive to reproduce, but the
+        release is still a release -- its rom is DAT-matched content like any
+        other, and its small files are what the .rsr carries. So it becomes
+        one LOOSE set: the content recorded by size/CRC/SHA-256 (so a batch
+        rebuild finds it by hash and copies it back), everything else carried
+        as sidecars exactly as beside a RAR set."""
+        cap = max(0, int(s.get("embed_max_mb", 16))) * 1024 * 1024
+        flags = content_flags([(p.name, p.stat().st_size) for p in files], cap)
+        content = [p for p, w in zip(files, flags) if w]
+        self._log(f"  Unpacked release — {len(content)} content file(s) "
+                  f"loose with no archive: recorded by hash and supplied at "
+                  f"rebuild; {len(files) - len(content)} other file(s) "
+                  "carried.", "info")
+        recs = []
+        for p in content:
+            self._progress(f"hashing {p.name}")
+            size = p.stat().st_size
+            recs.append({"name": p.relative_to(folder).as_posix(),
+                         "size": size, "packed_size": size,
+                         "crc32": _file_crc32(p), "sha256": _file_sha256(p),
+                         "method": 0, "source": "content",
+                         "mtime_ns": p.stat().st_mtime_ns,
+                         "win_attrs": _win_attrs(p)})
+        manifest = {
+            "rsr_version": RSR_VERSION, "magic": RSR_MAGIC,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
+            "host": {"platform": platform.platform(),
+                     "python": platform.python_version()},
+            "release": rel, "system": _release_system(rel),
+            "year": _release_year(folder, rel), "tag": _release_tag(folder.name),
+            "source_folder": str(folder), "kind": "loose",
+            "sets": [{"stem": rel, "format": "LOOSE", "files": recs,
+                      "verify": "exact"}],
+        }
+        embedded: dict[str, bytes] = {}
+        manifest["sidecars"] = self._capture_sidecars(folder, s, embedded,
+                                                      manifest)
+        out_dir = self._store_dir(store, folder, rel)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rsr_path = out_dir / f"{rel}.rsr"
+        self._write_rsr(rsr_path, manifest, embedded)
+        self._db_record(manifest, rsr_path)
+        self._db_forget(rel)
+        self._log(f"  ✓ {rsr_path.name} written ({rsr_path.stat().st_size:,} B)"
+                  " — LOOSE (content by hash, no archive)", "ok")
+        return {"ok": True, "recipe": "loose", "error": ""}
 
     def _capture_sidecars(self, folder: Path, s: dict, embedded: dict,
                           manifest: dict, whole: bool = False) -> list[dict]:
@@ -11826,6 +11869,9 @@ class RsrToolAPI:
                     if st.get("format") == "LHA":
                         ok_all &= self._rebuild_lha(st, z, content, out)
                         continue
+                    if st.get("format") == "LOOSE":
+                        ok_all &= self._rebuild_loose(st, content, out)
+                        continue
                     if not st.get("recipe"):
                         self._log(f"  {st.get('stem')}: no recipe captured — "
                                   "cannot rebuild this set.", "err")
@@ -12057,6 +12103,29 @@ class RsrToolAPI:
                   "ok")
 
         self._restore_extras(st, z, out)
+        return True
+
+    def _rebuild_loose(self, st: dict, content: Path, out: Path) -> bool:
+        """An unpacked release: copy each content file back by hash."""
+        for f in st.get("files", []):
+            src = self._source_by_hash(content, f)
+            if src is None:
+                self._log(f"    ✗ missing source: {f['name']} ({f['size']:,} B, "
+                          f"CRC {f['crc32']:08X})", "err")
+                return False
+            self._consumed.append(src)
+            if f.get("sha256") and _file_sha256(src) != f["sha256"]:
+                self._log(f"    ✗ {f['name']}: hash mismatch.", "err")
+                return False
+            dst = out / f["name"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            if f.get("mtime_ns"):
+                try:
+                    os.utime(dst, ns=(f["mtime_ns"], f["mtime_ns"]))
+                except OSError:
+                    pass
+            self._log(f"    ✓ {f['name']}  {f['size']:,} B — hash-exact.", "ok")
         return True
 
     def _write_replayed(self, produced, vols, z, out: Path) -> str | None:
