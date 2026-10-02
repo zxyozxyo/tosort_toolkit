@@ -420,6 +420,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <div class="t" id="mi-title">Release</div>
       <button class="btn btn-sm" id="mi-retry" onclick="retryRelease()"
               title="Put this release back on the queue of the run in progress">Try again</button>
+      <button class="btn btn-sm" id="mi-finish" onclick="finishRelease()"
+              title="Lift the time budget for THIS release only — the others keep the normal budget">Finish this one</button>
       <button class="btn btn-sm" id="mi-open" onclick="openInfoFolder()">Open folder</button>
       <button class="btn btn-sm" onclick="closeInfo()">Close</button>
     </div>
@@ -1029,8 +1031,29 @@ async function retryRelease() {
   setTimeout(closeInfo, 700);
 }
 
+// The pop-up's own "Finish this one": lifts the budget for this release only,
+// where the toolbar button lifts every release in flight.
+function finishable(name) {
+  const r = rows.get(name);
+  return !!(scanning && r && (r.kind === 'running' || r.status === 'running'));
+}
+
+async function finishRelease() {
+  const b = $('mi-finish');
+  b.disabled = true;
+  try {
+    const r = await window.pywebview.api.extend_budget_for(infoName);
+    b.textContent = r && r.ok ? 'Budget lifted ✓' : (r && r.error) || 'Not running';
+  } catch (e) {
+    b.textContent = 'Not running';
+  }
+}
+
 async function showInfo(key) {
   infoName = key;
+  $('mi-finish').textContent = 'Finish this one';
+  $('mi-finish').disabled = false;
+  $('mi-finish').style.display = finishable(key) ? '' : 'none';
   $('mi-retry').textContent = 'Try again';
   $('mi-retry').disabled = false;
   $('mi-retry').style.display = retryable(key) ? '' : 'none';

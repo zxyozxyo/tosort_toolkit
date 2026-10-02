@@ -891,11 +891,38 @@ def _release_year(folder: Path, rel: str) -> str:
 #  Volume discovery
 # ══════════════════════════════════════════════════════════════════════════
 
+def sfx_offset(path: Path) -> int:
+    """Where the RAR archive starts inside a self-extracting head, or 0.
+
+    A SFX head is a Windows/DOS program (MZ) with the archive appended:
+    DoomDC_Beta_1-DRAGONINC's di-doom.rar, Code_Warrior-KONCOOL's
+    .part01.exe, Tomb_Raider_La_Revelation_Finale-GENESIA's .exe -- the
+    stubs are 17-52 KB, so the first MB always holds the marker."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1 << 20)
+    except OSError:
+        return 0
+    if head[:2] != b"MZ":
+        return 0
+    j = head.find(RAR4_SIG)
+    k = head.find(RAR5_SIG)
+    cands = [x for x in (j, k) if x > 0]
+    return min(cands) if cands else 0
+
+
 def _rar_format(path: Path) -> str | None:
-    """'RAR4' / 'RAR5' / None, from the marker block every volume carries."""
+    """'RAR4' / 'RAR5' / None, from the marker block every volume carries --
+    after a self-extractor's stub, if it has one."""
     try:
         with open(path, "rb") as f:
             head = f.read(8)
+            if head[:2] == b"MZ":
+                off = sfx_offset(path)
+                if not off:
+                    return None
+                f.seek(off)
+                head = f.read(8)
     except OSError:
         return None
     if head[:8] == RAR5_SIG:
@@ -1088,6 +1115,26 @@ def group_archive_sets(base: Path) -> list[dict]:
         spelling[(parent, base.lower(), "part")] = (nums[0], stem0[:len(base)])
         families[(parent, base.lower(), "part")] = merged
 
+    # A self-extracting HEAD that names itself .exe (gt-tomb4.exe beside
+    # gt-tomb4.r00..., codewarrior.part01.exe beside .part02.rar...) landed in
+    # the lone pass above; give it back to the family it heads.
+    for key in [k for k in families if k[2] == "lone"]:
+        vols_l = families.get(key)
+        if not vols_l or len(vols_l) != 1:
+            continue
+        p = vols_l[0][1]
+        if p.suffix.lower() != ".exe" or not sfx_offset(p):
+            continue
+        parent = key[0]
+        m = re.match(r"^(?P<b>.+)\.part(?P<n>\d+)$", p.stem, re.I)
+        target = (((parent, m.group("b").lower(), "part"), int(m.group("n")))
+                  if m else ((parent, p.stem.lower(), "old"), -1))
+        fam = families.get(target[0])
+        if fam is not None and all(i != target[1] for i, _ in fam):
+            fam.append((target[1], p))
+            spelling[target[0]] = (target[1], m.group("b") if m else p.stem)
+            del families[key]
+
     sets = []
     for key, vols in families.items():
         parent, stem, scheme = key
@@ -1101,6 +1148,27 @@ def group_archive_sets(base: Path) -> list[dict]:
         # A byte-split archive: only the FIRST part carries the marker, the
         # rest are raw continuation bytes. Concatenate to recover one archive.
         split = len(paths) > 1 and not any(_rar_format(p) for p in paths[1:])
+        sfx = None
+        off = sfx_offset(paths[0])
+        if off:
+            # Everything downstream reads RAR headers from offset 0, so the
+            # set is handed on with a STRIPPED copy of its head under the
+            # same name; the stub is carried by the capture and put back in
+            # front at rebuild (see _write_replayed).
+            import hashlib, tempfile
+            st0 = paths[0].stat()
+            tag = hashlib.sha1(f"{paths[0]}|{st0.st_size}|{st0.st_mtime_ns}"
+                               .encode()).hexdigest()[:16]
+            cache = Path(tempfile.gettempdir()) / "rsr-sfx" / tag
+            stripped = cache / paths[0].name
+            if not (stripped.is_file()
+                    and stripped.stat().st_size == st0.st_size - off):
+                cache.mkdir(parents=True, exist_ok=True)
+                with open(paths[0], "rb") as fi, open(stripped, "wb") as fo:
+                    fi.seek(off)
+                    shutil.copyfileobj(fi, fo, 1 << 20)
+            sfx = {"orig": str(paths[0]), "offset": off}
+            paths = [stripped] + paths[1:]
         sets.append({
             "stem": stem,
             "dir": parent,
@@ -1108,6 +1176,7 @@ def group_archive_sets(base: Path) -> list[dict]:
             "format": fmt,
             "volumes": paths,
             "byte_split": split,
+            **({"sfx": sfx} if sfx else {}),
         })
     # Deterministic order, and a part-style set must not also surface as its
     # own `.rar` family (part01.rar matches the old-style `.rar` rule too).
@@ -3470,6 +3539,26 @@ class RsrToolAPI:
             with self._budget_lock:
                 self._budget_flagged[rel] = short
 
+    def extend_budget_for(self, rel: str) -> dict:
+        """Lift the time budget for ONE named release, if it is running now.
+
+        The toolbar button lifts everything in flight; this is the release's
+        own button in its info pop-up, for when several run at once and only
+        one deserves the extra time. Per-release and one-shot exactly as the
+        toolbar's: cleared as that release finishes."""
+        if not self._running:
+            return {"ok": False, "error": "nothing running"}
+        with self._budget_lock:
+            if rel not in self._budget_inflight:
+                return {"ok": False, "error": "that release is not running"}
+            already = rel in self._budget_lifted
+            self._budget_lifted.add(rel)
+        if not already:
+            self._log(f"  ⏱ Budget lifted for {rel} only — it will sweep to "
+                      "completion; every other release keeps the normal "
+                      "budget.", "warn")
+        return {"ok": True, "already": already}
+
     def extend_budget(self) -> dict:
         """Lift the time budget for the release being captured RIGHT NOW.
 
@@ -4626,8 +4715,21 @@ class RsrToolAPI:
             # a defect — but reported identically to a RAR set we failed to
             # find, it would hide real misses in thousands of expected ones.
             kinds = {p.suffix.lower() for p in folder.rglob("*") if p.is_file()}
-            if ".zip" in kinds:
-                zips = sorted(p for p in folder.rglob("*.zip") if p.is_file())
+
+            def _pk(q: Path) -> bool:
+                try:
+                    with open(q, "rb") as fh:
+                        return fh.read(4) == b"PK\x03\x04"
+                except OSError:
+                    return False
+            # By CONTENT, not by name: Dreamon_1-DRINK_TEAM and Interlude-IND
+            # ship a zip called .rar, which no RAR rule could read and the
+            # .zip test never looked at -- "incomplete set, head missing".
+            zips = sorted(p for p in folder.rglob("*") if p.is_file()
+                          and (p.suffix.lower() == ".zip"
+                               or (p.suffix.lower() not in _SIDECAR_EXT
+                                   and _pk(p))))
+            if zips:
                 return self._capture_zip(folder, store, s, rel, zips)
             if kinds & {".lha", ".lzh"}:
                 lhas = sorted(q for q in folder.rglob("*")
@@ -4728,7 +4830,9 @@ class RsrToolAPI:
         # the honest answer to "what about the original set the RARFIX fixes" —
         # that set is not a release we failed to capture, it is a broken copy of
         # one, and the correct bytes are in the fix.
-        vol_paths = [Path(v) for st in sets for v in st["volumes"]]
+        vol_paths = [Path(st["sfx"]["orig"]) if (st.get("sfx") and i == 0)
+                     else Path(v)
+                     for st in sets for i, v in enumerate(st["volumes"])]
         broken_keep: list = []          # (path, sfv record) kept verbatim
         pair_seed = None                # (this folder, partner, joined volumes)
         damaged = sfv_check(folder, vol_paths)
@@ -7114,9 +7218,26 @@ class RsrToolAPI:
                 "verify": verify,
                 "order": order,
                 "files": meta,
-                "volumes": volmeta,
+                "volumes": self._sfx_carry(st, si, volmeta, embedded),
             },
         }
+
+    @staticmethod
+    def _sfx_carry(st: dict, si: int, volmeta: list, embedded: dict) -> list:
+        """A self-extracting head: the set was captured from its stripped
+        copy, so keep the stub and the true head's hash beside volume one."""
+        sfx = st.get("sfx")
+        if not sfx or not volmeta:
+            return volmeta
+        orig = Path(sfx["orig"])
+        with open(orig, "rb") as fh:
+            stub = fh.read(int(sfx["offset"]))
+        key = f"sfx/{si}.bin"
+        embedded[key] = stub
+        volmeta[0] = dict(volmeta[0], sfx_stub=key,
+                          sfx_sha256=_file_sha256(orig),
+                          sfx_size=orig.stat().st_size)
+        return volmeta
 
     def _heal_source(self, vols, head: Path, newnum: bool, srcdir: Path,
                      exes, meta) -> dict | None:
@@ -8548,7 +8669,14 @@ class RsrToolAPI:
         # follows, so it is masked off: a single-volume or last volume of the
         # same build writes the same block without it.
         fam, fam_name = [], ""
-        if fmt == "RAR4" and isinstance(end_sig, tuple):
+        # Only on a volume that CONTINUES (bit 0). A single archive ends with
+        # (0x4000, 7) from every build 3.00-4.20 alike -- measured 2026-10-02
+        # on 3.30, 3.42, 3.93 and 4.20 -- so masking the bit off pinned every
+        # single-volume RAR 3.x archive to the eight 3.00 builds: Splatter-
+        # house_Trilogy, the TRSI and BigBlueBox PSN sets, PSVita.Standards...
+        # all "walls" swept against the wrong family since 13945d7.
+        if (fmt == "RAR4" and isinstance(end_sig, tuple)
+                and end_sig[0] & 1):
             eflags, esize = end_sig[0] & ~1, end_sig[1]
             if (eflags, esize) == (0x4000, 7):
                 fam_name, pat = "RAR 3.00", r"_rar300(b\d)?\.exe$"
@@ -11956,6 +12084,11 @@ class RsrToolAPI:
                         getattr(self, "_staged", []), getattr(self, "_staged_files", []))
                 return (f"    ✗ {v['name']}: hash mismatch after replay "
                         f"({why})." + (f" [{more}]" if more else ""))
+            if v.get("sfx_stub"):
+                data = z.read(v["sfx_stub"]) + data
+                if _sha256(data) != v["sfx_sha256"]:
+                    return (f"    ✗ {v['name']}: the self-extractor stub does "
+                            "not restore the original head.")
             dst = out / v.get("folder", "") / v["name"]
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(data)
