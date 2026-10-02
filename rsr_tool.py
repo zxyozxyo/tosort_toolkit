@@ -1284,6 +1284,29 @@ def _names_or_listfile(names: list, lst: Path, used: int) -> list:
     as a wall. A list file names the same things in the same order, and every
     rar since 1.x reads one. Written in the ANSI code page an old console rar
     expects; UTF-16 with a BOM only when a name cannot be said in it."""
+    def _ansi(n) -> bool:
+        try:
+            str(n).encode("mbcs", "strict")
+            return True
+        except UnicodeEncodeError:
+            return False
+        except LookupError:
+            return True
+    if names and not all(_ansi(n) for n in names):
+        # A name this code page cannot say (Kaitou_Apricot-IND's Japanese
+        # mp3s). A pre-4.x console rar reads its command line AND its list
+        # files in ANSI, so the name arrives as '?' and the file cannot be
+        # opened (3.30 rc 1, 3.71 rc 6, measured) -- yet the same builds read
+        # the names perfectly when they ENUMERATE the folder themselves. So
+        # hand them a recursive wildcard over the folder that holds exactly
+        # this set's files: relative when packing from the source root,
+        # absolute under -ep.
+        if all(Path(str(n)).is_absolute() for n in names):
+            root = Path(os.path.commonpath([str(n) for n in names]))
+            if root.is_file():
+                root = root.parent
+            return ["-r", str(root / "*")]
+        return ["-r", "*"]
     if used + sum(len(str(n)) + 3 for n in names) <= CMDLINE_MAX:
         return names
     text = "\r\n".join(str(n) for n in names) + "\r\n"
@@ -6902,6 +6925,22 @@ class RsrToolAPI:
                 foreign.append(str(nm))
             except LookupError:
                 break
+        # ...unless the archive carries every one of them as UNICODE too: a
+        # Unicode-aware build then reads the files by their real names, the
+        # streams reproduce, and only the OEM half of each name differs --
+        # header bytes, which the verify's delta carries like any other.
+        try:
+            import rarfile as _rf
+            _uni = {i.filename.rstrip("/\\") for i in _rf.RarFile(str(head)).infolist()
+                    if i.flags & 0x200}
+        except Exception:
+            _uni = set()
+        if foreign and all(str(n).rstrip("/\\") in _uni for n in foreign):
+            self._log(f"    {len(foreign)} name(s) are not in this system's "
+                      f"code page but the archive stores them as Unicode — "
+                      f"Unicode-aware builds can read them; expect a header "
+                      f"patch for the names' code-page half.", "dim")
+            foreign = []
         if foreign and st["format"] == "RAR4":
             import locale
             cp = locale.getpreferredencoding(False)
