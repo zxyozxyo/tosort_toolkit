@@ -1272,7 +1272,19 @@ def _inline_dirs(names: list, dirs) -> list:
     return inl + sorted(t for t in tops if t not in seen_t)
 
 
-def _names_or_listfile(names: list, lst: Path, used: int) -> list:
+def _short_path(p: Path) -> str | None:
+    """The 8.3 short form of an existing path (ASCII), or None."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 32768)
+        return buf.value if n else None
+    except Exception:
+        return None
+
+
+def _names_or_listfile(names: list, lst: Path, used: int, base=None,
+                       short: bool = False) -> list:
     """The names themselves, or ["@list"] when they would not fit.
 
     Windows caps a command line at 32,767 characters and CreateProcess simply
@@ -1292,7 +1304,29 @@ def _names_or_listfile(names: list, lst: Path, used: int) -> list:
             return False
         except LookupError:
             return True
-    if names and not all(_ansi(n) for n in names):
+    if short and names and not all(_ansi(n) for n in names):
+        # The GRAFT replay (see _graft_attempt): every header is replaced by
+        # the original's afterwards, so the names rar stores do not matter --
+        # only the ORDER does, and a wildcard cannot keep it. Each name's 8.3
+        # short form is pure ASCII, opens with any build, and keeps exactly
+        # the order given.
+        out = []
+        sb = _short_path(Path(base)) if base is not None else None
+        for n in names:
+            full = Path(str(n)) if Path(str(n)).is_absolute() else Path(base) / str(n)
+            if full.is_dir():
+                continue                   # the graft supplies folder entries
+            if _ansi(n):
+                out.append(n)
+                continue
+            sp = _short_path(full.resolve() if not full.exists() else full)
+            if sp is None:
+                return ["-r", "*"]
+            if not Path(str(n)).is_absolute() and sb:
+                sp = os.path.relpath(sp, sb)
+            out.append(sp)
+        names = out
+    elif names and not all(_ansi(n) for n in names):
         # A name this code page cannot say (Kaitou_Apricot-IND's Japanese
         # mp3s). A pre-4.x console rar reads its command line AND its list
         # files in ANSI, so the name arrives as '?' and the file cannot be
@@ -2390,6 +2424,80 @@ def rar2_insert_av(vol: bytes, av: bytes, end: bytes | None = None) -> bytes:
         struct.pack_into("<I", hdr, 14, nb)
     struct.pack_into("<H", hdr, 0, zlib.crc32(bytes(hdr[2:])) & 0xFFFF)
     return prefix + bytes(hdr) + data + vol[off + size + add:]
+
+
+def rar4_rewrite_rr(vol: bytes, sectors: int | None = None) -> bytes:
+    """Recompute a RAR4 volume's recovery record over its current bytes --
+    the same arithmetic rar2_insert_av uses, for a volume whose protected
+    bytes were changed after rar wrote it. No record: unchanged."""
+    blocks = list(_rar4_walk(vol))
+    rr = next(((o, sz, ad) for o, t, _f, sz, ad in blocks
+               if t == 0x78 or (t == 0x7A and _newsub_name(vol, o) == b"RR")),
+              None)
+    if rr is None:
+        return vol
+    off, size, add = rr
+    prefix = vol[:off]
+    hdr = bytearray(vol[off:off + size])
+    if hdr[2] == 0x7A:
+        if sectors:
+            struct.pack_into("<I", hdr, size - 12, sectors)
+        sectors = struct.unpack_from("<I", hdr, size - 12)[0]
+        data, nb = rar2_rr_data(prefix, sectors)
+        struct.pack_into("<I", hdr, 7, len(data))
+        struct.pack_into("<I", hdr, 11, len(data))
+        struct.pack_into("<I", hdr, 16, zlib.crc32(data) & 0xFFFFFFFF)
+        struct.pack_into("<Q", hdr, size - 8, nb)
+    else:
+        if sectors:
+            struct.pack_into("<H", hdr, 12, sectors)
+        sectors = struct.unpack_from("<H", hdr, 12)[0]
+        data, nb = rar2_rr_data(prefix, sectors)
+        struct.pack_into("<I", hdr, 7, len(data))
+        struct.pack_into("<I", hdr, 14, nb)
+    struct.pack_into("<H", hdr, 0, zlib.crc32(bytes(hdr[2:])) & 0xFFFF)
+    return prefix + bytes(hdr) + data + vol[off + size + add:]
+
+
+def rar4_file_headers(vol: bytes) -> list[bytes]:
+    """Every file/folder header block (0x74) of a RAR4 volume, in order."""
+    return [vol[o:o + sz] for o, t, _f, sz, _a in _rar4_walk(vol) if t == 0x74]
+
+
+def rar4_graft_headers(vol: bytes, heads: list[bytes],
+                       rr_sectors: int | None = None) -> bytes:
+    """Put the ORIGINAL's file headers into a replayed volume, then recompute
+    its recovery record. For a set packed on another code page
+    (Wind_A_Breath_Of_Heart-IND): the streams reproduce, only the OEM half of
+    each name differs -- but the record protects those header bytes, so a
+    plain delta faced a whole record of differences."""
+    def _is_dir(h: bytes) -> bool:
+        return len(h) > 5 and (int.from_bytes(h[3:5], "little") & 0xE0) == 0xE0
+
+    blocks = [b for b in _rar4_walk(vol)]
+    fb = [(o, sz, ad) for o, t, _f, sz, ad in blocks if t == 0x74]
+    if not fb:
+        return rar4_rewrite_rr(vol, rr_sectors)
+    start = fb[0][0]
+    end = fb[-1][0] + fb[-1][1] + fb[-1][2]
+    # The replay's FILE data in order; folder entries come from the original
+    # (a short-name replay names no folders -- naming one makes 3.00 recurse
+    # into it and add every file twice).
+    data = [vol[o + sz:o + sz + ad] for o, sz, ad in fb
+            if not _is_dir(vol[o:o + sz])]
+    out = bytearray(vol[:start])
+    k = 0
+    for h in heads:
+        out += h
+        if not _is_dir(h):
+            if k >= len(data):
+                return vol                 # shapes do not line up
+            out += data[k]
+            k += 1
+    out += vol[end:]
+    # The ORIGINAL's sector count: the record's size is often one no build
+    # reproduces (Wind-IND), and the verify only patched it afterwards.
+    return rar4_rewrite_rr(bytes(out), rr_sectors)
 
 
 def _default_dirs_form(exe_name: str) -> str:
@@ -6936,6 +7044,7 @@ class RsrToolAPI:
         except Exception:
             _uni = set()
         if foreign and all(str(n).rstrip("/\\") in _uni for n in foreign):
+            st["unicode_names"] = True
             self._log(f"    {len(foreign)} name(s) are not in this system's "
                       f"code page but the archive stores them as Unicode — "
                       f"Unicode-aware builds can read them; expect a header "
@@ -7730,7 +7839,7 @@ class RsrToolAPI:
                    groups, srcs: list, target: Path, tail=(),
                    vol_args=(), base=None, dirs=(),
                    dirs_first=True, dirs_inline=False,
-                   dirs_form=None) -> list[list[str]] | None:
+                   dirs_form=None, short_names=False) -> list[list[str]] | None:
         """The command SEQUENCE that builds this archive — usually one command.
 
         `groups` is [(level, count)] over `srcs` in archive order. One entry is
@@ -7852,7 +7961,8 @@ class RsrToolAPI:
                 # the top folder.
                 names = _inline_dirs(list(plain), dirs)
             cmd += [str(target)] + _names_or_listfile(
-                names, Path(target).parent / f"_names{gi}.lst", used)
+                names, Path(target).parent / f"_names{gi}.lst", used,
+                base=base, short=short_names)
             cmds.append(cmd)
             at += count
         return cmds or None
@@ -9950,7 +10060,8 @@ class RsrToolAPI:
                                dirs_inline=bool(recipe.get("dirs_inline")),
                                dirs_form=recipe.get("dirs_form")
                                or ("given" if recipe.get("dirs")
-                                   and not recipe.get("dirs_inline") else None))
+                                   and not recipe.get("dirs_inline") else None),
+                               short_names=bool(recipe.get("short_names")))
         return self._pack_cmds_extra(
             cmds, [x for x in (recipe.get("mc") or ())
                    if not str(x).startswith("@MMV")])
@@ -10042,6 +10153,59 @@ class RsrToolAPI:
             except OSError:
                 pass
         return out_vols
+
+    def _graft_attempt(self, recipe, src_files, vols, work, comment, st, base,
+                       compare, si):
+        """Replay, graft the original's file headers in, recompute the
+        record, compare. Multi-volume: each volume's header is longer or
+        shorter by the same amount, which moves every split point -- so pack
+        the volumes that much bigger or smaller first."""
+        heads = [rar4_file_headers(v.read_bytes()) for v in vols]
+        rr_secs = [rar4_rr_sectors(v) or None for v in vols]
+        rec = dict(recipe, short_names=True)
+        made = self._replay(rec, src_files, work / "graft0", comment,
+                            st["format"], base=base)
+        if not made or not heads[0]:
+            return None
+        if len(vols) > 1 and recipe.get("volume_bytes"):
+            mine = rar4_file_headers(made[0].read_bytes())
+            delta = (sum(len(h) for h in heads[0])
+                     - sum(len(h) for h in mine))
+            if delta:
+                rec = dict(recipe, volume_bytes=int(recipe["volume_bytes"]) - delta)
+                if recipe.get("volume_head_bytes"):
+                    rec["volume_head_bytes"] = int(recipe["volume_head_bytes"]) - delta
+                made = self._replay(rec, src_files, work / "graft1", comment,
+                                    st["format"], base=base)
+                if not made:
+                    return None
+        out = work / "graft_out"
+        out.mkdir(parents=True, exist_ok=True)
+        grafted = []
+        for i, p in enumerate(made):
+            q = out / p.name
+            q.write_bytes(rar4_graft_headers(
+                p.read_bytes(), heads[i] if i < len(heads) else [],
+                rr_secs[i] if i < len(rr_secs) else None))
+            grafted.append(q)
+        v2, m2, d2, r2 = compare(grafted)
+        if v2 == "none":
+            self._log("    grafting the original's file headers in did not "
+                      "bring the replay to a header residual either.", "dim")
+            return None
+        for i, h in enumerate(heads[:len(m2)]):
+            key = f"graft/{si}_{i:04d}.bin"
+            d2[key] = json.dumps({"h": [x.hex() for x in h],
+                                  "rr": rr_secs[i]}).encode()
+            m2[i]["graft"] = key
+        recipe["short_names"] = True
+        recipe.update(volume_bytes=rec.get("volume_bytes"),
+                      **({"volume_head_bytes": rec["volume_head_bytes"]}
+                         if rec.get("volume_head_bytes") else {}))
+        self._log(f"    with the original's file headers grafted in and the "
+                  f"recovery record recomputed, the replay is {v2} — the "
+                  "names' code-page half is all that differed.", "ok")
+        return grafted, v2, m2, d2, r2
 
     def _verify_replay(self, recipe, src_files, vols, work, comment, st, si=0,
                        base=None, packed=None):
@@ -10387,6 +10551,12 @@ class RsrToolAPI:
                     produced, verdict, volmeta, deltas, rr_maps = \
                         alt, v2, m2, d2, r2
                     break
+        if (verdict == "none" and st.get("unicode_names")
+                and st["format"] == "RAR4" and not st["byte_split"]):
+            got = self._graft_attempt(recipe, src_files, vols, work, comment,
+                                      st, base, _compare, si)
+            if got:
+                produced, verdict, volmeta, deltas, rr_maps = got
         if verdict == "none":
             return "none", volmeta, {}
         if verdict == "delta" and recipe.get("rr_pct"):
@@ -12175,6 +12345,10 @@ class RsrToolAPI:
                     f"{len(vols)}.")
         for p, v in zip(produced, vols):
             data = p.read_bytes()
+            if v.get("graft"):
+                g = json.loads(z.read(v["graft"]))
+                data = rar4_graft_headers(
+                    data, [bytes.fromhex(h) for h in g["h"]], g.get("rr"))
             if v.get("av"):
                 data = rar2_insert_av(data, z.read(v["av"]),
                                       z.read(v["av_end"]) if v.get("av_end")
