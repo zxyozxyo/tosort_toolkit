@@ -3099,6 +3099,59 @@ PPM_ORDERS = (0, 63, 58, 40, 37, 34, 25, 20, 16, 12, 10, 8, 6, 4, 2,
               7, 5, 3)
 PPM_MEMS = (64, 16, 4, 128, 256)
 
+# The rarfiles.lst every WinRAR install put beside rar.exe (this is 2.70's; the
+# 3.x lists only added extensions late in the order). It sets the FILE ORDER of
+# a solid archive packed recursively: priority extensions first, then
+# $default -- folders and extensionless files by name, then the rest by
+# extension. Code_Warrior_V4.0_ALL_DC-KONCOOL is rar 3.10 -r with this list:
+# its folder entries sit AMONG the files, and RAR 3.x codes the following file
+# differently after a folder entry, so a replay naming files in the right order
+# with the folders last walled 341 files in -- 472 of 472 with -r and this.
+RARFILES_LST = """\
+file_id.diz
+descript.ion
+read.*
+readme.*
+*.doc
+*.txt
+*.lst
+*.log
+*.ini
+*.bat
+*.cmd
+*.h
+*.c
+*.cpp
+*.asm
+*.bas
+*.bak
+*.rtf
+*.hlp
+*.inf
+*.com
+*.exe
+*.dll
+*.ovr
+*.ovl
+*.obj
+*.lib
+*.sys
+*.drv
+*.bin
+*.bmp
+*.wav
+*.stm
+$default
+*.gif
+*.jpg
+*.tif
+*.arj
+*.ha
+*.lzh
+*.rar
+*.zip
+"""
+
 
 # RAR 3.x -m2..-m5 runs filters (delta, E8/x86, audio, true-colour, itanium)
 # on the data it recognises; a packer can switch any of them off with -mc?-.
@@ -7402,6 +7455,14 @@ class RsrToolAPI:
                 dirs_first, base=srcdir if keep_paths else None)
             if recipe:
                 self._budget_hit = False
+        if not recipe and not (self._skip.is_set() or self._stop.is_set()):
+            recipe = self._sortlist_recipe(
+                st, targets, src_files, work, level, solid, mgroups,
+                sweep_vol, head_vol, newnum, dir_send, dirs_first, exes,
+                comment, cands[0], vols,
+                base=srcdir if keep_paths else None)
+            if recipe:
+                self._budget_hit = False
         if (not recipe and not self._budget_hit
                 and not (self._skip.is_set() or self._stop.is_set())):
             recipe = self._near_miss_recipe(meta, targets, dir_send, dirs_first)
@@ -7738,6 +7799,106 @@ class RsrToolAPI:
                 "tried": 0, "near_miss": len(miss)}
 
     MMV_MAX_FLIPS = 12
+
+    def _sortlist_recipe(self, st, targets, src_files, work, level, solid,
+                         groups, vol_bytes, head_vol, newnum, dirs, dirs_first,
+                         exes, comment, dict_kb, vols,
+                         base=None) -> dict | None:
+        """A pre-3.30 WinRAR pack the sweep cannot express, or None.
+
+        Two shapes, both off the sweep's per-name command line:
+          * a recursive SOLID pack in rar's own order (RARFILES_LST), whose
+            folder entries sit among the files and change how the next file
+            is coded;
+          * a self-extracting head whose stub shortened volume one -- the
+            sweep asks for that with a size list, which builds before 3.30
+            ignore, so every later volume boundary moved.
+        Code_Warrior_V4.0_ALL_DC-KONCOOL needs both: rar 3.10/3.11, 472 of 472.
+        One full pack per (version, shape) -- a handful, not a sweep."""
+        if st["format"] != "RAR4" or len(groups or ()) > 1:
+            return None
+        sfx = st.get("sfx") or {}
+        stub = int(sfx.get("offset") or 0)
+        sfx_ok = bool(stub and head_vol and vol_bytes
+                      and head_vol + stub == vol_bytes)
+        sort_ok = bool(solid and dirs and base is not None)
+        shapes = ([(True, sfx_ok)] if sort_ok else []) \
+            + ([(False, True)] if sfx_ok else [])
+        if not shapes:
+            return None
+        size = sum(p.stat().st_size for p in src_files if p.is_file())
+        if size > (4 << 30):
+            return None
+        unp = rar4_unp_max(st["volumes"])
+        lo, hi = (300, 329) if unp >= 29 else (200, 299)
+        seen, cands = set(), []
+        for ex in exes:
+            n = _exe_number(ex.name)
+            if lo <= n <= hi and n not in seen:
+                seen.add(n)
+                cands.append(ex.name)
+        if not cands:
+            return None
+        what = " and ".join(w for w, on in (
+            ("rar's own solid order with -r", sort_ok),
+            ("the self-extractor's split of volume one", sfx_ok)) if on)
+        self._log(f"    ◐ trying {what} on {len(cands)} pre-3.30 version(s) "
+                  "— shapes the sweep's command line cannot express.", "info")
+        best, fallback = (0, ""), None
+        for sort_on, sfx_on in shapes:
+            for exe in cands:
+                if self._stop.is_set() or self._skip.is_set():
+                    return None
+                rec = {"exe": exe, "version": _exe_label(exe), "mt": 0,
+                       "dict_kb": dict_kb,
+                       "level": level, "solid": solid,
+                       "volume_bytes": vol_bytes, "new_numbering": newnum,
+                       "dirs": list(dirs), "dirs_first": bool(dirs_first),
+                       "tried": 0}
+                if sort_on:
+                    rec["sort_list"] = "270"
+                if sfx_on:
+                    rec["sfx_head"] = stub
+                elif head_vol:
+                    rec["volume_head_bytes"] = head_vol
+                made = self._replay(rec, src_files, work / "sortlist",
+                                    comment, st["format"], base=base)
+                if not made:
+                    continue
+                got = self._streams_match(made[0], targets)
+                if len(got) > best[0]:
+                    best = (len(got), f"{_exe_label(exe)}"
+                            + (" -r sorted" if sort_on else "")
+                            + (" sfx-split" if sfx_on else ""))
+                if len(got) == len(targets):
+                    rec.pop("volume_head_bytes", None)
+                    # Streams alone leave the headers to a delta: 3.00 writes
+                    # Code Warrior's 419 streams too, but not 3.10's end
+                    # blocks. Whole volumes equal wins outright; otherwise
+                    # keep the first and see whether a later version does.
+                    ndiff = len(vols) if len(made) != len(vols) else sum(
+                        1 for a, b in zip(made, vols)
+                        if a.stat().st_size != b.stat().st_size
+                        or _file_sha256(a) != _file_sha256(b))
+                    exact = ndiff == 0
+                    label = f"{_exe_label(exe)}" + (" -r sorted" if sort_on
+                                                    else "")                         + (" sfx-split" if sfx_on else "")
+                    if exact:
+                        self._log(f"      ✓ {label}: every volume byte-exact.",
+                                  "ok")
+                        return rec
+                    # Otherwise the fewest volumes left to a header delta:
+                    # 3.10 leaves 2 of Code Warrior's 11, 3.00 all of them.
+                    self._log(f"      ◐ {label}: every stream reproduces, "
+                              f"{ndiff} of {len(vols)} volume(s) differ in "
+                              "their headers.", "dim")
+                    if fallback is None or ndiff < fallback[0]:
+                        fallback = (ndiff, rec)
+        if fallback is not None:
+            return fallback[1]
+        self._log(f"      closest: {best[0]} of {len(targets)} under "
+                  f"{best[1] or 'none'}.", "dim")
+        return None
 
     def _mm_flip_recipe(self, st, meta, targets, blocks, order, src_files,
                         work, level, solid, groups, vol_bytes, head_vol,
@@ -10323,7 +10484,18 @@ class RsrToolAPI:
             # each volume is packed that much smaller -- the original's data
             # per volume, exactly.
             vol_args = [f"-v{int(recipe['volume_bytes']) - int(recipe.get('av_size') or 0) - int(recipe.get('av_pad') or 0)}b"]
-            if recipe.get("volume_head_bytes"):
+            if recipe.get("sfx_head"):
+                # A self-extractor's stub eats into volume one. Builds before
+                # 3.30 take only ONE -v size, so the original's split comes
+                # back only by packing as an SFX with a stub of the same size
+                # (any bytes will do -- rar just prepends it); _replay cuts it
+                # off again.
+                stub = target.parent.parent / "sfxhead.sfx"
+                if (not stub.is_file()
+                        or stub.stat().st_size != int(recipe["sfx_head"])):
+                    stub.write_bytes(b"\0" * int(recipe["sfx_head"]))
+                vol_args.insert(0, f"-sfx{stub}")
+            elif recipe.get("volume_head_bytes"):
                 # Volume one packed smaller than the rest (see head_vol).
                 vol_args.insert(0, f"-v{int(recipe['volume_head_bytes'])}b")
             if not recipe.get("new_numbering"):
@@ -10357,9 +10529,27 @@ class RsrToolAPI:
                                or ("given" if recipe.get("dirs")
                                    and not recipe.get("dirs_inline") else None),
                                short_names=bool(recipe.get("short_names")))
-        return self._pack_cmds_extra(
+        cmds = self._pack_cmds_extra(
             cmds, [x for x in (recipe.get("mc") or ())
                    if not str(x).startswith("@MMV")])
+        if cmds and recipe.get("sort_list"):
+            # Recursive, in rar's own solid order (RARFILES_LST): the build
+            # runs from a private folder holding the list, and is given the
+            # source root instead of the names. Needs that root -- a flat set
+            # has no folders to place.
+            if base is None or len(cmds) != 1:
+                return None
+            sl = target.parent.parent / f"sl_{Path(recipe['exe']).stem}"
+            sl.mkdir(exist_ok=True)
+            sex = sl / recipe["exe"]
+            if not sex.is_file():
+                shutil.copy2(cmds[0][0], sex)
+            (sl / "rarfiles.lst").write_text(RARFILES_LST, encoding="ascii")
+            c = cmds[0]
+            at = c.index(str(target))
+            cmds = [[str(sex)] + [a for a in c[1:at] if a not in ("-ds", "-ep")]
+                    + ["-r", str(target), "*"]]
+        return cmds
 
     def _replay(self, recipe: dict, src_files, work: Path, comment,
                 fmt: str, base=None) -> list[Path] | None:
@@ -10423,6 +10613,16 @@ class RsrToolAPI:
                                        f" over {mb:,.0f} MB",
                              cwd=base):
                 return None
+        if recipe.get("sfx_head"):
+            # Packed as an SFX only to split where the original did: cut the
+            # stand-in stub off volume one, which is what the capture compared
+            # against (the real stub is carried and put back on write).
+            n = int(recipe["sfx_head"])
+            for p in list(out.iterdir()):
+                if p.suffix.lower() == ".exe" and p.is_file():
+                    data = p.read_bytes()
+                    p.with_suffix(".rar").write_bytes(data[n:])
+                    p.unlink()
         made = sorted(p for p in out.iterdir() if p.is_file())
         if not made:
             return None
@@ -11085,10 +11285,15 @@ class RsrToolAPI:
             z.comment = RSR_MAGIC.encode()
             z.writestr("manifest.json", json.dumps(manifest, indent=1))
             for name, data in embedded.items():
-                # Extras are already-compressed payloads far more often than
-                # not; storing them keeps the container honest about its size.
-                ct = (zipfile.ZIP_STORED if name.startswith("extras/")
-                      else zipfile.ZIP_DEFLATED)
+                # Extras are often already-compressed payloads (a cover jpg, a
+                # pdf), so they are deflated only when it pays. Storing them
+                # all made Code_Warrior_V4.0_ALL_DC-KONCOOL -- 419 source and
+                # help files -- a 75 MB .rsr for a 22 MB release.
+                ct = zipfile.ZIP_DEFLATED
+                if name.startswith("extras/") and data:
+                    probe = data[:1 << 20]
+                    if len(zlib.compress(probe, 1)) > 0.95 * len(probe):
+                        ct = zipfile.ZIP_STORED
                 z.writestr(name, data, compress_type=ct)
         if path.exists():
             path.unlink()
