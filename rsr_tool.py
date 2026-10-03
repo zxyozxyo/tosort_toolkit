@@ -2538,6 +2538,11 @@ class OrigStream:
             i += 1
         return bytes(out)
 
+    def name_at(self, pos: int):
+        """The file whose stream holds byte `pos`, or None."""
+        i = self._bisect.bisect_right(self.starts, pos) - 1
+        return self.blocks[i][0] if 0 <= i < len(self.blocks) else None
+
     def complete_before(self, pos: int) -> list:
         """Names whose whole stream lies before `pos` -- reproduced exactly."""
         return [n for n, e in self.ends.items() if e <= pos]
@@ -8870,8 +8875,12 @@ class RsrToolAPI:
                 # A near miss still has to be reported as one: the closest
                 # count and the -mm verdict solver both read it.
                 self._tally_reject("a later volume's compressed data diverged")
-                return [nm for nm in orig_stream.complete_before(rolling["pos"])
-                        if nm in targets]
+                # Only the file it parted in counts as missed. The files after
+                # it were never packed, and counting them as misses hid the
+                # "every stream but the image" shape the -mm solver keys on
+                # (Jet_Coaster_Dream_2: 43 of 47 reported, really 46).
+                bad = orig_stream.name_at(rolling["pos"])
+                return [nm for nm in targets if nm != bad]
             ran_ok = finished and self._probe_head(wdir) is not None
         else:
             ran_ok = all(self._run(c, timeout=pack_timeout,

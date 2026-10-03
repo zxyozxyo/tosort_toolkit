@@ -116,3 +116,9 @@ rom_test_matrix/logs/
 rom_test_matrix/run*.txt
 rom_test_matrix/*console*.txt
 rom_test_matrix/stage_*.txt
+
+# local backups and reports (2026-10-03 tidy-up)
+_old_backups/
+reports/
+BACKUP_*/
+!DATS/
