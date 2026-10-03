@@ -1090,10 +1090,17 @@ def group_archive_sets(base: Path) -> list[dict]:
     runs: dict[tuple, list[tuple[int, tuple]]] = {}
     for key, vols in families.items():
         parent, stem, scheme = key
-        m = re.match(r"^(?P<base>.*?)(?P<n>\d{2,3})$", stem)
+        m = re.match(r"^(?P<base>.*?)(?P<n>\d{1,3})$", stem)
         if scheme == "old" and len(vols) == 1 and vols[0][0] == -1 and m:
             runs.setdefault((parent, m.group("base"), len(m.group("n"))),
                             []).append((int(m.group("n")), key))
+    # Unpadded numbering (MegaMan_War_of_the_Past-DCSteve: Megaman1.rar ..
+    # Megaman13.rar) splits across two widths; 1-9 runs on into 10-..
+    for (parent, base, w) in sorted(runs, key=lambda k: k[2]):
+        lo, hi = runs.get((parent, base, w)), runs.get((parent, base, w + 1))
+        if (lo and hi and sorted(n for n, _ in lo)[-1] == 10 ** w - 1
+                and min(n for n, _ in hi) == 10 ** w):
+            lo.extend(runs.pop((parent, base, w + 1)))
     for (parent, base, _w), members in runs.items():
         members.sort()
         nums = [n for n, _ in members]
@@ -4895,6 +4902,49 @@ class RsrToolAPI:
                     return sib, s2, union
         return None
 
+    @staticmethod
+    def _twin_volume(folder: Path, vol: Path, crc: int, by_sfv: bool):
+        """(sibling folder, its file) holding exactly these bytes under another
+        name, or None.
+
+        Rune_Caster_JAP_DC-MINIME shipped a bad .r01 and a FIX release with the
+        good one -- renamed mm-runef.r01, a stem _find_pair never matches. A
+        copy that already has the good bytes in place fails its own .sfv (the
+        sfv predates the fix) and was filed as damaged; the fix, one lone
+        middle volume, as a partial set with no partner.
+
+        by_sfv: the sibling's .sfv must list `crc` -- the damaged side asking
+        "does a fix vouch for what I hold". Otherwise (the fix asking where it
+        belongs) the release's own sfv is stale by definition, so the bytes are
+        hashed -- only same-size, same-extension files in a sibling from the
+        same group whose name starts with the same word."""
+        size = vol.stat().st_size
+        me = _release_name(folder)
+        grp = me.rsplit("-", 1)[-1].lower()
+        word = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", me).split("_")[0].lower()
+        for sib in sorted(folder.parent.iterdir()):
+            if not sib.is_dir() or sib == folder:
+                continue
+            if by_sfv:
+                want = [n for n, c in sfv_expected(sib).items() if c == crc]
+                cands = [p for p in sib.iterdir() if p.name.lower() in want]
+            else:
+                other = _release_name(sib)
+                if (other.rsplit("-", 1)[-1].lower() != grp
+                        or re.sub(r"^\d{4}-\d{2}-\d{2}-", "", other)
+                        .split("_")[0].lower() != word):
+                    continue
+                cands = [p for p in sib.iterdir()
+                         if p.suffix.lower() == vol.suffix.lower()]
+            for p in cands:
+                try:
+                    if (p.is_file() and p.stat().st_size == size
+                            and _file_crc32(p) == crc):
+                        return sib, p
+                except OSError:
+                    continue
+        return None
+
     def _capture_release(self, folder: Path, store: Path, s: dict,
                          exes: list[Path]) -> dict:
         rel = _release_name(folder)
@@ -5017,6 +5067,21 @@ class RsrToolAPI:
         broken_keep: list = []          # (path, sfv record) kept verbatim
         pair_seed = None                # (this folder, partner, joined volumes)
         damaged = sfv_check(folder, vol_paths)
+        twin_seed = None                # (fix folder, {our name: its name})
+        if damaged:
+            twins = {d["name"]: self._twin_volume(folder, folder / d["name"],
+                                                  d["actual"], True)
+                     for d in damaged}
+            sibs = {t[0] for t in twins.values() if t}
+            if all(twins.values()) and len(sibs) == 1:
+                sib = sibs.pop()
+                self._log(f"  ✓ {', '.join(twins)} fail(s) this release's own "
+                          f".sfv, but {sib.name} ships exactly these bytes — "
+                          "the fix is already in place here, and the .sfv "
+                          "predates it. Capturing with the fix as its pair.",
+                          "ok")
+                twin_seed = (sib, {n: t[1].name for n, t in twins.items()})
+                damaged = []
         if damaged:
             names = ", ".join(d["name"] for d in damaged[:4])
             self._log(f"  ✗ {len(damaged)} volume(s) fail the .sfv: {names}"
@@ -5093,6 +5158,9 @@ class RsrToolAPI:
                            for p in union}
         else:
             pair_origin = {}
+        if twin_seed:
+            pair_used = (folder, twin_seed[0], folder)
+            manifest["pair"] = sorted({folder.name, twin_seed[0].name})
         try:
             for si, st in enumerate(sets):
                 if self._stop.is_set() or self._skip.is_set():
@@ -5110,6 +5178,28 @@ class RsrToolAPI:
                               "lives in the release this one pairs with.",
                               "dim")
                     pair = self._find_pair(folder, st)
+                    vols = [Path(v) for v in st["volumes"]]
+                    twin = (None if pair or len(vols) != 1 else
+                            self._twin_volume(folder, vols[0],
+                                              _file_crc32(vols[0]), False))
+                    if twin:
+                        # A renamed fix volume whose bytes already sit in its
+                        # release. That release is captured WITH this folder
+                        # (the pre-flight finds us from its side), so capture
+                        # it now, or report that it already was.
+                        sib = twin[0]
+                        done = self._existing_rsr(store, sib, _release_name(sib))
+                        if done and s.get("skip_done"):
+                            self._log(f"    {vols[0].name} is {twin[1].name} "
+                                      f"in {sib.name}, already captured with "
+                                      f"its pair as {done.name}.", "dim")
+                            return {"ok": False, "partial": True,
+                                    "error": "captured with its pair"}
+                        self._log(f"    ✓ {vols[0].name} is byte-identical to "
+                                  f"{twin[1].name} in {sib.name} — capturing "
+                                  "that release, with this one as its pair.",
+                                  "ok")
+                        return self._capture_release(sib, store, s, exes)
                     if not pair:
                         self._log("    the other half is not in this scan "
                                   "folder, so there is nothing to join it to.",
@@ -5178,6 +5268,15 @@ class RsrToolAPI:
 
             if not manifest["sets"]:
                 return {"ok": False, "error": "nothing captured"}
+            if twin_seed:
+                # The fix's volume IS one of ours under its own name: the
+                # rebuild writes the same verified bytes into its folder.
+                for st_ in manifest["sets"]:
+                    for v in st_.get("volumes") or []:
+                        theirs = twin_seed[1].get(v.get("name"))
+                        if theirs:
+                            v["copies"] = [{"folder": twin_seed[0].name,
+                                            "name": theirs}]
 
             # A .rsr is only ever written when EVERY set captured and verified.
             # Writing a partial one is worse than writing none: it cannot
@@ -11879,8 +11978,9 @@ class RsrToolAPI:
                              st.get("sha256"), None))
                 continue
             for v in st.get("volumes", []):
-                want.append((dest / v.get("folder", "") / v["name"],
-                             v.get("size"), None, v.get("head_sha")))
+                for c in [v] + list(v.get("copies") or []):
+                    want.append((dest / c.get("folder", "") / c["name"],
+                                 v.get("size"), None, v.get("head_sha")))
         for f in manifest.get("sidecars", []):
             if f.get("stored"):
                 want.append((dest / f.get("folder", "") / f["name"],
@@ -12578,6 +12678,10 @@ class RsrToolAPI:
             dst = out / v.get("folder", "") / v["name"]
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(data)
+            for c in v.get("copies") or []:      # a fix volume's other name
+                cp = out / c.get("folder", "") / c["name"]
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                cp.write_bytes(data)
         return None
 
     def _legacy_rr_recipes(self, recipe: dict) -> list[tuple[dict, str]]:
