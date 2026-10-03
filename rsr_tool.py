@@ -6804,6 +6804,22 @@ class RsrToolAPI:
         mflags = main_flags(head)
         # The main header is the authority on both of these; see main_flags().
         solid = any(f["solid"] for f in meta) or bool(mflags & MHD_SOLID)
+        # INDEPENDENT SOLID VOLUMES (-sv): the solid stream restarts at the
+        # first file that BEGINS in each new volume, so a later file carries
+        # no solid flag. Nintendo_Emu_With_500_Roms_USA_DC-LUCID: gleam.cdi is
+        # the first file to begin in volume four and starts afresh, the .cue
+        # after it is solid again. Without -sv every build wrote the .cdi
+        # against the .bin's dictionary, and rar 2.50 -- which reproduces the
+        # 64 MB .bin exactly -- walled at "1 of 3". A volume set cannot be
+        # appended to (rar: "Cannot modify volume"), so a second command is
+        # not the explanation.
+        solid_vols = bool(solid and st["format"] == "RAR4" and len(vols) > 1
+                          and len(meta) > 1
+                          and any(not f["solid"] for f in meta[1:]))
+        if solid_vols:
+            self._log("    independent solid volumes: a later file starts a "
+                      "fresh solid stream, which inside one volume set only "
+                      "-sv does — sweeping with -sv.", "dim")
         # NOT `locked` — that name is taken further down by the list of
         # source files antivirus grabbed after extraction, and a truthy empty
         # list quietly swallowed this flag once already.
@@ -7438,7 +7454,8 @@ class RsrToolAPI:
                                         year_after=0 if signed_by is not None
                                         else int(s.get("year_after") or 0),
                                         host=rar4_host(vols)
-                                        if st["format"] == "RAR4" else -1)
+                                        if st["format"] == "RAR4" else -1,
+                                        solid_vols=solid_vols)
             if recipe:
                 if rr_pass != sweep_rr:
                     recipe["rr_exact"] = True
@@ -9255,7 +9272,8 @@ class RsrToolAPI:
                       host=-1, rr_sectors=-1, dos_only=False,
                       year_before=0, year_after=0,
                       dirs=(), dirs_first=True, mm_ev=None,
-                      head_vol=0, orig_stream=None) -> dict | None:
+                      head_vol=0, orig_stream=None,
+                      solid_vols=False) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -9810,6 +9828,15 @@ class RsrToolAPI:
                       + (f" for {grp}" if grp else "")
                       + " — trying those first.", "dim")
 
+        if solid_vols:
+            # Independent solid volumes (see the detection in _capture_set):
+            # every combo packs with -sv in place of -s. One that already
+            # names its own solid mode (-s1 for the Unix line) keeps it.
+            combos = [(c[0], c[1], tuple(c[2] if len(c) > 2 else ())
+                       + (() if any(str(x).startswith("-s")
+                                    for x in (c[2] if len(c) > 2 else ()))
+                          else ("-sv",)))
+                      for c in combos]
         sig = self._order_sig(combos)
         start, when = self._resume_point(rel, sig)
         if start >= len(combos):
