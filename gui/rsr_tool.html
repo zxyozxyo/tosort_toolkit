@@ -435,6 +435,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
               title="Put this release back on the queue of the run in progress">Try again</button>
       <button class="btn btn-sm" id="mi-finish" onclick="finishRelease()"
               title="Lift the time budget for THIS release only — the others keep the normal budget">Finish this one</button>
+      <button class="btn btn-sm" id="mi-skip" onclick="skipRelease()"
+              title="Abandon THIS release only and move on — the others keep running (the toolbar Skip abandons every release in flight)">Skip this one</button>
       <button class="btn btn-sm" id="mi-open" onclick="openInfoFolder()">Open folder</button>
       <button class="btn btn-sm" onclick="closeInfo()">Close</button>
     </div>
@@ -1118,8 +1120,22 @@ async function finishRelease() {
   }
 }
 
+async function skipRelease() {
+  const b = $('mi-skip');
+  b.disabled = true;
+  try {
+    const r = await window.pywebview.api.skip_release(infoName);
+    b.textContent = r && r.ok ? 'Skipping ✓' : (r && r.error) || 'Not running';
+  } catch (e) {
+    b.textContent = 'Not running';
+  }
+}
+
 async function showInfo(key) {
   infoName = key;
+  $('mi-skip').textContent = 'Skip this one';
+  $('mi-skip').disabled = false;
+  $('mi-skip').style.display = finishable(key) ? '' : 'none';
   $('mi-finish').textContent = 'Finish this one';
   $('mi-finish').disabled = false;
   $('mi-finish').style.display = finishable(key) ? '' : 'none';

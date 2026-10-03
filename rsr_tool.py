@@ -199,6 +199,45 @@ _FIX_TAGS = ("DIRFIX", "NFOFIX", "PROOFFIX", "SFVFIX", "SAMPLEFIX",
              "RARFIX", "SUBFIX", "SYNCFIX")
 
 
+class _SkipFlag:
+    """The Skip button's flag, which can also name ONE release.
+
+    `set()` is the toolbar's Skip: every release in flight sees it, as before.
+    `skip_rel(name)` is the info pop-up's "Skip this one": only threads working
+    on that release (the capture thread and its combo slots, which carry the
+    release name in the thread-local) see is_set() turn True. Every existing
+    `self._skip.is_set()` check therefore honours both without changing."""
+
+    def __init__(self, current_rel):
+        self._ev = threading.Event()
+        self._rels: set = set()
+        self._lock = threading.Lock()
+        self._current = current_rel
+
+    def set(self):
+        self._ev.set()
+
+    def clear(self):
+        self._ev.clear()
+
+    def is_set(self) -> bool:
+        if self._ev.is_set():
+            return True
+        rel = self._current()
+        if not rel:
+            return False
+        with self._lock:
+            return rel in self._rels
+
+    def skip_rel(self, rel: str):
+        with self._lock:
+            self._rels.add(rel)
+
+    def forget(self, rel: str):
+        with self._lock:
+            self._rels.discard(rel)
+
+
 def _fix_tag(rel: str) -> str:
     """The scene FIX tag in a release name ('DIRFIX'), or ''.
 
@@ -3455,7 +3494,7 @@ class RsrToolAPI:
         self._ev_dropped = 0
         self._ev_thread = None
         self._stop = threading.Event()
-        self._skip = threading.Event()
+        self._skip = _SkipFlag(lambda: getattr(self._tl, "rel", None))
         self._running = False
         # Claimed under this lock BEFORE the worker thread starts. The flag
         # used to be set inside the thread, so a second Scan click in that
@@ -3465,6 +3504,8 @@ class RsrToolAPI:
         # second, each at half the speed).
         self._start_lock = threading.Lock()
         self._procs: set = set()
+        self._proc_rel: dict = {}          # process -> the release it packs for
+        self._capturing: set = set()       # releases being captured right now
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
         self._budget_min = 0
@@ -3755,6 +3796,29 @@ class RsrToolAPI:
         self._log("  ⏭ Skip requested — abandoning this release now.", "warn")
         return {"ok": True}
 
+    def skip_release(self, rel: str) -> dict:
+        """Skip ONE release that is running now -- the info pop-up's button.
+        The toolbar's Skip abandons every release in flight; this kills only
+        the rar processes packing for this one, and only its threads see the
+        flag."""
+        if not self._running:
+            return {"ok": False, "error": "nothing running"}
+        with self._proc_lock:
+            running = rel in self._capturing
+        if not running:
+            return {"ok": False, "error": "that release is not running"}
+        self._skip.skip_rel(rel)
+        with self._proc_lock:
+            procs = [p for p, r in self._proc_rel.items() if r == rel]
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        self._log(f"  ⏭ Skip requested for {rel} only — abandoning it now.",
+                  "warn")
+        return {"ok": True}
+
     def _budget_free(self, rel: str) -> bool:
         """Has this release been granted its extension?
 
@@ -3879,6 +3943,7 @@ class RsrToolAPI:
         _die_with_us(p)
         with self._proc_lock:
             self._procs.add(p)
+            self._proc_rel[p] = getattr(self._tl, "rel", None)
         try:
             started = time.monotonic()
             deadline = started + timeout
@@ -3907,6 +3972,7 @@ class RsrToolAPI:
         finally:
             with self._proc_lock:
                 self._procs.discard(p)
+                self._proc_rel.pop(p, None)
 
     def _run(self, cmd: list, timeout: int, heartbeat: str = "",
              cwd=None, env=None) -> bool:
@@ -3940,6 +4006,7 @@ class RsrToolAPI:
         _die_with_us(p)
         with self._proc_lock:
             self._procs.add(p)
+            self._proc_rel[p] = getattr(self._tl, "rel", None)
         try:
             started = time.monotonic()
             deadline = started + timeout
@@ -3965,6 +4032,7 @@ class RsrToolAPI:
         finally:
             with self._proc_lock:
                 self._procs.discard(p)
+                self._proc_rel.pop(p, None)
 
     # ── settings ──────────────────────────────────────────────────────────
 
@@ -4713,6 +4781,8 @@ class RsrToolAPI:
             # fires — otherwise a skip pressed late in one release could still
             # be set as the next one starts and silently skip that too.
             self._skip.clear()
+            self._skip.forget(rel)
+            self._tl.rel = rel           # what a per-release skip looks for
             # Same reasoning for the budget flag: _capture_release returns
             # early on a ZIP or an archive-less folder without ever reaching
             # the point where it resets this, so a stale True would relabel the
@@ -4747,6 +4817,8 @@ class RsrToolAPI:
                 with lock:
                     counters["walls"] += 1
                 return
+            with self._proc_lock:
+                self._capturing.add(rel)
             try:
                 res = self._capture_release(folder, store, s, exes)
             except Exception as e:
@@ -4758,6 +4830,8 @@ class RsrToolAPI:
                 # than at the next release's start: with several in flight,
                 # "the next release" is not a single thing.
                 self._budget_leave(rel)
+                with self._proc_lock:
+                    self._capturing.discard(rel)
             if self._skip.is_set():
                 # Skipped by hand: not a failure, and nothing partial is left
                 # in the store — _capture_release only writes a .rsr after its
@@ -10065,8 +10139,13 @@ class RsrToolAPI:
                                    len(combos) - idx))
             chunk = combos[idx:idx + width]
             results: list = [None] * len(chunk)
+            slot_rel = getattr(self._tl, "rel", None)
+            slot_tag = getattr(self._tl, "tag", "")
 
             def _slot(s: int):
+                # A fresh thread has none of the capture thread's locals: the
+                # release name is what a per-release Skip is matched on.
+                self._tl.rel, self._tl.tag = slot_rel, slot_tag
                 ex_, n_, *rest_ = chunk[s]
                 extra_ = rest_[0] if rest_ else ()
                 try:
