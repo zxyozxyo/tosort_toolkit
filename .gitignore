@@ -121,4 +121,4 @@ rom_test_matrix/stage_*.txt
 _old_backups/
 reports/
 BACKUP_*/
-!DATS/
+\!DATS/
