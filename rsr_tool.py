@@ -8315,7 +8315,16 @@ class RsrToolAPI:
             # and the rebuild run in different folders, and the form has to
             # come out the same in both.
             used = 2500
+            # Not before 2.80 when anything sits deeper than one folder:
+            # 2.50-2.71 add a named folder's OWN files and never descend
+            # (measured: `top` gives top\a.txt, not top\sub\b.txt), so
+            # WinCE_Dreamcast_DevKit-KZM's replay packed 40 of 954 files.
+            # They take the full list, in a listfile. One level deep is safe
+            # and stays as it was -- the seven MAME 0.145 DVDs (2.70b4, one
+            # folder each) were captured exact through this fallback.
+            nested = any(len(Path(str(n)).parts) > 2 for n in plain)
             if (dirs and len(groups) == 1 and dirs_form != "omit"
+                    and not (nested and 0 < _exe_number(ex.name) < 280)
                     and used + sum(len(str(n)) + 3 for n in names)
                     > CMDLINE_MAX):
                 # Too long to name every file. Name the FOLDERS instead: it
