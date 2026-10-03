@@ -57,6 +57,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
 .chk-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);cursor:pointer}
 .chk-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
+.meta-pick{font-size:11px;color:var(--text2);margin:2px 0}
+.meta-pick summary{cursor:pointer}
+.meta-pick summary b{color:var(--acc);font-weight:600}
+.meta-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:2px 10px;
+  margin-top:4px;padding:6px 8px;background:var(--bg0);border:1px solid var(--border);
+  border-radius:5px;max-height:160px;overflow-y:auto}
+.meta-list .chk-row span{color:var(--text3)}
 .cpu-row{display:flex;align-items:center;gap:8px;margin-top:6px;padding:6px 8px;
   background:var(--bg0);border:1px solid var(--border);border-radius:5px}
 .cpu-row input[type=range]{flex:1;accent-color:var(--acc);cursor:pointer;min-width:90px}
@@ -302,9 +309,15 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
             <label class="chk-row"><input type="checkbox" id="clean_extras">
               Tidy the content folder: remove loose nfo / diz / cue / sfv&hellip; that are
               byte-identical to a file in a rebuilt release</label>
-            <label class="chk-row"><input type="checkbox" id="metadata_releases" checked>
-              Also write the nfo-only releases (dirfix / nfofix) &mdash; they have
-              no content to match on</label>
+            <details class="meta-pick" id="meta-pick"
+                     title="Releases with nothing to match on (nfo/dirfix-only, carried whole) are written straight from the store. Only the systems ticked here are written; none ticked = none written.">
+              <summary>Sidecar-only releases to write: <b id="meta-pick-sum">none</b></summary>
+              <div class="meta-list" id="meta-pick-list"></div>
+              <div class="row" style="margin-top:4px">
+                <button class="btn btn-sm" onclick="metaAll(true)">All</button>
+                <button class="btn btn-sm" onclick="metaAll(false)">None</button>
+              </div>
+            </details>
             <div class="cpu-row" title="How many releases to rebuild at the same time. Takes effect as slots free, even mid-rebuild. There is no core slider here: -mt is part of each release's recipe, so a rebuild has to pack at the thread count it was captured with.">
               <div class="lbl" style="min-width:auto">At once</div>
               <input type="range" id="rebuild_jobs" min="1" max="8" step="1" value="1"
@@ -473,6 +486,8 @@ window.addEventListener('pywebviewready', async () => {
   jobsPreview();
   $('rebuild_jobs').value = s.rebuild_jobs || 1;
   rebuildJobsPreview();
+  metaSel = new Set(s.meta_systems || []);
+  loadMetaSystems();
   refreshStats();
   dbSearch();
   checkPriors();
@@ -584,6 +599,50 @@ async function pickRsr() {
   if (p) $('rb-rsr').value = p;
 }
 function save() { window.pywebview.api.save_settings(cfg()); }
+
+// Sidecar-only releases (nothing to match on) are written only for the
+// systems ticked here; the choice is kept in the settings file.
+let metaSel = new Set();
+function metaSelected() { return [...metaSel].sort(); }
+function metaSummary(total) {
+  const sel = metaSelected();
+  $('meta-pick-sum').textContent = !sel.length ? 'none'
+    : sel.length === total ? 'all systems' : sel.join(', ');
+}
+async function loadMetaSystems() {
+  let r;
+  try { r = await window.pywebview.api.meta_release_systems(); } catch (e) { return; }
+  const box = $('meta-pick-list');
+  box.innerHTML = '';
+  const systems = (r && r.systems) || [];
+  for (const it of systems) {
+    const lab = document.createElement('label');
+    lab.className = 'chk-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = metaSel.has(it.system);
+    cb.dataset.sys = it.system;
+    cb.onchange = () => {
+      if (cb.checked) metaSel.add(it.system); else metaSel.delete(it.system);
+      metaSummary(systems.length);
+      window.pywebview.api.save_settings({meta_systems: metaSelected()});
+    };
+    lab.append(cb, document.createTextNode(' ' + it.system + ' '));
+    const n = document.createElement('span');
+    n.textContent = '(' + it.count + ')';
+    lab.append(n);
+    box.append(lab);
+  }
+  metaSummary(systems.length);
+}
+function metaAll(on) {
+  for (const cb of $('meta-pick-list').querySelectorAll('input[type=checkbox]')) {
+    cb.checked = on;
+    if (on) metaSel.add(cb.dataset.sys); else metaSel.delete(cb.dataset.sys);
+  }
+  metaSummary($('meta-pick-list').children.length);
+  window.pywebview.api.save_settings({meta_systems: metaSelected()});
+}
 
 let scanning = false;
 
@@ -761,7 +820,7 @@ async function startBatch() {
     content: $('rb-root').value.trim(),
     out: $('rb-bout').value.trim(),
     delete_content: $('delete_content').checked,
-    metadata_releases: $('metadata_releases').checked,
+    meta_systems: metaSelected(),
     skip_rebuilt: $('skip_rebuilt').checked,
     clean_extras: $('clean_extras').checked,
   });

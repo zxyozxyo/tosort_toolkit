@@ -4028,6 +4028,11 @@ class RsrToolAPI:
             # Releases REBUILT at once. Separate from `jobs` because a rebuild
             # replays one command at its recipe's own -mt. See _rebuild_slots.
             "rebuild_jobs": max(1, min(8, _num(cfg.get("rebuild_jobs"), 1, int))),
+            # Systems whose sidecar-only releases (nothing to match on) a batch
+            # rebuild writes. Empty = none: they used to be written on every
+            # run whatever was being rebuilt.
+            "meta_systems": [str(x) for x in (cfg.get("meta_systems") or [])
+                             if str(x).strip()],
             # Not a setting — what the machine has, so the GUI can size its
             # slider and say what "auto" currently works out to.
             "cores": os.cpu_count() or 0,
@@ -4063,6 +4068,9 @@ class RsrToolAPI:
             "workers": max(0, min(256, _num(s.get("workers"),
                                             cur["workers"], int))),
             "jobs": max(1, min(16, _num(s.get("jobs"), cur["jobs"], int))),
+            "meta_systems": ([str(x) for x in s["meta_systems"] if str(x).strip()]
+                             if isinstance(s.get("meta_systems"), list)
+                             else cur["meta_systems"]),
         }
         # Keep anything already in the file that this method does not model.
         # It writes a fixed whitelist, so every save silently DROPPED the
@@ -11651,7 +11659,11 @@ class RsrToolAPI:
         delete_content = bool((cfg or {}).get("delete_content"))
         # Default ON: without it these releases are simply unreachable from
         # this screen, and a set is not complete without them.
-        with_meta = bool((cfg or {}).get("metadata_releases", True))
+        meta_systems = (cfg or {}).get("meta_systems")
+        if not isinstance(meta_systems, list):
+            meta_systems = self.get_settings()["meta_systems"]
+        meta_systems = [str(x) for x in meta_systems if str(x).strip()]
+        with_meta = bool(meta_systems)
         # Default ON: a re-run should not redo what is already sitting in the
         # output folder, finished and verified.
         skip_rebuilt = bool((cfg or {}).get("skip_rebuilt", True))
@@ -11663,7 +11675,8 @@ class RsrToolAPI:
             self._size_map_cache = {}
             try:
                 self._rebuild_batch_run(root, out, delete_content, with_meta,
-                                        skip_rebuilt, clean_extras)
+                                        skip_rebuilt, clean_extras,
+                                        meta_systems=meta_systems)
             except Exception as e:
                 self._log(f"Batch rebuild error: {e}", "err")
                 self._log(traceback.format_exc(), "dim")
@@ -11693,7 +11706,8 @@ class RsrToolAPI:
                            delete_content: bool = False,
                            with_meta: bool = True,
                            skip_rebuilt: bool = True,
-                           clean_extras: bool = False):
+                           clean_extras: bool = False,
+                           meta_systems=None):
         self._log("══ BATCH REBUILD ══", "info")
         self._content_root = root
         # A re-run in the same session must see files added since the last one
@@ -12027,7 +12041,8 @@ class RsrToolAPI:
                           f"needs them.", "dim")
 
         if with_meta:
-            done += self._rebuild_metadata(matched, out, skip_rebuilt)
+            done += self._rebuild_metadata(matched, out, skip_rebuilt,
+                                           meta_systems)
 
         tidied = tidied_live
         if clean_extras and not self._stop.is_set():
@@ -12049,8 +12064,28 @@ class RsrToolAPI:
                   + (f" {_human_bytes(freed)} of unpacked sources deleted."
                      if freed else ""), "ok" if not failed else "warn")
 
+    def meta_release_systems(self) -> dict:
+        """Systems holding sidecar-only releases (nothing to match on), with
+        how many each, for the rebuild panel's picker."""
+        if not self._db_path.is_file():
+            return {"ok": True, "systems": []}
+        con = self._db()
+        try:
+            rows = con.execute(
+                "SELECT r.name FROM releases r "
+                "WHERE r.rsr_path IS NOT NULL AND NOT EXISTS ("
+                "  SELECT 1 FROM files f "
+                "  WHERE f.release = r.name AND f.source = 'content')"
+            ).fetchall()
+        finally:
+            con.close()
+        counts = collections.Counter(_release_system(n) for (n,) in rows)
+        return {"ok": True,
+                "systems": [{"system": s, "count": c}
+                            for s, c in sorted(counts.items())]}
+
     def _rebuild_metadata(self, matched: dict, out: Path,
-                          skip_rebuilt: bool = True) -> int:
+                          skip_rebuilt: bool = True, meta_systems=None) -> int:
         """Write the releases that are nothing but an nfo.
 
         A DIRFIX or NFOFIX release has no archive and therefore no content
@@ -12067,7 +12102,6 @@ class RsrToolAPI:
         belongs to some other system, and excluding it would strand it for
         good. When the run built nothing there is nothing to scope by, so
         everything is written."""
-        systems = {_release_system(rel) for rel in matched}
         con = self._db()
         try:
             # The test is "has it nothing to match on", not "is it an nfo".
@@ -12085,10 +12119,12 @@ class RsrToolAPI:
             ).fetchall()
         finally:
             con.close()
-        todo = [(n, rp) for n, rp in rows
-                if not systems
-                or _release_system(n) in systems
-                or _release_system(n) == "Unknown"]
+        # Only the systems ticked in the rebuild panel (meta_systems). The
+        # old rule -- whatever this run matched, plus every "Unknown", plus
+        # EVERYTHING when nothing matched -- rewrote hundreds of them on
+        # every run.
+        want = set(meta_systems or ())
+        todo = [(n, rp) for n, rp in rows if _release_system(n) in want]
         if not todo:
             return 0
         self._log("", "")
