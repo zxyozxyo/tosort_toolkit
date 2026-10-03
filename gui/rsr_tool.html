@@ -679,7 +679,17 @@ async function exportBlocked(){
   }
 }
 
+let scanStarting = false;
 async function startScan() {
+  // One start at a time. The store check below is awaited BEFORE setBusy
+  // disables the button, so a second click in that gap used to start a
+  // second scan of the same folders -- every release swept twice.
+  if (scanStarting || scanning) return;
+  scanStarting = true;
+  try { await startScanInner(); } finally { scanStarting = false; }
+}
+
+async function startScanInner() {
   const srcs = allSources();
   if (!srcs.length) { log('Pick a folder of originals first.', 'warn'); return; }
   // Confirmed here rather than only warned in the log: by the time a warning

@@ -45,6 +45,7 @@ import platform
 import threading
 import subprocess
 import traceback
+import collections
 from collections import deque
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
@@ -2500,6 +2501,48 @@ def rar4_graft_headers(vol: bytes, heads: list[bytes],
     return rar4_rewrite_rr(bytes(out), rr_sectors)
 
 
+class OrigStream:
+    """The original set's FILE DATA, every packed block in archive order,
+    read as one stream -- what a candidate pack has to reproduce, without the
+    headers, recovery records or AV blocks around it (whose sizes may move
+    the volume split points without the streams differing at all).
+
+    `blocks` is [(name, volume path, offset, size)] in archive order."""
+
+    def __init__(self, blocks):
+        import bisect as _b
+        self._bisect = _b
+        self.blocks = list(blocks)
+        self.starts, pos = [], 0
+        ends: dict = {}
+        for name, _v, _o, size in self.blocks:
+            self.starts.append(pos)
+            pos += size
+            ends[name] = pos
+        self.total = pos
+        self.ends = ends
+
+    def read(self, pos: int, n: int) -> bytes:
+        out = bytearray()
+        i = max(0, self._bisect.bisect_right(self.starts, pos) - 1)
+        while n > 0 and i < len(self.blocks):
+            _name, vol, off, size = self.blocks[i]
+            skip = pos - self.starts[i]
+            take = min(size - skip, n)
+            if take > 0:
+                with open(vol, "rb") as fh:
+                    fh.seek(off + skip)
+                    out += fh.read(take)
+                pos += take
+                n -= take
+            i += 1
+        return bytes(out)
+
+    def complete_before(self, pos: int) -> list:
+        """Names whose whole stream lies before `pos` -- reproduced exactly."""
+        return [n for n, e in self.ends.items() if e <= pos]
+
+
 def _default_dirs_form(exe_name: str) -> str:
     """How to name folders for this build when nothing else says so.
 
@@ -3349,6 +3392,13 @@ class RsrToolAPI:
         self._stop = threading.Event()
         self._skip = threading.Event()
         self._running = False
+        # Claimed under this lock BEFORE the worker thread starts. The flag
+        # used to be set inside the thread, so a second Scan click in that
+        # gap passed the check: two full scans of the same folders ran side
+        # by side, every release swept twice (overnight 2026-10-02: DoomDC,
+        # Virtua_Cop_2, Guitar_Rock_Tour... each started twice in the same
+        # second, each at half the speed).
+        self._start_lock = threading.Lock()
         self._procs: set = set()
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
@@ -4375,6 +4425,10 @@ class RsrToolAPI:
                 self._ev_flush()
                 self._emit("scan_done", {})
 
+        with self._start_lock:
+            if self._running:
+                return {"ok": False, "error": "Already running"}
+            self._running = True
         threading.Thread(target=_bg, daemon=True).start()
         return {"ok": True, "started": True}
 
@@ -4839,6 +4893,7 @@ class RsrToolAPI:
     def _capture_release(self, folder: Path, store: Path, s: dict,
                          exes: list[Path]) -> dict:
         rel = _release_name(folder)
+        self._tl.system = _release_system(rel)
         sets = group_archive_sets(folder)
         if not sets:
             # Say WHICH kind of nothing. A third of the NDS corpus is ZIP
@@ -7154,6 +7209,24 @@ class RsrToolAPI:
                           f"{said}.", "dim")
 
         recipe = None
+        # The original's file data as one stream, for the rolling volume check
+        # in _try_combo. Only for a volumed RAR4 set, where a full pack is many
+        # volumes long and most wrong combos show it in the first few.
+        orig_stream = None
+        if st["format"] == "RAR4" and len(vols) > 2 and not st["byte_split"]:
+            try:
+                vidx = {str(Path(v)): i for i, v in enumerate(
+                    shadow_names(len(vols), newnum))}
+                seq = []
+                for name, bl in blocks.items():
+                    for vol, off, size in bl:
+                        seq.append((vidx.get(Path(vol).name, 1 << 30), off,
+                                    name, vol, size))
+                seq.sort()
+                orig_stream = OrigStream([(nm, v, o, sz)
+                                          for _i, o, nm, v, sz in seq])
+            except Exception:
+                orig_stream = None
         budget = getattr(self, "_budget_min", 0)
         self._deadline = None if self._budget_override else (
             (time.monotonic() + budget * 60) if budget else None)
@@ -7181,6 +7254,7 @@ class RsrToolAPI:
             recipe = self._sweep_recipe(st["format"], exes, level, dkb, solid,
                                         src_files, targets, work, s["max_mt"],
                                         year, grp, self._deadline, rel,
+                                        orig_stream=orig_stream,
                                         vol_bytes=sweep_vol,
                                         head_vol=head_vol,
                                         new_numbering=newnum, groups=mgroups,
@@ -7577,7 +7651,7 @@ class RsrToolAPI:
             return None
         n_ok, label, mt_, sw_, names, exe, dkb = bp[:7]
         sw_ = [str(x) for x in (sw_ or ())]
-        if "-mm" not in sw_ or solid or any(f.get("solid") for f in meta):
+        if solid or any(f.get("solid") for f in meta):
             return None
         if rar4_unp_max(st["volumes"]) >= 29:
             return None
@@ -7593,7 +7667,7 @@ class RsrToolAPI:
                 return None
         except (OSError, ImportError):
             return None
-        self._log(f"    ◐ {label} -mm reproduces every stream but "
+        self._log(f"    ◐ {label} reproduces every stream but "
                   f"{', '.join(n.split('/')[-1] for n in miss)} — trying the "
                   "multimedia verdicts that can differ between PCs (one full "
                   "pack per round).", "info")
@@ -7615,6 +7689,15 @@ class RsrToolAPI:
             orig_blocks[name] = bl
             if self._stop.is_set() or self._skip.is_set():
                 return None
+        if not any(b[1] for bl in orig_blocks.values() for b in bl):
+            return None                    # no audio anywhere: not this class
+        if "-mm" not in sw_:
+            # The closest combo was a PLAIN one -- -mm and plain write the
+            # same stream up to the first audio verdict, so the sweep keeps
+            # whichever came first. Jet_Coaster_Dream_2-STONEARTS: 46 of 47
+            # under 2.70b4 -s1 -ds, and 382 audio blocks that only start
+            # 609 MB into the image, past the multimedia check's scan.
+            sw_ = sw_ + ["-mm"]
         self._log(f"      the original's blocks decoded in "
                   f"{time.monotonic() - t0:,.0f}s "
                   f"({sum(len(b) for b in orig_blocks.values()):,} blocks, "
@@ -8052,16 +8135,38 @@ class RsrToolAPI:
         # rather than being dropped: the sweep returns on first match so the
         # speed is the same either way, but a wall it reports is still real.
         tiers = [ranked]
+        try:
+            self._format_backstop = bool(json.loads(
+                (self._app_dir / "rsr_tool.json").read_text(encoding="utf-8")
+            ).get("format_backstop", False))
+        except Exception:
+            self._format_backstop = False
         if unp_max:
             fits = [e for e in ranked if _fmt_fits(e.name, unp_max)]
             miss = [e for e in ranked if e not in set(fits)]
-            if fits and miss:
+            if fits and miss and getattr(self, "_format_backstop", False):
                 tiers = [fits, miss]
                 self._log("    archive is RAR "
                           f"{'2.0' if unp_max < 29 else '3.x'} format "
                           f"(unp_ver {unp_max}) — leading with the "
                           f"{len(fits)} build(s) that can write it, the other "
                           f"{len(miss)} behind them as a backstop.", "dim")
+            elif fits and miss:
+                # The backstop never once won. Counted 2026-10-03 over every
+                # capture in the store: 11,585 sets with compressed data, and
+                # the winning build could write the archive's stamp in all of
+                # them (9,659 unp 29, 1,926 unp 20). What it did do was finish
+                # every WALL: for a 2.0-format archive it is 10,362 of 13,190
+                # combos -- 3 to 23 hours a release on the overnight run, spent
+                # proving builds that cannot write a 2.0 stream do not write
+                # this one. Off unless asked for (format_backstop in the json).
+                tiers = [fits]
+                self._log("    archive is RAR "
+                          f"{'2.0' if unp_max < 29 else '3.x'} format "
+                          f"(unp_ver {unp_max}) — sweeping the {len(fits)} "
+                          f"build(s) that can write it; the {len(miss)} that "
+                          "cannot are skipped (in 11,585 captures one never "
+                          "won).", "dim")
         groups = []
         for tier in tiers:
             older = [e for e in tier
@@ -8508,7 +8613,8 @@ class RsrToolAPI:
     def _try_combo(self, ex: Path, n: int, wdir: Path, fmt: str, dict_kb: int,
                    solid: bool, groups, srcs, vol_args, base, prefix,
                    end_sig, hdr_ext, targets, extra=(), probe_vol=0,
-                   want_vols=0, vol_first=0, dirs=(), dirs_first=True):
+                   want_vols=0, vol_first=0, dirs=(), dirs_first=True,
+                   orig_stream=None):
         """One (build, -mt) candidate, in its own directory. True if it is the
         recipe, False if not, None if the build cannot run this recipe at all.
 
@@ -8731,10 +8837,48 @@ class RsrToolAPI:
                 self._tally_reject(why)
                 return False
 
-        if not all(self._run(c, timeout=pack_timeout,
-                             heartbeat=f"sweep -mt{n} {_exe_label(ex.name)}",
-                             cwd=base)
-                   for c in cmds):
+        rolling = {"done": 0, "pos": 0, "bad": False}
+
+        def _rolled_off() -> bool:
+            """A volume rar has finished (it has opened the next one) whose
+            file data departs from the original's at the same stream position.
+            The volume-one probe cannot see a build that agrees for the first
+            50 MB and parts later -- Cafe_Cuillere-HR's .at9 run -- and every
+            such combo used to pay for the whole 1.6 GB pack."""
+            made = sorted((q for q in wdir.iterdir() if _classify_volume(q.name)),
+                          key=lambda q: _classify_volume(q.name)[2])
+            for v in made[rolling["done"]:len(made) - 1]:
+                data = v.read_bytes()
+                for o, t, _f, sz, ad in _rar4_walk(data):
+                    if t != 0x74 or not ad:
+                        continue
+                    chunk = data[o + sz:o + sz + ad]
+                    if orig_stream.read(rolling["pos"], len(chunk)) != chunk:
+                        rolling["bad"] = True
+                        return True
+                    rolling["pos"] += len(chunk)
+                rolling["done"] += 1
+            return False
+
+        if (orig_stream is not None and fmt == "RAR4" and len(cmds) == 1
+                and vol_args and want_vols > 2
+                and not (extra and extra[0] == self.DOS_MARK)):
+            finished = self._run_until(
+                cmds[0], _rolled_off, timeout=pack_timeout,
+                heartbeat=f"sweep -mt{n} {_exe_label(ex.name)}", cwd=base)
+            if rolling["bad"]:
+                # A near miss still has to be reported as one: the closest
+                # count and the -mm verdict solver both read it.
+                self._tally_reject("a later volume's compressed data diverged")
+                return [nm for nm in orig_stream.complete_before(rolling["pos"])
+                        if nm in targets]
+            ran_ok = finished and self._probe_head(wdir) is not None
+        else:
+            ran_ok = all(self._run(c, timeout=pack_timeout,
+                                   heartbeat=f"sweep -mt{n} {_exe_label(ex.name)}",
+                                   cwd=base)
+                         for c in cmds)
+        if not ran_ok:
             # Tallied, because it was not: a combo whose pack command never ran
             # used to return here silently, so the wall line counted only the
             # combos that got as far as the structure gate and reported "all 31
@@ -8808,7 +8952,7 @@ class RsrToolAPI:
                       host=-1, rr_sectors=-1, dos_only=False,
                       year_before=0, year_after=0,
                       dirs=(), dirs_first=True, mm_ev=None,
-                      head_vol=0) -> dict | None:
+                      head_vol=0, orig_stream=None) -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -9069,12 +9213,20 @@ class RsrToolAPI:
         if fmt == "RAR4" and unp_max:
             cap = [c for c in combos if _fmt_fits(c[0].name, unp_max)]
             inc = [c for c in combos if not _fmt_fits(c[0].name, unp_max)]
-            if inc:
+            if inc and getattr(self, "_format_backstop", False):
                 combos = cap + inc
                 self._log(f"    {len(cap):,} combo(s) from builds that can "
                           f"write {'2.0' if unp_max < 29 else '3.x'} format "
                           f"lead — including their -s1 and -mm forms; the "
                           f"{len(inc):,} that cannot follow as a backstop.",
+                          "dim")
+            elif inc and cap:
+                # Dropped, not deferred -- see the tier note in _order_combos:
+                # in 11,585 captures no build outside the stamp ever won.
+                combos = cap
+                self._log(f"    {len(cap):,} combo(s) from builds that can "
+                          f"write {'2.0' if unp_max < 29 else '3.x'} format; "
+                          f"{len(inc):,} from builds that cannot are skipped.",
                           "dim")
         # The PPM tail. -m5 can compress with LZSS or PPMd and rar chooses per
         # file; ask for the default only and an archive whose packer forced PPM
@@ -9575,7 +9727,8 @@ class RsrToolAPI:
                         ex_, n_, probe_dir / f"w{s}", fmt, dict_kb, solid,
                         groups, srcs, vol_args, base, prefix, end_sig,
                         hdr_ext, targets, extra_, probe_vol,
-                        want_vols, vol_first, dirs, dirs_first)
+                        want_vols, vol_first, dirs, dirs_first,
+                        orig_stream=orig_stream)
                 except Exception as e:
                     # Never silent. 83a1ba6 referenced `dirs` here without
                     # passing it in, every Windows combo raised NameError, and
@@ -10997,6 +11150,10 @@ class RsrToolAPI:
                 self._ev_flush()
                 self._emit("scan_done", {})
 
+        with self._start_lock:
+            if self._running:
+                return {"ok": False, "error": "Already running"}
+            self._running = True
         threading.Thread(target=_bg, daemon=True).start()
         return {"ok": True, "started": True}
 
@@ -11133,6 +11290,10 @@ class RsrToolAPI:
                 self._ev_flush()
                 self._emit("scan_done", {})
 
+        with self._start_lock:
+            if self._running:
+                return {"ok": False, "error": "Already running"}
+            self._running = True
         threading.Thread(target=_bg, daemon=True).start()
         return {"ok": True, "started": True}
 
@@ -13637,6 +13798,28 @@ class RsrToolAPI:
         try:
             con = self._db()
             try:
+                # Sharpest of all: what this group has won with ON THIS
+                # SYSTEM. A group's priors pool every platform it released
+                # on -- HR's top prior is rar 4.11 -mt8 (317 hits, mostly
+                # elsewhere) while every one of its 32 captured PSV releases
+                # is 5.30 -mt4, and on a 1.6 GB PSV set each wrong prior is a
+                # six-minute pack: 187 of them before the sweep proper.
+                system = getattr(self._tl, "system", "") or ""
+                if grp and system and system != "Unknown":
+                    won = collections.Counter()
+                    for name, exe, mt in con.execute(
+                            "SELECT name, recipe_exe, mt FROM releases "
+                            "WHERE format=? AND recipe_exe != '' AND name LIKE ?",
+                            (fmt, f"%-{grp}")):
+                        if (_release_group(name) == grp
+                                and _release_system(name) == system):
+                            won[(exe, int(mt))] += 1
+                    for (exe, mt), _n in won.most_common(6):
+                        for (sw,) in con.execute(
+                                "SELECT sw FROM recipes WHERE grp=? AND exe=? "
+                                "AND mt=? ORDER BY hits DESC", (grp, exe, mt)):
+                            _take(exe, mt, sw)
+                        _take(exe, mt, "")
                 for i, (where, args) in enumerate(rings):
                     if i == n_group and year:
                         # The era ring: after the group's own history, before
