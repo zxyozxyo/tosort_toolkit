@@ -8810,11 +8810,45 @@ class RsrToolAPI:
                 # at its final value for a moment before the file is closed.
                 return len(_vols()) >= 2
 
-            if not self._run_until(probe_cmds[0], _closed,
-                                   timeout=pack_timeout,
-                                   heartbeat=f"probe -mt{n} "
-                                             f"{_exe_label(ex.name)}",
-                                   cwd=base):
+            # FIRST LOOK, as the DOS line has had all along: most wrong combos
+            # part from the original inside the first megabyte, yet each one
+            # packed a whole first volume (15-50 MB) before it was judged.
+            # Two checkpoints, then the volume-one probe decides as before --
+            # agreement here is only a reprieve, never a verdict.
+            look = {"next": 0, "bad": False}
+            marks = (1 << 20, 4 << 20)
+
+            def _ready():
+                if _closed():
+                    return True
+                if look["next"] >= len(marks) or not prefix:
+                    return False
+                h = self._probe_head(wdir)
+                try:
+                    if h is None or h.stat().st_size < marks[look["next"]] + 4096:
+                        return False
+                except OSError:
+                    return False
+                if self._early_verdict(h, prefix, marks[look["next"]]) is False:
+                    look["bad"] = True
+                    return True
+                look["next"] += 1
+                return False
+
+            finished = self._run_until(probe_cmds[0], _ready,
+                                       timeout=pack_timeout,
+                                       heartbeat=f"probe -mt{n} "
+                                                 f"{_exe_label(ex.name)}",
+                                       cwd=base)
+            if look["bad"]:
+                for junk in wdir.iterdir():
+                    try:
+                        junk.unlink()
+                    except OSError:
+                        pass
+                self._tally_reject(self.PREFIX_DIVERGED)
+                return False
+            if not finished:
                 self._tally_reject("the probe pack never produced volume two")
                 return False
             head = self._probe_head(wdir) or wdir / "probe.rar"
