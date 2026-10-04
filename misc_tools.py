@@ -417,13 +417,23 @@ class MiscToolsAPI:
     # else — a destination is the user's own folder and may hold anything.
     _BACKUP_DIR_RE = re.compile(r"^tosort_toolkit_backup_\d{8}-\d{4}$")
 
-    def _prune_old_backups(self, dst_root: Path, keep: int, current: Path, L):
-        """Keep the newest `keep` timestamped backups in dst_root, delete older.
+    # Written into a backup folder only when every file copied without error.
+    _COMPLETE_MARK = ".backup_complete"
 
-        Deliberately narrow: only DIRECT CHILDREN of the destination whose name
-        matches _BACKUP_DIR_RE exactly, never the backup just written, and only
-        when there are more than `keep` of them. The timestamp format sorts
-        chronologically as text, so no mtime guesswork is involved."""
+    def _prune_old_backups(self, dst_root: Path, keep: int, current: Path, L):
+        """Keep the newest `keep` COMPLETE timestamped backups in dst_root and
+        delete every other one -- older complete ones and failed partial ones.
+
+        It used to run only after a clean backup and to count every folder
+        alike. Once the destination filled up, every run errored, so nothing
+        was ever pruned again and the drive stayed full for good (79 backups on
+        Z:, the newest holding 3,424 of 352,887 files). Now a run that errors
+        still prunes -- against the last complete copies, which it keeps.
+
+        Backups made before the marker existed count as complete only to make
+        up the number, newest first, so the first runs after this change do
+        not throw away the last good copies. Only DIRECT CHILDREN matching
+        _BACKUP_DIR_RE are ever touched, and never `current`."""
         try:
             found = sorted((p for p in dst_root.iterdir()
                             if p.is_dir() and self._BACKUP_DIR_RE.match(p.name)),
@@ -431,14 +441,26 @@ class MiscToolsAPI:
         except Exception as e:
             L(f"  Could not list {dst_root} to prune old backups — {e}", "warn")
             return
-        old = [p for p in found[:-keep] if p.resolve() != current.resolve()] \
-            if len(found) > keep else []
+        cur = current.resolve() if current else None
+        others = [p for p in found if p.resolve() != cur]
+        marked = [p for p in others if (p / self._COMPLETE_MARK).is_file()]
+        legacy = [p for p in others if not (p / self._COMPLETE_MARK).is_file()]
+        # A finished, complete `current` is one of the `keep`.
+        want = keep - (1 if current and (current / self._COMPLETE_MARK).is_file()
+                       else 0)
+        keepers = marked[-want:] if want > 0 else []
+        if len(keepers) < want:
+            newest_marked = marked[-1].name if marked else ""
+            fill = [p for p in legacy if p.name < newest_marked or not marked]
+            keepers = sorted(keepers + fill[-(want - len(keepers)):],
+                             key=lambda p: p.name)
+        old = [p for p in others if p not in keepers]
         if not old:
             L(f"  Retention: {len(found)} backup(s) here, keeping {keep} — "
               "nothing to remove.", "dim")
             return
         L(f"  Retention: {len(found)} backup(s) here, keeping the newest "
-          f"{keep} — removing {len(old)}.", "info")
+          f"{keep} complete — removing {len(old)}.", "info")
         removed = 0
         for p in old:
             try:
@@ -484,6 +506,11 @@ class MiscToolsAPI:
                 else:
                     target = dst_root / ("tosort_toolkit_backup_"
                                          + _t.strftime("%Y%m%d-%H%M"))
+                    # Make room FIRST: a full destination is exactly when the
+                    # copy fails, and it must not have to succeed before the
+                    # space it needs can be freed.
+                    if keep > 0:
+                        self._prune_old_backups(dst_root, keep, target, L)
                 copied = errors = 0
                 total = 0
                 for f in files:
@@ -502,15 +529,23 @@ class MiscToolsAPI:
                 L(f"  ✓ {target} — {copied} file(s), {total:,} B"
                   + (f", {errors} error(s)" if errors else ""),
                   "ok" if not errors else "warn")
-                # Retention. Only after a CLEAN full backup: if this run had
-                # errors the new copy may be incomplete, and that is exactly
-                # when the older ones must not be thrown away.
-                if mode != "quick" and keep > 0:
-                    if errors:
-                        L(f"  Keeping all old backups in {dest} — this run had "
-                          f"{errors} error(s), so the new copy isn't trusted "
-                          "enough to prune against.", "warn")
+                # Retention. A clean copy is marked complete and counts towards
+                # `keep`; a copy with errors does not count, so the complete
+                # backups it would have replaced are kept -- but the prune
+                # still runs, so failed partial copies and anything past `keep`
+                # cannot pile up until the drive is full.
+                if mode != "quick":
+                    if not errors:
+                        try:
+                            (target / self._COMPLETE_MARK).write_text(
+                                _t.strftime("%Y-%m-%d %H:%M:%S"), "utf-8")
+                        except Exception as e:
+                            L(f"  could not mark {target.name} complete — {e}",
+                              "warn")
                     else:
+                        L(f"  {target.name} had {errors} error(s) — not counted "
+                          "as a complete backup.", "warn")
+                    if keep > 0:
                         self._prune_old_backups(dst_root, keep, target, L)
             L(f"{tag}Backup run complete.", "ok")
             # Stamp completion so the startup auto-backup knows whether a fresh
