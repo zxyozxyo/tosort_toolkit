@@ -2802,6 +2802,13 @@ def rar4_reserved_data_offset(path: Path, name: str):
     return off
 
 
+class _Prefix(dict):
+    """{name: (volume, data offset, length)} of each file's first block, plus
+    `.stored`: the names the original STORED (method 0x30). Stays a plain dict
+    to every reader that only unpacks the tuples."""
+    stored = frozenset()
+
+
 def rar4_reserved_data_offsets(path: Path, name: str) -> list:
     """Every place the packed data can start under a reserved header.
 
@@ -2822,8 +2829,13 @@ def rar4_reserved_data_offsets(path: Path, name: str) -> list:
             head = fh.read(4096)
     except OSError:
         return [base]
+    # Extended time is 2 bytes of flags plus 0-3 per stored time (and 4 more
+    # for each of ctime/atime), high sizes 8: anything up to 24 bytes, so
+    # every one is tried rather than guessing which fields this build wrote.
+    # Xbox.HI-RES.Cover.Collection-WAM (rar 3.30) carries just the 2-byte
+    # flags word -- data at base+2, which the +5/+8/+13 guess missed.
     out = [base]
-    for extra in (5, 8, 13):
+    for extra in range(1, 25):
         off = base + extra
         if off <= len(head) and not any(head[base:off]):
             out.append(off)
@@ -7042,12 +7054,14 @@ class RsrToolAPI:
         # store-vs-compress differently when streaming to volumes, and a stored
         # set needs no probe anyway because storing is deterministic and the
         # sweep ends on its first combo.
-        prefix = {}
+        prefix = _Prefix()
         for f in meta:
             b = blocks.get(f["name"]) or []
             if b:
                 vol, off, size = b[0]
                 prefix[f["name"]] = (vol, off, size)
+        prefix.stored = frozenset(f["name"] for f in meta
+                                  if int(f.get("method") or 0) in (0, 0x30))
         probe_vol = 0
         if len(vols) == 1 and prefix:
             stored_only = all(int(f.get("method", 0) or 0) == 0 for f in meta)
@@ -9206,6 +9220,17 @@ class RsrToolAPI:
                 return False
             cmds = []
         else:
+            # Wipe BEFORE building the command: _pack_cmds writes the listfile
+            # (_names0.lst) for a long file list INTO wdir, and the wipe below
+            # used to delete it again, so rar exited 6 ("cannot open") on every
+            # combo -- Xbox.HI-RES.Cover.Collection-WAM (283 files) walled in
+            # 6 s as "the probe pack never produced volume two".
+            try:
+                if wdir.exists():
+                    _rmtree(wdir)
+                wdir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
             cmds = self._pack_cmds(ex, fmt, dict_kb, n, solid, groups, srcs,
                                    wdir / "probe.rar", vol_args=vol_args,
                                    base=base, dirs=dirs,
@@ -9214,13 +9239,10 @@ class RsrToolAPI:
             if cmds is None:
                 return None
         try:
-            # _run_dos_pack already made this directory and filled it -- DOSBox
-            # mounts it, so it has to exist before the pack runs. Wiping it
-            # here would delete the very output we are about to verify.
-            if not (extra and extra[0] == self.DOS_MARK):
-                if wdir.exists():
-                    _rmtree(wdir)
-                wdir.mkdir(parents=True, exist_ok=True)
+            # The Windows path wiped wdir above, before its listfile was
+            # written into it. _run_dos_pack already made this directory and
+            # filled it -- DOSBox mounts it -- so it is never wiped here.
+            wdir.mkdir(parents=True, exist_ok=True)
         except OSError:
             return None
 
@@ -9308,6 +9330,8 @@ class RsrToolAPI:
                                        cwd=base)
             if look["bad"]:
                 for junk in wdir.iterdir():
+                    if junk.name.startswith("_names"):
+                        continue        # the listfile the next pack reads
                     try:
                         junk.unlink()
                     except OSError:
@@ -9334,6 +9358,8 @@ class RsrToolAPI:
                     and header_exttime(head) != hdr_ext):
                 why = "the header timestamp did not match"
             for junk in wdir.iterdir():
+                if junk.name.startswith("_names"):
+                    continue            # the listfile the full pack reads
                 try:
                     junk.unlink()
                 except OSError:
@@ -10542,7 +10568,22 @@ class RsrToolAPI:
         except OSError:
             return None
         looked = False
+        # A file the original STORED is no evidence yet: rar compresses it
+        # first and only falls back to storing once that turns out bigger, so
+        # a half-written probe holds the attempt it is about to throw away.
+        # Xbox.HI-RES.Cover.Collection-WAM's first jpg is stored; every combo
+        # of rar 3.30 -- which reproduces 282 of its 283 streams -- was ruled
+        # out on the first MB against raw JPEG bytes.
+        # And if a stored file COULD be the one under the placeholder, there is
+        # no verdict at all: the other names' readings would only be compared
+        # against bytes of that abandoned attempt and disagree by construction.
+        stored = getattr(prefix, "stored", ())
+        if any(rar4_reserved_data_offsets(probe_head, nm)
+               for nm in prefix if nm in stored):
+            return None
         for nm, (src_vol, src_off, src_len) in prefix.items():
+          if nm in stored:
+              continue
           for off in rar4_reserved_data_offsets(probe_head, nm):
             n = min(size - off, src_len)
             if n < min_bytes:
