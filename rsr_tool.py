@@ -869,7 +869,62 @@ _PLAT_LOOKUP.update({"DSI": "NDS", "NSW": "SWITCH", "XBONE": "XBOX",
                      "PSVITA": "PSV"})
 
 
-def _release_system(rel: str) -> str:
+# Spellings and systems the scene uses that _PLATFORMS does not name. Consulted
+# only when the ordinary lookup finds NOTHING, so no release already filed under
+# a system can move: measured 2026-10-04, 3,123 of 24,394 captures sat in
+# rsr_store/Unknown -- 1,281 of them PSX releases whose names never say PSX.
+_PLAT_FALLBACK = {
+    "GC": "NGC", "GCN": "NGC", "GAMECUBE": "NGC",
+    "INTV": "INTV", "INTELLIVISION": "INTV", "LYNX": "LYNX", "N64": "N64",
+    "AMIGA": "AMIGA", "CD32": "CD32", "C64": "C64", "C264": "C264",
+    "ATARI2600": "ATARI2600", "GB": "GB", "GAMEBOY": "GB",
+    "JAG": "JAG", "JAGUAR": "JAG", "3DO": "3DO", "MCD": "MCD", "MEGACD": "MCD",
+    "PSONE": "PS1", "PLAYSTATION2": "PS2", "PSCD": "PSX",
+    "GG": "GG", "GAMEGEAR": "GG", "ATARI7800": "ATARI7800", "AGB": "GBA",
+    "MAME": "MAME",
+}
+# Folder words that name a system (the operator's own sorting: "PSX Scene
+# 2000", "PSX 2000 - KALISTO", "INT", "MCD Scene 2018"), checked nearest first.
+_FOLDER_SYSTEM = dict({p: p for p in _PLATFORMS}, **_PLAT_FALLBACK,
+                      INT="INTV", DREAMCAST="DC", DC="DC",
+                      GUIDES="GUIDES", MISCELLANEOUS="MISC", MISC="MISC")
+
+
+def _folder_system(folder) -> str:
+    """The system a release's SOURCE FOLDER sits under, or ''. Only the first
+    word of each folder name counts ("PSX 2000 - KALISTO" -> PSX), and the
+    game-guides shelf is GUIDES."""
+    if not folder:
+        return ""
+    try:
+        parts = list(Path(folder).parts[:-1])
+    except Exception:
+        return ""
+    for part in reversed(parts):
+        if part.lower().startswith("game guides"):
+            return "GUIDES"
+        words = re.split(r"[\s\-_]+", part.strip())
+        word = words[0].upper() if words and words[0] else ""
+        if word in _FOLDER_SYSTEM:
+            return _FOLDER_SYSTEM[word]
+    return ""
+
+
+def _rsr_system(rsr_path, name: str) -> str:
+    """The system a CAPTURED release is filed under: the SYSTEM folder of
+    store/SYSTEM/YEAR/RELEASE/RELEASE.rsr. That is where capture put it --
+    possibly from its source folder, which the name alone cannot recover."""
+    try:
+        parts = Path(rsr_path).parts
+        if (len(parts) >= 4 and parts[-2] == name
+                and re.fullmatch(r"\d{4}", parts[-3])):
+            return parts[-4]
+    except Exception:
+        pass
+    return _release_system(name)
+
+
+def _release_system(rel: str, folder=None) -> str:
     """The platform tag in a release name, or 'Unknown'.
 
     Tokens only. A release is `Name_REGION_LANG_PLATFORM-GROUP`, so splitting on
@@ -899,7 +954,16 @@ def _release_system(rel: str) -> str:
         hit = _PLAT_LOOKUP.get(t.upper())
         if hit:
             return hit
-    return "Unknown"
+    toks = [t.upper() for t in re.split(r"[._\-()\[\] ]+", rel) if t]
+    if toks[:1] == ["ROMS"]:
+        return "ROMSETS"                 # Roms.GoodSMS..., Roms.GoodWSx...
+    for i, t in enumerate(toks):
+        hit = _PLAT_FALLBACK.get(t)
+        if hit == "GB" and toks[i + 1:i + 2] == ["ADVANCE"]:
+            return "GBA"                     # Virtual.GameBoy.Advance...
+        if hit:
+            return hit
+    return _folder_system(folder) or "Unknown"
 
 
 def _release_group(rel: str) -> str:
@@ -4667,7 +4731,8 @@ class RsrToolAPI:
         NDS + 3DS sets alone are thousands of folders in one directory. System
         then year is the split that matches how the source is already organised
         and how anyone would go looking."""
-        return store / _release_system(rel) / _release_year(folder, rel) / rel
+        return (store / _release_system(rel, folder)
+                / _release_year(folder, rel) / rel)
 
     @staticmethod
     def _existing_rsr(store: Path, folder: Path, rel: str) -> Path | None:
@@ -5088,7 +5153,7 @@ class RsrToolAPI:
     def _capture_release(self, folder: Path, store: Path, s: dict,
                          exes: list[Path]) -> dict:
         rel = _release_name(folder)
-        self._tl.system = _release_system(rel)
+        self._tl.system = _release_system(rel, folder)
         sets = group_archive_sets(folder)
         if not sets:
             # Say WHICH kind of nothing. A third of the NDS corpus is ZIP
@@ -5265,7 +5330,7 @@ class RsrToolAPI:
             "host": {"platform": platform.platform(),
                      "python": platform.python_version()},
             "release": rel,
-            "system": _release_system(rel),
+            "system": _release_system(rel, folder),
             "year": _release_year(folder, rel),
             "tag": _release_tag(folder.name),
             "source_folder": str(folder),
@@ -5365,7 +5430,7 @@ class RsrToolAPI:
                                    for p in union}
                     pair_used = (folder, sib, base)
                     manifest["release"] = base_rel
-                    manifest["system"] = _release_system(base_rel)
+                    manifest["system"] = _release_system(base_rel, base)
                     manifest["year"] = _release_year(base, base_rel)
                     manifest["tag"] = _release_tag(base.name)
                     manifest["pair"] = sorted({folder.name, sib.name})
@@ -6010,7 +6075,7 @@ class RsrToolAPI:
             "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
             "host": {"platform": platform.platform(),
                      "python": platform.python_version()},
-            "release": rel, "system": _release_system(rel),
+            "release": rel, "system": _release_system(rel, folder),
             "year": _release_year(folder, rel), "tag": _release_tag(folder.name),
             "kind": "lha", "source_folder": str(folder), "sets": [],
         }
@@ -6215,7 +6280,7 @@ class RsrToolAPI:
             "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
             "host": {"platform": platform.platform(),
                      "python": platform.python_version()},
-            "release": rel, "system": _release_system(rel),
+            "release": rel, "system": _release_system(rel, folder),
             "year": _release_year(folder, rel), "tag": _release_tag(folder.name),
             "kind": "zip", "source_folder": str(folder), "sets": [],
         }
@@ -6601,7 +6666,7 @@ class RsrToolAPI:
             "host": {"platform": platform.platform(),
                      "python": platform.python_version()},
             "release": rel,
-            "system": _release_system(rel),
+            "system": _release_system(rel, folder),
             "year": _release_year(folder, rel),
             "tag": _release_tag(folder.name),
             "source_folder": str(folder),
@@ -6675,7 +6740,7 @@ class RsrToolAPI:
             "tool": f"tosort_toolkit rsr_tool {RSR_VERSION}",
             "host": {"platform": platform.platform(),
                      "python": platform.python_version()},
-            "release": rel, "system": _release_system(rel),
+            "release": rel, "system": _release_system(rel, folder),
             "year": _release_year(folder, rel), "tag": _release_tag(folder.name),
             "source_folder": str(folder), "kind": "loose",
             "sets": [{"stem": rel, "format": "LOOSE", "files": recs,
@@ -12156,14 +12221,14 @@ class RsrToolAPI:
         con = self._db()
         try:
             rows = con.execute(
-                "SELECT r.name FROM releases r "
+                "SELECT r.name, r.rsr_path FROM releases r "
                 "WHERE r.rsr_path IS NOT NULL AND NOT EXISTS ("
                 "  SELECT 1 FROM files f "
                 "  WHERE f.release = r.name AND f.source = 'content')"
             ).fetchall()
         finally:
             con.close()
-        counts = collections.Counter(_release_system(n) for (n,) in rows)
+        counts = collections.Counter(_rsr_system(p, n) for n, p in rows)
         return {"ok": True,
                 "systems": [{"system": s, "count": c}
                             for s, c in sorted(counts.items())]}
@@ -12208,7 +12273,7 @@ class RsrToolAPI:
         # EVERYTHING when nothing matched -- rewrote hundreds of them on
         # every run.
         want = set(meta_systems or ())
-        todo = [(n, rp) for n, rp in rows if _release_system(n) in want]
+        todo = [(n, rp) for n, rp in rows if _rsr_system(rp, n) in want]
         if not todo:
             return 0
         self._log("", "")
@@ -14340,12 +14405,12 @@ class RsrToolAPI:
                 system = getattr(self._tl, "system", "") or ""
                 if grp and system and system != "Unknown":
                     won = collections.Counter()
-                    for name, exe, mt in con.execute(
-                            "SELECT name, recipe_exe, mt FROM releases "
+                    for name, exe, mt, rp in con.execute(
+                            "SELECT name, recipe_exe, mt, rsr_path FROM releases "
                             "WHERE format=? AND recipe_exe != '' AND name LIKE ?",
                             (fmt, f"%-{grp}")):
                         if (_release_group(name) == grp
-                                and _release_system(name) == system):
+                                and _rsr_system(rp, name) == system):
                             won[(exe, int(mt))] += 1
                     for (exe, mt), _n in won.most_common(6):
                         for (sw,) in con.execute(
