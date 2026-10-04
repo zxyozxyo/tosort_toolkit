@@ -266,12 +266,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
                    oninput="jobsPreview()" onchange="jobsApply()">
             <span class="cpu-val" id="jobs-val">1 release</span>
           </div>
-          <div class="row" style="margin-top:2px">
+          <div class="row" style="margin-top:2px;flex-wrap:wrap;row-gap:4px">
             <button class="btn btn-go" id="btn-scan" onclick="startScan()">Scan &amp; capture</button>
             <button class="btn btn-sm" id="btn-skip" onclick="skipFile()" disabled
-                    title="Abandon EVERY release being captured right now and move on. To skip just one, click it in the list and use its own Skip this one.">Skip all running</button>
+                    title="Abandon EVERY release being captured right now and move on. To skip just one, click it in the list and use its own Skip this one.">Skip all</button>
             <button class="btn btn-sm" id="btn-finish" onclick="finishThisOne()" disabled
-                    title="Lift the time budget for EVERY release running right now (later releases get the normal budget again). To finish just one, click it in the list and use its own Finish this one.">Finish all running</button>
+                    title="Lift the time budget for EVERY release running right now (later releases get the normal budget again). To finish just one, click it in the list and use its own Finish this one.">Finish all</button>
             <button class="btn btn-stop" id="btn-stop" onclick="stopRun()" disabled>Stop</button>
           </div>
         </div>
