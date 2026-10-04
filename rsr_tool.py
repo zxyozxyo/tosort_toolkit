@@ -8041,7 +8041,10 @@ class RsrToolAPI:
         if size > (4 << 30):
             return None
         unp = rar4_unp_max(st["volumes"])
-        lo, hi = (300, 329) if unp >= 29 else (200, 299)
+        # Not 2.0x: those builds hang on a free-space prompt or predate the
+        # switches this needs (Tomb_Raider_La_Revelation_Finale-GENESIA sat an
+        # hour on rar 2.03), and every 2.x win here is 2.50 or later.
+        lo, hi = (300, 329) if unp >= 29 else (250, 299)
         seen, cands = set(), []
         for ex in exes:
             n = _exe_number(ex.name)
