@@ -861,7 +861,12 @@ _PLATFORMS = (
     "LINUX", "PC",
 )
 _PLAT_LOOKUP = {p: p for p in _PLATFORMS}
-_PLAT_LOOKUP.update({"DSI": "NDS", "NSW": "SWITCH", "XBONE": "XBOX"})
+_PLAT_LOOKUP.update({"DSI": "NDS", "NSW": "SWITCH", "XBONE": "XBOX",
+                     # MiRAGE's homebrew (`Flick_PSVITA-MiRAGE`) and the
+                     # CONSOLE standards nfo filed as Unknown, so the rebuild's
+                     # PSV sidecar tick never reached them. Not bare VITA: an
+                     # ordinary word in titles.
+                     "PSVITA": "PSV"})
 
 
 def _release_system(rel: str) -> str:
