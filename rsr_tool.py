@@ -2802,6 +2802,34 @@ def rar4_reserved_data_offset(path: Path, name: str):
     return off
 
 
+def rar4_reserved_data_offsets(path: Path, name: str) -> list:
+    """Every place the packed data can start under a reserved header.
+
+    The fixed 32 + name is only the SHORTEST header. rar 3.x also reserves
+    5 bytes of extended time (flag 0x1000) and 64-bit packers 8 bytes of high
+    sizes, and the placeholder is zeroed all the same, so its length cannot be
+    read off it. Taking the shortest as THE offset compared the right data
+    five bytes out of line: Crazy_Taxi_USA_NGC-MOONCUBE (rar 3.30, data at 66
+    not 61) was ruled out by the first look on every combo while rar 3.30
+    reproduces its first volume byte for byte -- a false wall for every 3.x
+    archive written with extended times. Only candidates whose whole span
+    before them is still zero are returned."""
+    base = rar4_reserved_data_offset(path, name)
+    if base is None:
+        return []
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return [base]
+    out = [base]
+    for extra in (5, 8, 13):
+        off = base + extra
+        if off <= len(head) and not any(head[base:off]):
+            out.append(off)
+    return out
+
+
 def rar4_av_owner(vol: Path) -> str | None:
     """The licence name in an AV (authenticity verification) block, or None.
 
@@ -10515,9 +10543,7 @@ class RsrToolAPI:
             return None
         looked = False
         for nm, (src_vol, src_off, src_len) in prefix.items():
-            off = rar4_reserved_data_offset(probe_head, nm)
-            if off is None:
-                continue
+          for off in rar4_reserved_data_offsets(probe_head, nm):
             n = min(size - off, src_len)
             if n < min_bytes:
                 continue
