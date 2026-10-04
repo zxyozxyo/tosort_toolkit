@@ -12456,6 +12456,8 @@ class RsrToolAPI:
             try:
                 if not src.is_file():
                     continue
+                if src.parent == self._work_root():
+                    continue                    # our own stand-in (empty.bin)
                 if src.resolve() == out_res or out_res in src.resolve().parents:
                     self._log(f"    ⚠ refusing to delete {src.name}: it is "
                               "inside the output folder.", "warn")
@@ -12724,7 +12726,9 @@ class RsrToolAPI:
             self._log(f"  captured {manifest.get('created_utc')} by "
                       f"{manifest.get('tool')}", "dim")
             out.mkdir(parents=True, exist_ok=True)
-            work = Path(tempfile.mkdtemp(prefix="rsr-rb-", dir=self._work_root()))
+            # The same prefix as a capture's work folder, and a set folder
+            # (`set0` below) as short as the capture's: see _rebuild_set.
+            work = Path(tempfile.mkdtemp(prefix="rsr-", dir=self._work_root()))
             ok_all = True
             self._infer_set_folders(manifest, z)
             try:
@@ -12778,7 +12782,13 @@ class RsrToolAPI:
 
         # Gather sources: loose content from the user's folder, archive-only
         # extras straight out of the container.
-        setwork = work / stem.replace(os.sep, "_")
+        # As short as the capture's `set0`. Named after the set it was 19+
+        # characters longer, and a deep tree crossed MAX_PATH where the
+        # capture had not: Sony_Vita_Sdk_0945-YLoD's
+        # ...\tex_bg\poster_girl_01.tga could not be opened by rar 4.10,
+        # which skipped it, and .r12 failed its hash at every rebuild.
+        n = sum(1 for q in work.iterdir() if q.name.startswith("set"))
+        setwork = work / f"set{n}"
         srcdir = setwork / "src"
         srcdir.mkdir(parents=True, exist_ok=True)
         srcs = []
@@ -12794,6 +12804,11 @@ class RsrToolAPI:
             dst.parent.mkdir(parents=True, exist_ok=True)
             if f.get("stored"):
                 dst.write_bytes(z.read(f["stored"]))
+            elif f.get("size") is not None and int(f["size"]) == 0:
+                # Nothing to find: an EMPTY file is its own content.
+                # Dreamon_1_Multi_PAL_DC-DRINK_TEAM failed its rebuild on
+                # "missing source: MONACO/MONACO.BIN (0 B)".
+                dst.write_bytes(b"")
             else:
                 # A NAME match is a hint, not an answer -- so check it before
                 # believing it. Dreamcast releases almost all ship a self-boot
@@ -13124,6 +13139,16 @@ class RsrToolAPI:
         once per set and re-walking a rom library each time would be silly."""
         want_size = f.get("size")
         want_crc = f.get("crc32")
+        if want_size == 0:
+            # An EMPTY file is its own content: there is nothing to find, and
+            # asking the folder for it failed the rebuild instead --
+            # Dreamon_1_Multi_PAL_DC-DRINK_TEAM, "missing source:
+            # MONACO/MONACO.BIN (0 B)". A stand-in of our own, never the
+            # operator's (the delete-sources pass skips it).
+            empty = self._work_root() / "empty.bin"
+            if not empty.is_file() or empty.stat().st_size:
+                empty.write_bytes(b"")
+            return empty
         if not want_size or want_crc is None:
             return None
         # The batch hands each release the folder its MATCHED file sits in.
