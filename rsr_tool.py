@@ -5190,6 +5190,40 @@ class RsrToolAPI:
                     continue
         return None
 
+    _NOT_VERDICT = ("budget", "stopped", "skipped", "damaged", "truncated",
+                    "corrupt", "incomplete release", "head volume",
+                    "code page", "locale", "unreadable", "encrypted")
+
+    def _small_wall_carry(self, folder: Path, store: Path, s: dict, rel: str,
+                          errors: str):
+        """Carry a SMALL release no recipe reaches WHOLE, or None.
+
+        The PLUS3DS trainers (~170 KB, 22 B off), the 1 MB DC cheat and
+        trainer discs, an nfo collection holding two files of one name
+        (Dreamcast_NFO_Archive-EEA): worth more kept, indexed and rebuilding
+        byte-exact than as permanent misses -- the same call srrdb makes for
+        an nfo fix. Only on a VERDICT: a budget stop, a hand stop, a damaged,
+        truncated or unreadable copy or a locale problem is not one, and
+        carrying a damaged copy would verify the damage. Shared by the RAR,
+        ZIP and LHA paths -- the ZIP walls used to stay walls however small
+        (Gamecube.Operating.Boot.System.V1.1, 996 KB)."""
+        cap = max(int(s.get("embed_max_mb", 16) or 0),
+                  int(s.get("wall_carry_mb", 0) or 0)) * 1024 * 1024
+        errs = (errors or "").lower()
+        rel_files = [p for p in folder.rglob("*") if p.is_file()]
+        total = sum(p.stat().st_size for p in rel_files)
+        if (cap and total < cap and rel_files
+                and not (self._skip.is_set() or self._stop.is_set())
+                and not any(k in errs for k in self._NOT_VERDICT)):
+            return self._capture_metadata(
+                folder, store, s, rel, rel_files,
+                whole=True,
+                why=f"  No recipe reproduces this release, but it is "
+                    f"small ({total:,} B in {len(rel_files)} file(s)) "
+                    f"— carrying it whole, verbatim: kept and "
+                    f"rebuildable, a container rather than a recipe.")
+        return None
+
     def _capture_release(self, folder: Path, store: Path, s: dict,
                          exes: list[Path]) -> dict:
         rel = _release_name(folder)
@@ -5216,12 +5250,20 @@ class RsrToolAPI:
                                or (p.suffix.lower() not in _SIDECAR_EXT
                                    and _pk(p))))
             if zips:
-                return self._capture_zip(folder, store, s, rel, zips)
+                res = self._capture_zip(folder, store, s, rel, zips)
+                if not res.get("ok") and not res.get("damaged"):
+                    res = self._small_wall_carry(
+                        folder, store, s, rel, str(res.get("error", ""))) or res
+                return res
             if kinds & {".lha", ".lzh"}:
                 lhas = sorted(q for q in folder.rglob("*")
                               if q.is_file()
                               and q.suffix.lower() in (".lha", ".lzh"))
-                return self._capture_lha(folder, store, s, rel, lhas)
+                res = self._capture_lha(folder, store, s, rel, lhas)
+                if not res.get("ok") and not res.get("damaged"):
+                    res = self._small_wall_carry(
+                        folder, store, s, rel, str(res.get("error", ""))) or res
+                return res
             # A metadata-only fix (DIRFIX, NFOFIX, …) IS the release — it never
             # had an archive, so reporting "no archive set found" calls a
             # complete release a miss and buries it among the real ones. There
@@ -5543,24 +5585,10 @@ class RsrToolAPI:
                 # budget stop, a hand stop, a damaged or incomplete copy or a
                 # locale problem is not one, and carrying a damaged copy would
                 # verify the damage.
-                cap = max(int(s.get("embed_max_mb", 16) or 0),
-                          int(s.get("wall_carry_mb", 0) or 0)) * 1024 * 1024
-                errs = " ".join(set_errors).lower()
-                not_verdict = ("budget", "stopped", "skipped", "damaged",
-                               "truncated", "corrupt", "incomplete release",
-                               "head volume", "code page", "locale")
-                rel_files = [p for p in folder.rglob("*") if p.is_file()]
-                total = sum(p.stat().st_size for p in rel_files)
-                if (cap and total < cap and rel_files
-                        and not (self._skip.is_set() or self._stop.is_set())
-                        and not any(k in errs for k in not_verdict)):
-                    return self._capture_metadata(
-                        folder, store, s, rel, rel_files,
-                        whole=True,
-                        why=f"  No recipe reproduces this release, but it is "
-                            f"small ({total:,} B in {len(rel_files)} file(s)) "
-                            f"— carrying it whole, verbatim: kept and "
-                            f"rebuildable, a container rather than a recipe.")
+                carried = self._small_wall_carry(folder, store, s, rel,
+                                                 " ".join(set_errors))
+                if carried is not None:
+                    return carried
                 self._log("  ✗ Not every set captured and verified — writing "
                           "NO .rsr, so a re-run still sees this release.", "err")
                 # Say WHICH kind of failure, because the caller records a wall
