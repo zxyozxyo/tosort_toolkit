@@ -1369,6 +1369,18 @@ CMDLINE_MAX = 30000
 # The most packed data a combo may miss and still be handed to the verifying
 # replay as a near miss (see _near_miss_recipe).
 NEAR_MISS_BYTES = 64 << 10
+# ...or up to this share of the release's packed data, whichever is more, but
+# never past NEAR_MISS_CEIL. Sega_Germany_Dreamcast_Pre-Launch_Press_Disc_DC-
+# s1xty: rar 3.60 -mt2 rebuilds 2391 of its 2392 streams, and the first file's
+# 765 KB matches nothing -- every build diverges at the same byte 2,305 of it,
+# so it is the input, not the packer. 64 KB turned a 577 MB release into a
+# wall over 0.13% of it.
+NEAR_MISS_SHARE = 200
+NEAR_MISS_CEIL = 1_500_000
+
+
+def _near_miss_allowance(total_packed: int) -> int:
+    return max(NEAR_MISS_BYTES, min(NEAR_MISS_CEIL, total_packed // NEAR_MISS_SHARE))
 
 
 def _inline_dirs(names: list, dirs) -> list:
@@ -4404,6 +4416,15 @@ class RsrToolAPI:
         pack = self._app_dir / "apps" / "winrar_pack-4.20"
         return sorted(pack.glob("*_rar*.exe")) if pack.is_dir() else []
 
+    def _extractor(self, exes) -> Path:
+        """The rar that extracts a set's sources: the newest in the pack, not
+        the newest of `exes`. A sweep narrowed to old builds -- 2005's 3.60
+        for Dreamcast_Scene_Folder_Names_NFO_SFV -- extracted with 3.60, which
+        cannot write a path past 260 characters, and five 268-character names
+        came out empty: "extraction incomplete" on an intact release. An
+        empty `exes` (a DOS-only run) crashed outright."""
+        return (self._pack_exes() or list(exes))[-1]
+
     def _pack_ignored(self) -> list[str]:
         """Executables sitting in the build pack that `_pack_exes` cannot see.
 
@@ -7122,7 +7143,7 @@ class RsrToolAPI:
         self._progress(f"extracting {total_src / (1 << 20):,.0f} MB — "
                        f"{st['stem']}")
         t_x = time.monotonic()
-        ok_x = self._run([str(exes[-1]), "x", "-y", "-o+", str(head),
+        ok_x = self._run([str(self._extractor(exes)), "x", "-y", "-o+", str(head),
                           str(srcdir) + os.sep], timeout=3600,
                          heartbeat=f"extracting {total_src / (1 << 20):,.0f} MB "
                                    f"· {st['stem']}")
@@ -7965,7 +7986,7 @@ class RsrToolAPI:
                           f"{o:,} (mask 0x{m:02X}) — the packed-data CRC pins "
                           "it; repairing the working copy, the recipe will "
                           "put it back.", "dim")
-        ok = flips and self._run([str(exes[-1]), "x", "-y", "-o+", str(head),
+        ok = flips and self._run([str(self._extractor(exes)), "x", "-y", "-o+", str(head),
                                   str(srcdir) + os.sep], timeout=3600,
                                  heartbeat="re-extracting the repaired set")
         if ok and all((srcdir / f["name"]).is_file()
@@ -7976,7 +7997,7 @@ class RsrToolAPI:
             return out
         # Still failing. Only when the packed data itself is proven intact is
         # the extracted-with-errors file the real input.
-        ok = self._run([str(exes[-1]), "x", "-y", "-o+", "-kb", str(head),
+        ok = self._run([str(self._extractor(exes)), "x", "-y", "-o+", "-kb", str(head),
                         str(srcdir) + os.sep], timeout=3600,
                        heartbeat="extracting, keeping the damaged file")
         if not all((srcdir / f["name"]).is_file()
@@ -8014,7 +8035,7 @@ class RsrToolAPI:
         delta carries a difference that size easily, so hand the combo to the
         verifying replay: it still has to rebuild the archive byte-exact
         through diff_bytes, or nothing is written. Only when the missed
-        streams are at most 1% of them and NEAR_MISS_BYTES of packed data."""
+        streams are at most 1% of them and _near_miss_allowance of packed data."""
         bp = self._best_partial
         if not bp or len(bp) < 7 or not bp[0]:
             return None
@@ -8024,7 +8045,9 @@ class RsrToolAPI:
         if not miss or len(miss) > max(1, len(targets) // 100):
             return None
         miss_bytes = sum(int(f.get("packed_size") or 0) for f in miss)
-        if miss_bytes > self.NEAR_MISS_BYTES:
+        total = sum(int(f.get("packed_size") or 0) for f in meta
+                    if f["name"] in targets)
+        if miss_bytes > _near_miss_allowance(total):
             return None
         self._log(f"    ◐ near miss: {label}{'' if mt_ < 0 else f' -mt{mt_}'} "
                   f"reproduces {n_ok} of {len(targets)} stream(s); the rest "
@@ -10033,7 +10056,17 @@ class RsrToolAPI:
                     rest = [c for c in combos
                             if not (len(c) > 2 and c[2]
                                     and c[2][0] == self.DOS_MARK)]
-                    hot = 0
+                    # The group's known Windows recipes still go first: each
+                    # is a prefix probe, seconds, where a DOS combo is a full
+                    # pack. Beats_Of_Rage_DC-IND says MS-DOS in every header,
+                    # spent a 4 h budget on 64 DOS combos, and was rar 3.20 for
+                    # Windows -- one of IND's 10 known recipes -- in 398 s.
+                    win_hot = [c for c in combos[:hot]
+                               if not (len(c) > 2 and c[2]
+                                       and c[2][0] == self.DOS_MARK)]
+                    rest = rest[len(win_hot):] if rest[:len(win_hot)] == win_hot \
+                        else [c for c in rest if c not in win_hot]
+                    hot = len(win_hot)
                     self._tl.dos_only_builds = dcount
                     if dos_only:
                         # Measured over the corpus: 284 of 284 captured
@@ -10046,6 +10079,8 @@ class RsrToolAPI:
                         # build matched", which is a weaker statement than the
                         # sweep's usual one.
                         combos = head_dos
+                        rest = win_hot + rest
+                        hot = 0
                         self._tl.dos_only_skipped = len(rest)
                         self._log(f"    the header says this was packed on "
                                   f"MS-DOS — trying the {dcount} DOS combo(s) "
@@ -10054,10 +10089,13 @@ class RsrToolAPI:
                                   "builds only' setting). A wall here means no "
                                   "DOS build matched.", "dim")
                     else:
-                        combos = head_dos + rest
+                        combos = win_hot + head_dos + rest
                         self._log(f"    the header says this was packed on "
                                   f"MS-DOS — leading with the {dcount} DOS "
-                                  "combo(s); the Windows sweep follows as a "
+                                  "combo(s)"
+                                  + (f", after the group's {hot} known Windows "
+                                     "recipe(s)" if hot else "")
+                                  + "; the Windows sweep follows as a "
                                   "backstop.", "dim")
                 else:
                     self._log(f"    {len(dos)} DOS RAR build(s) queued behind "
@@ -10709,7 +10747,8 @@ class RsrToolAPI:
         # small misses, while they stay within that allowance; a big one
         # still ends it at once, before anything large is hashed.
         allow_n = max(1, len(targets) // 100)
-        allow_b = NEAR_MISS_BYTES
+        allow_b = _near_miss_allowance(sum(
+            t[0] for t in targets.values() if isinstance(t, tuple) and t))
         matched, missed_n, missed_b = [], 0, 0
         for name in sorted(targets, key=_size):
             got = blocks.get(name)
