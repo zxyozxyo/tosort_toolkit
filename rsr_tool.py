@@ -1633,6 +1633,35 @@ def _open_rar(head, info_callback=None):
         return rf
 
 
+def _nfo_password(folder: Path) -> str | None:
+    """The password a release's nfo announces, or None.
+
+    The two encrypted originals seen so far both said it in plain words:
+    Pikmin_2_USA_NGC-STARCUBE 'we password protected our rars, the password
+    is "m3troid"'. Looks for a quoted word, or the word after "password is" /
+    "password:", on a line that mentions a password."""
+    pat_q = re.compile(r"""["']([^"'\s]{2,64})["']""")
+    pat_w = re.compile(r"(?:pass(?:word)?|pw)\s*(?:is|:|=)\s*([^\s\"'|]{2,64})",
+                       re.I)
+    try:
+        nfos = sorted(p for p in Path(folder).iterdir()
+                      if p.is_file() and p.suffix.lower() in (".nfo", ".txt"))
+    except OSError:
+        return None
+    for p in nfos:
+        try:
+            text = p.read_bytes()[:256 << 10].decode("cp437", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if not re.search(r"pass(?:word)?|\bpw\b", line, re.I):
+                continue
+            m = pat_q.search(line) or pat_w.search(line)
+            if m:
+                return m.group(1)
+    return None
+
+
 def packed_blocks(head: Path) -> dict[str, list[tuple[str, int, int]]]:
     """{packed file name: [(volume, offset, length), …]} — where each file's
     COMPRESSED bytes physically live, in order, across the whole set.
@@ -7007,6 +7036,27 @@ class RsrToolAPI:
                              "volume that is not in this folder"}
         if not infos:
             return {"ok": False, "error": "no packed files"}
+        # Encrypted, which an original scene release almost never is: say so
+        # BEFORE extracting. Pikmin_2_USA_NGC-STARCUBE ("for reasons unknown,
+        # we password protected our rars") read as "extraction incomplete",
+        # i.e. a damaged download, after unpacking 1.4 GB into a password
+        # prompt. Encryption salts are random, so no recipe can ever rebuild
+        # it -- it is a decision for the operator, not a sweep.
+        locked = [i.filename for i in infos
+                  if getattr(i, "needs_password", lambda: False)()]
+        if locked:
+            pw = _nfo_password(folder)
+            self._log(f"    🔒 password-protected: {locked[0]}"
+                      + (f" (+{len(locked) - 1} more)" if len(locked) > 1
+                         else "")
+                      + " is encrypted"
+                      + (f"; the nfo gives the password \"{pw}\"" if pw
+                         else "; no password found in the nfo")
+                      + ". An encrypted rar cannot be rebuilt from its "
+                      "content — only carried whole.", "warn")
+            return {"ok": False,
+                    "error": "password-protected (encrypted)"
+                             + (f", nfo password \"{pw}\"" if pw else "")}
 
         meta = self._read_files(infos, st["format"])
         # Directory names in archive order, and whether they come BEFORE the
