@@ -12593,6 +12593,24 @@ class RsrToolAPI:
                         _file_sha256(q))
             except OSError:
                 continue
+        # ...and every file the release carries INSIDE its archive. Those are
+        # only ever in the rebuilt volumes, never loose in `rel_out`, so the
+        # loop above cannot see them: Roms.MAME.v0.139.Full.Arcade.Set rebuilt
+        # and verified, and its 8,502 nfo/jpg/pdf/exe extras stayed in the
+        # content folder for good. An extra is embedded in the .rsr and was
+        # just packed into volumes that matched their hashes, so a loose file
+        # with its exact size and sha256 is a redundant copy.
+        con = self._db()
+        try:
+            for size, sha in con.execute(
+                    "SELECT size, sha256 FROM files WHERE release=? AND "
+                    "source='extra' AND sha256 IS NOT NULL AND sha256!='' "
+                    "AND size>0 AND size<=?", (rel_out.name, 64 << 20)):
+                wrote.setdefault(int(size), set()).add(sha)
+        except Exception:
+            pass
+        finally:
+            con.close()
         if not wrote:
             return 0
         cache = getattr(self, "_size_map_cache", None)
