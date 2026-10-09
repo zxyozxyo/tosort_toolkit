@@ -155,6 +155,45 @@ def _file_crc32(path: Path, chunk: int = 1 << 20) -> int:
     return c & 0xFFFFFFFF
 
 
+# CRCs of the operator's content files, keyed on (path, size, mtime) so an
+# edited file is simply a new key. A rebuild batch hashes every candidate once
+# to match it, then each release went looking for its source again by content
+# -- and every GameCube disc is exactly 1,459,978,240 B, so "size narrows it
+# for free" narrowed nothing: each release re-read same-size discs until it
+# reached its own. 107 NGC rebuilds on 2026-10-09 spent 8.2 hours doing that
+# (4.6 min each, worst 15). A stale entry can only ever cost a failed
+# rebuild: the staged copy is CRC-checked as it is copied, and every volume
+# is hash-verified at the end.
+_CRC_MEMO: dict = {}
+_CRC_MEMO_LOCK = threading.Lock()
+
+
+def _file_crc32_memo(path: Path) -> int:
+    st = Path(path).stat()
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    with _CRC_MEMO_LOCK:
+        hit = _CRC_MEMO.get(key)
+    if hit is None:
+        hit = _file_crc32(path)
+        with _CRC_MEMO_LOCK:
+            if len(_CRC_MEMO) > 500_000:
+                _CRC_MEMO.clear()
+            _CRC_MEMO[key] = hit
+    return hit
+
+
+def _copy_crc32(src: Path, dst: Path, chunk: int = 1 << 22) -> int:
+    """shutil.copy2, returning the CRC-32 of the bytes copied -- one read of
+    the source instead of a copy and then a second full read to check it."""
+    c = 0
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        for blk in iter(lambda: fi.read(chunk), b""):
+            c = zlib.crc32(blk, c)
+            fo.write(blk)
+    shutil.copystat(src, dst)
+    return c & 0xFFFFFFFF
+
+
 def _num(value, fallback, cast):
     """Coerce a GUI form value, falling back to the stored one on junk.
 
@@ -11944,7 +11983,7 @@ class RsrToolAPI:
             return {"ok": False, "error": "no index yet"}
         try:
             size = p.stat().st_size
-            crc = _file_crc32(p)
+            crc = _file_crc32_memo(p)
         except OSError as e:
             # The batch walks the content folder once and then works through
             # the list, and the file can be gone by the time its turn comes:
@@ -12575,7 +12614,7 @@ class RsrToolAPI:
             # .ips can be byte-identical to another release's extra, and
             # removing it would strand that patch from this content folder.
             try:
-                size, crc = p.stat().st_size, _file_crc32(p)
+                size, crc = p.stat().st_size, _file_crc32_memo(p)
             except OSError:
                 return True
             con = self._db()
@@ -13107,6 +13146,7 @@ class RsrToolAPI:
             rel_name = f["name"].replace("\\", "/") if keep_paths else base
             dst = srcdir / rel_name
             dst.parent.mkdir(parents=True, exist_ok=True)
+            copied_crc = None
             if f.get("stored"):
                 dst.write_bytes(z.read(f["stored"]))
             elif f.get("size") is not None and int(f["size"]) == 0:
@@ -13156,8 +13196,10 @@ class RsrToolAPI:
                 # and nothing else — never a folder sweep, never the match the
                 # batch runner happened to hash first.
                 self._consumed.append(Path(found))
-                shutil.copy2(found, dst)
-            if f.get("crc32") is not None and _file_crc32(dst) != f["crc32"]:
+                copied_crc = _copy_crc32(Path(found), dst)
+            if f.get("crc32") is not None and (
+                    copied_crc if copied_crc is not None
+                    else _file_crc32(dst)) != f["crc32"]:
                 self._log(f"    ✗ {base}: CRC does not match what was "
                           "captured — wrong file.", "err")
                 return False
@@ -13427,7 +13469,7 @@ class RsrToolAPI:
         try:
             if want_size and p.stat().st_size != want_size:
                 return False
-            if want_crc is not None and _file_crc32(p) != want_crc:
+            if want_crc is not None and _file_crc32_memo(p) != want_crc:
                 return False
             if want_crc == self.CRC32_RESIDUE and f.get("sha256"):
                 return _file_sha256(p) == f["sha256"]
