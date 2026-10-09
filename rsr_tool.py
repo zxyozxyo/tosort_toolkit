@@ -61,6 +61,25 @@ RSR_MAGIC     = "RSR/1 Reproducible Scene Release"
 CONFIG_NAME   = "rsr_tool.json"
 DB_NAME       = "rsr_index.db"
 
+# The "Work folder" setting: where extracted sources, sweep packs and rebuilds
+# are staged. "" = the system temp folder (C:, usually). RsrToolAPI keeps it in
+# step with rsr_tool.json; module-level so the set finder's SFX cache uses it too.
+_WORK_DIR = ""
+
+
+def _temp_base() -> Path:
+    """The work folder if one is set and usable, else the system temp folder.
+    A work folder on a drive that is not there today (an unplugged USB disk)
+    falls back rather than failing every capture."""
+    if _WORK_DIR:
+        try:
+            p = Path(_WORK_DIR)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except OSError:
+            pass
+    return Path(tempfile.gettempdir())
+
 RAR4_SIG      = b"Rar!\x1a\x07\x00"
 RAR5_SIG      = b"Rar!\x1a\x07\x01\x00"
 
@@ -1275,7 +1294,7 @@ def group_archive_sets(base: Path) -> list[dict]:
             st0 = paths[0].stat()
             tag = hashlib.sha1(f"{paths[0]}|{st0.st_size}|{st0.st_mtime_ns}"
                                .encode()).hexdigest()[:16]
-            cache = Path(tempfile.gettempdir()) / "rsr-sfx" / tag
+            cache = _temp_base() / "rsr-sfx" / tag
             stripped = cache / paths[0].name
             if not (stripped.is_file()
                     and stripped.stat().st_size == st0.st_size - off):
@@ -3658,6 +3677,8 @@ class RsrToolAPI:
         self._capturing: set = set()       # releases being captured right now
         self._proc_lock = threading.Lock()
         self._app_dir = Path(__file__).parent
+        global _WORK_DIR
+        _WORK_DIR = self.get_settings()["work_dir"]
         self._budget_min = 0
         self._content_root = None      # never delete the root itself
         # Per-CAPTURE state, kept per thread. With several releases in flight
@@ -4202,6 +4223,9 @@ class RsrToolAPI:
             # single folder needs no list at all.
             "sources": [str(p) for p in (cfg.get("sources") or []) if str(p).strip()],
             "store": cfg.get("store", str(self._app_dir / "rsr_store")),
+            # Where sources are extracted and sweeps/rebuilds staged -- tens of
+            # GB at a time with several jobs. "" = the system temp folder.
+            "work_dir": str(cfg.get("work_dir") or "").strip(),
             "max_mt": _num(cfg.get("max_mt"), 16, int),
             "embed_extras": bool(cfg.get("embed_extras", True)),
             "embed_max_mb": _num(cfg.get("embed_max_mb"), 16, int),
@@ -4264,6 +4288,9 @@ class RsrToolAPI:
             "sources": ([str(p).strip() for p in s["sources"] if str(p).strip()]
                         if isinstance(s.get("sources"), list) else cur["sources"]),
             "store": (s.get("store") or cur["store"]).strip(),
+            # Unlike `store`, an empty box is a real choice: back to %TEMP%.
+            "work_dir": str(s["work_dir"] if "work_dir" in s
+                            else cur["work_dir"]).strip(),
             "max_mt": max(0, min(32, _num(s.get("max_mt"), cur["max_mt"], int))),
             "embed_extras": bool(s.get("embed_extras", cur["embed_extras"])),
             "embed_max_mb": max(0, min(4096, _num(s.get("embed_max_mb"),
@@ -4307,6 +4334,8 @@ class RsrToolAPI:
             self._config_path.write_text(json.dumps(out, indent=2), "utf-8")
         except Exception as e:
             return {"ok": False, "error": str(e)}
+        global _WORK_DIR
+        _WORK_DIR = out["work_dir"]
         return {"ok": True, "settings": out}
 
     def store_status(self, path: str = "") -> dict:
@@ -4436,8 +4465,9 @@ class RsrToolAPI:
 
         Still under %TEMP% rather than beside the code: these hold the whole
         extracted source, which is gigabytes for a 3DS release, and the system
-        temp drive is the one with room for that."""
-        root = Path(tempfile.gettempdir()) / "rsr-work"
+        temp drive is the one with room for that -- or, when it has not, the
+        "Work folder" setting moves all of it to another drive (_temp_base)."""
+        root = _temp_base() / "rsr-work"
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -4621,7 +4651,7 @@ class RsrToolAPI:
         300 KB is a build that hangs, and the only useful thing to learn about
         it is that it must never be run again."""
         out = {"s1": False, "vol": False, "hang": False, "alive": False}
-        work = Path(tempfile.mkdtemp(prefix="rsrdoscap"))
+        work = Path(tempfile.mkdtemp(prefix="rsrdoscap", dir=self._work_root()))
         try:
             for key, extra, volb in (("s1", ("-s1", "-ds"), 0),
                                      ("vol", (), 200000)):

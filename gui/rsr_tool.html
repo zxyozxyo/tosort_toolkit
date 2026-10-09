@@ -208,6 +208,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           </div>
           <div class="warn-line" id="store-warn"></div>
           <div class="row">
+            <div class="lbl">Work folder</div>
+            <input class="txt" id="work_dir" placeholder="blank = system temp (C:)"
+                   title="Where sources are extracted and sweeps/rebuilds are staged — needs tens of GB free"
+                   onchange="save()">
+            <button class="btn btn-sm" onclick="pick('work_dir')">…</button>
+          </div>
+          <div class="row">
             <div class="lbl">Max -mt</div>
             <input class="num" id="max_mt" type="number" min="0" max="32" value="16">
             <span class="hint">thread counts swept 0–N</span>
@@ -462,6 +469,7 @@ window.addEventListener('pywebviewready', async () => {
   renderSources();
   $('store').value = s.store || '';
   checkStore();
+  $('work_dir').value = s.work_dir || '';
   $('max_mt').value = s.max_mt;
   $('embed_max_mb').value = s.embed_max_mb;
   $('wall_carry_mb').value = s.wall_carry_mb || 0;
@@ -574,6 +582,7 @@ function cfg() {
     source: allSources()[0] || $('source').value.trim(),
     sources: allSources().slice(1),
     store: $('store').value.trim(),
+    work_dir: $('work_dir').value.trim(),
     max_mt: $('max_mt').value,
     embed_max_mb: $('embed_max_mb').value,
     wall_carry_mb: $('wall_carry_mb').value,
@@ -594,7 +603,7 @@ function cfg() {
 
 async function pick(id) {
   const p = await window.pywebview.api.browse_folder();
-  if (p) { $(id).value = p; if (id === 'source' || id === 'store') save(); }
+  if (p) { $(id).value = p; if (id === 'source' || id === 'store' || id === 'work_dir') save(); }
 }
 async function pickRsr() {
   const p = await window.pywebview.api.browse_rsr();
