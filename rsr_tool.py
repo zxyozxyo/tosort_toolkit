@@ -663,6 +663,32 @@ def _method_groups(meta: list[dict]) -> list[tuple[int, int]]:
     return [(lvl, n) for lvl, n in out]
 
 
+# rar's default `-ms` list (3.x): file types stored as-is, not compressed.
+MS_DEFAULT_EXTS = {"7z", "ace", "arj", "bz2", "cab", "gz", "jpeg", "jpg",
+                   "lha", "lzh", "mp3", "rar", "taz", "tgz", "z", "zip"}
+
+
+def _wants_ms(meta: list[dict]) -> str:
+    """'-ms<exts>' for a compressed set that STORES an already-compressed
+    type, else ''. Without it every build compresses the .7z -- by a
+    sliver, but compressed -- so no combo can match. EMiL's 2005 GameCube
+    rips are a .7z beside a -m5 .nfo: Animal_Crossing_PAL_RIPPED_NGC-EMiL
+    swept 11,789 combos without it; 3.60 -m5 -ms -mt2 is byte-identical.
+
+    The list is named, not left to the build's default: before 3.60 the
+    default did not include 7z, and Donkey_Konga_2_PAL_READ_NFO_NGC-EMiL is
+    3.42/3.51 with `-ms7z`. Naming exactly the stored types reproduces both
+    (on 3.60 it stores what the default would have)."""
+    stored = [f for f in meta if int(f.get("method", 0)) == 0
+              and int(f.get("packed_size") or 0) == int(f.get("size") or 0)
+              and int(f.get("size") or 0) > 0]
+    if not any(int(f.get("method", 0)) > 0 for f in meta):
+        return ""
+    exts = sorted({Path(str(f.get("name", ""))).suffix.lower().lstrip(".")
+                   for f in stored} & MS_DEFAULT_EXTS)
+    return f"-ms{';'.join(exts)}" if exts else ""
+
+
 def _mt_label(exe: str, mt) -> str:
     """'-mt8', or 'no -mt' for a build that has no such switch — reporting
     '-mt0' for 3.00 would describe a command nobody could run."""
@@ -678,6 +704,13 @@ def _supports_vn(fname: str) -> bool:
     2.70b4 and 2.71. Redundant there in any case -- .rar/.r00 IS the 2.x
     default, which is the whole of what -vn asks for."""
     return _exe_number(fname) >= 300
+
+
+def _supports_ms(fname: str) -> bool:
+    """Does this build take -ms<list>? It arrived in 3.00: every 2.x and
+    2.90 build exits 7 on it and writes nothing, so it must never reach
+    them -- a 2.x set that auto-stored a .zip would wall."""
+    return _exe_number(fname) >= 300 or _dos32_number(fname) >= 300
 
 
 def _supports_mt(fname: str) -> bool:
@@ -7817,7 +7850,8 @@ class RsrToolAPI:
                                         else int(s.get("year_after") or 0),
                                         host=rar4_host(vols)
                                         if st["format"] == "RAR4" else -1,
-                                        solid_vols=solid_vols)
+                                        solid_vols=solid_vols,
+                                        store_ms=_wants_ms(meta))
             if recipe:
                 if rr_pass != sweep_rr:
                     recipe["rr_exact"] = True
@@ -9661,7 +9695,7 @@ class RsrToolAPI:
                       year_before=0, year_after=0,
                       dirs=(), dirs_first=True, mm_ev=None,
                       head_vol=0, orig_stream=None,
-                      solid_vols=False) -> dict | None:
+                      solid_vols=False, store_ms="") -> dict | None:
         """Pack every file TOGETHER at each (build, -mt) and keep the combo
         whose streams match byte for byte.
 
@@ -10240,6 +10274,19 @@ class RsrToolAPI:
                                     for x in (c[2] if len(c) > 2 else ()))
                           else ("-sv",)))
                       for c in combos]
+        if store_ms:
+            # See _wants_ms. Appended, so the known recipes still lead; the
+            # recipe's `mc` carries it to every replay.
+            # Not twice: a recipe learned with it already carries one.
+            combos = [(c[0], c[1], tuple(c[2] if len(c) > 2 else ())
+                       + ((store_ms,) if _supports_ms(c[0].name)
+                          and not any(str(x).startswith("-ms")
+                                      for x in (c[2] if len(c) > 2 else ()))
+                          else ()))
+                      for c in combos]
+            self._log("    an already-compressed file is STORED beside "
+                      f"compressed ones — sweeping with {store_ms} (store "
+                      "those types).", "dim")
         sig = self._order_sig(combos)
         start, when = self._resume_point(rel, sig)
         if start >= len(combos):
